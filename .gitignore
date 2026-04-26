@@ -1,0 +1,47 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# .env files carry the faucet's master private key — never commit these.
+*.env
+.env
+.env.*
+!.env.example
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environment ─────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+
+# ── Testing ─────────────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ── IDE ─────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Backup files (left by editors / refactors) ──────────────────────────────
+*.bak
+
+# ── Runtime state (SQLite + WAL sidecars) ───────────────────────────────────
+# The vault registry database accumulates in the working directory at runtime;
+# operators back it up out-of-band, never into git.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

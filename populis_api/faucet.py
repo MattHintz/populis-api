@@ -1,0 +1,206 @@
+"""XCH launcher-payer (faucet).
+
+The faucet is a single BLS key controlled by the backend that funds every
+new vault's launcher coin.  Users never pay — they only sign an EIP-712
+(or BLS) message to prove ownership of their public key.
+
+On testnet11 the faucet can be topped up for free from the Chia testnet
+faucet (https://testnet11-faucet.chia.net).  On mainnet (Phase 2) this
+faucet is replaced by user-paid launchers or a dedicated onboarding
+service.
+
+Key derivation follows the standard Chia wallet path
+  m / 12381' / 8444' / 2' / 0'
+which is the first wallet address (address index 0).
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program
+from chia.wallet.derive_keys import master_sk_to_wallet_sk_unhardened
+from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import (
+    DEFAULT_HIDDEN_PUZZLE_HASH,
+    calculate_synthetic_secret_key,
+    puzzle_for_pk,
+)
+from chia_rs import AugSchemeMPL, G1Element, PrivateKey
+from chia_rs.sized_bytes import bytes32
+
+logger = logging.getLogger(__name__)
+
+# Network-specific AGG_SIG_ME additional data.
+# Pulled from chia.consensus.default_constants.DEFAULT_CONSTANTS / testnet11 overrides.
+AGG_SIG_ME_DATA = {
+    "mainnet": bytes.fromhex(
+        "ccd5bb71183532bff220ba46c268991a00000000000000000000000000000000"
+    ),
+    "testnet11": bytes.fromhex(
+        "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615"
+    ),
+}
+
+
+@dataclass
+class FaucetKey:
+    """A derived wallet key + puzzle."""
+
+    wallet_sk: PrivateKey
+    wallet_pk: G1Element
+    synthetic_sk: PrivateKey
+    synthetic_pk: G1Element
+    puzzle: Program
+    puzzle_hash: bytes32
+
+
+class Faucet:
+    """Single-address XCH faucet for funding vault launchers."""
+
+    def __init__(self, master_sk: PrivateKey, network: str) -> None:
+        if network not in AGG_SIG_ME_DATA:
+            raise ValueError(f"Unknown network for faucet: {network}")
+        self.network = network
+        self.master_sk = master_sk
+        self.agg_sig_me_data = AGG_SIG_ME_DATA[network]
+        self.key = self._derive_wallet_key(0)
+
+    @classmethod
+    def from_seed_hex(cls, seed_hex: str, network: str) -> Faucet:
+        """Build a faucet from a 32-byte hex seed.
+
+        `AugSchemeMPL.key_gen(seed)` is called with the bytes — this is the
+        canonical way to generate a master BLS key from an entropy seed.
+        """
+        seed = bytes.fromhex(seed_hex[2:] if seed_hex.startswith("0x") else seed_hex)
+        if len(seed) != 32:
+            raise ValueError(
+                f"faucet seed must be 32 bytes (64 hex chars), got {len(seed)} bytes"
+            )
+        master_sk = AugSchemeMPL.key_gen(seed)
+        return cls(master_sk, network)
+
+    @classmethod
+    def from_mnemonic(cls, mnemonic: str, network: str) -> Faucet:
+        """Build a faucet from a 12/24-word BIP-39 mnemonic."""
+        from chia.util.keychain import mnemonic_to_seed
+
+        seed = mnemonic_to_seed(mnemonic)
+        master_sk = AugSchemeMPL.key_gen(seed)
+        return cls(master_sk, network)
+
+    @classmethod
+    def from_master_private_key_hex(cls, sk_hex: str, network: str) -> Faucet:
+        """Build a faucet from a raw 32-byte BLS private key hex string.
+
+        Use this when you already have a master ``PrivateKey`` (e.g. pulled
+        from the chia keychain by fingerprint) and don't have the original
+        mnemonic/seed handy.  The 32 bytes are the serialised master sk,
+        ``bytes(PrivateKey)``.
+        """
+        raw = bytes.fromhex(sk_hex[2:] if sk_hex.startswith("0x") else sk_hex)
+        if len(raw) != 32:
+            raise ValueError(
+                f"master private key must be 32 bytes (64 hex chars), got {len(raw)}"
+            )
+        master_sk = PrivateKey.from_bytes(raw)
+        return cls(master_sk, network)
+
+    def _derive_wallet_key(self, index: int) -> FaucetKey:
+        wallet_sk = master_sk_to_wallet_sk_unhardened(self.master_sk, index)
+        wallet_pk = wallet_sk.get_g1()
+        synth_sk = calculate_synthetic_secret_key(wallet_sk, DEFAULT_HIDDEN_PUZZLE_HASH)
+        synth_pk = synth_sk.get_g1()
+        puzzle = puzzle_for_pk(wallet_pk)
+        puzzle_hash = bytes32(puzzle.get_tree_hash())
+        return FaucetKey(
+            wallet_sk=wallet_sk,
+            wallet_pk=wallet_pk,
+            synthetic_sk=synth_sk,
+            synthetic_pk=synth_pk,
+            puzzle=puzzle,
+            puzzle_hash=puzzle_hash,
+        )
+
+    @property
+    def address_puzzle_hash(self) -> bytes32:
+        return self.key.puzzle_hash
+
+    @property
+    def address_hex(self) -> str:
+        return "0x" + self.key.puzzle_hash.hex()
+
+    def bech32_address(self) -> str:
+        """Return the faucet's XCH bech32m address for the configured network."""
+        from chia.util.bech32m import encode_puzzle_hash
+
+        prefix = "txch" if self.network == "testnet11" else "xch"
+        return encode_puzzle_hash(self.key.puzzle_hash, prefix)
+
+    def select_coin(
+        self,
+        candidate_coins: list[dict],
+        min_amount: int,
+        *,
+        max_amount: Optional[int] = None,
+    ) -> Optional[Coin]:
+        """Pick the smallest coin that meets the launcher budget.
+
+        Prefers tight matches to minimise change outputs and keep the mempool
+        small. Rejects coins already spent per coinset's `spent_block_index`.
+
+        Args:
+            candidate_coins: raw coin records from coinset.org.
+            min_amount: smallest acceptable coin amount (inclusive).
+            max_amount: optional ceiling (inclusive).  POP-CANON-009 fix:
+                enforces ``settings.faucet_max_spend_mojos``.  Mirrors the
+                ``max_coin_amount`` field of Chia's
+                ``chia.wallet.util.tx_config.CoinSelectionConfig``: the
+                operator's configured ceiling on per-spend faucet usage.
+        """
+        usable: list[Coin] = []
+        for rec in candidate_coins:
+            if rec.get("spent_block_index") not in (0, None):
+                continue
+            coin_json = rec.get("coin") or rec
+            amount = int(coin_json["amount"])
+            if amount < min_amount:
+                continue
+            if max_amount is not None and amount > max_amount:
+                continue
+            usable.append(
+                Coin(
+                    parent_coin_info=_hex_to_bytes32(coin_json["parent_coin_info"]),
+                    puzzle_hash=_hex_to_bytes32(coin_json["puzzle_hash"]),
+                    amount=amount,
+                )
+            )
+        if not usable:
+            return None
+        usable.sort(key=lambda c: c.amount)
+        return usable[0]
+
+    def sign_delegated_spend(
+        self, coin: Coin, conditions: Program
+    ) -> bytes:
+        """Sign the faucet's standard p2_delegated spend with AGG_SIG_ME.
+
+        For `p2_delegated_puzzle_or_hidden_puzzle`, the AGG_SIG_ME message is:
+            sha256tree(delegated_puzzle) + coin.name() + AGG_SIG_ME_ADDITIONAL_DATA
+        and the signer is the synthetic secret key.
+        """
+        delegated_puzzle = Program.to((1, conditions))  # (q . conditions)
+        message = (
+            bytes(delegated_puzzle.get_tree_hash())
+            + bytes(coin.name())
+            + self.agg_sig_me_data
+        )
+        sig = AugSchemeMPL.sign(self.key.synthetic_sk, message)
+        return bytes(sig)
+
+
+def _hex_to_bytes32(h: str) -> bytes32:
+    clean = h[2:] if h.startswith("0x") else h
+    return bytes32.fromhex(clean)

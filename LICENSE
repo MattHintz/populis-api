@@ -1,0 +1,50 @@
+PROPRIETARY LICENSE — ALL RIGHTS RESERVED
+
+Copyright (c) 2025-2026 Matthew S. Hintz
+All rights reserved.
+
+This software, including all source code, compiled artifacts, documentation,
+design materials, protocol specifications, puzzle code, driver code, test
+suites, audit reports, and any and all accompanying files (collectively, the
+"Software"), is the sole and exclusive property of Matthew S. Hintz (the
+"Author").
+
+No license — express, implied, by estoppel, or otherwise — is granted to any
+person or entity under any patent, copyright, trademark, trade secret, or any
+other intellectual property right owned or controlled by the Author.
+
+Without the prior express written permission of the Author, no person or
+entity may:
+
+  1. Copy, reproduce, republish, upload, post, transmit, or distribute the
+     Software or any portion thereof in any form or by any means;
+
+  2. Modify, adapt, translate, create derivative works of, reverse engineer,
+     disassemble, or decompile the Software, in whole or in part;
+
+  3. Use the Software or any portion thereof for any commercial purpose,
+     including but not limited to operating a service, protocol, product,
+     application, or network that incorporates the Software;
+
+  4. Deploy, execute, or operate the Software on any blockchain, test network,
+     main network, sidechain, rollup, or other distributed computing system;
+
+  5. Sublicense, rent, lease, lend, sell, resell, transfer, assign, or
+     otherwise make the Software available to any third party;
+
+  6. Remove, obscure, or alter any copyright, trademark, attribution, or
+     other proprietary notice included in the Software.
+
+Viewing the Software — whether on a public source-code hosting service, in a
+downloaded archive, or in any other form — does not by itself grant any of
+the rights enumerated above.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF,
+OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+For licensing inquiries, contact the Author.
