@@ -57,11 +57,47 @@ class Settings(BaseSettings):
     deployment_manifest_path: str = "./deployment_manifest.json"
 
     # ── Admin auth ────────────────────────────────────────────────────────
-    # Bearer token required by all /admin/* endpoints.  When unset, /admin/*
-    # endpoints are disabled (return 503) — the safest default for a public
-    # endpoint without an explicit operator opt-in.  Generate with
-    # `openssl rand -hex 32`.
+    # Bearer token required by `/admin/deploy/*` and other one-shot operator
+    # commands.  When unset, those routes are disabled (return 503) — the
+    # safest default for a public endpoint without an explicit operator
+    # opt-in.  Generate with `openssl rand -hex 32`.
     admin_token: Optional[str] = None
+
+    # ── Admin Desk (interactive operator UI) ──────────────────────────────
+    # The Admin Desk uses a wallet-pubkey allowlist + short-lived JWT
+    # instead of the static `admin_token` model.  See
+    # `docs/ADMIN_DESK_DESIGN.md` §3 for the full rationale.
+
+    # Comma-separated list of 0x-prefixed pubkeys (or BLS G1 hex) allowed to
+    # log in to the admin desk.  When empty, the admin desk routes return
+    # 503.  Examples:
+    #   POPULIS_ADMIN_PUBKEY_ALLOWLIST=0xabc...,0x123...
+    admin_pubkey_allowlist: str = ""
+
+    # HS256 secret used to sign admin-desk JWTs.  Generate with
+    # `openssl rand -hex 32`.  When empty, a random per-process secret is
+    # generated; that's fine for local dev but means tokens don't survive
+    # restart.  In production, set this explicitly.
+    admin_jwt_secret: str = ""
+
+    # Lifetime (seconds) of an admin JWT.  Default 15 minutes.  Refresh via
+    # /admin/auth/refresh while the session is active.
+    admin_jwt_ttl_seconds: int = 900
+
+    # Rate limit on /admin/auth/challenge per source IP per minute.
+    admin_login_per_ip_per_minute: int = 6
+
+    # Default voting window (seconds) for newly-published mint proposals.
+    # The operator can override per-proposal within
+    # [voting_window_min, voting_window_max].  Default 24h.
+    voting_window_seconds_default: int = 86400
+    voting_window_seconds_min: int = 3600       # 1h floor
+    voting_window_seconds_max: int = 604800     # 7d ceiling
+
+    # Filesystem path to the admin desk SQLite database (mint proposals,
+    # property metadata).  Distinct from the vault registry path so the
+    # operator can back them up independently.
+    admin_db_path: str = "./admin_desk.db"
 
     # ── CORS ──────────────────────────────────────────────────────────────
     cors_origins: str = "http://localhost:4200,http://localhost:5173"
@@ -98,6 +134,19 @@ class Settings(BaseSettings):
 
     def allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    def admin_pubkey_allowlist_set(self) -> set[str]:
+        """Return the lowercase, normalized set of allowlisted admin pubkeys.
+
+        Hex prefix ``0x`` is preserved if present so callers can match on
+        whichever convention they prefer; comparisons should also normalize
+        to lower-case.  An empty allowlist disables the admin desk
+        (callers handle the 503 path).
+        """
+        raw = (self.admin_pubkey_allowlist or "").strip()
+        if not raw:
+            return set()
+        return {p.strip().lower() for p in raw.split(",") if p.strip()}
 
 
 @lru_cache

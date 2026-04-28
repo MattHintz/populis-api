@@ -1,0 +1,850 @@
+"""SQLite-backed mint-proposal store for the Populis Admin Desk.
+
+Persists the lifecycle of every operator-initiated mint proposal so the
+admin desk can survive process restart, surface accurate audit trails,
+and enforce uniqueness invariants (one PROPERTY_ID at a time).
+
+Mirrors the architectural pattern of ``vault_db.py``:
+  * single-file SQLite database (WAL mode, normal sync) — concurrent
+    readers + one writer per process,
+  * dataclass record (``StoredMintProposal``) for wire-friendly transport,
+  * explicit transaction context manager (``_txn``) with BEGIN IMMEDIATE,
+  * ``PRAGMA user_version`` driven schema migrations,
+  * threading.RLock around every public method for in-process safety.
+
+Two tables:
+  * ``mint_proposals`` — primary lifecycle table (DRAFT → ... → MINTED).
+  * ``property_metadata`` — off-chain blobs keyed by deed launcher_id,
+    populated only after MINTED.
+
+State transitions are enforced *inside* the store: a caller that asks
+to ``set_published`` on a proposal that isn't in DRAFT receives
+``InvalidTransition`` rather than a silent no-op.  Each transition is a
+discrete public method so the rules are visible at the call site.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import secrets
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Literal, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# Bumping this triggers ``_migrate`` on next ``MintProposalStore`` open.
+SCHEMA_VERSION = 1
+
+
+# ── Lifecycle state machine ──────────────────────────────────────────────────
+ProposalState = Literal[
+    "DRAFT",       # operator created in API, not yet on-chain
+    "PROPOSED",    # on-chain governance proposal opened (PGT lock)
+    "VOTING",      # accumulating committee votes; deadline not reached
+    "PASSED",      # quorum reached, awaiting execution
+    "FAILED",      # deadline reached without quorum
+    "EXECUTED",    # EXECUTE_MINT spend pushed; deed launcher pending
+    "MINTED",      # deed singleton confirmed on-chain
+    "CANCELED",    # operator-canceled (DRAFT only)
+]
+
+ALL_STATES: tuple[str, ...] = (
+    "DRAFT", "PROPOSED", "VOTING", "PASSED",
+    "FAILED", "EXECUTED", "MINTED", "CANCELED",
+)
+
+# Valid forward transitions.  Backwards moves are forbidden.
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "DRAFT":    {"PROPOSED", "CANCELED"},
+    "PROPOSED": {"VOTING", "FAILED"},
+    "VOTING":   {"PASSED", "FAILED"},
+    "PASSED":   {"EXECUTED"},
+    "EXECUTED": {"MINTED"},
+    "FAILED":   set(),
+    "MINTED":   set(),
+    "CANCELED": set(),
+}
+
+
+class MintProposalStoreError(Exception):
+    """Base class for store-level errors."""
+
+
+class InvalidTransition(MintProposalStoreError):
+    """Caller attempted a transition that the lifecycle forbids."""
+
+
+class DuplicateProperty(MintProposalStoreError):
+    """A proposal for the same PROPERTY_ID is already in flight."""
+
+
+class DuplicateProposalHash(MintProposalStoreError):
+    """A proposal with the same on-chain proposal_hash already exists."""
+
+
+class ProposalNotFound(MintProposalStoreError):
+    """No proposal exists with the requested id."""
+
+
+# ── Data classes ─────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class StoredMintProposal:
+    """One row of the ``mint_proposals`` table.
+
+    Bytes are stored as raw ``BLOB`` (32-byte hashes); the caller can
+    convert to ``bytes32`` on the way out.  ``off_chain_metadata`` is a
+    JSON-serialisable dict (or None).  Transition timestamps are unix
+    seconds (int) — None means the transition hasn't happened.
+    """
+    id: str
+    owner_pubkey: str
+    state: str
+    par_value: int
+    asset_class: str
+    property_id: str
+    jurisdiction: str
+    royalty_puzhash: bytes
+    royalty_bps: int
+
+    smart_deed_inner_puzhash: bytes
+    eve_inner_puzhash: bytes
+    deed_full_puzhash: bytes
+    proposal_hash: bytes
+
+    proposal_tracker_coin_id: Optional[bytes]
+    pgt_lock_coin_id: Optional[bytes]
+    published_bundle_id: Optional[str]
+    executed_bundle_id: Optional[str]
+    deed_launcher_id: Optional[bytes]
+
+    vote_tally: int
+    quorum_required: int
+    deadline: Optional[int]
+
+    created_at: int
+    published_at: Optional[int]
+    executed_at: Optional[int]
+    minted_at: Optional[int]
+
+    off_chain_metadata: Optional[dict[str, Any]] = field(default=None)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        """Render as a JSON-friendly dict for API responses.
+
+        Bytes columns are 0x-hex.  Nullable fields stay null.  No PII or
+        secrets in any column — every field is safe to expose.
+        """
+        return {
+            "id": self.id,
+            "owner_pubkey": self.owner_pubkey,
+            "state": self.state,
+            "par_value": self.par_value,
+            "asset_class": self.asset_class,
+            "property_id": self.property_id,
+            "jurisdiction": self.jurisdiction,
+            "royalty_puzhash": "0x" + self.royalty_puzhash.hex(),
+            "royalty_bps": self.royalty_bps,
+            "computed": {
+                "smart_deed_inner_puzhash": "0x" + self.smart_deed_inner_puzhash.hex(),
+                "eve_inner_puzhash": "0x" + self.eve_inner_puzhash.hex(),
+                "deed_full_puzhash": "0x" + self.deed_full_puzhash.hex(),
+                "proposal_hash": "0x" + self.proposal_hash.hex(),
+            },
+            "on_chain": {
+                "proposal_tracker_coin_id":
+                    ("0x" + self.proposal_tracker_coin_id.hex())
+                    if self.proposal_tracker_coin_id else None,
+                "pgt_lock_coin_id":
+                    ("0x" + self.pgt_lock_coin_id.hex())
+                    if self.pgt_lock_coin_id else None,
+                "deed_launcher_id":
+                    ("0x" + self.deed_launcher_id.hex())
+                    if self.deed_launcher_id else None,
+                "published_bundle_id": self.published_bundle_id,
+                "executed_bundle_id": self.executed_bundle_id,
+            },
+            "vote_tally": self.vote_tally,
+            "quorum_required": self.quorum_required,
+            "deadline": self.deadline,
+            "timestamps": {
+                "created_at": self.created_at,
+                "published_at": self.published_at,
+                "executed_at": self.executed_at,
+                "minted_at": self.minted_at,
+            },
+            "off_chain_metadata": self.off_chain_metadata,
+        }
+
+
+# ── ID generation ────────────────────────────────────────────────────────────
+def _new_proposal_id() -> str:
+    """Generate a sortable-ish proposal id: ``mp_<ts8><rand16>``.
+
+    8 hex chars of unix timestamp (good for ~1090 years past 1970, when
+    unix time exceeds 32 bits the prefix grows to 9 chars and that's
+    fine because we only ever use the value as an opaque string),
+    followed by 16 hex chars of cryptographically-random suffix to
+    make collisions astronomically unlikely without a database round
+    trip to check.
+
+    The string is k-sortable: rows created in the same second sort
+    arbitrarily, but rows from different seconds sort in creation
+    order.  That's a useful default for `ORDER BY id DESC`.
+    """
+    ts = format(int(time.time()), "x").rjust(8, "0")
+    return f"mp_{ts}{secrets.token_hex(8)}"
+
+
+# ── The store ────────────────────────────────────────────────────────────────
+class MintProposalStore:
+    """SQLite-backed persistent store for mint proposals.
+
+    Open one instance per process.  ``close()`` is idempotent.  See the
+    module docstring for design rationale; see ``vault_db.py`` for the
+    sibling vault-registry store that uses the same patterns.
+    """
+
+    def __init__(self, path: str | Path, timeout: float = 5.0) -> None:
+        self.path = str(path) if path == ":memory:" else str(Path(path))
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+
+        self._conn = sqlite3.connect(
+            self.path,
+            timeout=timeout,
+            isolation_level=None,            # explicit transactions
+            check_same_thread=False,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+
+        self._configure_pragmas()
+        self._migrate()
+        logger.info(
+            "MintProposalStore opened at %s (schema_version=%d)",
+            self.path, SCHEMA_VERSION,
+        )
+
+    # ── connection setup ───────────────────────────────────────────
+
+    def _configure_pragmas(self) -> None:
+        cur = self._conn.cursor()
+        if self.path != ":memory:":
+            cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.execute("PRAGMA temp_store=MEMORY")
+
+    def _migrate(self) -> None:
+        with self._lock, self._txn() as cur:
+            current = cur.execute("PRAGMA user_version").fetchone()[0]
+            if current >= SCHEMA_VERSION:
+                return
+            for v in range(current + 1, SCHEMA_VERSION + 1):
+                method = getattr(self, f"_migrate_to_v{v}")
+                method(cur)
+                cur.execute(f"PRAGMA user_version = {v}")
+                logger.info("MintProposalStore migrated to schema v%d", v)
+
+    def _migrate_to_v1(self, cur: sqlite3.Cursor) -> None:
+        """Initial schema: ``mint_proposals`` + ``property_metadata``.
+
+        Constraints enforce the non-trivial invariants directly in the
+        database so a buggy caller can't corrupt the registry:
+
+          * length(<32-byte field>) == 32 — every puzhash / coin_id must
+            be exactly bytes32,
+          * ``state`` is one of the eight legal values,
+          * ``property_id`` is unique while a proposal is active (the
+            partial index excludes terminal/canceled rows so a failed
+            mint doesn't permanently lock out the same property),
+          * ``proposal_hash`` is globally unique because two distinct
+            proposals can never share the same on-chain identity.
+        """
+        cur.execute("""
+            CREATE TABLE mint_proposals (
+                id                          TEXT     PRIMARY KEY NOT NULL,
+                owner_pubkey                TEXT     NOT NULL,
+                state                       TEXT     NOT NULL,
+                par_value                   INTEGER  NOT NULL,
+                asset_class                 TEXT     NOT NULL,
+                property_id                 TEXT     NOT NULL,
+                jurisdiction                TEXT     NOT NULL,
+                royalty_puzhash             BLOB     NOT NULL,
+                royalty_bps                 INTEGER  NOT NULL,
+
+                smart_deed_inner_puzhash    BLOB     NOT NULL,
+                eve_inner_puzhash           BLOB     NOT NULL,
+                deed_full_puzhash           BLOB     NOT NULL,
+                proposal_hash               BLOB     NOT NULL,
+
+                proposal_tracker_coin_id    BLOB,
+                pgt_lock_coin_id            BLOB,
+                published_bundle_id         TEXT,
+                executed_bundle_id          TEXT,
+                deed_launcher_id            BLOB,
+
+                vote_tally                  INTEGER  NOT NULL DEFAULT 0,
+                quorum_required             INTEGER  NOT NULL,
+                deadline                    INTEGER,
+
+                created_at                  INTEGER  NOT NULL,
+                published_at                INTEGER,
+                executed_at                 INTEGER,
+                minted_at                   INTEGER,
+
+                off_chain_metadata          TEXT,
+
+                CHECK (state IN (
+                    'DRAFT','PROPOSED','VOTING','PASSED',
+                    'FAILED','EXECUTED','MINTED','CANCELED'
+                )),
+                CHECK (par_value > 0),
+                CHECK (royalty_bps BETWEEN 0 AND 10000),
+                CHECK (length(royalty_puzhash)          = 32),
+                CHECK (length(smart_deed_inner_puzhash) = 32),
+                CHECK (length(eve_inner_puzhash)        = 32),
+                CHECK (length(deed_full_puzhash)        = 32),
+                CHECK (length(proposal_hash)            = 32),
+                CHECK (proposal_tracker_coin_id IS NULL OR length(proposal_tracker_coin_id) = 32),
+                CHECK (pgt_lock_coin_id         IS NULL OR length(pgt_lock_coin_id)         = 32),
+                CHECK (deed_launcher_id         IS NULL OR length(deed_launcher_id)         = 32)
+            )
+        """)
+        # Active-proposal uniqueness: a property can be in at most one
+        # non-terminal proposal at a time.  Failed/Canceled don't block
+        # a re-attempt.
+        cur.execute("""
+            CREATE UNIQUE INDEX idx_mint_proposals_active_property
+                ON mint_proposals (property_id)
+                WHERE state NOT IN ('FAILED','CANCELED','MINTED')
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX idx_mint_proposals_proposal_hash
+                ON mint_proposals (proposal_hash)
+        """)
+        cur.execute("CREATE INDEX idx_mint_proposals_state        ON mint_proposals (state)")
+        cur.execute("CREATE INDEX idx_mint_proposals_owner_pubkey ON mint_proposals (owner_pubkey)")
+
+        # Off-chain metadata, populated at MINTED.
+        cur.execute("""
+            CREATE TABLE property_metadata (
+                deed_launcher_id  BLOB PRIMARY KEY NOT NULL,
+                payload_json      TEXT NOT NULL,
+                updated_at        INTEGER NOT NULL,
+                CHECK (length(deed_launcher_id) = 32)
+            )
+        """)
+
+    # ── transaction helper ─────────────────────────────────────────
+
+    @contextmanager
+    def _txn(self) -> Iterator[sqlite3.Cursor]:
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            yield cur
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+        finally:
+            cur.close()
+
+    # ── creation ────────────────────────────────────────────────────
+
+    def create(
+        self,
+        *,
+        owner_pubkey: str,
+        par_value: int,
+        asset_class: str,
+        property_id: str,
+        jurisdiction: str,
+        royalty_puzhash: bytes,
+        royalty_bps: int,
+        smart_deed_inner_puzhash: bytes,
+        eve_inner_puzhash: bytes,
+        deed_full_puzhash: bytes,
+        proposal_hash: bytes,
+        quorum_required: int,
+        off_chain_metadata: Optional[dict[str, Any]] = None,
+    ) -> StoredMintProposal:
+        """Insert a fresh DRAFT proposal.
+
+        Raises:
+            DuplicateProperty: a non-terminal proposal already exists for
+                ``property_id``.
+            DuplicateProposalHash: ``proposal_hash`` collides with a
+                previous proposal (overwhelmingly improbable, but
+                surfaces a real bug if it ever does happen).
+        """
+        if not _is_bytes32(royalty_puzhash):
+            raise ValueError("royalty_puzhash must be bytes32")
+        if not _is_bytes32(smart_deed_inner_puzhash):
+            raise ValueError("smart_deed_inner_puzhash must be bytes32")
+        if not _is_bytes32(eve_inner_puzhash):
+            raise ValueError("eve_inner_puzhash must be bytes32")
+        if not _is_bytes32(deed_full_puzhash):
+            raise ValueError("deed_full_puzhash must be bytes32")
+        if not _is_bytes32(proposal_hash):
+            raise ValueError("proposal_hash must be bytes32")
+        if par_value <= 0:
+            raise ValueError("par_value must be positive")
+        if not 0 <= royalty_bps <= 10_000:
+            raise ValueError("royalty_bps out of range")
+        if quorum_required <= 0:
+            raise ValueError("quorum_required must be positive")
+
+        proposal_id = _new_proposal_id()
+        now = int(time.time())
+        metadata_json = json.dumps(off_chain_metadata) if off_chain_metadata else None
+
+        try:
+            with self._lock, self._txn() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO mint_proposals (
+                        id, owner_pubkey, state,
+                        par_value, asset_class, property_id, jurisdiction,
+                        royalty_puzhash, royalty_bps,
+                        smart_deed_inner_puzhash, eve_inner_puzhash,
+                        deed_full_puzhash, proposal_hash,
+                        vote_tally, quorum_required,
+                        created_at, off_chain_metadata
+                    ) VALUES (?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    """,
+                    (
+                        proposal_id, owner_pubkey,
+                        par_value, asset_class, property_id, jurisdiction,
+                        royalty_puzhash, royalty_bps,
+                        smart_deed_inner_puzhash, eve_inner_puzhash,
+                        deed_full_puzhash, proposal_hash,
+                        quorum_required,
+                        now, metadata_json,
+                    ),
+                )
+        except sqlite3.IntegrityError as e:
+            # SQLite surfaces partial-index violations as
+            # "UNIQUE constraint failed: <table>.<column>" — the column
+            # name is the only stable signal across SQLite versions.
+            msg = str(e)
+            if "property_id" in msg:
+                raise DuplicateProperty(
+                    f"property_id={property_id!r} already has an active proposal"
+                ) from e
+            if "proposal_hash" in msg:
+                raise DuplicateProposalHash(
+                    f"proposal_hash {proposal_hash.hex()} already exists"
+                ) from e
+            raise
+
+        return self._get_or_raise(proposal_id)
+
+    # ── reads ───────────────────────────────────────────────────────
+
+    def get(self, proposal_id: str) -> Optional[StoredMintProposal]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mint_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
+    def _get_or_raise(self, proposal_id: str) -> StoredMintProposal:
+        rec = self.get(proposal_id)
+        if rec is None:
+            raise ProposalNotFound(proposal_id)
+        return rec
+
+    def get_by_property_id(self, property_id: str) -> Optional[StoredMintProposal]:
+        """Return the *active* (non-terminal) proposal for ``property_id``.
+
+        Useful for the /admin/mint/propose pre-flight check so the API
+        can return a friendly 409 instead of a database constraint
+        error.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM mint_proposals
+                WHERE property_id = ?
+                  AND state NOT IN ('FAILED','CANCELED','MINTED')
+                """,
+                (property_id,),
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
+    def list(
+        self,
+        *,
+        states: Optional[list[str]] = None,
+        owner_pubkey: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[StoredMintProposal]:
+        """List proposals, newest first.
+
+        Filters compose by AND.  ``states`` is a list of state names;
+        ``None`` means no state filter.  ``owner_pubkey`` filters to a
+        single proposer.
+        """
+        if limit <= 0 or limit > 1000:
+            raise ValueError("limit must be in 1..1000")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if states:
+            placeholders = ",".join("?" * len(states))
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states)
+        if owner_pubkey:
+            clauses.append("owner_pubkey = ?")
+            params.append(owner_pubkey)
+
+        where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        params.append(offset)
+        sql = (
+            "SELECT * FROM mint_proposals "
+            f"{where_sql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_row_to_record(r) for r in rows]
+
+    def count(self, *, state: Optional[str] = None) -> int:
+        """Total number of proposals (optionally filtered by ``state``)."""
+        with self._lock:
+            if state is None:
+                row = self._conn.execute("SELECT COUNT(*) FROM mint_proposals").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM mint_proposals WHERE state = ?",
+                    (state,),
+                ).fetchone()
+        return int(row[0])
+
+    # ── transitions ─────────────────────────────────────────────────
+
+    def cancel(self, proposal_id: str) -> StoredMintProposal:
+        """DRAFT → CANCELED.  No on-chain effect."""
+        return self._transition(
+            proposal_id,
+            target_state="CANCELED",
+            updates=[],
+        )
+
+    def set_published(
+        self,
+        proposal_id: str,
+        *,
+        proposal_tracker_coin_id: bytes,
+        pgt_lock_coin_id: bytes,
+        published_bundle_id: str,
+        deadline: int,
+    ) -> StoredMintProposal:
+        """DRAFT → PROPOSED.
+
+        Records the on-chain coin ids that the EXECUTE_MINT spend will
+        later need to reference.  ``deadline`` is a unix timestamp
+        snapshotted from the operator's voting-window choice; the
+        deadline lives on-chain inside the tracker singleton state but
+        we cache it here for cheap UI lookups.
+        """
+        if not _is_bytes32(proposal_tracker_coin_id):
+            raise ValueError("proposal_tracker_coin_id must be bytes32")
+        if not _is_bytes32(pgt_lock_coin_id):
+            raise ValueError("pgt_lock_coin_id must be bytes32")
+        if deadline <= 0:
+            raise ValueError("deadline must be positive")
+
+        return self._transition(
+            proposal_id,
+            target_state="PROPOSED",
+            updates=[
+                ("proposal_tracker_coin_id", proposal_tracker_coin_id),
+                ("pgt_lock_coin_id",         pgt_lock_coin_id),
+                ("published_bundle_id",      published_bundle_id),
+                ("deadline",                 deadline),
+                ("published_at",             int(time.time())),
+            ],
+        )
+
+    def update_vote_tally(
+        self,
+        proposal_id: str,
+        *,
+        vote_tally: int,
+    ) -> StoredMintProposal:
+        """Update the cached vote tally during PROPOSED/VOTING.
+
+        Doesn't change state; the PROPOSED → VOTING bump happens in
+        ``set_voting``.  Tally must monotonically increase (PGT lockups
+        are append-only) — we enforce that.
+        """
+        if vote_tally < 0:
+            raise ValueError("vote_tally must be non-negative")
+        with self._lock, self._txn() as cur:
+            row = cur.execute(
+                "SELECT state, vote_tally FROM mint_proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                raise ProposalNotFound(proposal_id)
+            if row["state"] not in ("PROPOSED", "VOTING"):
+                raise InvalidTransition(
+                    f"vote tally update only allowed in PROPOSED/VOTING; current={row['state']}"
+                )
+            if vote_tally < int(row["vote_tally"]):
+                raise InvalidTransition(
+                    f"vote_tally must monotonically increase: "
+                    f"current={row['vote_tally']}, requested={vote_tally}"
+                )
+            cur.execute(
+                "UPDATE mint_proposals SET vote_tally = ? WHERE id = ?",
+                (vote_tally, proposal_id),
+            )
+        return self._get_or_raise(proposal_id)
+
+    def set_voting(self, proposal_id: str) -> StoredMintProposal:
+        """PROPOSED → VOTING.
+
+        A purely-cosmetic transition for the UI: tally has at least one
+        committee vote on top of the operator's PROPOSE-mode lock.  The
+        on-chain semantics don't distinguish PROPOSED from VOTING; this
+        is a UX hint.
+        """
+        return self._transition(
+            proposal_id, target_state="VOTING", updates=[],
+        )
+
+    def set_passed(self, proposal_id: str) -> StoredMintProposal:
+        """VOTING → PASSED.  Quorum reached, deadline arrived."""
+        return self._transition(
+            proposal_id, target_state="PASSED", updates=[],
+        )
+
+    def set_failed(self, proposal_id: str) -> StoredMintProposal:
+        """PROPOSED/VOTING → FAILED.  Deadline reached without quorum."""
+        return self._transition(
+            proposal_id,
+            target_state="FAILED",
+            updates=[],
+            allowed_from={"PROPOSED", "VOTING"},
+        )
+
+    def set_executed(
+        self,
+        proposal_id: str,
+        *,
+        executed_bundle_id: str,
+    ) -> StoredMintProposal:
+        """PASSED → EXECUTED.  EXECUTE_MINT bundle pushed to mempool."""
+        return self._transition(
+            proposal_id,
+            target_state="EXECUTED",
+            updates=[
+                ("executed_bundle_id", executed_bundle_id),
+                ("executed_at",        int(time.time())),
+            ],
+        )
+
+    def set_minted(
+        self,
+        proposal_id: str,
+        *,
+        deed_launcher_id: bytes,
+    ) -> StoredMintProposal:
+        """EXECUTED → MINTED.
+
+        Once the deed singleton is confirmed the operator can populate
+        ``property_metadata`` for buyers.  ``deed_launcher_id`` is the
+        bytes32 launcher coin id that uniquely identifies the deed
+        singleton lineage.
+        """
+        if not _is_bytes32(deed_launcher_id):
+            raise ValueError("deed_launcher_id must be bytes32")
+        return self._transition(
+            proposal_id,
+            target_state="MINTED",
+            updates=[
+                ("deed_launcher_id", deed_launcher_id),
+                ("minted_at",        int(time.time())),
+            ],
+        )
+
+    def _transition(
+        self,
+        proposal_id: str,
+        *,
+        target_state: str,
+        updates: list[tuple[str, Any]],
+        allowed_from: Optional[set[str]] = None,
+    ) -> StoredMintProposal:
+        """Generic state-machine transition.
+
+        Reads the current state inside the transaction, validates that
+        ``current → target_state`` is allowed (looking the source set
+        up in ``ALLOWED_TRANSITIONS`` unless ``allowed_from`` overrides
+        it), then applies ``updates`` plus the state column.
+        """
+        with self._lock, self._txn() as cur:
+            row = cur.execute(
+                "SELECT state FROM mint_proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                raise ProposalNotFound(proposal_id)
+            current = row["state"]
+
+            valid_sources = (
+                allowed_from
+                if allowed_from is not None
+                else {s for s, dests in ALLOWED_TRANSITIONS.items() if target_state in dests}
+            )
+            if current not in valid_sources:
+                raise InvalidTransition(
+                    f"cannot transition {proposal_id} {current} → {target_state}; "
+                    f"allowed sources: {sorted(valid_sources)}"
+                )
+
+            assignments = ["state = ?"] + [f"{col} = ?" for col, _ in updates]
+            params: list[Any] = [target_state] + [val for _, val in updates] + [proposal_id]
+            cur.execute(
+                f"UPDATE mint_proposals SET {', '.join(assignments)} WHERE id = ?",
+                tuple(params),
+            )
+        return self._get_or_raise(proposal_id)
+
+    # ── property metadata ───────────────────────────────────────────
+
+    def set_property_metadata(
+        self,
+        deed_launcher_id: bytes,
+        payload: dict[str, Any],
+    ) -> None:
+        """Insert or replace the off-chain metadata blob for a minted deed.
+
+        The payload is stored as JSON; the schema permits any
+        JSON-serialisable shape.  Validation of individual fields is
+        the caller's responsibility (the API layer enforces the
+        wire schema).
+        """
+        if not _is_bytes32(deed_launcher_id):
+            raise ValueError("deed_launcher_id must be bytes32")
+        encoded = json.dumps(payload, separators=(",", ":"))
+        now = int(time.time())
+        with self._lock, self._txn() as cur:
+            cur.execute(
+                """
+                INSERT INTO property_metadata (deed_launcher_id, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(deed_launcher_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at   = excluded.updated_at
+                """,
+                (deed_launcher_id, encoded, now),
+            )
+
+    def get_property_metadata(self, deed_launcher_id: bytes) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM property_metadata WHERE deed_launcher_id = ?",
+                (deed_launcher_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload_json"])
+
+    # ── housekeeping ────────────────────────────────────────────────
+
+    def schema_version(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def close(self) -> None:
+        """Close the SQLite connection.  Idempotent."""
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.ProgrammingError:
+                pass
+
+    def __enter__(self) -> "MintProposalStore":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+def _is_bytes32(value: Any) -> bool:
+    return isinstance(value, (bytes, bytearray)) and len(value) == 32
+
+
+def _row_to_record(row: sqlite3.Row) -> StoredMintProposal:
+    return StoredMintProposal(
+        id=str(row["id"]),
+        owner_pubkey=str(row["owner_pubkey"]),
+        state=str(row["state"]),
+        par_value=int(row["par_value"]),
+        asset_class=str(row["asset_class"]),
+        property_id=str(row["property_id"]),
+        jurisdiction=str(row["jurisdiction"]),
+        royalty_puzhash=bytes(row["royalty_puzhash"]),
+        royalty_bps=int(row["royalty_bps"]),
+
+        smart_deed_inner_puzhash=bytes(row["smart_deed_inner_puzhash"]),
+        eve_inner_puzhash=bytes(row["eve_inner_puzhash"]),
+        deed_full_puzhash=bytes(row["deed_full_puzhash"]),
+        proposal_hash=bytes(row["proposal_hash"]),
+
+        proposal_tracker_coin_id=(
+            bytes(row["proposal_tracker_coin_id"])
+            if row["proposal_tracker_coin_id"] is not None else None
+        ),
+        pgt_lock_coin_id=(
+            bytes(row["pgt_lock_coin_id"])
+            if row["pgt_lock_coin_id"] is not None else None
+        ),
+        published_bundle_id=row["published_bundle_id"],
+        executed_bundle_id=row["executed_bundle_id"],
+        deed_launcher_id=(
+            bytes(row["deed_launcher_id"])
+            if row["deed_launcher_id"] is not None else None
+        ),
+
+        vote_tally=int(row["vote_tally"]),
+        quorum_required=int(row["quorum_required"]),
+        deadline=int(row["deadline"]) if row["deadline"] is not None else None,
+
+        created_at=int(row["created_at"]),
+        published_at=int(row["published_at"]) if row["published_at"] is not None else None,
+        executed_at=int(row["executed_at"]) if row["executed_at"] is not None else None,
+        minted_at=int(row["minted_at"]) if row["minted_at"] is not None else None,
+
+        off_chain_metadata=(
+            json.loads(row["off_chain_metadata"])
+            if row["off_chain_metadata"] is not None else None
+        ),
+    )
+
+
+__all__ = [
+    "ProposalState",
+    "ALL_STATES",
+    "ALLOWED_TRANSITIONS",
+    "StoredMintProposal",
+    "MintProposalStore",
+    "MintProposalStoreError",
+    "InvalidTransition",
+    "DuplicateProperty",
+    "DuplicateProposalHash",
+    "ProposalNotFound",
+    "SCHEMA_VERSION",
+]

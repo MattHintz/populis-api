@@ -22,6 +22,7 @@ dependencies = [
     "pycoin>=0.92",
     "pycryptodome>=3.20",
     "python-dotenv>=1.0",
+    "pyjwt>=2.9",
     # Populis protocol (local path install)
     # Use: pip install -e ../populis_protocol
 ]
