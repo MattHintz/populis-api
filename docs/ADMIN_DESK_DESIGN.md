@@ -297,16 +297,25 @@ Creates a DRAFT proposal. Does NOT touch chain.
   "id": "mp_01HXYZ…",
   "state": "DRAFT",
   "computed": {
-    "smart_deed_inner_puzhash": "0x…",
-    "eve_inner_puzhash": "0x…",
-    "deed_full_puzhash": "0x…",
-    "proposal_hash": "0x…"
+    "smart_deed_inner_puzhash": null,
+    "eve_inner_puzhash": null,
+    "deed_full_puzhash": null,
+    "proposal_hash": null
   },
   "created_at": 1714345200
 }
 ```
 
-The `computed.proposal_hash` is what governance will track. It is `sha256tree(deed_full_puzhash)` per `quorum_did_inner.clsp`'s expected message.
+> **Schema note (Step A.2 implementation discovery):**
+> All four computed hashes depend on the launcher coin id, which is
+> only chosen when the operator picks a faucet coin to fund the
+> launcher at publish time.  The `SINGLETON_STRUCT` curried into
+> `smart_deed_inner` carries `launcher_id`, so every downstream
+> hash inherits that dependency.  DRAFT carries metadata only; the
+> four computed fields flip from `null` → `bytes32` atomically when
+> `/admin/mint/{id}/publish` succeeds.
+
+The `computed.proposal_hash` is what governance tracks. It is `sha256tree(deed_full_puzhash)` per `quorum_did_inner.clsp`'s expected message.
 
 #### `GET /admin/mint`
 Query params: `?state=PROPOSED,VOTING&owner=me|all`
@@ -380,10 +389,10 @@ The committee endpoint is the **publish-only** gateway; the actual signing happe
 | `jurisdiction` | TEXT NOT NULL | |
 | `royalty_puzhash` | BLOB NOT NULL | bytes32 |
 | `royalty_bps` | INTEGER NOT NULL | |
-| `smart_deed_inner_puzhash` | BLOB NOT NULL | bytes32 |
-| `eve_inner_puzhash` | BLOB NOT NULL | bytes32 |
-| `deed_full_puzhash` | BLOB NOT NULL | bytes32 |
-| `proposal_hash` | BLOB NOT NULL UNIQUE | bytes32, foreign-keyed by tracker singleton |
+| `smart_deed_inner_puzhash` | BLOB NULL | bytes32, populated at PROPOSED |
+| `eve_inner_puzhash` | BLOB NULL | bytes32, populated at PROPOSED |
+| `deed_full_puzhash` | BLOB NULL | bytes32, populated at PROPOSED |
+| `proposal_hash` | BLOB NULL UNIQUE | bytes32, populated at PROPOSED, on-chain identity |
 | `proposal_tracker_coin_id` | BLOB NULL | populated on PROPOSED |
 | `pgt_lock_coin_id` | BLOB NULL | operator's PROPOSE-mode lock |
 | `published_bundle_id` | TEXT NULL | for audit |

@@ -25,6 +25,8 @@ from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 
 from .admin import router as admin_router
+from .admin_auth import router as admin_auth_router
+from .mint_endpoints import router as mint_endpoints_router
 from .challenges import (
     ChallengeStore,
     ChallengeStoreFullError,
@@ -151,6 +153,12 @@ app.add_middleware(
 
 # Admin router (gated by POPULIS_ADMIN_TOKEN; returns 503 when token is unset).
 app.include_router(admin_router)
+
+# Admin Desk: wallet-signed JWT auth + mint-proposal lifecycle.
+# Both routers return 503 when POPULIS_ADMIN_PUBKEY_ALLOWLIST is unset
+# (admin desk disabled by default).  See docs/ADMIN_DESK_DESIGN.md.
+app.include_router(admin_auth_router)
+app.include_router(mint_endpoints_router)
 
 
 # ─── Dependency injectors ───────────────────────────────────────────────

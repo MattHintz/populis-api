@@ -112,10 +112,15 @@ class StoredMintProposal:
     royalty_puzhash: bytes
     royalty_bps: int
 
-    smart_deed_inner_puzhash: bytes
-    eve_inner_puzhash: bytes
-    deed_full_puzhash: bytes
-    proposal_hash: bytes
+    # All four computed hashes depend on the launcher coin id (via
+    # the SINGLETON_STRUCT curried into smart_deed_inner) and are
+    # therefore None in DRAFT.  They become non-None at the
+    # DRAFT → PROPOSED transition (set_published) once a faucet coin
+    # has been selected to fund the launcher.
+    smart_deed_inner_puzhash: Optional[bytes]
+    eve_inner_puzhash: Optional[bytes]
+    deed_full_puzhash: Optional[bytes]
+    proposal_hash: Optional[bytes]
 
     proposal_tracker_coin_id: Optional[bytes]
     pgt_lock_coin_id: Optional[bytes]
@@ -151,10 +156,18 @@ class StoredMintProposal:
             "royalty_puzhash": "0x" + self.royalty_puzhash.hex(),
             "royalty_bps": self.royalty_bps,
             "computed": {
-                "smart_deed_inner_puzhash": "0x" + self.smart_deed_inner_puzhash.hex(),
-                "eve_inner_puzhash": "0x" + self.eve_inner_puzhash.hex(),
-                "deed_full_puzhash": "0x" + self.deed_full_puzhash.hex(),
-                "proposal_hash": "0x" + self.proposal_hash.hex(),
+                "smart_deed_inner_puzhash":
+                    ("0x" + self.smart_deed_inner_puzhash.hex())
+                    if self.smart_deed_inner_puzhash else None,
+                "eve_inner_puzhash":
+                    ("0x" + self.eve_inner_puzhash.hex())
+                    if self.eve_inner_puzhash else None,
+                "deed_full_puzhash":
+                    ("0x" + self.deed_full_puzhash.hex())
+                    if self.deed_full_puzhash else None,
+                "proposal_hash":
+                    ("0x" + self.proposal_hash.hex())
+                    if self.proposal_hash else None,
             },
             "on_chain": {
                 "proposal_tracker_coin_id":
@@ -279,10 +292,14 @@ class MintProposalStore:
                 royalty_puzhash             BLOB     NOT NULL,
                 royalty_bps                 INTEGER  NOT NULL,
 
-                smart_deed_inner_puzhash    BLOB     NOT NULL,
-                eve_inner_puzhash           BLOB     NOT NULL,
-                deed_full_puzhash           BLOB     NOT NULL,
-                proposal_hash               BLOB     NOT NULL,
+                -- All four computed hashes depend on the chosen
+                -- launcher coin id (via the SINGLETON_STRUCT curried
+                -- into smart_deed_inner), so they are nullable in
+                -- DRAFT and populated atomically by set_published().
+                smart_deed_inner_puzhash    BLOB,
+                eve_inner_puzhash           BLOB,
+                deed_full_puzhash           BLOB,
+                proposal_hash               BLOB,
 
                 proposal_tracker_coin_id    BLOB,
                 pgt_lock_coin_id            BLOB,
@@ -308,10 +325,10 @@ class MintProposalStore:
                 CHECK (par_value > 0),
                 CHECK (royalty_bps BETWEEN 0 AND 10000),
                 CHECK (length(royalty_puzhash)          = 32),
-                CHECK (length(smart_deed_inner_puzhash) = 32),
-                CHECK (length(eve_inner_puzhash)        = 32),
-                CHECK (length(deed_full_puzhash)        = 32),
-                CHECK (length(proposal_hash)            = 32),
+                CHECK (smart_deed_inner_puzhash IS NULL OR length(smart_deed_inner_puzhash) = 32),
+                CHECK (eve_inner_puzhash        IS NULL OR length(eve_inner_puzhash)        = 32),
+                CHECK (deed_full_puzhash        IS NULL OR length(deed_full_puzhash)        = 32),
+                CHECK (proposal_hash            IS NULL OR length(proposal_hash)            = 32),
                 CHECK (proposal_tracker_coin_id IS NULL OR length(proposal_tracker_coin_id) = 32),
                 CHECK (pgt_lock_coin_id         IS NULL OR length(pgt_lock_coin_id)         = 32),
                 CHECK (deed_launcher_id         IS NULL OR length(deed_launcher_id)         = 32)
@@ -369,32 +386,23 @@ class MintProposalStore:
         jurisdiction: str,
         royalty_puzhash: bytes,
         royalty_bps: int,
-        smart_deed_inner_puzhash: bytes,
-        eve_inner_puzhash: bytes,
-        deed_full_puzhash: bytes,
-        proposal_hash: bytes,
         quorum_required: int,
         off_chain_metadata: Optional[dict[str, Any]] = None,
     ) -> StoredMintProposal:
-        """Insert a fresh DRAFT proposal.
+        """Insert a fresh DRAFT proposal carrying only the operator
+        metadata fields.
+
+        All four computed puzzle hashes (smart_deed_inner_puzhash,
+        eve_inner_puzhash, deed_full_puzhash, proposal_hash) depend on
+        the launcher coin id, which is selected at publish time.
+        ``set_published`` populates all four atomically.
 
         Raises:
-            DuplicateProperty: a non-terminal proposal already exists for
-                ``property_id``.
-            DuplicateProposalHash: ``proposal_hash`` collides with a
-                previous proposal (overwhelmingly improbable, but
-                surfaces a real bug if it ever does happen).
+            DuplicateProperty: a non-terminal proposal already exists
+                for ``property_id``.
         """
         if not _is_bytes32(royalty_puzhash):
             raise ValueError("royalty_puzhash must be bytes32")
-        if not _is_bytes32(smart_deed_inner_puzhash):
-            raise ValueError("smart_deed_inner_puzhash must be bytes32")
-        if not _is_bytes32(eve_inner_puzhash):
-            raise ValueError("eve_inner_puzhash must be bytes32")
-        if not _is_bytes32(deed_full_puzhash):
-            raise ValueError("deed_full_puzhash must be bytes32")
-        if not _is_bytes32(proposal_hash):
-            raise ValueError("proposal_hash must be bytes32")
         if par_value <= 0:
             raise ValueError("par_value must be positive")
         if not 0 <= royalty_bps <= 10_000:
@@ -414,18 +422,14 @@ class MintProposalStore:
                         id, owner_pubkey, state,
                         par_value, asset_class, property_id, jurisdiction,
                         royalty_puzhash, royalty_bps,
-                        smart_deed_inner_puzhash, eve_inner_puzhash,
-                        deed_full_puzhash, proposal_hash,
                         vote_tally, quorum_required,
                         created_at, off_chain_metadata
-                    ) VALUES (?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    ) VALUES (?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                     """,
                     (
                         proposal_id, owner_pubkey,
                         par_value, asset_class, property_id, jurisdiction,
                         royalty_puzhash, royalty_bps,
-                        smart_deed_inner_puzhash, eve_inner_puzhash,
-                        deed_full_puzhash, proposal_hash,
                         quorum_required,
                         now, metadata_json,
                     ),
@@ -438,10 +442,6 @@ class MintProposalStore:
             if "property_id" in msg:
                 raise DuplicateProperty(
                     f"property_id={property_id!r} already has an active proposal"
-                ) from e
-            if "proposal_hash" in msg:
-                raise DuplicateProposalHash(
-                    f"proposal_hash {proposal_hash.hex()} already exists"
                 ) from e
             raise
 
@@ -543,6 +543,10 @@ class MintProposalStore:
         self,
         proposal_id: str,
         *,
+        smart_deed_inner_puzhash: bytes,
+        eve_inner_puzhash: bytes,
+        deed_full_puzhash: bytes,
+        proposal_hash: bytes,
         proposal_tracker_coin_id: bytes,
         pgt_lock_coin_id: bytes,
         published_bundle_id: str,
@@ -550,30 +554,55 @@ class MintProposalStore:
     ) -> StoredMintProposal:
         """DRAFT → PROPOSED.
 
-        Records the on-chain coin ids that the EXECUTE_MINT spend will
-        later need to reference.  ``deadline`` is a unix timestamp
-        snapshotted from the operator's voting-window choice; the
-        deadline lives on-chain inside the tracker singleton state but
-        we cache it here for cheap UI lookups.
+        Atomically commits all four launcher-id-dependent computed
+        puzzle hashes plus the on-chain coin ids that the
+        EXECUTE_MINT spend will later need to reference.
+
+        ``deadline`` is a unix timestamp snapshotted from the
+        operator's voting-window choice; the deadline lives on-chain
+        inside the tracker singleton state but we cache it here for
+        cheap UI lookups.
+
+        Raises:
+            DuplicateProposalHash: ``proposal_hash`` collides with a
+                previously-published proposal (the on-chain identity
+                must be globally unique).
         """
-        if not _is_bytes32(proposal_tracker_coin_id):
-            raise ValueError("proposal_tracker_coin_id must be bytes32")
-        if not _is_bytes32(pgt_lock_coin_id):
-            raise ValueError("pgt_lock_coin_id must be bytes32")
+        for label, value in (
+            ("smart_deed_inner_puzhash", smart_deed_inner_puzhash),
+            ("eve_inner_puzhash",        eve_inner_puzhash),
+            ("deed_full_puzhash",        deed_full_puzhash),
+            ("proposal_hash",            proposal_hash),
+            ("proposal_tracker_coin_id", proposal_tracker_coin_id),
+            ("pgt_lock_coin_id",         pgt_lock_coin_id),
+        ):
+            if not _is_bytes32(value):
+                raise ValueError(f"{label} must be bytes32")
         if deadline <= 0:
             raise ValueError("deadline must be positive")
 
-        return self._transition(
-            proposal_id,
-            target_state="PROPOSED",
-            updates=[
-                ("proposal_tracker_coin_id", proposal_tracker_coin_id),
-                ("pgt_lock_coin_id",         pgt_lock_coin_id),
-                ("published_bundle_id",      published_bundle_id),
-                ("deadline",                 deadline),
-                ("published_at",             int(time.time())),
-            ],
-        )
+        try:
+            return self._transition(
+                proposal_id,
+                target_state="PROPOSED",
+                updates=[
+                    ("smart_deed_inner_puzhash", smart_deed_inner_puzhash),
+                    ("eve_inner_puzhash",        eve_inner_puzhash),
+                    ("deed_full_puzhash",        deed_full_puzhash),
+                    ("proposal_hash",            proposal_hash),
+                    ("proposal_tracker_coin_id", proposal_tracker_coin_id),
+                    ("pgt_lock_coin_id",         pgt_lock_coin_id),
+                    ("published_bundle_id",      published_bundle_id),
+                    ("deadline",                 deadline),
+                    ("published_at",             int(time.time())),
+                ],
+            )
+        except sqlite3.IntegrityError as e:
+            if "proposal_hash" in str(e):
+                raise DuplicateProposalHash(
+                    f"proposal_hash {proposal_hash.hex()} already exists"
+                ) from e
+            raise
 
     def update_vote_tally(
         self,
@@ -799,10 +828,22 @@ def _row_to_record(row: sqlite3.Row) -> StoredMintProposal:
         royalty_puzhash=bytes(row["royalty_puzhash"]),
         royalty_bps=int(row["royalty_bps"]),
 
-        smart_deed_inner_puzhash=bytes(row["smart_deed_inner_puzhash"]),
-        eve_inner_puzhash=bytes(row["eve_inner_puzhash"]),
-        deed_full_puzhash=bytes(row["deed_full_puzhash"]),
-        proposal_hash=bytes(row["proposal_hash"]),
+        smart_deed_inner_puzhash=(
+            bytes(row["smart_deed_inner_puzhash"])
+            if row["smart_deed_inner_puzhash"] is not None else None
+        ),
+        eve_inner_puzhash=(
+            bytes(row["eve_inner_puzhash"])
+            if row["eve_inner_puzhash"] is not None else None
+        ),
+        deed_full_puzhash=(
+            bytes(row["deed_full_puzhash"])
+            if row["deed_full_puzhash"] is not None else None
+        ),
+        proposal_hash=(
+            bytes(row["proposal_hash"])
+            if row["proposal_hash"] is not None else None
+        ),
 
         proposal_tracker_coin_id=(
             bytes(row["proposal_tracker_coin_id"])

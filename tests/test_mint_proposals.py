@@ -38,8 +38,9 @@ def _b32(byte_value: int) -> bytes:
 def _new_args(*, suffix: int = 0, owner: str = "0xowner") -> dict:
     """Return a kwargs dict suitable for ``store.create``.
 
-    Each call with a different ``suffix`` produces unique
-    bytes32 / property_id / proposal_hash so tests don't collide.
+    DRAFT proposals carry only operator-supplied metadata.  All four
+    computed puzzle hashes are populated atomically at the DRAFT →
+    PROPOSED transition by ``set_published``.
     """
     return dict(
         owner_pubkey=owner,
@@ -49,11 +50,21 @@ def _new_args(*, suffix: int = 0, owner: str = "0xowner") -> dict:
         jurisdiction="US-TX-Travis",
         royalty_puzhash=_b32(0xAA),
         royalty_bps=200,
+        quorum_required=500_000,
+    )
+
+
+def _publish_args(*, suffix: int = 0) -> dict:
+    """Return a kwargs dict suitable for ``store.set_published`` after id."""
+    return dict(
         smart_deed_inner_puzhash=_b32(0xB0 + (suffix & 0x0F)),
         eve_inner_puzhash=_b32(0xC0 + (suffix & 0x0F)),
         deed_full_puzhash=_b32(0xD0 + (suffix & 0x0F)),
         proposal_hash=_b32(0xE0 + (suffix & 0x0F)),
-        quorum_required=500_000,
+        proposal_tracker_coin_id=_b32(0x11),
+        pgt_lock_coin_id=_b32(0x22),
+        published_bundle_id="bundle",
+        deadline=2_000_000_000,
     )
 
 
@@ -135,13 +146,9 @@ class TestCreate:
 
 # ── validation errors ───────────────────────────────────────────────────────
 class TestCreateValidation:
-    @pytest.mark.parametrize("field", [
-        "royalty_puzhash", "smart_deed_inner_puzhash",
-        "eve_inner_puzhash", "deed_full_puzhash", "proposal_hash",
-    ])
-    def test_non_bytes32_rejected(self, store, field):
+    def test_non_bytes32_royalty_puzhash_rejected(self, store):
         args = _new_args(suffix=10)
-        args[field] = b"\x00" * 31  # one byte short
+        args["royalty_puzhash"] = b"\x00" * 31  # one byte short
         with pytest.raises(ValueError, match="bytes32"):
             store.create(**args)
 
@@ -169,52 +176,52 @@ class TestCreateValidation:
 class TestUniqueness:
     def test_duplicate_active_property_rejected(self, store):
         store.create(**_new_args(suffix=20))
-        # Same property_id, different proposal_hash → blocked because
-        # the first proposal is still in DRAFT (active).
-        args2 = _new_args(suffix=20)
-        args2["proposal_hash"] = _b32(0x77)
+        # Same property_id → blocked because the first proposal is
+        # still in DRAFT (active).
         with pytest.raises(DuplicateProperty):
-            store.create(**args2)
+            store.create(**_new_args(suffix=20))
 
     def test_property_re_attempt_after_cancel(self, store):
         rec = store.create(**_new_args(suffix=21))
         store.cancel(rec.id)
         # Same property_id is OK now because the first proposal is
         # CANCELED (terminal/excluded by the partial index).
-        args2 = _new_args(suffix=21)
-        args2["proposal_hash"] = _b32(0x88)
-        args2["smart_deed_inner_puzhash"] = _b32(0x55)
-        rec2 = store.create(**args2)
+        rec2 = store.create(**_new_args(suffix=21))
         assert rec2.state == "DRAFT"
         assert rec2.id != rec.id
 
-    def test_duplicate_proposal_hash_rejected(self, store):
-        store.create(**_new_args(suffix=22))
-        # Same proposal_hash, different property_id.  Globally unique
-        # because this is the on-chain proposal identity.
-        args2 = _new_args(suffix=22)
-        args2["property_id"] = "US-TX-Travis-9999"
-        args2["proposal_hash"] = _new_args(suffix=22)["proposal_hash"]
+    def test_duplicate_proposal_hash_rejected_at_publish(self, store):
+        # The proposal_hash uniqueness check fires at set_published,
+        # because that's when the field is first populated.  Two
+        # DRAFTs with no proposal_hash coexist freely.
+        a = store.create(**_new_args(suffix=22))
+        b = store.create(**_new_args(suffix=23))
+        store.set_published(a.id, **_publish_args(suffix=22))
+        # Re-using the same proposal_hash on a different proposal must fail.
         with pytest.raises(DuplicateProposalHash):
-            store.create(**args2)
+            store.set_published(b.id, **_publish_args(suffix=22))
 
 
 # ── state machine ────────────────────────────────────────────────────────────
 class TestStateMachine:
     def test_happy_path_full_lifecycle(self, store):
         rec = store.create(**_new_args(suffix=30))
+        # DRAFT — all four computed hashes are still None.
+        assert rec.smart_deed_inner_puzhash is None
+        assert rec.eve_inner_puzhash is None
+        assert rec.deed_full_puzhash is None
+        assert rec.proposal_hash is None
 
-        rec = store.set_published(
-            rec.id,
-            proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="bundle-published",
-            deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=30))
         assert rec.state == "PROPOSED"
+        # set_published populated all launcher-id-dependent commitments.
+        assert rec.smart_deed_inner_puzhash == _b32(0xB0 + (30 & 0x0F))
+        assert rec.eve_inner_puzhash == _b32(0xC0 + (30 & 0x0F))
+        assert rec.deed_full_puzhash == _b32(0xD0 + (30 & 0x0F))
+        assert rec.proposal_hash == _b32(0xE0 + (30 & 0x0F))
         assert rec.proposal_tracker_coin_id == _b32(0x11)
         assert rec.pgt_lock_coin_id == _b32(0x22)
-        assert rec.published_bundle_id == "bundle-published"
+        assert rec.published_bundle_id == "bundle"
         assert rec.deadline == 2_000_000_000
         assert rec.published_at is not None
 
@@ -245,13 +252,7 @@ class TestStateMachine:
 
     def test_backwards_transition_rejected(self, store):
         rec = store.create(**_new_args(suffix=32))
-        rec = store.set_published(
-            rec.id,
-            proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b",
-            deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=32))
         # PROPOSED → DRAFT not in ALLOWED_TRANSITIONS.
         # Use cancel() since cancel is DRAFT-only.
         with pytest.raises(InvalidTransition):
@@ -265,13 +266,7 @@ class TestStateMachine:
 
     def test_failed_blocks_further_transitions(self, store):
         rec = store.create(**_new_args(suffix=33))
-        rec = store.set_published(
-            rec.id,
-            proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b",
-            deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=33))
         rec = store.set_failed(rec.id)
         assert rec.state == "FAILED"
         with pytest.raises(InvalidTransition):
@@ -282,21 +277,13 @@ class TestStateMachine:
     def test_set_failed_allowed_from_proposed_or_voting(self, store):
         # PROPOSED → FAILED
         a = store.create(**_new_args(suffix=40))
-        a = store.set_published(
-            a.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b1", deadline=2_000_000_000,
-        )
+        a = store.set_published(a.id, **_publish_args(suffix=40))
         a = store.set_failed(a.id)
         assert a.state == "FAILED"
 
         # VOTING → FAILED
         b = store.create(**_new_args(suffix=41))
-        b = store.set_published(
-            b.id, proposal_tracker_coin_id=_b32(0x33),
-            pgt_lock_coin_id=_b32(0x44),
-            published_bundle_id="b2", deadline=2_000_000_000,
-        )
+        b = store.set_published(b.id, **_publish_args(suffix=41))
         b = store.set_voting(b.id)
         b = store.set_failed(b.id)
         assert b.state == "FAILED"
@@ -308,11 +295,7 @@ class TestStateMachine:
 
     def test_cancel_only_from_draft(self, store):
         rec = store.create(**_new_args(suffix=43))
-        rec = store.set_published(
-            rec.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=43))
         with pytest.raises(InvalidTransition):
             store.cancel(rec.id)
 
@@ -320,22 +303,14 @@ class TestStateMachine:
         with pytest.raises(ProposalNotFound):
             store.cancel("mp_unknown")
         with pytest.raises(ProposalNotFound):
-            store.set_published(
-                "mp_unknown", proposal_tracker_coin_id=_b32(0x11),
-                pgt_lock_coin_id=_b32(0x22),
-                published_bundle_id="b", deadline=2_000_000_000,
-            )
+            store.set_published("mp_unknown", **_publish_args(suffix=99))
 
 
 # ── vote tally ──────────────────────────────────────────────────────────────
 class TestVoteTally:
     def test_tally_updates_in_proposed(self, store):
         rec = store.create(**_new_args(suffix=50))
-        rec = store.set_published(
-            rec.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=50))
         rec = store.update_vote_tally(rec.id, vote_tally=10_000)
         assert rec.vote_tally == 10_000
         rec = store.update_vote_tally(rec.id, vote_tally=20_000)
@@ -343,22 +318,14 @@ class TestVoteTally:
 
     def test_tally_must_monotonically_increase(self, store):
         rec = store.create(**_new_args(suffix=51))
-        rec = store.set_published(
-            rec.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=51))
         rec = store.update_vote_tally(rec.id, vote_tally=10_000)
         with pytest.raises(InvalidTransition, match="monotonically"):
             store.update_vote_tally(rec.id, vote_tally=9_000)
 
     def test_tally_negative_rejected(self, store):
         rec = store.create(**_new_args(suffix=52))
-        rec = store.set_published(
-            rec.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=52))
         with pytest.raises(ValueError):
             store.update_vote_tally(rec.id, vote_tally=-1)
 
@@ -369,11 +336,7 @@ class TestVoteTally:
 
     def test_tally_in_passed_rejected(self, store):
         rec = store.create(**_new_args(suffix=54))
-        rec = store.set_published(
-            rec.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        rec = store.set_published(rec.id, **_publish_args(suffix=54))
         rec = store.set_voting(rec.id)
         rec = store.set_passed(rec.id)
         with pytest.raises(InvalidTransition):
@@ -397,11 +360,7 @@ class TestList:
     def test_list_filter_by_state(self, store):
         draft = store.create(**_new_args(suffix=70, owner="0xa"))
         published = store.create(**_new_args(suffix=71, owner="0xb"))
-        store.set_published(
-            published.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        store.set_published(published.id, **_publish_args(suffix=71))
         drafts = store.list(states=["DRAFT"])
         assert {r.id for r in drafts} == {draft.id}
         proposed = store.list(states=["PROPOSED"])
@@ -434,11 +393,7 @@ class TestList:
     def test_count_by_state(self, store):
         store.create(**_new_args(suffix=100))
         published = store.create(**_new_args(suffix=101))
-        store.set_published(
-            published.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="b", deadline=2_000_000_000,
-        )
+        store.set_published(published.id, **_publish_args(suffix=101))
         assert store.count() == 2
         assert store.count(state="DRAFT") == 1
         assert store.count(state="PROPOSED") == 1
@@ -481,12 +436,15 @@ class TestPublicDict:
         assert d["royalty_puzhash"].startswith("0x")
         assert len(d["royalty_puzhash"]) == 2 + 64
 
-        # Computed sub-dict
+        # Computed sub-dict — at DRAFT, all four hashes are None.
+        # They become populated at the DRAFT → PROPOSED transition
+        # because they all depend on the launcher coin id (via the
+        # SINGLETON_STRUCT curried into smart_deed_inner).
         c = d["computed"]
-        for k in ("smart_deed_inner_puzhash", "eve_inner_puzhash",
-                  "deed_full_puzhash", "proposal_hash"):
-            assert c[k].startswith("0x")
-            assert len(c[k]) == 2 + 64
+        assert c["smart_deed_inner_puzhash"] is None
+        assert c["eve_inner_puzhash"] is None
+        assert c["deed_full_puzhash"] is None
+        assert c["proposal_hash"] is None
 
         # On-chain sub-dict starts entirely null in DRAFT
         assert d["on_chain"] == {
@@ -506,16 +464,22 @@ class TestPublicDict:
 
     def test_to_public_dict_after_publish_includes_chain(self, store):
         rec = store.create(**_new_args(suffix=201))
-        rec = store.set_published(
-            rec.id, proposal_tracker_coin_id=_b32(0x11),
-            pgt_lock_coin_id=_b32(0x22),
-            published_bundle_id="bundle-x", deadline=2_000_000_000,
-        )
+        # In DRAFT all four computed commitments are null.
+        d_draft = rec.to_public_dict()
+        for k in ("smart_deed_inner_puzhash", "eve_inner_puzhash",
+                  "deed_full_puzhash", "proposal_hash"):
+            assert d_draft["computed"][k] is None
+
+        rec = store.set_published(rec.id, **_publish_args(suffix=201))
         d = rec.to_public_dict()
         assert d["state"] == "PROPOSED"
+        for k in ("smart_deed_inner_puzhash", "eve_inner_puzhash",
+                  "deed_full_puzhash", "proposal_hash"):
+            assert d["computed"][k].startswith("0x")
+            assert len(d["computed"][k]) == 2 + 64
         assert d["on_chain"]["proposal_tracker_coin_id"].endswith("11" * 32)
         assert d["on_chain"]["pgt_lock_coin_id"].endswith("22" * 32)
-        assert d["on_chain"]["published_bundle_id"] == "bundle-x"
+        assert d["on_chain"]["published_bundle_id"] == "bundle"
         assert d["timestamps"]["published_at"] is not None
 
 
