@@ -132,10 +132,8 @@ class TestAuthGating:
         ("/admin/mint/anything/cancel", "POST"),
         ("/admin/mint/anything/publish", "POST"),
         ("/admin/mint/anything/execute", "POST"),
-        ("/admin/committee/proposals", "GET"),
-        ("/admin/committee/vote",      "POST"),
     ])
-    def test_no_auth_returns_401(self, client, path, method):
+    def test_admin_paths_require_auth(self, client, path, method):
         # No allowlist member is configured → 503; with allowlist set
         # but no token → 401.  The fixture sets the allowlist, so we
         # expect 401 here.
@@ -145,6 +143,19 @@ class TestAuthGating:
     def test_bad_token_returns_403(self, client):
         resp = client.get("/admin/mint", headers={"Authorization": "Bearer not.a.jwt"})
         assert resp.status_code == 403
+
+    @pytest.mark.parametrize("path,method,expected", [
+        # POP-CANON-013: committee endpoints are intentionally public.
+        # /committee/proposals is a 200 read; /committee/vote is a 501
+        # stub but reachable without admin JWT.
+        ("/admin/committee/proposals", "GET",  200),
+        ("/admin/committee/vote",      "POST", 501),
+    ])
+    def test_committee_paths_do_not_require_admin_auth(
+        self, client, path, method, expected,
+    ):
+        resp = client.request(method, path, json={})
+        assert resp.status_code == expected, resp.text
 
 
 # ── Propose ─────────────────────────────────────────────────────────────────
@@ -161,7 +172,8 @@ class TestPropose:
         assert body["state"] == "DRAFT"
         assert body["par_value"] == 1_000_000_001
         assert body["owner_pubkey"] == _TEST_ADDRESS_LOWER
-        assert body["property_id"] == "US-TX-Travis-0001"
+        # POP-CANON-014: stored property_id is the canonical (upper, stripped) form.
+        assert body["property_id"] == "US-TX-TRAVIS-0001"
         # All four computed hashes are None at DRAFT.
         for k in ("smart_deed_inner_puzhash", "eve_inner_puzhash",
                   "deed_full_puzhash", "proposal_hash"):
@@ -396,27 +408,22 @@ class TestStepBStubs:
         assert resp.status_code == 501
 
     def test_committee_vote_returns_501(self, client):
-        token = _login(client)
-        resp = client.post(
-            "/admin/committee/vote",
-            json={},
-            headers=_auth_header(token),
-        )
+        # POP-CANON-013: no admin JWT required.
+        resp = client.post("/admin/committee/vote", json={})
         assert resp.status_code == 501
 
 
 # ── Committee proposal listing ──────────────────────────────────────────────
 class TestCommitteeProposals:
-    def test_empty(self, client):
-        token = _login(client)
-        resp = client.get(
-            "/admin/committee/proposals",
-            headers=_auth_header(token),
-        )
+    """POP-CANON-013: committee endpoints are public — no admin JWT required."""
+
+    def test_empty_no_auth(self, client):
+        # Hits /admin/committee/proposals without any Authorization header.
+        resp = client.get("/admin/committee/proposals")
         assert resp.status_code == 200
         assert resp.json() == {"proposals": [], "count": 0}
 
-    def test_excludes_drafts(self, client):
+    def test_excludes_drafts_no_auth(self, client):
         # Drafts are NOT visible to the committee — only PROPOSED/VOTING.
         # Step A.2 doesn't have a /publish endpoint, so all proposals
         # stay DRAFT and the committee list stays empty.
@@ -426,10 +433,8 @@ class TestCommitteeProposals:
             json=_propose_body(suffix=110),
             headers=_auth_header(token),
         )
-        resp = client.get(
-            "/admin/committee/proposals",
-            headers=_auth_header(token),
-        )
+        # Read committee list anonymously — no auth header.
+        resp = client.get("/admin/committee/proposals")
         body = resp.json()
         assert body["count"] == 0
         assert body["proposals"] == []

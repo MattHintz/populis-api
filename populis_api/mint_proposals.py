@@ -399,7 +399,21 @@ class MintProposalStore:
 
         Raises:
             DuplicateProperty: a non-terminal proposal already exists
-                for ``property_id``.
+                for the canonicalised ``property_id``.
+            ValueError: any input fails its individual validation
+                (bytes32 fields, positivity, range), or the
+                ``property_id`` collapses to empty after canonicalisation.
+
+        ``property_id`` is canonicalised by ``strip().upper()`` to
+        defeat the trivial uniqueness bypass identified in
+        POP-CANON-014: SQLite's default BINARY collation would
+        otherwise treat ``"US-TX-1234"``, ``"us-tx-1234"``, and
+        ``" US-TX-1234 "`` as three distinct active proposals.
+        Real-world property identifiers (parcel numbers, MLS ids,
+        ISO country / region codes) are conventionally upper-case,
+        so canonicalising at the store layer is both safe and
+        defence-in-depth against any caller that forgets to
+        normalise.
         """
         if not _is_bytes32(royalty_puzhash):
             raise ValueError("royalty_puzhash must be bytes32")
@@ -409,6 +423,13 @@ class MintProposalStore:
             raise ValueError("royalty_bps out of range")
         if quorum_required <= 0:
             raise ValueError("quorum_required must be positive")
+
+        # POP-CANON-014: canonicalise property_id before the uniqueness
+        # check.  See docstring above.
+        canonical_pid = property_id.strip().upper()
+        if not canonical_pid:
+            raise ValueError("property_id must be non-empty after stripping whitespace")
+        property_id = canonical_pid
 
         proposal_id = _new_proposal_id()
         now = int(time.time())
@@ -465,10 +486,17 @@ class MintProposalStore:
     def get_by_property_id(self, property_id: str) -> Optional[StoredMintProposal]:
         """Return the *active* (non-terminal) proposal for ``property_id``.
 
+        ``property_id`` is canonicalised the same way ``create()`` does
+        (``strip().upper()``) so callers can pass either the raw
+        operator input or the canonical form interchangeably
+        (POP-CANON-014).
+
         Useful for the /admin/mint/propose pre-flight check so the API
         can return a friendly 409 instead of a database constraint
-        error.
-        """
+        violation."""
+        property_id = property_id.strip().upper()
+        if not property_id:
+            return None
         with self._lock:
             row = self._conn.execute(
                 """

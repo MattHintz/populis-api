@@ -116,7 +116,13 @@ The Admin Desk uses **wallet-pubkey allowlist + short-lived JWT**:
 }
 ```
 
-**Allowlist storage** (Step A): env var, refreshed on app start. Rotation = restart the API.
+**Allowlist storage** (Step A): env var (`POPULIS_ADMIN_PUBKEY_ALLOWLIST`).
+Rotation works without an API restart: `get_settings` re-reads on each cache miss,
+and `require_admin_jwt` re-checks live membership on every request
+(POP-CANON-012 fix).  A subject removed from the allowlist immediately
+loses authority on the next `/admin/*` request — even if their JWT is
+still cryptographically valid under the unchanged secret.
+
 **Allowlist storage** (future): on-chain registry singleton (the `admin_registry_inner.clsp` from earlier sketches) for trustless rotation. Out of scope for Step A.
 
 ### 3.3 The bearer-token mechanism stays
@@ -127,7 +133,7 @@ The Admin Desk uses **wallet-pubkey allowlist + short-lived JWT**:
 
 | Threat | Mitigation |
 |---|---|
-| Stolen JWT | 15-minute TTL + memory-only storage + refresh requires re-signing |
+| Stolen JWT | 15-minute TTL + memory-only storage; allowlist re-check on every request immediately revokes a stolen JWT once the operator rotates the allowlist (POP-CANON-012). |
 | Replay of login | Nonce popped atomically on login |
 | Allowlist tampering | Env var, server-side; pubkeys hex-validated on parse |
 | MITM of login envelope | EIP-712 chainId binding + HTTPS only in production |
@@ -353,10 +359,22 @@ DRAFT → CANCELED. No on-chain effect; just cleans up the DB row.
 
 ### 6.3 Committee endpoints
 
+> **Auth note (POP-CANON-013):** Both committee endpoints are
+> deliberately **NOT** gated by `require_admin_jwt`.  Committee
+> voting is open to any PGT holder — locking it behind the admin
+> allowlist would conflate "operator desk authority" (an internal
+> capability) with "PGT-weighted governance" (a token-holder
+> capability), breaking decentralised governance.
+
 #### `GET /admin/committee/proposals`
-Returns ALL open proposals across all admins (for committee voters).
+**Public read.** Returns ALL open proposals across all admins (for
+committee voters).  No authentication required; rate-limit at the
+reverse-proxy edge if needed.
 
 #### `POST /admin/committee/vote`
+**Public publish-only gateway.** No admin JWT required — the embedded
+PGT-VOTE signature inside the spend bundle is the authority.
+
 ```json
 // Request: pre-signed PGT-VOTE bundle from the voter's own wallet
 {

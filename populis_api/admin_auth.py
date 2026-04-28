@@ -50,6 +50,14 @@ router = APIRouter(prefix="/admin/auth", tags=["admin-auth"])
 # ── EIP-712 envelope for admin login ─────────────────────────────────────────
 ADMIN_LOGIN_PRIMARY_TYPE = "PopulisAdminLogin"
 
+# The only scope minted by the JWT issuer today.  Surfaced as a
+# constant so the EIP-712 envelope binds it explicitly: when a
+# future refactor introduces additional scopes (e.g. ``admin-readonly``
+# or per-action scopes), an existing user signature cannot be replayed
+# to mint a JWT for the new scope without the operator re-signing
+# (POP-CANON-015).
+ADMIN_LOGIN_SCOPE = "admin"
+
 ADMIN_LOGIN_TYPES = {
     "EIP712Domain": [
         {"name": "name", "type": "string"},
@@ -64,6 +72,14 @@ ADMIN_LOGIN_TYPES = {
         # against grossly stale signatures (the server still enforces
         # TTL via the ChallengeStore expires_at).
         {"name": "issuedAt", "type": "uint256"},
+        # POP-CANON-015: bind authType + scope so a signature for one
+        # auth path / scope cannot be replayed for another.  Today
+        # ``authType`` is constrained by the challenge store invariant
+        # and ``scope`` is hard-coded to ``"admin"``, but the
+        # cryptographic binding is what future-proofs the envelope
+        # against scope-confusion attacks.
+        {"name": "authType", "type": "string"},
+        {"name": "scope",    "type": "string"},
     ],
 }
 
@@ -73,6 +89,9 @@ def admin_login_typed_data(
     nonce_hex: str,
     issued_at: int,
     settings: Settings,
+    *,
+    auth_type: str = "evm",
+    scope: str = ADMIN_LOGIN_SCOPE,
 ) -> dict[str, Any]:
     """Build the EIP-712 envelope the admin signs to log in.
 
@@ -81,6 +100,11 @@ def admin_login_typed_data(
     primary type so a registration signature cannot replay as a login
     signature.  EVM wallets display the primary type prominently in
     the signing prompt.
+
+    ``auth_type`` and ``scope`` are bound into the signed message so
+    a signature for ``auth_type='evm', scope='admin'`` cannot later
+    be replayed to authenticate as ``auth_type='chia_bls'`` or for a
+    different scope (POP-CANON-015 future-proofing).
     """
     return {
         "types": ADMIN_LOGIN_TYPES,
@@ -94,6 +118,8 @@ def admin_login_typed_data(
             "owner": to_checksum_address(owner_address),
             "nonce": nonce_hex,
             "issuedAt": issued_at,
+            "authType": auth_type,
+            "scope": scope,
         },
     }
 
@@ -120,10 +146,21 @@ def get_admin_challenges() -> ChallengeStore:
 def get_jwt_secret(settings: Optional[Settings] = None) -> str:
     """Return the configured JWT secret, caching a random fallback once.
 
-    If ``POPULIS_ADMIN_JWT_SECRET`` is set, it's used verbatim.  Otherwise
-    a per-process random secret is generated on first use.  Subsequent
-    calls return the same secret so tokens issued in the same process
-    are mutually verifiable.
+    Resolution rules (POP-CANON-016):
+      1. If ``POPULIS_ADMIN_JWT_SECRET`` is set: use it verbatim.
+      2. If unset AND the allowlist is empty (admin desk disabled):
+         generate a per-process random fallback so tests and dev
+         environments can issue JWTs without forcing the operator
+         to set a secret they're not using.
+      3. If unset AND the allowlist is non-empty: refuse — this is
+         the multi-worker divergence trap.  Each gunicorn/uvicorn
+         worker would otherwise generate its own random secret;
+         JWTs issued by worker A would fail verification on worker B,
+         producing intermittent 403s indistinguishable from real
+         token-tampering signals.
+
+    Subsequent calls return the cached value so tokens issued in the
+    same process are mutually verifiable.
     """
     global _resolved_jwt_secret
     if _resolved_jwt_secret is not None:
@@ -131,12 +168,30 @@ def get_jwt_secret(settings: Optional[Settings] = None) -> str:
     s = settings or get_settings()
     if s.admin_jwt_secret:
         _resolved_jwt_secret = s.admin_jwt_secret
-    else:
-        _resolved_jwt_secret = secrets.token_hex(32)
-        logger.warning(
-            "POPULIS_ADMIN_JWT_SECRET unset; generated a random per-process "
-            "secret. Outstanding admin tokens will not survive restart."
+        return _resolved_jwt_secret
+
+    # POP-CANON-016: fail fast when the allowlist is configured but
+    # the JWT secret is not.  Allow the random-fallback path only
+    # when the admin desk itself is disabled (empty allowlist).
+    if s.admin_pubkey_allowlist_set():
+        raise RuntimeError(
+            "POPULIS_ADMIN_PUBKEY_ALLOWLIST is configured but "
+            "POPULIS_ADMIN_JWT_SECRET is empty.  Multi-worker "
+            "deployments would generate divergent per-process secrets, "
+            "causing intermittent 403s when load-balanced refresh "
+            "requests land on a different worker than the original "
+            "/login.  Set POPULIS_ADMIN_JWT_SECRET to a stable "
+            "high-entropy value (≥32 bytes hex) before enabling the "
+            "admin desk."
         )
+
+    _resolved_jwt_secret = secrets.token_hex(32)
+    logger.warning(
+        "POPULIS_ADMIN_JWT_SECRET unset; generated a random per-process "
+        "secret. Outstanding admin tokens will not survive restart. "
+        "(Allowed because POPULIS_ADMIN_PUBKEY_ALLOWLIST is empty — "
+        "the admin desk is disabled.)"
+    )
     return _resolved_jwt_secret
 
 
@@ -223,7 +278,11 @@ def require_admin_jwt(
 
     503 if the admin desk is not configured (empty allowlist).
     401 if the Authorization header is missing or malformed.
-    403 if the JWT is invalid/expired/forged.
+    403 if the JWT is invalid/expired/forged, OR if ``claims.sub`` is
+        no longer present in the live allowlist (POP-CANON-012:
+        revocation must terminate sessions without requiring a process
+        restart, even if the JWT itself is still cryptographically
+        valid under the unchanged secret).
     """
     if not settings.admin_pubkey_allowlist_set():
         raise HTTPException(
@@ -239,11 +298,27 @@ def require_admin_jwt(
         )
     token = authorization.split(None, 1)[1].strip()
     try:
-        return verify_jwt(token, settings)
+        claims = verify_jwt(token, settings)
     except JWTVerifyError as e:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=str(e),
         ) from e
+
+    # POP-CANON-012: re-check live allowlist on every authenticated
+    # request.  An admin removed from POPULIS_ADMIN_PUBKEY_ALLOWLIST
+    # must lose all admin authority within at most one settings cache
+    # cycle, regardless of whether their JWT is still within its TTL.
+    # Without this check, refresh-after-revocation chains keep a
+    # compromised admin authoritative until the API process restarts.
+    if claims.sub.lower() not in settings.admin_pubkey_allowlist_set():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Subject {claims.sub} is no longer in the admin allowlist. "
+                f"Re-authenticate via /admin/auth/login if your pubkey was re-added."
+            ),
+        )
+    return claims
 
 
 # ── Wire schemas ─────────────────────────────────────────────────────────────
@@ -321,6 +396,8 @@ async def admin_challenge(
             nonce_hex=ch.nonce,
             issued_at=issued_at,
             settings=settings,
+            auth_type=body.auth_type,
+            scope=ADMIN_LOGIN_SCOPE,
         )
     else:
         # BLS path: surface the same fields as a flat dict; the chia
@@ -334,6 +411,8 @@ async def admin_challenge(
                 "owner": body.owner,
                 "nonce": ch.nonce,
                 "issuedAt": issued_at,
+                "authType": body.auth_type,
+                "scope": ADMIN_LOGIN_SCOPE,
             },
         }
 
@@ -386,6 +465,8 @@ async def admin_login(
         nonce_hex=ch.nonce,
         issued_at=int(ch.issued_at),
         settings=settings,
+        auth_type=body.auth_type,
+        scope=ADMIN_LOGIN_SCOPE,
     )
     try:
         recovery = recover_evm_signer(typed_data, body.signature)
@@ -452,10 +533,12 @@ async def admin_refresh(
     proof of authorisation.  If the current JWT has expired the
     dependency returns 403 and the client must restart the login flow.
 
-    A subsequent allowlist change does NOT invalidate already-issued
-    JWTs — by design.  Operators rotating the allowlist must restart
-    the API to invalidate all in-flight admin sessions; the 15-minute
-    default TTL bounds the worst-case delay.
+    Allowlist revocation is enforced by ``require_admin_jwt`` (see
+    POP-CANON-012): a subject removed from the allowlist while their
+    JWT is still cryptographically valid will fail this dependency
+    with 403 — they cannot refresh.  Operators rotating the allowlist
+    therefore terminate revoked sessions within at most one
+    ``get_settings`` cache cycle, no process restart required.
     """
     token, exp = issue_jwt(
         sub=claims.sub,
@@ -474,6 +557,7 @@ __all__ = [
     "AdminLoginResponse",
     "AdminRefreshResponse",
     "ADMIN_LOGIN_PRIMARY_TYPE",
+    "ADMIN_LOGIN_SCOPE",
     "ADMIN_LOGIN_TYPES",
     "admin_login_typed_data",
     "issue_jwt",

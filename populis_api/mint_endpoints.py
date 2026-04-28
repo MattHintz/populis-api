@@ -304,10 +304,22 @@ async def execute_mint_proposal(proposal_id: str) -> dict[str, Any]:
 
 
 # ── /admin/committee/* endpoints ────────────────────────────────────────────
+#
+# POP-CANON-013: committee endpoints are deliberately NOT gated by
+# require_admin_jwt.  The design (see ADMIN_DESK_DESIGN.md §6.3) is that
+# committee voting is open to any PGT holder, not just allowlisted
+# admins — locking it behind the admin allowlist would conflate
+# "operator desk authority" (an internal-team capability) with
+# "PGT-weighted governance" (a token-holder capability), breaking
+# decentralised governance.
+#
+# /committee/proposals is a public read.  /committee/vote (Step B) will
+# carry its authority in the embedded PGT-VOTE signature inside the
+# spend bundle — the API is publish-only and validates bundle
+# structure, not signer identity.
 @router.get(
     "/admin/committee/proposals",
     response_model=MintProposalListResponse,
-    dependencies=[Depends(require_admin_jwt)],
 )
 async def list_committee_proposals(
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
@@ -319,6 +331,10 @@ async def list_committee_proposals(
     Filters to PROPOSED + VOTING — terminal and DRAFT proposals are
     excluded.  Used by the committee voting UI to populate the
     "open proposals" sidebar.
+
+    Public: no authentication required.  Any PGT holder (or any
+    interested observer) may read this list.  Rate-limiting can be
+    layered at the reverse-proxy edge if needed.
     """
     if limit < 1 or limit > 1_000:
         raise HTTPException(status_code=400, detail="limit must be 1..1000")
@@ -341,9 +357,15 @@ async def list_committee_proposals(
 @router.post(
     "/admin/committee/vote",
     response_model=dict[str, Any],
-    dependencies=[Depends(require_admin_jwt)],
 )
 async def cast_committee_vote(proposal_id: str = "") -> dict[str, Any]:
+    """Forward a committee vote bundle to chain.  Step B implementation.
+
+    The PGT-VOTE signature inside the spend bundle is the authority —
+    the API does not require admin JWT authentication for this
+    endpoint.  Voters who hold PGT but are not allowlisted admins must
+    be able to participate in governance.
+    """
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail=f"/admin/committee/vote is not implemented yet. {_STEP_B_NOTE}",

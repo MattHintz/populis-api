@@ -201,6 +201,58 @@ class TestUniqueness:
         with pytest.raises(DuplicateProposalHash):
             store.set_published(b.id, **_publish_args(suffix=22))
 
+    # POP-CANON-014: property_id is canonicalised by strip().upper()
+    # before the active-proposal uniqueness check.  Without the
+    # canonicalisation, two byte-distinct property_ids that refer to
+    # the same real-world property would create independent active
+    # proposals, breaking the "no two deeds for the same property"
+    # invariant.
+    @pytest.mark.parametrize("variant", [
+        "us-tx-travis-9001",      # lowercase
+        "US-TX-TRAVIS-9001 ",     # trailing space
+        " US-TX-TRAVIS-9001",     # leading space
+        "  us-tx-travis-9001\t",  # mixed whitespace and case
+    ])
+    def test_property_id_canonicalised_blocks_lookalike_duplicates(
+        self, store, variant,
+    ):
+        canonical = "US-TX-TRAVIS-9001"
+        args = _new_args(suffix=24)
+        args["property_id"] = canonical
+        first = store.create(**args)
+        assert first.property_id == canonical
+
+        # Same property under any case/whitespace variant must be
+        # blocked, not silently accepted as a "different" property.
+        args2 = _new_args(suffix=25)  # different suffix → different par_value etc.
+        args2["property_id"] = variant
+        with pytest.raises(DuplicateProperty):
+            store.create(**args2)
+
+    def test_property_id_canonicalised_on_create(self, store):
+        # The stored row carries the canonical (upper, stripped) form,
+        # not whatever the caller happened to pass in.
+        args = _new_args(suffix=26)
+        args["property_id"] = "  us-tx-travis-9100  "
+        rec = store.create(**args)
+        assert rec.property_id == "US-TX-TRAVIS-9100"
+
+    def test_property_id_empty_after_strip_rejected(self, store):
+        args = _new_args(suffix=27)
+        args["property_id"] = "   "
+        with pytest.raises(ValueError, match="non-empty"):
+            store.create(**args)
+
+    def test_get_by_property_id_canonicalises_lookup(self, store):
+        # Callers can pass any case/whitespace variant; the lookup
+        # finds the active proposal on the canonical form.
+        rec = store.create(**{
+            **_new_args(suffix=28),
+            "property_id": "US-TX-TRAVIS-9200",
+        })
+        assert store.get_by_property_id("us-tx-travis-9200").id == rec.id
+        assert store.get_by_property_id("  US-TX-TRAVIS-9200  ").id == rec.id
+
 
 # ── state machine ────────────────────────────────────────────────────────────
 class TestStateMachine:

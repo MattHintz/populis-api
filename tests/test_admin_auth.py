@@ -98,10 +98,15 @@ class TestTypedData:
         assert td["message"]["owner"] == _TEST_ADDRESS
         assert td["message"]["nonce"].startswith("0x")
         assert td["message"]["issuedAt"] == 1_000_000_000
+        # POP-CANON-015: authType + scope are bound into every login envelope.
+        assert td["message"]["authType"] == "evm"
+        assert td["message"]["scope"] == "admin"
 
     def test_envelope_distinct_from_registration_typehash(self, settings_with_admin):
         # Sanity: PopulisVaultRegister envelope and PopulisAdminLogin
-        # envelope must not collide.
+        # envelope must not collide.  The primary type alone separates
+        # them under EIP-712's structHash, so even fields that overlap
+        # by name (e.g. ``authType``) hash distinctly.
         td = admin_login_typed_data(
             owner_address=_TEST_ADDRESS,
             nonce_hex="0x" + "22" * 32,
@@ -109,8 +114,10 @@ class TestTypedData:
             settings=settings_with_admin,
         )
         assert td["primaryType"] == "PopulisAdminLogin"
-        # Different fields than the registration envelope.
-        register_only = {"poolLauncherId", "authType", "chiaNetwork"}
+        # Registration-only fields that should NOT appear in the admin
+        # login envelope (poolLauncherId, chiaNetwork are pool-binding
+        # fields specific to vault registration).
+        register_only = {"poolLauncherId", "chiaNetwork"}
         assert register_only.isdisjoint(td["message"].keys())
 
 
@@ -189,8 +196,12 @@ class TestJWTRoundtrip:
 
 
 class TestJWTSecretCaching:
-    def test_random_secret_when_unset(self, monkeypatch):
+    def test_random_secret_when_unset_and_admin_desk_disabled(self, monkeypatch):
+        # POP-CANON-016: random fallback is allowed only when the
+        # allowlist is empty (admin desk disabled).  This test exercises
+        # the dev/test-only path.
         monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        monkeypatch.delenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", raising=False)
         get_settings.cache_clear()
         s = get_settings()
         secret1 = admin_auth.get_jwt_secret(s)
@@ -206,6 +217,21 @@ class TestJWTSecretCaching:
         get_settings.cache_clear()
         s = get_settings()
         assert admin_auth.get_jwt_secret(s) == explicit
+
+    def test_unset_secret_with_enabled_allowlist_raises(self, monkeypatch):
+        # POP-CANON-016: when the admin desk is enabled (allowlist set)
+        # but POPULIS_ADMIN_JWT_SECRET is missing, get_jwt_secret must
+        # refuse rather than silently generate a per-process random
+        # secret.  The silent path produces intermittent 403s under
+        # multi-worker deployments because each worker's secret diverges.
+        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        monkeypatch.setenv(
+            "POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER,
+        )
+        get_settings.cache_clear()
+        s = get_settings()
+        with pytest.raises(RuntimeError, match="POPULIS_ADMIN_JWT_SECRET"):
+            admin_auth.get_jwt_secret(s)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
