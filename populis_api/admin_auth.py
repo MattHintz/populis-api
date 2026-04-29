@@ -202,6 +202,53 @@ def reset_admin_state_for_tests() -> None:
     _resolved_jwt_secret = None
 
 
+def validate_admin_config_at_startup(settings: Settings) -> None:
+    """Fail-fast check, run once from the FastAPI lifespan.
+
+    Surfaces admin-desk misconfiguration at boot rather than at the
+    first admin request.  This is the startup-time complement to the
+    runtime guard inside ``get_jwt_secret`` (POP-CANON-016): operators
+    deploying with monitoring that watches process health get
+    immediate feedback, instead of discovering the misconfiguration
+    only when an admin tries to sign in hours later.
+
+    Raises:
+        RuntimeError: ``POPULIS_ADMIN_PUBKEY_ALLOWLIST`` is non-empty
+            but ``POPULIS_ADMIN_JWT_SECRET`` is empty.  In that
+            configuration each gunicorn/uvicorn worker would generate
+            its own random secret on first JWT issuance, causing
+            cross-worker token-verification failures (the
+            "intermittent 403s" trap described in
+            ``research/CANON_POPULIS_ADMIN_DESK_AUDIT_2026_04_28.md``).
+    """
+    if not settings.admin_pubkey_allowlist_set():
+        # Admin desk disabled — random per-process secret is acceptable
+        # (it's only used for the dev/test environment paths and never
+        # shared across workers because admin endpoints all 503).
+        logger.info(
+            "Admin desk disabled (POPULIS_ADMIN_PUBKEY_ALLOWLIST unset)."
+        )
+        return
+
+    if not settings.admin_jwt_secret:
+        raise RuntimeError(
+            "Admin desk is enabled (POPULIS_ADMIN_PUBKEY_ALLOWLIST is set) "
+            "but POPULIS_ADMIN_JWT_SECRET is empty. "
+            "Multi-worker deployments would generate divergent per-process "
+            "secrets, causing intermittent 403s on load-balanced refresh "
+            "requests.  Set POPULIS_ADMIN_JWT_SECRET to a stable "
+            "high-entropy value (≥32 bytes hex) before starting the API."
+        )
+
+    allowlist_size = len(settings.admin_pubkey_allowlist_set())
+    logger.info(
+        "Admin desk enabled (%d pubkey%s allowlisted, JWT TTL %ds).",
+        allowlist_size,
+        "" if allowlist_size == 1 else "s",
+        settings.admin_jwt_ttl_seconds,
+    )
+
+
 # ── JWT helpers ──────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class AdminClaims:
@@ -560,6 +607,7 @@ __all__ = [
     "ADMIN_LOGIN_SCOPE",
     "ADMIN_LOGIN_TYPES",
     "admin_login_typed_data",
+    "validate_admin_config_at_startup",
     "issue_jwt",
     "verify_jwt",
     "require_admin_jwt",

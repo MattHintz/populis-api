@@ -24,13 +24,46 @@ from chia.types.blockchain_format.program import Program
 from chia.wallet.derive_keys import master_sk_to_wallet_sk_unhardened
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import (
     DEFAULT_HIDDEN_PUZZLE_HASH,
+    MOD as _P2_DELEGATED_MOD,
     calculate_synthetic_secret_key,
-    puzzle_for_pk,
 )
 from chia_rs import AugSchemeMPL, G1Element, PrivateKey
 from chia_rs.sized_bytes import bytes32
 
 logger = logging.getLogger(__name__)
+
+
+# Cache the p2_delegated_or_hidden MOD as bytes at this module's import
+# time.  chia_rs's `LazyNode` (the SEXP backing every chia ``Program``)
+# is *not* thread-safe — the underlying PyO3 binding panics with
+# "LazyNode is unsendable, but sent to another thread" when a
+# Program created on thread A is deserialised / curried on thread B.
+#
+# This bites us specifically under pytest's ``TestClient(app)``, which
+# runs the FastAPI lifespan on an anyio portal thread distinct from the
+# import thread.  The lifespan's faucet construction calls
+# ``puzzle_for_pk(wallet_pk)`` → ``MOD.curry(...)`` and then
+# ``get_tree_hash()`` walks the LazyNode → panic.
+#
+# The fix: capture MOD as bytes once at import time, then on every call
+# deserialise a *thread-local* copy via ``Program.from_bytes(...)``.
+# Each call thus operates on a Program whose LazyNode is owned by the
+# caller's thread.  Per-call deserialisation is cheap (the puzzle is
+# tiny), and we only do it once per faucet, not per request.
+_P2_DELEGATED_MOD_BYTES: bytes = bytes(_P2_DELEGATED_MOD)
+
+
+def _puzzle_for_pk_threadsafe(public_key: G1Element) -> Program:
+    """Thread-safe replacement for ``chia...puzzle_for_pk``.
+
+    Reconstructs the p2_delegated_or_hidden MOD from cached bytes on
+    the calling thread, then curries the public key in.  The returned
+    ``Program``'s LazyNode is owned by the calling thread, so all
+    subsequent operations (``bytes(...)``, ``get_tree_hash()``,
+    ``run(...)``) are safe.
+    """
+    mod_local = Program.from_bytes(_P2_DELEGATED_MOD_BYTES)
+    return mod_local.curry(public_key)
 
 # Network-specific AGG_SIG_ME additional data.
 # Pulled from chia.consensus.default_constants.DEFAULT_CONSTANTS / testnet11 overrides.
@@ -113,7 +146,11 @@ class Faucet:
         wallet_pk = wallet_sk.get_g1()
         synth_sk = calculate_synthetic_secret_key(wallet_sk, DEFAULT_HIDDEN_PUZZLE_HASH)
         synth_pk = synth_sk.get_g1()
-        puzzle = puzzle_for_pk(wallet_pk)
+        # Thread-safe puzzle construction (see the module-level note on
+        # ``_P2_DELEGATED_MOD_BYTES``).  This is what lets the faucet be
+        # constructed on the lifespan thread and used from request
+        # handlers on the asyncio thread without a LazyNode panic.
+        puzzle = _puzzle_for_pk_threadsafe(wallet_pk)
         puzzle_hash = bytes32(puzzle.get_tree_hash())
         return FaucetKey(
             wallet_sk=wallet_sk,

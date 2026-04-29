@@ -234,6 +234,36 @@ class TestJWTSecretCaching:
             admin_auth.get_jwt_secret(s)
 
 
+class TestStartupValidator:
+    """POP-CANON-016: startup-time complement to the runtime guard.
+
+    The runtime path (``get_jwt_secret``) only fires on the first JWT
+    issuance, which can be hours after deployment.  The startup
+    validator runs from the FastAPI lifespan so misconfiguration
+    surfaces at boot.
+    """
+
+    def test_passes_when_admin_desk_disabled(self, monkeypatch):
+        monkeypatch.delenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", raising=False)
+        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        get_settings.cache_clear()
+        # No exception, no return value — just logs an "admin desk disabled" line.
+        admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_passes_when_both_set(self, monkeypatch):
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        get_settings.cache_clear()
+        admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_raises_when_allowlist_set_but_secret_missing(self, monkeypatch):
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
+        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="POPULIS_ADMIN_JWT_SECRET"):
+            admin_auth.validate_admin_config_at_startup(get_settings())
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 class TestChallenge:
     def test_503_when_allowlist_empty(self, monkeypatch):

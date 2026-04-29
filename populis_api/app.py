@@ -25,7 +25,10 @@ from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 
 from .admin import router as admin_router
-from .admin_auth import router as admin_auth_router
+from .admin_auth import (
+    router as admin_auth_router,
+    validate_admin_config_at_startup,
+)
 from .mint_endpoints import router as mint_endpoints_router
 from .challenges import (
     ChallengeStore,
@@ -54,6 +57,40 @@ logger = logging.getLogger(__name__)
 # Precompute at import time to sidestep pyo3's "LazyNode is unsendable" panic
 # when FastAPI dispatches sync endpoints via anyio's thread pool.
 VAULT_INNER_MOD_HASH_HEX: str = "0x" + VAULT_INNER_MOD.get_tree_hash().hex()
+
+# Warm up chia puzzle templates on the import thread so their internal
+# `chia_protocol::lazy_node::LazyNode` is bound to the main thread.
+# Without this, when Starlette's lifespan runs on the anyio worker thread
+# and the faucet calls `puzzle_for_pk(wallet_pk).get_tree_hash()`, the
+# LazyNode (created lazily during the *first* access on whatever thread)
+# panics with "LazyNode is unsendable, but sent to another thread".
+#
+# The fix is to force-touch each puzzle template here, on the import
+# thread, so the LazyNode is materialised once and the resulting bytes
+# are cached on the Program — making subsequent cross-thread access
+# safe.  This mirrors the precomputation above for VAULT_INNER_MOD and
+# closes the four chia_rs LazyNode errors in tests/test_smoke.py.
+def _warm_chia_puzzle_templates() -> None:
+    # p2_delegated_puzzle_or_hidden_puzzle.MOD — used by Faucet to
+    # derive the wallet puzzle hash via puzzle_for_pk.
+    from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import MOD as P2_MOD
+    bytes(P2_MOD)               # force serialize → caches Program._bytes
+    P2_MOD.get_tree_hash()      # force tree-hash compute too
+
+    # Eagerly import chia.wallet.trading.offer (and therefore
+    # chia.wallet.util.puzzle_compression) here, on the main thread.
+    # That module's body contains a top-level
+    # ``bytes(standard_puzzle.MOD) + bytes(LEGACY_CAT_MOD)``
+    # which walks two more LazyNodes; without this warm-up those walks
+    # would happen on the first request thread (the /protocol endpoint
+    # lazy-imports protocol_deployment, which transitively pulls in
+    # chia.wallet.trading.offer) and panic with the same
+    # "LazyNode is unsendable" assertion failure.
+    import chia.wallet.trading.offer  # noqa: F401 — import for side-effect
+    import chia.wallet.util.puzzle_compression  # noqa: F401
+
+
+_warm_chia_puzzle_templates()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
 
@@ -62,6 +99,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+
+    # POP-CANON-016: fail fast at boot if the admin desk is enabled but
+    # POPULIS_ADMIN_JWT_SECRET is unset.  This complements the runtime
+    # guard inside ``get_jwt_secret``; with both, an operator gets the
+    # clear error during deployment rather than at the first admin
+    # request hours later.
+    validate_admin_config_at_startup(settings)
+
     app.state.settings = settings
     app.state.coinset = CoinsetClient(settings.coinset_base_url)
 
