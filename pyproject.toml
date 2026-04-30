@@ -19,7 +19,6 @@ dependencies = [
     "eth-utils>=4",
     "eth-account>=0.13",
     "eth-keys>=0.5",
-    "pycoin>=0.92",
     "pycryptodome>=3.20",
     "python-dotenv>=1.0",
     "pyjwt>=2.9",
