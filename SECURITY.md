@@ -64,12 +64,18 @@ at least one regression test under `tests/`.
 | POP-CANON-A2  | High | AUTHZ trust roots | **on-chain primitive landed** | `populis_protocol/populis_puzzles/admin_authority_inner.clsp` + `populis_api/populis_api/admin_authority.py` |
 | POP-CANON-A4  | Med | Data integrity / SP-2 | **on-chain primitive landed** | `populis_protocol/populis_puzzles/property_registry_inner.clsp` + `populis_api/populis_api/singletons.py` |
 | POP-CANON-A1  | Med | Data integrity / state machine | **on-chain primitive landed** | `populis_protocol/populis_puzzles/mint_proposal_inner.clsp` + `populis_api/populis_api/singletons.py` |
+| POP-CANON-017 | Med | AUTHZ / quorum-dilution | **fixed** | `admin_authority_inner.clsp` rejects `[X, X, Y]` allowlists via `has-no-duplicates`; driver preflight in `admin_authority_driver.py` |
+| POP-CANON-018 | Med (×4 systemic) | AUTHZ / driver-vs-puzzle drift | **fixed** | `is-size-bls-g1` + `all-bls-g1-pubkeys` in `utility_macros.clib`, asserted in all four A.x puzzles |
+| POP-CANON-019 | Med | SP-2 / Data integrity | **fixed** | `pool_singleton_inner.clsp:spend_settlement` rejects duplicate `deed_releases` via `has-no-duplicate-firsts` |
+| POP-CANON-020 | Med | SP-2 / cross-coin coordination | **fixed** | `pool_singleton_inner.clsp:spend_generate_offer` emits the `CREATE_PUZZLE_ANNOUNCEMENT` that `vault_singleton_inner.clsp:spend_accept_offer` asserts |
+| POP-CANON-021 | Low-Med | TRUTH-1 / cross-layer drift | **fixed** | `admin_auth.py:validate_admin_config_at_startup` raises on EVM↔BLS drift; `/admin/auth/authority` carries `phase`/`gating_source`/`informational_only` disclaimer |
 
 Full audit narratives:
 
 * `research/CANON_POPULIS_API_AUDIT_2026_04_26.md` — first pass (POP-CANON-002…006).
 * `research/CANON_POPULIS_DEEP_AUDIT_2026_04_26.md` — second pass (POP-CANON-007…011).
 * `research/CANON_POPULIS_ADMIN_DESK_AUDIT_2026_04_28.md` — admin desk pass (POP-CANON-012…016).
+* `research/CANON_POPULIS_TRANSPARENCY_SINGLETONS_2026_05_03.md` — transparency-singletons pass (POP-CANON-017…021); all five PoC-confirmed findings fixed in the same commit window.
 
 The `populis_protocol` Chialisp puzzle suite has its own audit at
 `populis_protocol/docs/SECURITY_AUDIT_2026_04_19.md` (14 findings).
