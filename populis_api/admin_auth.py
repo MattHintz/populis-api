@@ -693,6 +693,64 @@ async def admin_authority(
     }
 
 
+@router.get("/authority_v2", tags=["admin-auth"])
+async def admin_authority_v2(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    """Public read of the on-chain admin-authority v2 singleton state.
+
+    The v2 singleton (``admin_authority_v2_inner.clsp``, Phase 9-Hermes-C)
+    replaces v1's flat BLS allowlist with CHIP-0043 MIPS composition:
+    each admin slot holds a OneOfN of personal auth methods (BLS,
+    EIP-712 / MetaMask, passkey, ...) under a protocol-level MofN quorum.
+    Lets admins mix signing methods and add backup keys over time
+    without going through PGT governance.
+
+    Returns the deterministic ``state_hash`` along with the launcher
+    coin id, MIPS root hash, admins hash, pending-ops hash, and
+    authority version. The endpoint is intentionally unauthenticated:
+    any third party can fetch it, walk the singleton lineage on
+    coinset.org, and verify the operator is publishing the same state
+    on-chain.
+
+    When the operator has not configured v2 (no launcher id, no state
+    hashes), the response has ``enabled: false`` and most fields are
+    ``null`` — the endpoint never 404s, so monitoring tools can
+    consistently scrape it.
+
+    The ``phase`` field tells consumers whether v2 is the gating
+    source for admin auth or just an informational transparency
+    surface (mirrors v1's POP-CANON-021 disclaimer pattern). In Phase
+    2-informational-only the admin desk is still gated by v1's BLS
+    allowlist; v2's MIPS quorum authorises rotations of the v2
+    singleton state but doesn't yet authenticate API requests.
+
+    Migration story: see
+    ``research/POPULIS_ADMIN_AUTHORITY_V2_DESIGN.md`` section 7.
+    """
+    from .admin_authority_v2 import build_admin_authority_v2_snapshot
+    snap = build_admin_authority_v2_snapshot(settings)
+    return {
+        "enabled": snap.enabled,
+        "launcher_id": snap.launcher_id_hex,
+        "mips_root_hash": snap.mips_root_hash_hex,
+        "admins_hash": snap.admins_hash_hex,
+        "pending_ops_hash": snap.pending_ops_hash_hex,
+        "authority_version": snap.authority_version,
+        "state_hash": snap.state_hash_hex,
+        # Migration phase indicator. Mirrors v1's `phase` field shape
+        # so consumers can pick the same handling code path.
+        "phase": snap.phase,
+        # Until v2 becomes the gating source (Phase 4) the admin desk
+        # continues to authenticate via v1's BLS allowlist or whatever
+        # Phase 2 EVM/JWT plumbing is in place. Surface this gating
+        # source here so consumers don't have to special-case the
+        # transition.
+        "gating_source": "POPULIS_ADMIN_PUBKEY_ALLOWLIST",
+        "informational_only": True,
+    }
+
+
 @router.post("/refresh", response_model=AdminRefreshResponse)
 async def admin_refresh(
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],

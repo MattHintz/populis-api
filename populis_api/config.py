@@ -105,6 +105,45 @@ class Settings(BaseSettings):
     # ``new_version > old_version`` (replay protection).
     protocol_admin_authority_version: int = 1
 
+    # ── Admin-authority v2 singleton (Phase 9-Hermes-C) ───────────────────
+    # On-chain replacement for the v1 BLS allowlist using CHIP-0043 MIPS
+    # composition. Each admin slot holds a OneOfN of personal auth methods
+    # (BLS, EIP-712 / MetaMask, passkey, ...) under a protocol-level MofN
+    # quorum. Lets admins mix signing methods and add backup keys over time
+    # without going through PGT governance.
+    #
+    # Phase 2-informational-only (current): when the operator launches a
+    # v2 singleton and publishes its launcher id + state hashes, the API
+    # surfaces them on ``/admin/auth/authority_v2`` so admins and external
+    # auditors can independently verify operator config matches on-chain
+    # state. Admin desk gating still uses the v1 BLS allowlist.
+    #
+    # Phase 4-gating-source (future): require_admin_jwt walks the v2
+    # singleton lineage at every request and authenticates via the MIPS
+    # quorum. EIP-712 / MetaMask admins authenticate without ever issuing
+    # a BLS signature.
+    #
+    # Migration playbook: research/POPULIS_ADMIN_AUTHORITY_V2_DESIGN.md §7.
+    protocol_admin_authority_v2_launcher_id: Optional[str] = None
+    # 0x-prefixed 32-byte sha256-tree hash of the MIPS m_of_n quorum tree.
+    # Computed off-chain via chia-wallet-sdk MIPS bindings; published here
+    # so the snapshot endpoint can return the same value the on-chain
+    # puzzle has curried.
+    protocol_admin_authority_v2_mips_root_hash: Optional[str] = None
+    # 0x-prefixed sha256-tree hash of the admins list (each entry is
+    # ``(admin_idx, leaves_list, m_within)``). Computed via
+    # ``populis_puzzles.admin_authority_v2_driver.compute_admins_hash``.
+    protocol_admin_authority_v2_admins_hash: Optional[str] = None
+    # 0x-prefixed sha256-tree hash of the pending-ops list. Defaults to
+    # the empty-list hash when omitted; bumped whenever a KEY_ADD_PROPOSE
+    # / KEY_REMOVE_EMERGENCY adds an entry, or KEY_ADD_ACTIVATE / VETO
+    # / KEY_ADD_REMOVE_ACTIVATE removes one.
+    protocol_admin_authority_v2_pending_ops_hash: Optional[str] = None
+    # Monotonic uint64 stamped into the v2 singleton's curried state.
+    # Strictly increases across all 6 spend tags. Defaults to 1; operators
+    # migrating from v1 typically set this to v1's authority_version + 1.
+    protocol_admin_authority_v2_version: int = 1
+
     # ── Property-registry singleton (A.4) ─────────────────────────────────
     # On-chain replacement for the off-chain property-uniqueness role
     # of ``MintProposalStore`` (POP-CANON-014).  When the operator has
