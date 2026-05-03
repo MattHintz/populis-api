@@ -1,26 +1,41 @@
 # Populis API
 
 Backend for the Populis Portal.  Turns EVM and Chia wallet signatures into
-launched vault singletons on Chia testnet11 (via coinset.org).
+launched vault singletons on Chia testnet11 (via coinset.org), and runs
+the operator-side admin desk that drives genesis deployment, mint
+proposals, and the on-chain trust-root singletons (A.1..A.4).
+
+> **Operator audience?**  Skip ahead:
+> - **`GENESIS_README.md`** — first-time protocol bootstrap (PGT, pool, governance, A.2/A.3/A.4 singletons).
+> - **`ADMIN_README.md`** — day-to-day admin-desk operations (JWT, mint proposals, key rotation).
+> - **`SECURITY.md`** — full audit trail (POP-CANON-* findings, A.x phase status).
 
 ## What it does
 
-1. Issues short-lived challenge nonces + EIP-712 typed-data envelopes for
-   the frontend to sign.
-2. Recovers the user's secp256k1 public key from the signed EIP-712 payload
-   (server-side ecrecover) — this is what Populis curries into the vault
-   singleton as `OWNER_PUBKEY` for `AUTH_TYPE_SECP256K1`.
-3. Selects an unspent XCH coin from the configured **faucet**, builds a
-   signed two-coin launcher bundle (parent + launcher), and broadcasts to
-   coinset.org's `push_tx`.  The faucet's per-spend cap is enforced at
-   coin selection time, and a configurable opt-in worker periodically
-   consolidates the faucet's UTXO set so registration cost stays
-   constant as volume grows.
-4. Persists registered vaults in a SQLite database (WAL mode, indexed
-   reverse lookup by EVM address) so registry state survives process
-   restart.  Frontends poll `GET /vault/{launcher_id}` for confirmation
-   status; `GET /vault/by-evm/{address}` returns the vault for a given
+1. **User onboarding** — issues short-lived challenge nonces + EIP-712
+   typed-data envelopes for the frontend to sign.
+2. **Vault creation** — recovers the user's secp256k1 public key from
+   the signed EIP-712 payload (server-side ecrecover) — this is what
+   Populis curries into the vault singleton as `OWNER_PUBKEY` for
+   `AUTH_TYPE_SECP256K1`.
+3. **Launcher broadcast** — selects an unspent XCH coin from the
+   configured **faucet**, builds a signed two-coin launcher bundle
+   (parent + launcher), and broadcasts to coinset.org's `push_tx`.
+   The faucet's per-spend cap is enforced at coin selection time, and
+   a configurable opt-in worker periodically consolidates the
+   faucet's UTXO set so registration cost stays constant as volume
+   grows.
+4. **Registry persistence** — registered vaults live in a SQLite
+   database (WAL mode, indexed reverse lookup by EVM address) so
+   state survives process restart.  Frontends poll
+   `GET /vault/{launcher_id}` for confirmation status;
+   `GET /vault/by-evm/{address}` returns the vault for a given
    owner key.
+5. **Admin desk + genesis deploy** — operator endpoints under
+   `/admin/*` drive the one-shot genesis deployment, the interactive
+   mint-proposal workflow, and the four A.x trust-root singletons
+   (protocol-config, admin-authority, property-registry,
+   mint-proposal).
 
 ## Quick start
 
@@ -44,15 +59,40 @@ Server docs at `http://localhost:8787/docs`.
 
 ## Endpoints
 
+### Public
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET    | `/health` | Backend liveness + chain peak |
-| GET    | `/protocol` | Pool launcher id, vault mod hash, EIP-712 domain, faucet address + balance |
+| GET    | `/protocol` | Pool launcher id, vault mod hash, EIP-712 domain, faucet address + balance, **A.3** `protocol_config_hash`, **A.4** `property_registry_launcher_id` + `property_registry_mod_hash`, **A.1** `mint_proposal_mod_hash` |
 | POST   | `/auth/challenge` | Issue nonce + EIP-712 typed data |
 | POST   | `/vault/register/evm` | Recover secp256k1 pubkey → build + push launcher |
 | POST   | `/vault/register/chia` | Verify BLS signature → build + push launcher |
 | GET    | `/vault/{launcher_id}` | Vault state (confirmed, current coin id, balance) |
 | GET    | `/vault/by-evm/{address}` | Look up vault by owner EVM address |
+| GET    | `/admin/auth/authority` | **A.2** public snapshot of the on-chain admin-authority singleton state |
+
+### Admin (JWT-gated — see `ADMIN_README.md`)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST   | `/admin/auth/challenge` | Issue admin login nonce |
+| POST   | `/admin/auth/login` | Verify wallet sig → return short-lived JWT |
+| POST   | `/admin/auth/refresh` | Refresh active JWT |
+| POST   | `/admin/mint/propose` | Create a mint proposal (DRAFT) |
+| GET    | `/admin/mint`, `/admin/mint/{id}` | List / read mint proposals |
+| POST   | `/admin/mint/{id}/cancel` | Cancel a DRAFT proposal |
+| POST   | `/admin/mint/{id}/publish` | DRAFT → APPROVED |
+| POST   | `/admin/mint/{id}/execute` | APPROVED → EXECUTED |
+| GET    | `/admin/committee/proposals` | Public committee view (no auth — for the PGT-VOTE flow) |
+| POST   | `/admin/committee/vote` | Submit a PGT-VOTE bundle |
+
+### Operator (admin-token-gated — see `GENESIS_README.md`)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET    | `/admin/deployment` | Read current deployment manifest |
+| POST   | `/admin/deploy/protocol` | One-shot atomic genesis (PGT + pool + DID + governance) |
 
 ## EIP-712 domain
 
