@@ -245,6 +245,26 @@ class ProtocolInfo(BaseModel):
     faucet_balance_mojos: Optional[int]
     deployed: bool = False
     deployment_manifest: Optional[dict[str, Any]] = None
+    # ── A.3 protocol-config singleton fields ──────────────────────────
+    # Deterministic hash of (pool_launcher_id, governance_launcher_id,
+    # network, protocol_config_version).  When the operator has launched
+    # the on-chain singleton, the CREATE_PUZZLE_ANNOUNCEMENT it emits on
+    # every update spend carries this exact same hash — frontends can
+    # therefore independently verify the operator's published config
+    # against on-chain state by walking the singleton lineage on
+    # coinset.org and comparing.  Returned as ``None`` until both pool +
+    # governance launchers are configured (without them, the singleton
+    # has nothing meaningful to publish).  See SECURITY.md §A.3.
+    protocol_config_hash: Optional[str] = None
+    # Launcher coin id of the on-chain protocol-config singleton, when
+    # the operator has set ``POPULIS_PROTOCOL_CONFIG_LAUNCHER_ID``.
+    # Until Phase 1.5 lands the singleton-lineage indexer, this field
+    # is informational: clients can use it to locate the singleton on
+    # coinset.org and verify the published content_hash themselves.
+    protocol_config_launcher_id: Optional[str] = None
+    # Monotonically increasing version stamped into the singleton's
+    # curried state.  Bumped by the operator on every config update.
+    protocol_config_version: int = 1
 
 
 class ChallengeRequest(BaseModel):
@@ -356,6 +376,18 @@ async def protocol(
     except Exception as e:
         logger.warning("Failed to read deployment manifest: %s", e)
 
+    # POP-CANON-A3: compute the protocol_config_hash from whichever
+    # source (manifest > env) the API is currently trusting.  Frontends
+    # use this hash when binding the EIP-712 envelope; auditors can
+    # recompute it from on-chain singleton state and refuse to sign
+    # when the two diverge.
+    from .protocol_config import build_snapshot as _build_protocol_config_snapshot
+    protocol_snapshot = _build_protocol_config_snapshot(
+        settings,
+        pool_launcher_id_hex=pool_launcher_from_manifest,
+        governance_launcher_id_hex=gov_launcher_from_manifest,
+    )
+
     return ProtocolInfo(
         network=settings.network,
         pool_launcher_id=pool_launcher_from_manifest,
@@ -367,6 +399,9 @@ async def protocol(
         faucet_balance_mojos=faucet_balance,
         deployed=deployed,
         deployment_manifest=deployment_manifest,
+        protocol_config_hash=protocol_snapshot.content_hash_hex,
+        protocol_config_launcher_id=protocol_snapshot.protocol_config_launcher_id_hex,
+        protocol_config_version=protocol_snapshot.config_version,
     )
 
 

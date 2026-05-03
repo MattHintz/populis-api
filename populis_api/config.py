@@ -56,6 +56,27 @@ class Settings(BaseSettings):
     # the protocol-aware vault flows without re-deploying.
     deployment_manifest_path: str = "./deployment_manifest.json"
 
+    # ── Protocol-config singleton (A.3) ───────────────────────────────────
+    # On-chain replacement for the three trust-root env vars
+    # ``pool_launcher_id`` / ``governance_launcher_id`` / ``network``.
+    # When the operator has launched a ``protocol_config_inner.clsp``
+    # singleton, set this to its 32-byte launcher coin id (0x-prefixed
+    # hex).  The API then surfaces a deterministic ``protocol_config_hash``
+    # on ``/protocol`` so frontends can independently verify the
+    # operator's published config matches the on-chain singleton state.
+    #
+    # Phase 1 (this commit): the API computes content_hash from the
+    # *settings* values; the operator is responsible for keeping settings
+    # and on-chain state aligned.  Phase 1.5 adds a coinset.org indexer
+    # that walks the singleton lineage and parses the curried state
+    # directly, removing the operator-trust step.
+    protocol_config_launcher_id: Optional[str] = None
+    # Monotonically increasing version stamped into the singleton's
+    # curried state.  Bumped by the operator on every config update;
+    # the puzzle enforces ``new_version > old_version`` (replay
+    # protection).  Default 1 = "initial deployment".
+    protocol_config_version: int = 1
+
     # ── Admin auth ────────────────────────────────────────────────────────
     # Bearer token required by `/admin/deploy/*` and other one-shot operator
     # commands.  When unset, those routes are disabled (return 503) — the
