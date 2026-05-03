@@ -568,6 +568,41 @@ async def admin_login(
     return AdminLoginResponse(jwt=token, expires_at=exp, owner=sub)
 
 
+@router.get("/authority", tags=["admin-auth"])
+async def admin_authority(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    """Public read of the on-chain admin-authority singleton state (A.2).
+
+    Returns the deterministic ``state_hash`` along with the launcher
+    coin id, allowlist pubkey hashes (not full pubkeys, for bandwidth
+    + privacy), quorum threshold, and authority version.  The endpoint
+    is intentionally unauthenticated: any third party can fetch it,
+    walk the singleton lineage on coinset.org, and verify the operator
+    is publishing the same state on-chain.
+
+    When the operator has not configured A.2 (no launcher id, no
+    pubkeys), the response has ``enabled: false`` and most fields are
+    ``null`` — the endpoint never 404s, so monitoring tools can
+    consistently scrape it.
+
+    Phase 2 (this commit): the singleton is informational; admin desk
+    gating still uses ``admin_pubkey_allowlist`` (POP-CANON-012).
+    Phase 2.5 wires the singleton into ``require_admin_jwt`` so live
+    revocation becomes a chain event, not an env push.
+    """
+    from .admin_authority import build_admin_authority_snapshot
+    snap = build_admin_authority_snapshot(settings)
+    return {
+        "enabled": snap.enabled,
+        "launcher_id": snap.launcher_id_hex,
+        "allowlist_pubkey_hashes": snap.allowlist_pubkey_hashes_hex,
+        "quorum_m": snap.quorum_m,
+        "authority_version": snap.authority_version,
+        "state_hash": snap.state_hash_hex,
+    }
+
+
 @router.post("/refresh", response_model=AdminRefreshResponse)
 async def admin_refresh(
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],

@@ -77,6 +77,34 @@ class Settings(BaseSettings):
     # protection).  Default 1 = "initial deployment".
     protocol_config_version: int = 1
 
+    # ── Admin-authority singleton (A.2) ────────────────────────────────────
+    # On-chain replacement for ``POPULIS_ADMIN_PUBKEY_ALLOWLIST`` +
+    # ``POPULIS_ADMIN_JWT_SECRET`` trust roots.  When the operator has
+    # launched an ``admin_authority_inner.clsp`` singleton, set this
+    # to its launcher coin id; the API will surface a deterministic
+    # ``state_hash`` on ``/admin/auth/authority`` so admins (and
+    # external auditors) can independently verify the on-chain
+    # quorum-signed authority state.
+    #
+    # Phase 2 (this commit): the singleton's state is informational
+    # only — the API still gates the admin desk via
+    # ``admin_pubkey_allowlist`` env var.  Phase 2.5 wires the
+    # singleton state into ``require_admin_jwt`` so live revocation
+    # becomes a chain event rather than an env push.
+    protocol_admin_authority_launcher_id: Optional[str] = None
+    # Comma-separated BLS G1 pubkey hex strings (96 hex chars each)
+    # making up the m-of-n rotation quorum that controls the singleton.
+    # These are the operator team's COLD keys; distinct from the EVM
+    # addresses that drive the admin desk login flow.
+    protocol_admin_authority_pubkeys: str = ""
+    # Quorum threshold M for rotation spends; 1 ≤ M ≤ |pubkeys|.
+    # Defaults to 1 (single-key authority — fine for dev/test).
+    protocol_admin_authority_quorum_m: int = 1
+    # Monotonic version stamped into the singleton's curried state.
+    # Bumped by the operator on every rotation; the puzzle enforces
+    # ``new_version > old_version`` (replay protection).
+    protocol_admin_authority_version: int = 1
+
     # ── Admin auth ────────────────────────────────────────────────────────
     # Bearer token required by `/admin/deploy/*` and other one-shot operator
     # commands.  When unset, those routes are disabled (return 503) — the
@@ -168,6 +196,40 @@ class Settings(BaseSettings):
         if not raw:
             return set()
         return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+    def admin_authority_pubkeys_list(self) -> list[bytes]:
+        """Return the parsed ordered list of A.2 admin-authority BLS pubkeys.
+
+        Each pubkey is a 48-byte BLS G1 element.  Order matters — the
+        on-chain singleton's ``signer_indices`` solution param indexes
+        into this list, so any reordering would invalidate every
+        rotation signature.
+
+        Returns an empty list when the operator has not configured the
+        singleton (callers treat that as "A.2 disabled").
+
+        Raises ValueError if any entry is not 48 bytes after hex decode.
+        """
+        raw = (self.protocol_admin_authority_pubkeys or "").strip()
+        if not raw:
+            return []
+        out: list[bytes] = []
+        for i, hex_str in enumerate(p.strip() for p in raw.split(",") if p.strip()):
+            if hex_str.startswith("0x") or hex_str.startswith("0X"):
+                hex_str = hex_str[2:]
+            try:
+                pk = bytes.fromhex(hex_str)
+            except ValueError as e:
+                raise ValueError(
+                    f"protocol_admin_authority_pubkeys[{i}] is not valid hex: {e}"
+                )
+            if len(pk) != 48:
+                raise ValueError(
+                    f"protocol_admin_authority_pubkeys[{i}] must be 48 bytes "
+                    f"(BLS G1), got {len(pk)}"
+                )
+            out.append(pk)
+        return out
 
 
 @lru_cache

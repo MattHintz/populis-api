@@ -61,6 +61,7 @@ at least one regression test under `tests/`.
 | POP-CANON-015 | Low | SIGCOV-1 future-proofing | **fixed** | `admin_auth.py:ADMIN_LOGIN_TYPES` binds `authType`+`scope` |
 | POP-CANON-016 | Info | Ops | **fixed** | `admin_auth.py:validate_admin_config_at_startup` |
 | POP-CANON-A3  | Med | Trust roots | **on-chain primitive landed** | `populis_protocol/populis_puzzles/protocol_config_inner.clsp` + `populis_api/populis_api/protocol_config.py` |
+| POP-CANON-A2  | High | AUTHZ trust roots | **on-chain primitive landed** | `populis_protocol/populis_puzzles/admin_authority_inner.clsp` + `populis_api/populis_api/admin_authority.py` |
 
 Full audit narratives:
 
@@ -109,14 +110,53 @@ trusts its own settings + manifest as the canonical source for the
 four config fields; the on-chain singleton makes that trust auditable
 but does not yet *replace* it.
 
-### A.2 — Admin-authority singleton (planned)
+### A.2 — Admin-authority singleton (Phase 2: shipped)
 
-Replace `POPULIS_ADMIN_PUBKEY_ALLOWLIST` env var + `POPULIS_ADMIN_JWT_SECRET`
-with an on-chain authority coin that admins must spend to prove
-membership.  Will close `POP-CANON-012` cleanly (live revocation =
-chain event, not config push) and subsume `POP-CANON-016` (no JWT
-secret needed if every request proves authority via signature + coin
-existence).
+**On-chain primitive**: `admin_authority_inner.clsp` is a singleton
+whose curried state is `(ALLOWLIST, QUORUM_M, AUTHORITY_VERSION)`,
+where `ALLOWLIST` is an ordered list of BLS G1 pubkeys belonging to
+the operator's cold-key team.  Rotation requires *m* ≥ `QUORUM_M`
+valid `AGG_SIG_ME` signatures from indices into the *current*
+allowlist, plus a strictly-increasing `AUTHORITY_VERSION` (replay
+protection).  Each rotation spend emits a `CREATE_PUZZLE_ANNOUNCEMENT`
+carrying the deterministic
+`state_hash = sha256tree([allowlist, quorum_m, version])`.
+
+The puzzle enforces, on-chain:
+- `1 ≤ new_quorum_m ≤ len(new_allowlist)` (sane quorum bounds).
+- `signer_indices` is sorted strictly ascending — no duplicate signers.
+- Every signer index is in range `[0, len(current.allowlist) - 1]`.
+- `len(signer_indices) ≥ current.QUORUM_M` (quorum enforcement).
+- `new_authority_version > current.AUTHORITY_VERSION` (replay).
+- `my_amount` is odd (singleton convention).
+
+**Off-chain integration**:
+- New `GET /admin/auth/authority` endpoint exposes the snapshot:
+  `{enabled, launcher_id, allowlist_pubkey_hashes, quorum_m,
+  authority_version, state_hash}`.  Public, unauthenticated — any
+  third party can fetch it and verify against on-chain state.
+- `admin_authority.py:build_admin_authority_snapshot` is the single
+  source of truth for the off-chain state hash; cross-repo contract
+  with `populis_protocol/populis_puzzles/admin_authority_driver.py`
+  (regression-tested on both sides).
+- New env vars (operator opt-in):
+  - `POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID` — singleton coin id.
+  - `POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS` — comma-separated BLS hex.
+  - `POPULIS_PROTOCOL_ADMIN_AUTHORITY_QUORUM_M` — quorum threshold.
+  - `POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION` — monotonic version.
+
+**Closes**: foundation for closing `POP-CANON-012` cleanly (live
+revocation = on-chain rotation spend rather than env push) and
+subsuming `POP-CANON-016` (the JWT secret becomes optional — every
+admin request can be re-verified against the on-chain singleton state
+once Phase 2.5 lands).
+
+**Phase 2.5 (deferred)**: a coinset.org indexer that walks the
+admin-authority singleton lineage and replaces
+`admin_pubkey_allowlist_set()` as the gating source for
+`require_admin_jwt`.  Until then, the admin desk continues to enforce
+via env var; the on-chain singleton is informational only — but
+auditable.
 
 ### A.1 + A.4 — Mint-proposal + property-registry singletons (planned)
 
@@ -152,6 +192,12 @@ Before pointing the API at real money:
   launcher id alongside the deterministic `protocol_config_hash` so
   third parties can verify your published config against on-chain
   state.
+* **`POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID`** (optional, A.2) —
+  set this to the launcher coin id of your `admin_authority_inner.clsp`
+  singleton once deployed.  Pair with `POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS`
+  (comma-separated BLS G1 hex), `POPULIS_PROTOCOL_ADMIN_AUTHORITY_QUORUM_M`,
+  and `POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION` so the API publishes the
+  matching `state_hash` on `/admin/auth/authority`.
 * **`POPULIS_CORS_ORIGINS`** is set to the exact frontend origin(s);
   don't rely on the dev-mode `127.0.0.1`/`localhost` regex in prod.
 * **TLS termination** at the reverse proxy.  The API itself never
