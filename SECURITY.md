@@ -62,6 +62,8 @@ at least one regression test under `tests/`.
 | POP-CANON-016 | Info | Ops | **fixed** | `admin_auth.py:validate_admin_config_at_startup` |
 | POP-CANON-A3  | Med | Trust roots | **on-chain primitive landed** | `populis_protocol/populis_puzzles/protocol_config_inner.clsp` + `populis_api/populis_api/protocol_config.py` |
 | POP-CANON-A2  | High | AUTHZ trust roots | **on-chain primitive landed** | `populis_protocol/populis_puzzles/admin_authority_inner.clsp` + `populis_api/populis_api/admin_authority.py` |
+| POP-CANON-A4  | Med | Data integrity / SP-2 | **on-chain primitive landed** | `populis_protocol/populis_puzzles/property_registry_inner.clsp` + `populis_api/populis_api/singletons.py` |
+| POP-CANON-A1  | Med | Data integrity / state machine | **on-chain primitive landed** | `populis_protocol/populis_puzzles/mint_proposal_inner.clsp` + `populis_api/populis_api/singletons.py` |
 
 Full audit narratives:
 
@@ -158,13 +160,107 @@ admin-authority singleton lineage and replaces
 via env var; the on-chain singleton is informational only — but
 auditable.
 
-### A.1 + A.4 — Mint-proposal + property-registry singletons (planned)
+### A.4 — Property-registry singleton (Phase 3: shipped)
 
-Replace the SQLite-backed `MintProposalStore` with an on-chain state
-machine, gated by a property-registry singleton whose child-coin
-emission per `property_id_canon` makes duplicate-property minting
-consensus-impossible.  Will close `POP-CANON-013` and `POP-CANON-014`
-in one move.
+**On-chain primitive**: `property_registry_inner.clsp` is a singleton
+whose curried state is `(SELF_MOD_HASH, GOV_PUBKEY, REGISTRY_VERSION)`.
+Each registration spend:
+
+  * Requires an `AGG_SIG_ME` from `GOV_PUBKEY` over a message that
+    binds BOTH the canonicalised property id AND the new version slot
+    (replay-protected per-property + per-version).
+  * Bumps `REGISTRY_VERSION` by exactly 1 (no skipping; version
+    doubles as registration index).
+  * Recreates the singleton with the new version curried in.
+  * Emits `CREATE_PUZZLE_ANNOUNCEMENT` with body
+    `PROTOCOL_PREFIX (0x50) || property_id_canon`.  This is the
+    permanent on-chain record; A.1's `mint_proposal_inner` ASSERTs
+    this exact announcement during DRAFT → APPROVED transitions
+    (cross-coin coordination — V2 work).
+
+The puzzle enforces, on-chain:
+- `is-size-b32 property_id_canon` (32-byte canonical form).
+- `new_registry_version = REGISTRY_VERSION + 1` (no skipping).
+- `my_amount` is odd (singleton convention).
+
+**Off-chain integration**:
+- `singletons.py:build_singletons_snapshot` exposes the registry
+  launcher id + uncurried `property_registry_inner.clsp` mod-hash on
+  the `/protocol` endpoint so clients can locate the singleton on
+  coinset.org.
+- `property_registry_driver.canonicalise_property_id` is the canonical
+  human-id → bytes32 conversion: `strip().upper().sha256()`.  The
+  off-chain `MintProposalStore.create()` (POP-CANON-014) uses the
+  *same* canonicalisation, so the off-chain and on-chain registries
+  agree on identity.
+- New env var: `POPULIS_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID`.
+
+**Closes**: foundation for closing `POP-CANON-014` cleanly once
+Phase 3.5 lands.
+
+**Phase 3.5 (deferred)**: extend the puzzle's curried state with a
+sorted-Merkle-tree root and require non-membership proofs at
+registration time, making duplicate property registrations
+consensus-impossible.  Until then, off-chain
+`MintProposalStore.create()` continues to enforce uniqueness; the
+on-chain registry is auditable but not yet *replaceable*.
+
+### A.1 — Mint-proposal singleton (Phase 3: shipped)
+
+**On-chain primitive**: `mint_proposal_inner.clsp` is a *per-proposal*
+singleton (each mint proposal is its own launcher coin) implementing
+the state machine
+
+```
+  DRAFT  ──gov-sig──▶  APPROVED
+     │
+     │ owner-sig
+     ▼
+  CANCELLED
+```
+
+Curried state:
+- `SELF_MOD_HASH` (self-recurry)
+- `OWNER_PUBKEY`, `GOV_PUBKEY` — BLS G1
+- `PROPOSAL_DATA_HASH` — bytes32 sha256tree of `(property_id_canon,
+  par_value_mojos, royalty_bps, quorum_threshold)`.  Stored as a hash
+  to avoid bloating the curried state; the full data is published
+  off-chain at launch time and re-derivable from the launcher coin's
+  spend bundle.
+- `PROPOSAL_STATE` — `1=DRAFT | 2=APPROVED | 3=CANCELLED`
+- `STATE_VERSION` — monotonic uint (replay-protected).
+
+Each transition emits per-transition `AGG_SIG_ME` (gov for APPROVE,
+owner for CANCEL), `CREATE_COIN` recurrying with the new state, a
+`CREATE_PUZZLE_ANNOUNCEMENT` carrying
+`PROTOCOL_PREFIX || sha256tree([transition_case, new_state, new_version])`,
+and `ASSERT_MY_AMOUNT`.
+
+The puzzle enforces, on-chain:
+- `new_state_version > STATE_VERSION` (replay).
+- `PROPOSAL_STATE == DRAFT` (V1 only allows DRAFT-origin transitions;
+  V2 adds APPROVED → EXECUTED + governance-cancel).
+- `transition_case ∈ {0x61 'a', 0x63 'c'}` (unknown transitions raise).
+
+**Off-chain integration**:
+- `singletons.py:build_singletons_snapshot` exposes the uncurried
+  `mint_proposal_inner.clsp` mod-hash on the `/protocol` endpoint so
+  clients can identify mint-proposal singletons by uncurrying and
+  comparing.
+- `mint_proposal_driver.compute_proposal_data_hash` is the canonical
+  off-chain ↔ on-chain content commitment.
+
+**Closes**: foundation for closing `POP-CANON-013` cleanly once
+Phase 3.5 lands.
+
+**Phase 3.5 (deferred)**:
+- `APPROVED → EXECUTED` transition gated by `ASSERT_COIN_ANNOUNCEMENT`
+  from the actual PGT-driven mint (cross-coin coordination with the
+  governance singleton).
+- `APPROVED → CANCELLED` via governance (with cooldown / quorum).
+- A coinset.org indexer that walks each mint-proposal singleton's
+  lineage to replace `MintProposalStore` as the gating source for
+  `/admin/mints/*` endpoints.
 
 ## Operator deployment checklist
 
@@ -198,6 +294,14 @@ Before pointing the API at real money:
   (comma-separated BLS G1 hex), `POPULIS_PROTOCOL_ADMIN_AUTHORITY_QUORUM_M`,
   and `POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION` so the API publishes the
   matching `state_hash` on `/admin/auth/authority`.
+* **`POPULIS_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID`** (optional, A.4) —
+  set this to the launcher coin id of your
+  `property_registry_inner.clsp` singleton once deployed.  The API
+  surfaces it on `/protocol` so off-chain consumers can walk the
+  singleton's lineage on coinset.org and rebuild the registered-
+  property set from the emitted announcements.  No companion env vars
+  are needed for V1 — the registry's allowlist is just the curried
+  `GOV_PUBKEY`, which lives on-chain.
 * **`POPULIS_CORS_ORIGINS`** is set to the exact frontend origin(s);
   don't rely on the dev-mode `127.0.0.1`/`localhost` regex in prod.
 * **TLS termination** at the reverse proxy.  The API itself never

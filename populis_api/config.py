@@ -105,6 +105,22 @@ class Settings(BaseSettings):
     # ``new_version > old_version`` (replay protection).
     protocol_admin_authority_version: int = 1
 
+    # ── Property-registry singleton (A.4) ─────────────────────────────────
+    # On-chain replacement for the off-chain property-uniqueness role
+    # of ``MintProposalStore`` (POP-CANON-014).  When the operator has
+    # launched a ``property_registry_inner.clsp`` singleton, set this
+    # to its launcher coin id; the API surfaces it on the ``/protocol``
+    # endpoint so clients can walk the singleton's lineage on
+    # coinset.org to enumerate registered properties.
+    #
+    # Phase 3 (this commit): the singleton is informational; off-chain
+    # ``MintProposalStore.create()`` continues to enforce uniqueness.
+    # Phase 3.5 (deferred): extend the puzzle's curried state with a
+    # sorted-Merkle-tree root and require non-membership proofs at
+    # registration time — making duplicate property registrations
+    # consensus-impossible.
+    protocol_property_registry_launcher_id: Optional[str] = None
+
     # ── Admin auth ────────────────────────────────────────────────────────
     # Bearer token required by `/admin/deploy/*` and other one-shot operator
     # commands.  When unset, those routes are disabled (return 503) — the

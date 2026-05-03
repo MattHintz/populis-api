@@ -89,6 +89,26 @@ def _warm_chia_puzzle_templates() -> None:
     import chia.wallet.trading.offer  # noqa: F401 — import for side-effect
     import chia.wallet.util.puzzle_compression  # noqa: F401
 
+    # populis_puzzles A.1, A.2, A.3, A.4 inner mods — same threading
+    # hazard.  Touching them here on the import thread caches each
+    # mod's serialised bytes + tree hash so cross-thread access in
+    # request handlers is safe.  Without this, /protocol's call to
+    # build_singletons_snapshot panics on the second hit.
+    from populis_puzzles.admin_authority_driver import admin_authority_inner_mod
+    from populis_puzzles.mint_proposal_driver import mint_proposal_inner_mod
+    from populis_puzzles.property_registry_driver import (
+        property_registry_inner_mod,
+    )
+    from populis_puzzles.protocol_config_driver import protocol_config_inner_mod
+    for mod in (
+        admin_authority_inner_mod(),
+        mint_proposal_inner_mod(),
+        property_registry_inner_mod(),
+        protocol_config_inner_mod(),
+    ):
+        bytes(mod)
+        mod.get_tree_hash()
+
 
 _warm_chia_puzzle_templates()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -265,6 +285,26 @@ class ProtocolInfo(BaseModel):
     # Monotonically increasing version stamped into the singleton's
     # curried state.  Bumped by the operator on every config update.
     protocol_config_version: int = 1
+    # ── A.4 property-registry singleton fields ────────────────────────
+    # Launcher coin id of the on-chain property-registry singleton, when
+    # the operator has set ``POPULIS_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID``.
+    # Off-chain consumers walk this singleton's lineage on coinset.org
+    # to discover registered property ids (each registration spend
+    # emits a CREATE_PUZZLE_ANNOUNCEMENT carrying the canonical id).
+    # Returned as ``None`` until the operator opts in.  See SECURITY.md §A.4.
+    property_registry_launcher_id: Optional[str] = None
+    # Tree hash of the uncurried ``property_registry_inner.clsp`` mod
+    # — clients use this to verify they're reading the canonical
+    # puzzle on-chain (rather than a malicious lookalike).
+    property_registry_mod_hash: Optional[str] = None
+    # ── A.1 mint-proposal singleton fields ────────────────────────────
+    # Tree hash of the uncurried ``mint_proposal_inner.clsp`` mod;
+    # exposed so clients can identify mint-proposal singletons on
+    # coinset.org by uncurrying their inner reveal and comparing this
+    # value.  Each individual proposal has its own launcher_id (not
+    # exposed here — that's per-proposal, not protocol-level).
+    # See SECURITY.md §A.1.
+    mint_proposal_mod_hash: Optional[str] = None
 
 
 class ChallengeRequest(BaseModel):
@@ -388,6 +428,13 @@ async def protocol(
         governance_launcher_id_hex=gov_launcher_from_manifest,
     )
 
+    # POP-CANON-A1 + A.4: surface the on-chain mint-proposal +
+    # property-registry singleton handles.  Mod-hashes are static
+    # across the deployment; launcher_id is operator-configurable
+    # (None until the property-registry is launched on-chain).
+    from .singletons import build_singletons_snapshot as _build_singletons_snapshot
+    singletons_snapshot = _build_singletons_snapshot(settings)
+
     return ProtocolInfo(
         network=settings.network,
         pool_launcher_id=pool_launcher_from_manifest,
@@ -402,6 +449,9 @@ async def protocol(
         protocol_config_hash=protocol_snapshot.content_hash_hex,
         protocol_config_launcher_id=protocol_snapshot.protocol_config_launcher_id_hex,
         protocol_config_version=protocol_snapshot.config_version,
+        property_registry_launcher_id=singletons_snapshot.property_registry_launcher_id_hex,
+        property_registry_mod_hash=singletons_snapshot.property_registry_mod_hash_hex,
+        mint_proposal_mod_hash=singletons_snapshot.mint_proposal_mod_hash_hex,
     )
 
 
