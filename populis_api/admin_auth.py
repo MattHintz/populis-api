@@ -240,11 +240,72 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
             "high-entropy value (≥32 bytes hex) before starting the API."
         )
 
+    # ── POP-CANON-021: A.2 transparency drift guard ─────────────────────
+    #
+    # Three independent settings are involved in admin authority:
+    #
+    #   1. POPULIS_ADMIN_PUBKEY_ALLOWLIST            (EVM addresses) →
+    #      gates require_admin_jwt at request time.
+    #   2. POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS  (BLS G1)        →
+    #      published via /admin/auth/authority as a transparency
+    #      surface; intended to mirror (1) one-to-one.
+    #   3. The on-chain singleton at
+    #      POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID — auditable
+    #      truth.  Phase 2.5 deferred.
+    #
+    # Without a startup check, an operator can ship the API with
+    # (1) populated and (2) empty, and the unauthenticated
+    # /admin/auth/authority endpoint will publish "no on-chain
+    # authority exists" while the admin desk is fully operational.
+    # That's transparency theatre: third-party auditors are misled.
+    #
+    # We refuse to boot in two demonstrable drift cases:
+    #
+    #   Drift A — EVM allowlist set, BLS pubkey list empty.
+    #   Drift B — Both non-empty, cardinality mismatch.
+    #
+    # The check is intentionally cheap: it runs at startup once, never
+    # at request time, and only fires when admin desk is enabled.
+    bls_pubkeys = settings.admin_authority_pubkeys_list()
     allowlist_size = len(settings.admin_pubkey_allowlist_set())
+
+    if not bls_pubkeys:
+        raise RuntimeError(
+            "Admin authority drift: POPULIS_ADMIN_PUBKEY_ALLOWLIST is set "
+            f"({allowlist_size} EVM admin"
+            f"{'' if allowlist_size == 1 else 's'}) but "
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS is empty.  "
+            "GET /admin/auth/authority would publish "
+            "'enabled: false' (no on-chain authority) while the API "
+            "fully accepts EVM-signed admin logins — third-party "
+            "auditors reading the endpoint would be silently misled.  "
+            "Either populate POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS "
+            "with one BLS G1 pubkey per EVM admin (each operator must "
+            "maintain a 1-to-1 mapping off-chain), or explicitly disable "
+            "the admin desk by emptying POPULIS_ADMIN_PUBKEY_ALLOWLIST.  "
+            "See SECURITY.md §A.2 for operator key-mapping discipline."
+        )
+
+    if len(bls_pubkeys) != allowlist_size:
+        raise RuntimeError(
+            f"Admin authority cardinality mismatch: "
+            f"POPULIS_ADMIN_PUBKEY_ALLOWLIST has {allowlist_size} EVM "
+            f"admin{'' if allowlist_size == 1 else 's'}; "
+            f"POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS has "
+            f"{len(bls_pubkeys)} BLS pubkey"
+            f"{'' if len(bls_pubkeys) == 1 else 's'}.  "
+            "These must be 1-to-1: each EVM admin must have a "
+            "corresponding BLS pubkey in the on-chain authority "
+            "singleton, and vice versa.  See SECURITY.md §A.2."
+        )
+
     logger.info(
-        "Admin desk enabled (%d pubkey%s allowlisted, JWT TTL %ds).",
+        "Admin desk enabled (%d pubkey%s allowlisted, %d BLS pubkey%s "
+        "configured for /admin/auth/authority transparency, JWT TTL %ds).",
         allowlist_size,
         "" if allowlist_size == 1 else "s",
+        len(bls_pubkeys),
+        "" if len(bls_pubkeys) == 1 else "s",
         settings.admin_jwt_ttl_seconds,
     )
 
@@ -590,6 +651,15 @@ async def admin_authority(
     gating still uses ``admin_pubkey_allowlist`` (POP-CANON-012).
     Phase 2.5 wires the singleton into ``require_admin_jwt`` so live
     revocation becomes a chain event, not an env push.
+
+    POP-CANON-021 disclaimer: the response includes a ``phase`` field
+    so consumers (auditors, monitors, downstream wallets) can tell
+    in-band that the published state is NOT the gating source today.
+    Without this field a third party could read the response and
+    incorrectly conclude the on-chain BLS quorum is what authorises
+    admin requests.  In Phase 2 the BLS quorum authorises *rotations*
+    of the on-chain authority singleton; the API admin desk itself is
+    still gated by ``POPULIS_ADMIN_PUBKEY_ALLOWLIST``.
     """
     from .admin_authority import build_admin_authority_snapshot
     snap = build_admin_authority_snapshot(settings)
@@ -600,6 +670,26 @@ async def admin_authority(
         "quorum_m": snap.quorum_m,
         "authority_version": snap.authority_version,
         "state_hash": snap.state_hash_hex,
+        # ── Transparency-drift disclaimer (POP-CANON-021) ────────
+        # The published state above is informational.  The admin desk
+        # is gated by `POPULIS_ADMIN_PUBKEY_ALLOWLIST` (EVM addresses,
+        # validated against the JWT subject by `require_admin_jwt`),
+        # not by the BLS allowlist published here.
+        #
+        # Phase progression:
+        #   "2-informational-only" — current.  This snapshot is
+        #     published as a transparency surface, NOT as the
+        #     gating source.  Operators must maintain a 1-to-1
+        #     EVM↔BLS mapping out-of-band; the startup validator
+        #     (POP-CANON-021) refuses to boot when it detects drift.
+        #   "2.5-on-chain-gated" — future.  `require_admin_jwt`
+        #     reads the on-chain singleton at every request and
+        #     rejects subjects whose pubkey hash is not in the
+        #     latest unspent state.  At that point gating_source
+        #     will become the singleton itself.
+        "phase": "2-informational-only",
+        "gating_source": "POPULIS_ADMIN_PUBKEY_ALLOWLIST",
+        "informational_only": True,
     }
 
 

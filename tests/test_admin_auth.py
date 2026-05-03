@@ -251,8 +251,13 @@ class TestStartupValidator:
         admin_auth.validate_admin_config_at_startup(get_settings())
 
     def test_passes_when_both_set(self, monkeypatch):
+        # POP-CANON-021: also set the BLS authority pubkeys list so the
+        # cardinality drift check passes.  Each EVM admin must have a
+        # matching BLS pubkey in the on-chain authority singleton — the
+        # validator now refuses to boot if these are out of sync.
         monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
         monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS", "11" * 48)
         get_settings.cache_clear()
         admin_auth.validate_admin_config_at_startup(get_settings())
 
@@ -261,6 +266,39 @@ class TestStartupValidator:
         monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
         get_settings.cache_clear()
         with pytest.raises(RuntimeError, match="POPULIS_ADMIN_JWT_SECRET"):
+            admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_raises_when_evm_set_but_bls_authority_empty(self, monkeypatch):
+        """POP-CANON-021 drift A: EVM allowlist set, BLS pubkeys empty.
+
+        The transparency endpoint would publish ``enabled: false`` while
+        the admin desk fully accepts EVM logins — silent drift between
+        published state and gating source.  Validator must refuse to boot.
+        """
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.delenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS", raising=False
+        )
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match=r"(?i)drift|authority"):
+            admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_raises_when_evm_and_bls_cardinality_differ(self, monkeypatch):
+        """POP-CANON-021 drift B: 1 EVM admin, 3 BLS pubkeys.
+
+        Cardinality alone reveals the misconfig — the operator forgot to
+        add the corresponding EVM admins (or removed one without
+        rotating the on-chain singleton).
+        """
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS",
+            ",".join(["11" * 48, "22" * 48, "33" * 48]),
+        )
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match=r"(?i)cardinality|mismatch"):
             admin_auth.validate_admin_config_at_startup(get_settings())
 
 
