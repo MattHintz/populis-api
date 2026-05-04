@@ -170,10 +170,78 @@ they're absent).
    The `protocol_config_hash` should match what the singleton's
    `CREATE_PUZZLE_ANNOUNCEMENT` emits.
 
-### A.2 — admin-authority singleton
+### A.5 — admin-authority-v2 singleton (Phase 2.5 — chain-gated admin desk)
 
-> Replaces `POPULIS_ADMIN_PUBKEY_ALLOWLIST` + `POPULIS_ADMIN_JWT_SECRET`
-> with m-of-n quorum on-chain rotation.
+> Replaces both `POPULIS_ADMIN_PUBKEY_ALLOWLIST` AND the A.2 v1
+> singleton with a MIPS-quorum design that supports per-admin
+> OneOfN of mixed auth methods (BLS, EIP-712 / MetaMask, passkey).
+> The launcher's wallet becomes admin slot 0 — no env-var bootstrap.
+
+#### Recommended path (portal wizard)
+
+The launch-authority-v2 wizard at
+`https://localhost:4200/admin/launch-authority-v2` automates the
+whole flow:
+
+1. Sign in to the admin desk with an EVM wallet (env-var allowlist
+   mode is fine for the bootstrap session).
+2. Click **"Use my connected wallet as first admin"**.  Wallet pops
+   a one-shot EIP-712 probe; portal recovers your compressed
+   secp256k1 pubkey, asks the API to compute the canonical
+   Eip712Member leaf hash, and pre-fills the records textarea.
+3. Compute the MIPS root hash off-chain (chia-wallet-sdk
+   `mOfNHash(config, m, [eip712MemberHash(...)])`) and paste it.
+4. Click **"Submit on chain"**.  Goby/Sage signs the funding spend;
+   the portal combines it with the launcher's permissionless spend
+   and pushes to coinset.org.
+5. After confirmation, click **"Download admin_records.json"**.
+6. Drop the downloaded file into the API host's deployment dir
+   (e.g. `/etc/populis/admin_records.json`) and configure:
+   ```bash
+   POPULIS_ADMIN_RECORDS_PATH=/etc/populis/admin_records.json
+   POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID=0x<launcher_id>
+   POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH=0x<admins_hash>
+   POPULIS_ADMIN_JWT_SECRET=$(openssl rand -hex 32)   # if not already set
+   # remove or empty POPULIS_ADMIN_PUBKEY_ALLOWLIST — JSON is now the gate
+   ```
+7. Restart the API.  Boot validator loads + verifies the JSON
+   against the on-chain `admins_hash`; refuses to start on drift.
+8. Verify the new mode:
+   ```bash
+   curl -s http://localhost:8787/admin/auth/authority_v2 | jq '{
+     gating_source, informational_only, admins_hash
+   }'
+   # → gating_source: "POPULIS_ADMIN_RECORDS_PATH"
+   # → informational_only: false
+   ```
+
+#### Direct CLI path (for ops who prefer it)
+
+1. Choose your initial admin records: each admin slot is
+   `(admin_idx, leaves: [Eip712Member|Bls|...], m_within)`.
+2. Compute leaf hashes via
+   `populis_puzzles.eip712_helpers.compute_eip712_member_leaf_hash`
+   for each EIP-712 admin's pubkey.
+3. Compute `admins_hash` via
+   `populis_puzzles.admin_authority_v2_driver.compute_admins_hash`.
+4. Compute the MIPS root hash via the chia-wallet-sdk MIPS helpers.
+5. Build the inner puzzle with
+   `admin_authority_v2_driver.make_inner_puzzle(mips_root_hash,
+   admins_hash, ...)` and launch as a singleton.
+6. Hand-author `admin_records.json` matching the schema in
+   `populis_api/admin_records.py`, or run the launch via the
+   wizard for the pre-baked download.
+
+> **Phase 2.5b-2 (pending):** the API will fetch
+> `admins_hash` directly from coinset.org at boot, eliminating the
+> operator-supplied `POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH`
+> env step.  Until then, drift between env and chain is caught by
+> the boot validator.
+
+### A.2 — admin-authority v1 singleton (legacy, still supported)
+
+> Pre-Phase-2.5 deployments use this; new deployments should jump
+> straight to A.5 above.
 
 1. Choose your initial allowlist of BLS G1 pubkeys (typically the
    operator team's cold-key set) and a quorum threshold *m*.
@@ -194,10 +262,10 @@ they're absent).
    ```
    The `state_hash` should match the singleton's announcement payload.
 
-> **Phase 2 caveat:** the on-chain singleton is *informational only*
-> — the live admin-desk gate remains the env-var allowlist.  Phase
-> 2.5 wires the singleton state into `require_admin_jwt`.  See
-> `SECURITY.md` §A.2.
+> **A.2 caveat:** v1 singleton is *informational only* in all
+> phases — the live gate is either the env-var allowlist (legacy)
+> or the A.5 v2 records JSON (Phase 2.5+).  See `SECURITY.md` §A.2
+> and §A.5.
 
 ### A.4 — property-registry singleton
 

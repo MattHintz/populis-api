@@ -159,12 +159,50 @@ subsuming `POP-CANON-016` (the JWT secret becomes optional — every
 admin request can be re-verified against the on-chain singleton state
 once Phase 2.5 lands).
 
-**Phase 2.5 (deferred)**: a coinset.org indexer that walks the
-admin-authority singleton lineage and replaces
-`admin_pubkey_allowlist_set()` as the gating source for
-`require_admin_jwt`.  Until then, the admin desk continues to enforce
-via env var; the on-chain singleton is informational only — but
-auditable.
+**Phase 2.5b (shipped — chain-verified records JSON)**: replaces
+`admin_pubkey_allowlist_set()` with `effective_admin_allowlist_set()`
+across `require_admin_jwt`, the challenge endpoint, the login
+endpoint, and the JWT-secret guard.  When `POPULIS_ADMIN_RECORDS_PATH`
+is set, the API at boot:
+
+1. Loads the operator-supplied admin records JSON.
+2. Recomputes its `admins_hash` via the protocol's canonical
+   `compute_admins_hash` (so the API and chain cannot drift on
+   what an admin records list hashes to).
+3. Verifies the result matches `POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH`
+   (which itself reflects on-chain singleton state; Phase 2.5b-2
+   replaces this env step with a direct coinset.org fetch).
+4. Cross-checks the JSON's `launcher_id` against
+   `POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID` to catch
+   deployment mix-ups.
+5. Builds the EVM-address allowlist from leaf metadata; that's
+   what `require_admin_jwt` consults at request time.
+
+Drift in any check → API refuses to boot.  POP-CANON-021's
+transparency-cardinality check is automatically skipped in records-
+path mode because the JSON encodes the EVM↔BLS mapping per-leaf.
+
+The two paths are NEVER unioned: when records JSON is configured,
+`POPULIS_ADMIN_PUBKEY_ALLOWLIST` is ignored, so an attacker who
+gains env-var write access cannot smuggle an admin past the on-chain
+hash check.
+
+**Phase 2.5c (shipped — deterministic leaf-hash service)**:
+`POST /admin/auth/eip712/compute_leaf_hash` (no auth) computes the
+canonical Eip712Member leaf hash for a given secp256k1 pubkey +
+network.  The launch wizard calls this when an operator opts to use
+their connected EVM wallet as the genesis admin.  Pure deterministic
+computation; verifiable by anyone running the same Python helper.
+
+**Phase 2.5b-2 (deferred)**: replace
+`POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH` with a direct
+coinset.org fetch at API boot, so the chain becomes the single
+source of truth (no operator-supplied env step in the trust path).
+
+**Closes** (now): `POP-CANON-012` is fully addressed for records-
+path deployments — revoking an admin is a chain rotation spend +
+JSON regeneration + API restart.  The env-push path remains as a
+fallback for pre-Phase-2.5 deployments.
 
 ### A.4 — Property-registry singleton (Phase 3: shipped)
 
