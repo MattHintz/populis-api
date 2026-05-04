@@ -767,6 +767,156 @@ class TestSettingsIntegration:
         with pytest.raises(RuntimeError, match=r"(?i)launcher id"):
             admin_auth.validate_admin_config_at_startup(get_settings())
 
+    def test_authority_v2_endpoint_reports_records_gating_source(
+        self, tmp_path, monkeypatch
+    ):
+        """When admin_records_path is set, /admin/auth/authority_v2's
+        ``gating_source`` field flips from the env-var name to the
+        records-path name and ``informational_only`` flips to False.
+        """
+        from fastapi.testclient import TestClient
+        from populis_api.app import app
+        from populis_api.config import get_settings
+
+        records = [
+            {
+                "admin_idx": 0,
+                "m_within": 1,
+                "leaves": [_make_leaf_dict(pubkey_seed=0x42)],
+            }
+        ]
+        path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
+        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        # Boot validator requires JWT secret when admin desk is
+        # enabled (which records_path enables); set a dummy.
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        get_settings.cache_clear()
+
+        with TestClient(app) as client:
+            r = client.get("/admin/auth/authority_v2")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["gating_source"] == "POPULIS_ADMIN_RECORDS_PATH"
+        assert body["informational_only"] is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /admin/auth/eip712/compute_leaf_hash endpoint
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestEip712ComputeLeafHashEndpoint:
+    """Integration tests for the public EIP-712 leaf-hash computation
+    endpoint.  This is what the launch wizard calls to populate the
+    admin records JSON's ``leaf_hash`` fields.
+    """
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from populis_api.app import app
+        return TestClient(app)
+
+    def test_happy_path_testnet11(self):
+        """Returns a 32-byte leaf hash + the curry args used to derive it."""
+        with self._client() as client:
+            r = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={
+                    "secp256k1_pubkey": "0x02" + "11" * 32,
+                    "network": "testnet11",
+                },
+            )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["network"] == "testnet11"
+        assert body["secp256k1_pubkey"] == "0x02" + "11" * 32
+        # Sanity-check shapes; the actual values are pinned by
+        # protocol-side tests in test_eip712_helpers.py.
+        assert body["leaf_hash"].startswith("0x") and len(body["leaf_hash"]) == 66
+        assert body["type_hash"].startswith("0x") and len(body["type_hash"]) == 66
+        assert (
+            body["prefix_and_domain_separator"].startswith("0x1901")
+        ), body["prefix_and_domain_separator"]
+        assert len(body["prefix_and_domain_separator"]) == 70  # 0x + 68 hex
+
+    def test_default_network_uses_settings(self, monkeypatch):
+        """Omitting ``network`` in the request defaults to the API's
+        configured POPULIS_NETWORK setting (testnet11 by default).
+        """
+        with self._client() as client:
+            r = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={"secp256k1_pubkey": "0x02" + "ab" * 32},
+            )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Default settings.network is "testnet11" — the conftest doesn't
+        # mask network, so this just confirms the fallback wiring.
+        assert body["network"] == "testnet11"
+
+    def test_mainnet_vs_testnet11_differ(self):
+        """Cross-network invariance: same pubkey → different leaf
+        hashes on different networks (signatures must NOT replay).
+        """
+        with self._client() as client:
+            mainnet = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={"secp256k1_pubkey": "0x02" + "11" * 32, "network": "mainnet"},
+            ).json()
+            testnet = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={"secp256k1_pubkey": "0x02" + "11" * 32, "network": "testnet11"},
+            ).json()
+        assert mainnet["leaf_hash"] != testnet["leaf_hash"]
+        assert mainnet["prefix_and_domain_separator"] != (
+            testnet["prefix_and_domain_separator"]
+        )
+        # type_hash is constant across networks.
+        assert mainnet["type_hash"] == testnet["type_hash"]
+
+    def test_rejects_short_pubkey(self):
+        with self._client() as client:
+            r = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={"secp256k1_pubkey": "0x02" + "11" * 31},  # 32 bytes
+            )
+        assert r.status_code == 400
+        assert "33 bytes" in r.json()["detail"]
+
+    def test_rejects_invalid_hex(self):
+        with self._client() as client:
+            r = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={"secp256k1_pubkey": "0xnot_hex"},
+            )
+        assert r.status_code == 400
+
+    def test_no_auth_required(self):
+        """Endpoint is intentionally unauthenticated — the leaf hash
+        is a public commitment that can be independently verified.
+        Anyone running the wizard can call this.
+        """
+        with self._client() as client:
+            # No Authorization header.
+            r = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={"secp256k1_pubkey": "0x02" + "11" * 32},
+            )
+        assert r.status_code == 200
+
+    def test_rejects_unsupported_network(self):
+        with self._client() as client:
+            r = client.post(
+                "/admin/auth/eip712/compute_leaf_hash",
+                json={
+                    "secp256k1_pubkey": "0x02" + "11" * 32,
+                    "network": "simulator",
+                },
+            )
+        # Pydantic catches this before the handler runs (Literal type).
+        assert r.status_code == 422
+
+
     def test_boot_validator_surfaces_load_errors(self, tmp_path, monkeypatch):
         """Malformed JSON at the configured path → boot fails with a
         clear ``Failed to load admin records`` message.

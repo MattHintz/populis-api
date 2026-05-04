@@ -824,14 +824,152 @@ async def admin_authority_v2(
         # Migration phase indicator. Mirrors v1's `phase` field shape
         # so consumers can pick the same handling code path.
         "phase": snap.phase,
-        # Until v2 becomes the gating source (Phase 4) the admin desk
-        # continues to authenticate via v1's BLS allowlist or whatever
-        # Phase 2 EVM/JWT plumbing is in place. Surface this gating
-        # source here so consumers don't have to special-case the
-        # transition.
-        "gating_source": "POPULIS_ADMIN_PUBKEY_ALLOWLIST",
-        "informational_only": True,
+        # Phase 2.5b: Surface the actual current gating source so
+        # consumers don't have to guess which mode is active.
+        # POPULIS_ADMIN_RECORDS_PATH (chain-verified records JSON) is
+        # PREFERRED when set; the env var is the legacy/fallback path.
+        "gating_source": (
+            "POPULIS_ADMIN_RECORDS_PATH"
+            if settings.admin_records_path
+            else "POPULIS_ADMIN_PUBKEY_ALLOWLIST"
+        ),
+        # ``informational_only`` flips to False when v2 is the actual
+        # gating source AND its records JSON is hash-verified against
+        # chain.  Phase 2.5b achieves the latter; Phase 4 (v2 quorum
+        # actively authorises spends) finishes the former.
+        "informational_only": not bool(settings.admin_records_path),
     }
+
+
+class Eip712LeafHashRequest(BaseModel):
+    """Request body for ``POST /admin/auth/eip712/compute_leaf_hash``."""
+
+    secp256k1_pubkey: str = Field(
+        ...,
+        description=(
+            "0x-prefixed 33-byte compressed secp256k1 public key.  Recover "
+            "from a wallet signature client-side (the portal does this via "
+            "ethers.SigningKey.recoverPublicKey + compressSecp256k1Pubkey)."
+        ),
+    )
+    network: Optional[Literal["testnet11", "mainnet"]] = Field(
+        None,
+        description=(
+            "Chia network selector.  When omitted, falls back to the API's "
+            "configured ``POPULIS_NETWORK``.  Bound into the EIP-712 domain "
+            "salt so signatures cannot be replayed across networks."
+        ),
+    )
+
+
+class Eip712LeafHashResponse(BaseModel):
+    """Response shape for ``POST /admin/auth/eip712/compute_leaf_hash``."""
+
+    leaf_hash: str
+    """0x-prefixed 32-byte sha256tree of the curried Eip712Member puzzle.
+
+    This is the value the launch wizard pastes into the admin records
+    JSON's ``leaves[i].leaf_hash`` field — and what the on-chain
+    ``ADMINS_HASH`` ultimately commits to via the singleton state.
+    """
+
+    secp256k1_pubkey: str
+    """Echoed back from the request, lowercased + 0x-prefixed.  Lets
+    the caller copy the entire response into the records JSON without
+    re-formatting."""
+
+    type_hash: str
+    """0x-prefixed 32-byte CHIP-0037 type hash.  Constant across
+    networks; surfaced so the wizard can include it in the records
+    JSON without re-deriving."""
+
+    prefix_and_domain_separator: str
+    """0x-prefixed 34-byte EIP-712 prefix (0x1901) + domain separator,
+    bound to the network's genesis challenge."""
+
+    network: str
+    """Echoes which network's domain separator was used."""
+
+
+@router.post(
+    "/eip712/compute_leaf_hash",
+    response_model=Eip712LeafHashResponse,
+    tags=["admin-auth"],
+)
+async def admin_eip712_compute_leaf_hash(
+    body: Eip712LeafHashRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Eip712LeafHashResponse:
+    """Compute the canonical Eip712Member leaf hash for an operator's
+    public key.
+
+    **Why this endpoint exists.** The launch wizard needs to write
+    ``leaf_hash`` into the admin records JSON before submitting the
+    on-chain launch (so it can compute ``admins_hash``, then the eve
+    coin's puzzle hash, then the launcher's spend solution).  The
+    canonical leaf hash requires currying the ``Eip712Member`` puzzle
+    bytecode with the operator's pubkey and tree-hashing the result.
+    The portal's WASM SDK (chia-wallet-sdk-wasm 0.33) doesn't yet
+    expose the ``eip712_member.clsp`` bytecode (PR #396 adds it but
+    isn't released), so we surface a server-side computation here.
+
+    **Trust model.** Pure deterministic computation — no secrets, no
+    state, no auth required.  Anyone can call it; anyone can verify
+    the response by re-running the same Python helper or (eventually)
+    the same WASM helper.  The leaf hash is a public commitment.
+
+    **Errors:**
+      400  pubkey is malformed (not 33 bytes, not hex, etc.)
+      400  network is configured but neither testnet11 nor mainnet
+    """
+    from .admin_records import _parse_hex
+    from populis_puzzles.eip712_helpers import (
+        compute_eip712_member_leaf_hash,
+        eip712_prefix_and_domain_separator,
+        eip712_type_hash,
+        genesis_challenge_for_network,
+    )
+
+    network = body.network or settings.network
+    try:
+        genesis = genesis_challenge_for_network(network)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    try:
+        pubkey = _parse_hex(body.secp256k1_pubkey, "secp256k1_pubkey")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if len(pubkey) != 33:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"secp256k1_pubkey must be 33 bytes (compressed), "
+                f"got {len(pubkey)}"
+            ),
+        )
+
+    prefix = eip712_prefix_and_domain_separator(genesis)
+    type_h = eip712_type_hash()
+    try:
+        leaf_hash = compute_eip712_member_leaf_hash(
+            secp256k1_pubkey=pubkey,
+            prefix_and_domain_separator=prefix,
+            type_hash=type_h,
+        )
+    except ValueError as e:
+        # Defensive: the parse above already enforces the constraints
+        # compute_eip712_member_leaf_hash checks, but surface any
+        # mismatch as 400 anyway.
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return Eip712LeafHashResponse(
+        leaf_hash="0x" + leaf_hash.hex(),
+        secp256k1_pubkey="0x" + pubkey.hex(),
+        type_hash="0x" + type_h.hex(),
+        prefix_and_domain_separator="0x" + prefix.hex(),
+        network=network,
+    )
 
 
 @router.post("/refresh", response_model=AdminRefreshResponse)

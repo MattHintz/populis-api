@@ -109,6 +109,22 @@ def _warm_chia_puzzle_templates() -> None:
         bytes(mod)
         mod.get_tree_hash()
 
+    # Phase 2.5: Eip712Member puzzle is loaded by admin_records.py (when
+    # leaf_hash is omitted from the JSON) and by the
+    # /admin/auth/eip712/compute_leaf_hash endpoint.  Warm it on the
+    # import thread for the same LazyNode-threading reason as above.
+    # ``_eip712_member_mod_hash()`` populates the module-level bytes32
+    # cache so per-request curry computations can use pure-bytes math
+    # without ever touching a LazyNode again.
+    from populis_puzzles.eip712_helpers import (
+        _eip712_member_mod_hash,
+        _eip712_member_puzzle,
+    )
+    _eip712_mod = _eip712_member_puzzle()
+    bytes(_eip712_mod)
+    _eip712_mod.get_tree_hash()
+    _eip712_member_mod_hash()  # populate the bytes32 cache
+
 
 _warm_chia_puzzle_templates()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")

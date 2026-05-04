@@ -61,16 +61,39 @@ for _key in _ADMIN_ENV_INT_KEYS:
 
 
 @pytest.fixture(autouse=True)
-def _admin_records_cache_reset():
-    """Clear the Phase 2.5 mtime-keyed records cache between tests so
-    two tests writing different records to the same path don't see a
-    stale entry."""
+def _admin_state_reset():
+    """Clear cached state between tests so per-test env changes
+    actually re-flow through ``get_settings``.
+
+    Without this, a previous test that set
+    ``POPULIS_ADMIN_RECORDS_PATH`` (e.g. via monkeypatch) leaves a
+    cached Settings instance pointing at the temp file even after
+    monkeypatch rolls back — subsequent tests' TestClient lifespan
+    sees a stale records_path and fails the boot validator.
+    """
+    # Clear the @lru_cache around get_settings so the next consumer
+    # rebuilds Settings from current env.
+    try:
+        from populis_api.config import get_settings
+        get_settings.cache_clear()
+    except ImportError:
+        pass
+
+    # Drop the Phase 2.5 mtime-keyed records cache so a temp path
+    # from a previous test doesn't survive into the next one.
     try:
         from populis_api.admin_records import clear_admin_records_cache
         clear_admin_records_cache()
     except ImportError:
         pass
+
     yield
+
+    try:
+        from populis_api.config import get_settings
+        get_settings.cache_clear()
+    except ImportError:
+        pass
     try:
         from populis_api.admin_records import clear_admin_records_cache
         clear_admin_records_cache()
