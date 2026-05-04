@@ -339,7 +339,14 @@ def _parse_admin_record(raw: object, position: int) -> AdminRecordSpec:
 
 
 def _parse_leaf(raw: object, record_pos: int, leaf_pos: int) -> Eip712LeafSpec:
-    """Parse one admin_records[i].leaves[j] entry."""
+    """Parse one admin_records[i].leaves[j] entry.
+
+    The ``leaf_hash`` field is optional: when omitted the loader
+    computes it from the curry args via the protocol's canonical
+    ``compute_eip712_member_leaf_hash``.  When supplied, the loader
+    cross-checks the value matches what would be computed; mismatch
+    raises (catches typos and trojan records).
+    """
     base_path = f"admin_records[{record_pos}].leaves[{leaf_pos}]"
     if not isinstance(raw, dict):
         raise AdminRecordsLoadError(f"{base_path} must be an object")
@@ -351,7 +358,6 @@ def _parse_leaf(raw: object, record_pos: int, leaf_pos: int) -> Eip712LeafSpec:
             f"(supported: 'eip712_member' — bls_member/passkey land in Phase 3+)"
         )
 
-    leaf_hash = _parse_hex32(raw.get("leaf_hash"), f"{base_path}.leaf_hash")
     type_hash = _parse_hex32(raw.get("type_hash"), f"{base_path}.type_hash")
 
     evm_address = raw.get("evm_address")
@@ -381,6 +387,41 @@ def _parse_leaf(raw: object, record_pos: int, leaf_pos: int) -> Eip712LeafSpec:
             f"{base_path}.prefix_and_domain_separator must start with "
             f"0x1901 (EIP-712 prefix), got 0x{domain[:2].hex()}"
         )
+
+    # Compute the canonical leaf hash from the curry args, then either
+    # verify the JSON-supplied value matches OR use the computed value
+    # if leaf_hash is omitted.  Importing lazily so the loader doesn't
+    # eagerly load the Eip712Member puzzle for every test that touches
+    # the schema.
+    from populis_puzzles.eip712_helpers import compute_eip712_member_leaf_hash
+    try:
+        computed_leaf = compute_eip712_member_leaf_hash(
+            secp256k1_pubkey=pubkey,
+            prefix_and_domain_separator=domain,
+            type_hash=type_hash,
+        )
+    except ValueError as e:
+        raise AdminRecordsLoadError(
+            f"{base_path}: failed to compute leaf hash: {e}"
+        ) from e
+
+    raw_leaf_hash = raw.get("leaf_hash")
+    if raw_leaf_hash is None:
+        leaf_hash = computed_leaf
+    else:
+        leaf_hash = _parse_hex32(raw_leaf_hash, f"{base_path}.leaf_hash")
+        if leaf_hash != computed_leaf:
+            raise AdminRecordsLoadError(
+                f"{base_path}.leaf_hash mismatch:\n"
+                f"  JSON-supplied: 0x{leaf_hash.hex()}\n"
+                f"  computed from curry args: 0x{computed_leaf.hex()}\n"
+                f"\n"
+                f"The leaf_hash field, when present, must match the "
+                f"sha256tree of the Eip712Member puzzle curried with "
+                f"(prefix_and_domain_separator, type_hash, secp256k1_pubkey).  "
+                f"Either drop leaf_hash from the JSON (loader will compute "
+                f"it) or fix the curry args."
+            )
 
     return Eip712LeafSpec(
         leaf_hash=leaf_hash,

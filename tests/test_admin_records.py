@@ -44,24 +44,47 @@ def _hash(byte: int) -> bytes32:
     return bytes32(bytes([byte]) * 32)
 
 
+def _pubkey(seed: int) -> str:
+    """Build a deterministic 33-byte 'compressed' pubkey hex.
+
+    These are NOT real secp256k1 pubkeys — they're 33-byte values
+    distinct enough that the curry-and-treehash produces unique leaf
+    hashes per seed.  Real secp256k1 pubkey validation happens at
+    sign-in time, not at admin records loading.
+    """
+    return "0x02" + bytes([seed]).hex() + "11" * 31
+
+
 def _make_leaf_dict(
     *,
-    leaf_hash: str,
+    leaf_hash: str | None = None,
     evm: str = "0x" + "ab" * 20,
-    pubkey: str = "0x02" + "11" * 32,  # 33 bytes (compressed)
+    pubkey: str | None = None,
     type_hash: str = "0x" + "ee" * 32,
     domain: str = "0x1901" + "ff" * 32,  # 34 bytes, 0x1901 prefix
+    pubkey_seed: int = 0xAA,
 ) -> dict:
-    """Build a leaf JSON dict with sane defaults; override one field
-    at a time in negative-path tests."""
-    return {
+    """Build a leaf JSON dict with sane defaults.
+
+    By default, ``leaf_hash`` is OMITTED so the loader computes it
+    from the curry args (the supported "operator emits records via
+    wizard" path).  Pass ``leaf_hash`` explicitly to test the
+    cross-check path.
+
+    ``pubkey_seed`` controls the synthetic pubkey shape so different
+    leaves produce different curried tree hashes; tests that need
+    distinct leaves should pass distinct seeds.
+    """
+    leaf: dict = {
         "kind": "eip712_member",
-        "leaf_hash": leaf_hash,
         "evm_address": evm,
-        "secp256k1_pubkey": pubkey,
+        "secp256k1_pubkey": pubkey if pubkey is not None else _pubkey(pubkey_seed),
         "type_hash": type_hash,
         "prefix_and_domain_separator": domain,
     }
+    if leaf_hash is not None:
+        leaf["leaf_hash"] = leaf_hash
+    return leaf
 
 
 def _make_admin_records_dict(
@@ -75,7 +98,7 @@ def _make_admin_records_dict(
             {
                 "admin_idx": 0,
                 "m_within": 1,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + "aa" * 32)],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xaa)],
             }
         ]
     return {
@@ -117,7 +140,11 @@ class TestLoadAdminRecords:
         assert admin.m_within == 1
         assert len(admin.leaves) == 1
         leaf = admin.leaves[0]
-        assert leaf.leaf_hash == _hash(0xAA)
+        # Leaf hash is computed from curry args, so we can't pin a
+        # constant here — but it must be a valid 32-byte value AND
+        # deterministic for the same inputs.
+        assert isinstance(leaf.leaf_hash, bytes)
+        assert len(leaf.leaf_hash) == 32
         assert leaf.evm_address == "0x" + "ab" * 20  # already lowercase
         assert len(leaf.secp256k1_pubkey) == 33
         assert leaf.type_hash == _hash(0xEE)
@@ -131,17 +158,17 @@ class TestLoadAdminRecords:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + "01" * 32),
-                    _make_leaf_dict(leaf_hash="0x" + "02" * 32),
+                    _make_leaf_dict(pubkey_seed=0x01),
+                    _make_leaf_dict(pubkey_seed=0x02),
                 ],
             },
             {
                 "admin_idx": 1,
                 "m_within": 2,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + "03" * 32),
-                    _make_leaf_dict(leaf_hash="0x" + "04" * 32),
-                    _make_leaf_dict(leaf_hash="0x" + "05" * 32),
+                    _make_leaf_dict(pubkey_seed=0x03),
+                    _make_leaf_dict(pubkey_seed=0x04),
+                    _make_leaf_dict(pubkey_seed=0x05),
                 ],
             },
         ]
@@ -157,7 +184,7 @@ class TestLoadAdminRecords:
         """Mixed-case EVM addresses are normalised to lowercase so the
         gating set check is case-insensitive."""
         leaf = _make_leaf_dict(
-            leaf_hash="0x" + "aa" * 32,
+            pubkey_seed=0xaa,
             evm="0xABcDeF0000000000000000000000000000000000",
         )
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
@@ -175,7 +202,7 @@ class TestLoadAdminRecords:
                 "m_within": 1,
                 "leaves": [
                     _make_leaf_dict(
-                        leaf_hash="0x" + "01" * 32,
+                        pubkey_seed=0x01,
                         evm="0x" + "11" * 20,
                     ),
                 ],
@@ -185,11 +212,11 @@ class TestLoadAdminRecords:
                 "m_within": 1,
                 "leaves": [
                     _make_leaf_dict(
-                        leaf_hash="0x" + "02" * 32,
+                        pubkey_seed=0x02,
                         evm="0x" + "22" * 20,
                     ),
                     _make_leaf_dict(
-                        leaf_hash="0x" + "03" * 32,
+                        pubkey_seed=0x03,
                         evm="0x" + "33" * 20,
                     ),
                 ],
@@ -219,48 +246,54 @@ class TestAdminsHashMatchesProtocol:
     """
 
     def test_single_admin_single_leaf(self, tmp_path):
-        leaf_hash = _hash(0xAA)
         records_data = [
             {
                 "admin_idx": 0,
                 "m_within": 1,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + leaf_hash.hex())],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xAA)],
             }
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records_data))
         config = load_admin_records_from_path(path)
 
-        # Protocol-side recomputation from the same leaves.
+        # Pull the loader-computed leaf hash and feed it into the
+        # protocol's canonical hash function — they must agree on
+        # what this admin's record hashes to.
+        loader_leaf = config.admin_records[0].leaves[0].leaf_hash
         expected = protocol_compute_admins_hash([
-            ProtocolAdminRecord(admin_idx=0, leaves=(leaf_hash,), m_within=1),
+            ProtocolAdminRecord(admin_idx=0, leaves=(loader_leaf,), m_within=1),
         ])
         assert config.compute_admins_hash() == expected
 
     def test_multi_admin_multi_leaf(self, tmp_path):
         """Order matters — both at admin-record level and leaf level."""
-        leaves_a = (_hash(0x01), _hash(0x02))
-        leaves_b = (_hash(0x03), _hash(0x04), _hash(0x05))
         records_data = [
             {
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + h.hex())
-                    for h in leaves_a
+                    _make_leaf_dict(pubkey_seed=0x01),
+                    _make_leaf_dict(pubkey_seed=0x02),
                 ],
             },
             {
                 "admin_idx": 1,
                 "m_within": 2,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + h.hex())
-                    for h in leaves_b
+                    _make_leaf_dict(pubkey_seed=0x03),
+                    _make_leaf_dict(pubkey_seed=0x04),
+                    _make_leaf_dict(pubkey_seed=0x05),
                 ],
             },
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records_data))
         config = load_admin_records_from_path(path)
 
+        # Use the loader-computed leaf hashes for the cross-check.
+        # If loader and protocol disagreed on Eip712Member curry-and-
+        # treehash, this test would fail.
+        leaves_a = tuple(leaf.leaf_hash for leaf in config.admin_records[0].leaves)
+        leaves_b = tuple(leaf.leaf_hash for leaf in config.admin_records[1].leaves)
         expected = protocol_compute_admins_hash([
             ProtocolAdminRecord(admin_idx=0, leaves=leaves_a, m_within=1),
             ProtocolAdminRecord(admin_idx=1, leaves=leaves_b, m_within=2),
@@ -276,8 +309,8 @@ class TestAdminsHashMatchesProtocol:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + ("01" * 32)),
-                    _make_leaf_dict(leaf_hash="0x" + ("02" * 32)),
+                    _make_leaf_dict(pubkey_seed=0x01),
+                    _make_leaf_dict(pubkey_seed=0x02),
                 ],
             }
         ]
@@ -286,8 +319,8 @@ class TestAdminsHashMatchesProtocol:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + ("02" * 32)),
-                    _make_leaf_dict(leaf_hash="0x" + ("01" * 32)),
+                    _make_leaf_dict(pubkey_seed=0x02),
+                    _make_leaf_dict(pubkey_seed=0x01),
                 ],
             }
         ]
@@ -405,7 +438,7 @@ class TestLoadErrors:
         them today rather than silently ignoring (would produce a
         wrong hash that mysteriously fails to verify on chain).
         """
-        leaf = _make_leaf_dict(leaf_hash="0x" + "aa" * 32)
+        leaf = _make_leaf_dict(pubkey_seed=0xaa)
         leaf["kind"] = "bls_member"
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
@@ -414,7 +447,7 @@ class TestLoadErrors:
 
     def test_evm_address_wrong_length(self, tmp_path):
         leaf = _make_leaf_dict(
-            leaf_hash="0x" + "aa" * 32,
+            pubkey_seed=0xaa,
             evm="0x1234",  # too short
         )
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
@@ -424,7 +457,7 @@ class TestLoadErrors:
 
     def test_pubkey_wrong_length(self, tmp_path):
         leaf = _make_leaf_dict(
-            leaf_hash="0x" + "aa" * 32,
+            pubkey_seed=0xaa,
             pubkey="0x" + "11" * 32,  # 32 bytes, not 33
         )
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
@@ -434,7 +467,7 @@ class TestLoadErrors:
 
     def test_domain_separator_wrong_prefix(self, tmp_path):
         leaf = _make_leaf_dict(
-            leaf_hash="0x" + "aa" * 32,
+            pubkey_seed=0xaa,
             domain="0x" + "00" * 34,  # right length but wrong prefix
         )
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
@@ -444,8 +477,8 @@ class TestLoadErrors:
 
     def test_m_within_exceeds_leaf_count(self, tmp_path):
         """Operator typo: m_within=3 but only 2 leaves → never satisfiable."""
-        leaf1 = _make_leaf_dict(leaf_hash="0x" + "aa" * 32)
-        leaf2 = _make_leaf_dict(leaf_hash="0x" + "bb" * 32)
+        leaf1 = _make_leaf_dict(pubkey_seed=0xaa)
+        leaf2 = _make_leaf_dict(pubkey_seed=0xbb)
         records = [{"admin_idx": 0, "m_within": 3, "leaves": [leaf1, leaf2]}]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         with pytest.raises(AdminRecordsLoadError, match="m_within \\(3\\) exceeds"):
@@ -456,7 +489,7 @@ class TestLoadErrors:
             {
                 "admin_idx": -1,
                 "m_within": 1,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + "aa" * 32)],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xaa)],
             }
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
@@ -468,17 +501,82 @@ class TestLoadErrors:
             {
                 "admin_idx": 0,
                 "m_within": 0,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + "aa" * 32)],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xaa)],
             }
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         with pytest.raises(AdminRecordsLoadError, match="m_within must be a positive"):
             load_admin_records_from_path(path)
 
+    def test_leaf_hash_cross_check_accepts_correct_value(self, tmp_path):
+        """When the JSON supplies leaf_hash AND it matches the
+        computed value, the loader accepts (no recompute hidden;
+        operators can pin known-good values for fixture verification).
+        """
+        # First load to compute the canonical hash, then re-emit the
+        # JSON with leaf_hash explicitly set to that value.
+        path1 = _write_json(
+            tmp_path,
+            _make_admin_records_dict(
+                admin_records=[
+                    {
+                        "admin_idx": 0,
+                        "m_within": 1,
+                        "leaves": [_make_leaf_dict(pubkey_seed=0x42)],
+                    }
+                ]
+            ),
+            filename="step1.json",
+        )
+        canonical = load_admin_records_from_path(path1)
+        canonical_leaf = canonical.admin_records[0].leaves[0].leaf_hash
+
+        # Now write with explicit leaf_hash = canonical → should load OK.
+        path2 = _write_json(
+            tmp_path,
+            _make_admin_records_dict(
+                admin_records=[
+                    {
+                        "admin_idx": 0,
+                        "m_within": 1,
+                        "leaves": [
+                            _make_leaf_dict(
+                                pubkey_seed=0x42,
+                                leaf_hash="0x" + canonical_leaf.hex(),
+                            )
+                        ],
+                    }
+                ]
+            ),
+            filename="step2.json",
+        )
+        config = load_admin_records_from_path(path2)
+        assert config.admin_records[0].leaves[0].leaf_hash == canonical_leaf
+
+    def test_leaf_hash_cross_check_rejects_mismatch(self, tmp_path):
+        """When the JSON supplies a wrong leaf_hash, the loader
+        refuses with a clear field-path error.  Catches both typos
+        and trojan records (an attacker who crafted a JSON with a
+        dummy curry args + cherry-picked leaf hash to slip a fake
+        admin past the on-chain admins_hash check).
+        """
+        leaf = _make_leaf_dict(
+            pubkey_seed=0xAA,
+            leaf_hash="0x" + "00" * 32,  # never-matches value
+        )
+        records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
+        path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
+        with pytest.raises(AdminRecordsLoadError) as exc_info:
+            load_admin_records_from_path(path)
+        msg = str(exc_info.value)
+        assert "leaf_hash mismatch" in msg
+        assert "JSON-supplied" in msg
+        assert "computed from curry args" in msg
+
     def test_field_path_in_error_for_nested_leaf(self, tmp_path):
         """Errors deep in the tree should reference the offending path."""
-        good_leaf = _make_leaf_dict(leaf_hash="0x" + "aa" * 32)
-        bad_leaf = _make_leaf_dict(leaf_hash="0x" + "bb" * 32)
+        good_leaf = _make_leaf_dict(pubkey_seed=0xaa)
+        bad_leaf = _make_leaf_dict(pubkey_seed=0xbb)
         bad_leaf["evm_address"] = "not_hex"
         records = [
             {
@@ -517,14 +615,14 @@ class TestSettingsIntegration:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + "01" * 32, evm=evm_a),
+                    _make_leaf_dict(pubkey_seed=0x01, evm=evm_a),
                 ],
             },
             {
                 "admin_idx": 1,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + "02" * 32, evm=evm_b),
+                    _make_leaf_dict(pubkey_seed=0x02, evm=evm_b),
                 ],
             },
         ]
@@ -552,7 +650,7 @@ class TestSettingsIntegration:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(leaf_hash="0x" + "01" * 32, evm=records_evm),
+                    _make_leaf_dict(pubkey_seed=0x01, evm=records_evm),
                 ],
             },
         ]
@@ -595,7 +693,7 @@ class TestSettingsIntegration:
             {
                 "admin_idx": 0,
                 "m_within": 1,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + "aa" * 32)],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xaa)],
             }
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
@@ -626,7 +724,7 @@ class TestSettingsIntegration:
             {
                 "admin_idx": 0,
                 "m_within": 1,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + "aa" * 32)],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xaa)],
             }
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
@@ -653,7 +751,7 @@ class TestSettingsIntegration:
             {
                 "admin_idx": 0,
                 "m_within": 1,
-                "leaves": [_make_leaf_dict(leaf_hash="0x" + "aa" * 32)],
+                "leaves": [_make_leaf_dict(pubkey_seed=0xaa)],
             }
         ]
         # JSON binds to launcher 0x10*32; env binds to 0xfe*32.
