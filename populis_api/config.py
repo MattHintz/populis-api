@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,31 @@ class Settings(BaseSettings):
         env_prefix="POPULIS_",
         extra="ignore",
     )
+
+    # ── Empty-string → None coercion for optional-string fields ──────────
+    # Setting an env var to "" (e.g. by the test conftest's ``.env``-mask
+    # shim) must read back as ``None`` rather than ``""`` so callers'
+    # ``is None`` checks behave the same as when the var is genuinely
+    # unset.  Applied to every ``Optional[str]`` field where ``None`` is
+    # the meaningful "absent" sentinel.
+    @field_validator(
+        "protocol_admin_authority_launcher_id",
+        "protocol_admin_authority_v2_launcher_id",
+        "protocol_admin_authority_v2_mips_root_hash",
+        "protocol_admin_authority_v2_admins_hash",
+        "protocol_admin_authority_v2_pending_ops_hash",
+        "pool_launcher_id",
+        "governance_launcher_id",
+        "protocol_config_launcher_id",
+        "protocol_property_registry_launcher_id",
+        "admin_records_path",
+        mode="before",
+    )
+    @classmethod
+    def _empty_string_is_none(cls, v: object) -> object:
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
     # ── Network ───────────────────────────────────────────────────────────
     network: Literal["testnet11", "mainnet"] = "testnet11"
@@ -176,7 +201,34 @@ class Settings(BaseSettings):
     # log in to the admin desk.  When empty, the admin desk routes return
     # 503.  Examples:
     #   POPULIS_ADMIN_PUBKEY_ALLOWLIST=0xabc...,0x123...
+    #
+    # Phase 2.5: ``admin_records_path`` (below) takes precedence when set.
+    # The env var becomes a fallback / break-glass for when the on-chain
+    # gating source is unreachable; an operator-facing deprecation timeline
+    # lands after the testnet11 dry-run validates the JSON-config path.
     admin_pubkey_allowlist: str = ""
+
+    # Path to a JSON file containing the OPERATOR-EXPANDED admin records
+    # (Phase 2.5b-1).  When set, the API:
+    #   1. Loads the records at boot.
+    #   2. Recomputes ``admins_hash`` from them via the protocol's
+    #      canonical hash function and asserts it matches the on-chain
+    #      singleton's ``admins_hash`` (sourced from
+    #      ``protocol_admin_authority_v2_admins_hash`` env until
+    #      Phase 2.5b-2 wires direct coinset.org lookups).
+    #   3. Builds the EVM-address allowlist from the JSON's eip712 leaf
+    #      metadata; this REPLACES ``admin_pubkey_allowlist`` as the
+    #      gating source for ``/admin/*`` routes.
+    #
+    # The file is ENVIRONMENT-LOCAL — it contains only data that's already
+    # public (pubkeys, EVM addresses, hashes); no secrets.  But it MUST
+    # match the on-chain state or the API refuses to boot, so treat it
+    # as part of the deployment artefact.
+    #
+    # See ``populis_api.admin_records.AdminRecordsConfig`` for the JSON
+    # schema; ``GENESIS_README.md`` shows how to generate this file from
+    # a launch wizard run.
+    admin_records_path: Optional[str] = None
 
     # HS256 secret used to sign admin-desk JWTs.  Generate with
     # `openssl rand -hex 32`.  When empty, a random per-process secret is
@@ -246,11 +298,47 @@ class Settings(BaseSettings):
         whichever convention they prefer; comparisons should also normalize
         to lower-case.  An empty allowlist disables the admin desk
         (callers handle the 503 path).
+
+        **Phase 2.5 note:** prefer ``effective_admin_allowlist_set`` for
+        per-request gating; this method is the legacy/env-var-only path
+        retained for the boot validator and as a break-glass fallback.
         """
         raw = (self.admin_pubkey_allowlist or "").strip()
         if not raw:
             return set()
         return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+    def effective_admin_allowlist_set(self) -> set[str]:
+        """Live admin EVM-address allowlist, combining all gating sources.
+
+        Phase 2.5b-1 promotes the on-chain-derived JSON records above
+        the env-var legacy path:
+
+        1. **Records JSON (preferred)**: when ``admin_records_path`` is
+           set, load + verify against on-chain ``admins_hash`` and
+           extract EVM addresses from leaf metadata.  Drift causes a
+           ``RuntimeError`` so the operator notices immediately.
+        2. **Env var (fallback)**: when the JSON path is unset, fall
+           back to ``admin_pubkey_allowlist`` (Phase 2 behaviour).
+        3. **Empty**: when neither is set, the admin desk is disabled
+           (callers handle 503).
+
+        Note that we INTENTIONALLY do not union the two sets — that
+        would let a misconfigured env var smuggle an extra admin past
+        the on-chain check.  When records JSON is configured it is the
+        SOLE gating source.
+
+        Lazy-loaded + cached by file mtime; an operator who edits the
+        JSON file sees the new allowlist on the next request without
+        restart (subject to ``get_settings`` cache clearing in tests).
+        """
+        if self.admin_records_path:
+            from .admin_records import get_admin_records_for_settings
+            records = get_admin_records_for_settings(self)
+            if records is None:
+                return set()  # path set but load failed validation already
+            return records.eip712_evm_address_set()
+        return self.admin_pubkey_allowlist_set()
 
     def admin_authority_pubkeys_list(self) -> list[bytes]:
         """Return the parsed ordered list of A.2 admin-authority BLS pubkeys.

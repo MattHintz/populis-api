@@ -37,14 +37,19 @@ PENDING_OPS_HASH_HEX = "0x" + ("dd" * 32)
 @pytest.fixture
 def fresh_settings(monkeypatch):
     """Reset env + cached settings for every test."""
+    # String-typed: setenv("") so conftest's .env mask survives.
+    # Integer-typed: delenv so Pydantic falls back to model default.
     for key in (
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS",
+    ):
+        monkeypatch.setenv(key, "")
+    for key in (
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION",
     ):
         monkeypatch.delenv(key, raising=False)

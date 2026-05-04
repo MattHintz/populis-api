@@ -170,19 +170,19 @@ def get_jwt_secret(settings: Optional[Settings] = None) -> str:
         _resolved_jwt_secret = s.admin_jwt_secret
         return _resolved_jwt_secret
 
-    # POP-CANON-016: fail fast when the allowlist is configured but
+    # POP-CANON-016: fail fast when the admin desk is enabled but
     # the JWT secret is not.  Allow the random-fallback path only
     # when the admin desk itself is disabled (empty allowlist).
-    if s.admin_pubkey_allowlist_set():
+    if s.effective_admin_allowlist_set():
         raise RuntimeError(
-            "POPULIS_ADMIN_PUBKEY_ALLOWLIST is configured but "
-            "POPULIS_ADMIN_JWT_SECRET is empty.  Multi-worker "
-            "deployments would generate divergent per-process secrets, "
-            "causing intermittent 403s when load-balanced refresh "
-            "requests land on a different worker than the original "
-            "/login.  Set POPULIS_ADMIN_JWT_SECRET to a stable "
-            "high-entropy value (≥32 bytes hex) before enabling the "
-            "admin desk."
+            "Admin desk is enabled (POPULIS_ADMIN_PUBKEY_ALLOWLIST or "
+            "admin_records_path is set) but POPULIS_ADMIN_JWT_SECRET is "
+            "empty.  Multi-worker deployments would generate divergent "
+            "per-process secrets, causing intermittent 403s when load-"
+            "balanced refresh requests land on a different worker than "
+            "the original /login.  Set POPULIS_ADMIN_JWT_SECRET to a "
+            "stable high-entropy value (≥32 bytes hex) before enabling "
+            "the admin desk."
         )
 
     _resolved_jwt_secret = secrets.token_hex(32)
@@ -221,12 +221,85 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
             "intermittent 403s" trap described in
             ``research/CANON_POPULIS_ADMIN_DESK_AUDIT_2026_04_28.md``).
     """
-    if not settings.admin_pubkey_allowlist_set():
+    # ── Phase 2.5b-1: chain-verified admin records (preferred path) ───
+    #
+    # When admin_records_path is set, load the JSON, verify it binds to
+    # the configured launcher_id, and verify its admins_hash matches
+    # the operator-supplied (and Phase 2.5b-2: directly-from-chain)
+    # ``admins_hash``.  Drift means the JSON is stale or tampered —
+    # refuse to boot rather than silently gate with mismatched records.
+    #
+    # We do this BEFORE the "is admin desk enabled?" check because that
+    # check itself loads the records (via ``effective_admin_allowlist_set``);
+    # surfacing the load error here gives the operator a single clean
+    # boot-time message instead of a half-loaded fallback path.
+    if settings.admin_records_path:
+        from .admin_records import (
+            AdminRecordsDriftError,
+            AdminRecordsLoadError,
+            get_admin_records_for_settings,
+            verify_against_admins_hash,
+            verify_against_launcher_id,
+        )
+        from chia_rs.sized_bytes import bytes32
+
+        try:
+            records = get_admin_records_for_settings(settings)
+        except AdminRecordsLoadError as e:
+            raise RuntimeError(
+                f"Failed to load admin records from "
+                f"POPULIS_ADMIN_RECORDS_PATH={settings.admin_records_path!r}: {e}"
+            ) from e
+        if records is None:
+            # Should not happen — admin_records_path is set so loader
+            # returns a config or raises.  Defensive belt-and-braces.
+            raise RuntimeError(
+                f"admin_records_path set but loader returned None: "
+                f"{settings.admin_records_path!r}"
+            )
+
+        # Cross-check launcher id against env (catches deployment mix-ups).
+        try:
+            verify_against_launcher_id(
+                records,
+                settings.protocol_admin_authority_v2_launcher_id,
+            )
+        except AdminRecordsDriftError as e:
+            raise RuntimeError(str(e)) from e
+
+        # Cross-check admins_hash.  Operator supplies this via
+        # POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH today; Phase
+        # 2.5b-2 will replace with a direct coinset.org fetch.
+        if settings.protocol_admin_authority_v2_admins_hash:
+            expected_hex = settings.protocol_admin_authority_v2_admins_hash
+            if expected_hex.startswith(("0x", "0X")):
+                expected_hex = expected_hex[2:]
+            try:
+                expected = bytes32(bytes.fromhex(expected_hex))
+            except (ValueError, AssertionError) as e:
+                raise RuntimeError(
+                    f"POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH "
+                    f"is not valid 32-byte hex: {e}"
+                ) from e
+            try:
+                verify_against_admins_hash(records, expected)
+            except AdminRecordsDriftError as e:
+                raise RuntimeError(str(e)) from e
+
+        logger.info(
+            "Admin desk gated by admin_records_path: "
+            "%d admin slot(s), %d EVM address(es) in allowlist.",
+            len(records.admin_records),
+            len(records.eip712_evm_address_set()),
+        )
+
+    if not settings.effective_admin_allowlist_set():
         # Admin desk disabled — random per-process secret is acceptable
         # (it's only used for the dev/test environment paths and never
         # shared across workers because admin endpoints all 503).
         logger.info(
-            "Admin desk disabled (POPULIS_ADMIN_PUBKEY_ALLOWLIST unset)."
+            "Admin desk disabled (no admin_records_path and "
+            "POPULIS_ADMIN_PUBKEY_ALLOWLIST unset)."
         )
         return
 
@@ -266,6 +339,16 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
     #
     # The check is intentionally cheap: it runs at startup once, never
     # at request time, and only fires when admin desk is enabled.
+    #
+    # Phase 2.5b-1: SKIP this check when the admin desk is gated by
+    # ``admin_records_path`` rather than the env-var allowlist.  The
+    # records JSON encodes the EVM↔BLS mapping per-leaf, so the
+    # transparency-drift trap (env says X EVMs, on-chain says 0 BLS
+    # keys) doesn't apply — both sides come from the same JSON file
+    # whose hash is verified against chain.
+    if settings.admin_records_path:
+        return
+
     bls_pubkeys = settings.admin_authority_pubkeys_list()
     allowlist_size = len(settings.admin_pubkey_allowlist_set())
 
@@ -392,7 +475,7 @@ def require_admin_jwt(
         restart, even if the JWT itself is still cryptographically
         valid under the unchanged secret).
     """
-    if not settings.admin_pubkey_allowlist_set():
+    if not settings.effective_admin_allowlist_set():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -418,7 +501,7 @@ def require_admin_jwt(
     # cycle, regardless of whether their JWT is still within its TTL.
     # Without this check, refresh-after-revocation chains keep a
     # compromised admin authoritative until the API process restarts.
-    if claims.sub.lower() not in settings.admin_pubkey_allowlist_set():
+    if claims.sub.lower() not in settings.effective_admin_allowlist_set():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -478,7 +561,7 @@ async def admin_challenge(
     /login.  Issuing a challenge is harmless even for an unrecognised
     pubkey because the challenge is single-use and TTL'd.
     """
-    if not settings.admin_pubkey_allowlist_set():
+    if not settings.effective_admin_allowlist_set():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin desk is disabled (POPULIS_ADMIN_PUBKEY_ALLOWLIST unset).",
@@ -545,7 +628,7 @@ async def admin_login(
       501  auth_type=='chia_bls' (BLS verification deferred to a
            later checkpoint; see the module-level comment)
     """
-    if not settings.admin_pubkey_allowlist_set():
+    if not settings.effective_admin_allowlist_set():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin desk is disabled (POPULIS_ADMIN_PUBKEY_ALLOWLIST unset).",
@@ -602,7 +685,7 @@ async def admin_login(
     # convention — short hex) OR the recovered compressed pubkey
     # (33-byte hex), so an operator can configure whichever they
     # prefer.  Compare lowercased.
-    allowlist = settings.admin_pubkey_allowlist_set()
+    allowlist = settings.effective_admin_allowlist_set()
     candidates = {
         recovery.address.lower(),
         recovery.compressed_pubkey_hex.lower(),

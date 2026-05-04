@@ -37,10 +37,20 @@ PCS_LAUNCHER = "0x" + ("ee" * 32)
 
 @pytest.fixture
 def fresh_settings(monkeypatch):
-    """Reset env + cached settings for every test."""
+    """Reset env + cached settings for every test.
+
+    Uses ``setenv("", "")`` (not ``delenv``) for string-typed keys so
+    the conftest's module-level mask of ``.env`` survives — see
+    ``conftest.py`` for why ``.env`` would otherwise leak through.
+    Integer-typed keys still use ``delenv`` because empty strings fail
+    Pydantic int validation.
+    """
     for key in (
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS",
+    ):
+        monkeypatch.setenv(key, "")
+    for key in (
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_QUORUM_M",
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION",
     ):

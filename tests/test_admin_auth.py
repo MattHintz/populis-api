@@ -200,8 +200,8 @@ class TestJWTSecretCaching:
         # POP-CANON-016: random fallback is allowed only when the
         # allowlist is empty (admin desk disabled).  This test exercises
         # the dev/test-only path.
-        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
-        monkeypatch.delenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", raising=False)
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
         get_settings.cache_clear()
         s = get_settings()
         secret1 = admin_auth.get_jwt_secret(s)
@@ -224,7 +224,7 @@ class TestJWTSecretCaching:
         # refuse rather than silently generate a per-process random
         # secret.  The silent path produces intermittent 403s under
         # multi-worker deployments because each worker's secret diverges.
-        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
         monkeypatch.setenv(
             "POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER,
         )
@@ -244,8 +244,8 @@ class TestStartupValidator:
     """
 
     def test_passes_when_admin_desk_disabled(self, monkeypatch):
-        monkeypatch.delenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", raising=False)
-        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
         get_settings.cache_clear()
         # No exception, no return value — just logs an "admin desk disabled" line.
         admin_auth.validate_admin_config_at_startup(get_settings())
@@ -263,7 +263,7 @@ class TestStartupValidator:
 
     def test_raises_when_allowlist_set_but_secret_missing(self, monkeypatch):
         monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-        monkeypatch.delenv("POPULIS_ADMIN_JWT_SECRET", raising=False)
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
         get_settings.cache_clear()
         with pytest.raises(RuntimeError, match="POPULIS_ADMIN_JWT_SECRET"):
             admin_auth.validate_admin_config_at_startup(get_settings())
@@ -277,9 +277,9 @@ class TestStartupValidator:
         """
         monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
         monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
-        monkeypatch.delenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS", raising=False
-        )
+        # setenv("", "") rather than delenv so the conftest's .env
+        # mask survives — see conftest.py for why.
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS", "")
         get_settings.cache_clear()
         with pytest.raises(RuntimeError, match=r"(?i)drift|authority"):
             admin_auth.validate_admin_config_at_startup(get_settings())
@@ -305,7 +305,7 @@ class TestStartupValidator:
 # ── Endpoints ────────────────────────────────────────────────────────────────
 class TestChallenge:
     def test_503_when_allowlist_empty(self, monkeypatch):
-        monkeypatch.delenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", raising=False)
+        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
         get_settings.cache_clear()
         app = FastAPI()
         app.include_router(admin_auth.router)
