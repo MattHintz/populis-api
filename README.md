@@ -1,9 +1,16 @@
 # Populis API
 
-Backend for the Populis Portal.  Turns EVM and Chia wallet signatures into
-launched vault singletons on Chia testnet11 (via coinset.org), and runs
-the operator-side admin desk that drives genesis deployment, mint
-proposals, and the on-chain trust-root singletons (A.1..A.4).
+Backend for the Populis Portal.  Turns EVM and Chia wallet signatures
+into launched vault singletons on Chia testnet11 (via coinset.org),
+plus operator endpoints for genesis deployment and mint-proposal
+persistence used by the admin desk.
+
+> **Phase 9-Hermes-D**: the portal now owns the admin-desk UX (mint
+> proposals, trust roots, key rotation) and reads on-chain state
+> directly from coinset.org via WASM.  The endpoints under
+> `/admin/mint/*` and the `/admin/auth/*` flow remain for backward
+> compat with the legacy server-side admin tooling, but the canonical
+> operator path is now the portal's WASM-first flow.
 
 > **Operator audience?**  Skip ahead:
 > - **`GENESIS_README.md`** — first-time protocol bootstrap (PGT, pool, governance, A.2/A.3/A.4 singletons).
@@ -32,10 +39,13 @@ proposals, and the on-chain trust-root singletons (A.1..A.4).
    `GET /vault/by-evm/{address}` returns the vault for a given
    owner key.
 5. **Admin desk + genesis deploy** — operator endpoints under
-   `/admin/*` drive the one-shot genesis deployment, the interactive
-   mint-proposal workflow, and the four A.x trust-root singletons
-   (protocol-config, admin-authority, property-registry,
-   mint-proposal).
+   `/admin/*` provide the one-shot genesis deployment helper plus a
+   server-side mint-proposal store retained for backward compat.
+   Trust-root singleton state (admin-authority v1+v2, protocol-config,
+   property-registry, mint-proposal) is exposed read-only via
+   `/admin/auth/authority` and `/admin/auth/authority_v2` so the
+   portal (and any external monitor) can verify the on-chain quorum
+   without re-implementing the singleton-walker logic.
 
 ## Quick start
 
@@ -70,7 +80,8 @@ Server docs at `http://localhost:8787/docs`.
 | POST   | `/vault/register/chia` | Verify BLS signature → build + push launcher |
 | GET    | `/vault/{launcher_id}` | Vault state (confirmed, current coin id, balance) |
 | GET    | `/vault/by-evm/{address}` | Look up vault by owner EVM address |
-| GET    | `/admin/auth/authority` | **A.2** public snapshot of the on-chain admin-authority singleton state |
+| GET    | `/admin/auth/authority` | **A.2 v1** public snapshot of the on-chain admin-authority singleton state (BLS m-of-n) |
+| GET    | `/admin/auth/authority_v2` | **A.2 v2** public snapshot of the CHIP-0043 MIPS quorum admin-authority singleton (used by the portal's `/admin/login` flow to cross-check the env-pinned MIPS root) |
 
 ### Admin (JWT-gated — see `ADMIN_README.md`)
 
