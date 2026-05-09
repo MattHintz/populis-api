@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 # Bumping this triggers ``_migrate`` on next ``MintProposalStore`` open.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # ── Lifecycle state machine ──────────────────────────────────────────────────
@@ -274,9 +274,8 @@ class MintProposalStore:
           * length(<32-byte field>) == 32 — every puzhash / coin_id must
             be exactly bytes32,
           * ``state`` is one of the eight legal values,
-          * ``property_id`` is unique while a proposal is active (the
-            partial index excludes terminal/canceled rows so a failed
-            mint doesn't permanently lock out the same property),
+          * ``property_id`` is unique while a proposal is active or
+            minted; only failed/canceled rows allow a re-attempt,
           * ``proposal_hash`` is globally unique because two distinct
             proposals can never share the same on-chain identity.
         """
@@ -334,13 +333,12 @@ class MintProposalStore:
                 CHECK (deed_launcher_id         IS NULL OR length(deed_launcher_id)         = 32)
             )
         """)
-        # Active-proposal uniqueness: a property can be in at most one
-        # non-terminal proposal at a time.  Failed/Canceled don't block
-        # a re-attempt.
+        # Active-or-minted uniqueness: a property can be in at most one
+        # proposal that can still become, or already is, a deed.
         cur.execute("""
             CREATE UNIQUE INDEX idx_mint_proposals_active_property
                 ON mint_proposals (property_id)
-                WHERE state NOT IN ('FAILED','CANCELED','MINTED')
+                WHERE state NOT IN ('FAILED','CANCELED')
         """)
         cur.execute("""
             CREATE UNIQUE INDEX idx_mint_proposals_proposal_hash
@@ -357,6 +355,14 @@ class MintProposalStore:
                 updated_at        INTEGER NOT NULL,
                 CHECK (length(deed_launcher_id) = 32)
             )
+        """)
+
+    def _migrate_to_v2(self, cur: sqlite3.Cursor) -> None:
+        cur.execute("DROP INDEX IF EXISTS idx_mint_proposals_active_property")
+        cur.execute("""
+            CREATE UNIQUE INDEX idx_mint_proposals_active_property
+                ON mint_proposals (property_id)
+                WHERE state NOT IN ('FAILED','CANCELED')
         """)
 
     # ── transaction helper ─────────────────────────────────────────
@@ -502,7 +508,7 @@ class MintProposalStore:
                 """
                 SELECT * FROM mint_proposals
                 WHERE property_id = ?
-                  AND state NOT IN ('FAILED','CANCELED','MINTED')
+                  AND state NOT IN ('FAILED','CANCELED')
                 """,
                 (property_id,),
             ).fetchone()

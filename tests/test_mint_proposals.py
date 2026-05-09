@@ -190,6 +190,19 @@ class TestUniqueness:
         assert rec2.state == "DRAFT"
         assert rec2.id != rec.id
 
+    def test_property_re_attempt_after_minted_rejected(self, store):
+        rec = store.create(**_new_args(suffix=29))
+        rec = store.set_published(rec.id, **_publish_args(suffix=29))
+        rec = store.set_voting(rec.id)
+        rec = store.set_passed(rec.id)
+        rec = store.set_executed(rec.id, executed_bundle_id="bundle-executed")
+        rec = store.set_minted(rec.id, deed_launcher_id=_b32(0x29))
+        assert rec.state == "MINTED"
+        assert store.get_by_property_id(" us-tx-travis-0029 ").id == rec.id
+
+        with pytest.raises(DuplicateProperty):
+            store.create(**_new_args(suffix=29))
+
     def test_duplicate_proposal_hash_rejected_at_publish(self, store):
         # The proposal_hash uniqueness check fires at set_published,
         # because that's when the field is first populated.  Two
