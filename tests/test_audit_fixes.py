@@ -326,6 +326,34 @@ class TestPopIsWriteOnceReadOnce:
         assert ch3 is not None
 
 
+class TestChallengeRequestValidationBeforeAllocation:
+    def test_public_evm_challenge_invalid_address_does_not_allocate(self) -> None:
+        from fastapi.testclient import TestClient
+        from populis_api.app import app, get_challenge_store
+
+        store = ChallengeStore(ttl_seconds=300, max_pending=1, per_ip_per_minute=100)
+        app.dependency_overrides[get_challenge_store] = lambda: store
+        try:
+            with TestClient(app) as client:
+                bad = client.post(
+                    "/auth/challenge",
+                    json={"address": "0x1234", "auth_type": "evm"},
+                )
+                assert bad.status_code == 422
+                assert len(store) == 0
+
+                good = client.post(
+                    "/auth/challenge",
+                    json={
+                        "address": "0x1234567890123456789012345678901234567890",
+                        "auth_type": "evm",
+                    },
+                )
+                assert good.status_code == 200, good.text
+        finally:
+            app.dependency_overrides.clear()
+
+
 # ============================================================================
 # POP-CANON-004 / TRUTH-1 — push_tx success/failure surfaced
 # ============================================================================

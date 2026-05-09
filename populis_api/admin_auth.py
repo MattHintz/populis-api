@@ -37,11 +37,11 @@ from typing import Annotated, Any, Literal, Optional
 import jwt as pyjwt
 from eth_utils import to_checksum_address
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .challenges import ChallengeStore, ChallengeStoreFullError, RateLimitedError
 from .config import Settings, get_settings
-from .evm_auth import recover_evm_signer
+from .evm_auth import normalize_evm_address, recover_evm_signer
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/auth", tags=["admin-auth"])
@@ -522,6 +522,12 @@ class AdminChallengeRequest(BaseModel):
     owner: str = Field(..., description="0x-prefixed Ethereum address (EVM) "
                                         "or 0x-prefixed BLS G1 pubkey hex.")
     auth_type: AuthType = Field("evm")
+
+    @model_validator(mode="after")
+    def validate_owner_for_auth_type(self):
+        if self.auth_type == "evm":
+            self.owner = normalize_evm_address(self.owner, "owner")
+        return self
 
 
 class AdminChallengeResponse(BaseModel):

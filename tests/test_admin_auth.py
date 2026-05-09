@@ -328,6 +328,15 @@ class TestChallenge:
         assert body["expires_at"] > int(time.time())
         assert body["typed_data"]["primaryType"] == ADMIN_LOGIN_PRIMARY_TYPE
 
+    def test_invalid_evm_owner_does_not_allocate_challenge(self, client):
+        store = admin_auth.get_admin_challenges()
+        resp = client.post(
+            "/admin/auth/challenge",
+            json={"owner": "0x1234", "auth_type": "evm"},
+        )
+        assert resp.status_code == 422
+        assert len(store) == 0
+
     def test_chia_bls_returns_minimal_envelope(self, client):
         resp = client.post(
             "/admin/auth/challenge",

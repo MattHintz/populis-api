@@ -105,13 +105,26 @@ def registration_typed_data(
         "primaryType": REGISTER_PRIMARY_TYPE,
         "domain": eip712_domain(),
         "message": {
-            "owner": to_checksum_address(owner_address),
+            "owner": normalize_evm_address(owner_address, "owner_address"),
             "nonce": nonce_hex,
             "poolLauncherId": pool_launcher_id_hex,
             "authType": auth_type,
             "chiaNetwork": chia_network,
         },
     }
+
+
+def normalize_evm_address(address: str, field_name: str = "address") -> str:
+    if not isinstance(address, str) or not address.startswith(("0x", "0X")):
+        raise ValueError(f"{field_name} must be a 0x-prefixed EVM address")
+    body = address[2:]
+    if len(body) != 40:
+        raise ValueError(f"{field_name} must be 20 bytes")
+    try:
+        bytes.fromhex(body)
+    except ValueError as e:
+        raise ValueError(f"{field_name} must be valid hex") from e
+    return to_checksum_address(address)
 
 
 def recover_evm_signer(typed_data: dict[str, Any], signature_hex: str) -> EvmRecovery:
@@ -180,6 +193,7 @@ __all__ = [
     "REGISTER_TYPES",
     "VAULT_SPEND_TYPEHASH_STRING",
     "eip712_domain",
+    "normalize_evm_address",
     "registration_typed_data",
     "recover_evm_signer",
     "EvmRecovery",

@@ -19,7 +19,7 @@ from typing import Annotated, Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
@@ -40,6 +40,7 @@ from .coinset_client import CoinsetClient
 from .config import Settings, get_settings
 from .evm_auth import (
     eip712_domain,
+    normalize_evm_address,
     recover_evm_signer,
     registration_typed_data,
     VAULT_SPEND_TYPEHASH_STRING,
@@ -326,6 +327,12 @@ class ProtocolInfo(BaseModel):
 class ChallengeRequest(BaseModel):
     address: str = Field(..., description="EVM address or Chia BLS pubkey hex")
     auth_type: str = Field(..., pattern="^(evm|chia_bls|passkey)$")
+
+    @model_validator(mode="after")
+    def validate_address_for_auth_type(self):
+        if self.auth_type == "evm":
+            self.address = normalize_evm_address(self.address, "address")
+        return self
 
 
 class ChallengeResponse(BaseModel):
