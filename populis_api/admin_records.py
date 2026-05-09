@@ -546,6 +546,39 @@ def verify_against_launcher_id(
         )
 
 
+def verify_admin_records_for_settings(
+    config: AdminRecordsConfig,
+    settings: object,
+) -> None:
+    """Validate loaded records against the live Settings trust root.
+
+    This is intentionally called on every cache hit and cache miss before
+    records become the active allowlist.  A post-boot file edit or env
+    drift must not bypass the same launcher/admins-hash checks that the
+    startup validator performs.
+    """
+    expected_hash_hex = getattr(
+        settings,
+        "protocol_admin_authority_v2_admins_hash",
+        None,
+    )
+    if not expected_hash_hex:
+        raise AdminRecordsDriftError(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH is required "
+            "when POPULIS_ADMIN_RECORDS_PATH is the live admin gating source. "
+            "Refusing to use unverifiable admin records as an allowlist."
+        )
+    expected_hash = _parse_hex32(
+        expected_hash_hex,
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+    )
+    verify_against_launcher_id(
+        config,
+        getattr(settings, "protocol_admin_authority_v2_launcher_id", None),
+    )
+    verify_against_admins_hash(config, expected_hash)
+
+
 __all__ = [
     "AdminRecordsConfig",
     "AdminRecordSpec",
@@ -555,6 +588,7 @@ __all__ = [
     "load_admin_records_from_path",
     "verify_against_admins_hash",
     "verify_against_launcher_id",
+    "verify_admin_records_for_settings",
     "get_admin_records_for_settings",
     "clear_admin_records_cache",
 ]
@@ -606,8 +640,10 @@ def get_admin_records_for_settings(settings: object) -> Optional[AdminRecordsCon
     key = (str(p.resolve()), mtime)
     cached = _records_cache.get(key)
     if cached is not None:
+        verify_admin_records_for_settings(cached, settings)
         return cached
 
     config = load_admin_records_from_path(p)
+    verify_admin_records_for_settings(config, settings)
     _records_cache[key] = config
     return config

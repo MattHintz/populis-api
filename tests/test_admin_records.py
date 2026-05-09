@@ -13,6 +13,7 @@ rather than during a real-chain verification.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,19 @@ def _write_json(tmp_path: Path, data: dict, filename: str = "admin_records.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data))
     return p
+
+
+def _pin_records_trust_root(monkeypatch, path: Path) -> AdminRecordsConfig:
+    config = load_admin_records_from_path(path)
+    monkeypatch.setenv(
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "0x" + config.compute_admins_hash().hex(),
+    )
+    monkeypatch.setenv(
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        "0x" + config.launcher_id.hex(),
+    )
+    return config
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -628,6 +642,7 @@ class TestSettingsIntegration:
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        _pin_records_trust_root(monkeypatch, path)
         # Legacy env var explicitly empty so we know the JSON path is winning.
         monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
         get_settings.cache_clear()
@@ -656,6 +671,7 @@ class TestSettingsIntegration:
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        _pin_records_trust_root(monkeypatch, path)
         monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", env_evm)
         get_settings.cache_clear()
         s = get_settings()
@@ -665,6 +681,55 @@ class TestSettingsIntegration:
             "JSON allowlist must NOT include env-var admin"
         )
         assert env_evm not in result
+
+    def test_records_path_requires_expected_admins_hash(self, tmp_path, monkeypatch):
+        from populis_api.config import get_settings
+
+        path = _write_json(tmp_path, _make_admin_records_dict())
+        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
+        get_settings.cache_clear()
+        s = get_settings()
+
+        with pytest.raises(AdminRecordsDriftError, match="ADMINS_HASH is required"):
+            s.effective_admin_allowlist_set()
+
+    def test_records_path_revalidates_hot_reload_before_allowlist(
+        self, tmp_path, monkeypatch
+    ):
+        from populis_api.config import get_settings
+
+        records_a = [
+            {
+                "admin_idx": 0,
+                "m_within": 1,
+                "leaves": [
+                    _make_leaf_dict(pubkey_seed=0x01, evm="0x" + "11" * 20),
+                ],
+            }
+        ]
+        records_b = [
+            {
+                "admin_idx": 0,
+                "m_within": 1,
+                "leaves": [
+                    _make_leaf_dict(pubkey_seed=0x02, evm="0x" + "22" * 20),
+                ],
+            }
+        ]
+        path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records_a))
+        _pin_records_trust_root(monkeypatch, path)
+        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        get_settings.cache_clear()
+        s = get_settings()
+        assert s.effective_admin_allowlist_set() == {"0x" + "11" * 20}
+
+        path.write_text(json.dumps(_make_admin_records_dict(admin_records=records_b)))
+        stat = path.stat()
+        os.utime(path, (stat.st_atime, stat.st_mtime + 10))
+
+        with pytest.raises(AdminRecordsDriftError, match="drift"):
+            s.effective_admin_allowlist_set()
 
     def test_falls_back_to_env_var_when_records_path_unset(self, monkeypatch):
         """Phase 2 backward-compat: when the JSON path is unset, the
@@ -756,9 +821,14 @@ class TestSettingsIntegration:
         ]
         # JSON binds to launcher 0x10*32; env binds to 0xfe*32.
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
+        config = load_admin_records_from_path(path)
 
         monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
         monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+            "0x" + config.compute_admins_hash().hex(),
+        )
         monkeypatch.setenv(
             "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
             "0x" + "fe" * 32,
@@ -787,6 +857,7 @@ class TestSettingsIntegration:
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        _pin_records_trust_root(monkeypatch, path)
         # Boot validator requires JWT secret when admin desk is
         # enabled (which records_path enables); set a dummy.
         monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)

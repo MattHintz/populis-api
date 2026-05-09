@@ -65,12 +65,11 @@ class AdminAuthorityV2Snapshot:
     """
 
     enabled: bool
-    """``False`` when the operator has not configured v2.
+    """``True`` only when the operator publishes a v2 launcher id.
 
-    All other fields are still populated for diagnostic display when
-    enabled is False (e.g., the operator might have computed the
-    launcher ID but not yet broadcast the launch spend — useful for
-    "ready to deploy" UI states)."""
+    Hash-only config is not enough to claim an enabled/deployed
+    singleton because auditors need a launcher id to locate and verify
+    the on-chain state."""
 
     launcher_id_hex: Optional[str]
     """0x-prefixed launcher coin id of the on-chain v2 singleton, or
@@ -129,6 +128,19 @@ class AdminAuthorityV2Snapshot:
         MIPS quorum (EIP-712 / BLS / passkey leaves).
     """
 
+    deployment_status: str
+    """Operator configuration status.
+
+    Values are ``"not-configured"``, ``"hash-config-only"``,
+    ``"launcher-only"``, or ``"deployed-configured"``.  Hash-only
+    settings are explicitly not chain-verifiable because auditors need
+    a launcher id to locate the singleton.
+    """
+
+    chain_verifiable: bool
+    """``True`` only when launcher id plus required state hashes are
+    present."""
+
 
 def _resolve_phase(
     enabled: bool,
@@ -181,9 +193,17 @@ def build_admin_authority_v2_snapshot(
     )
     version = settings.protocol_admin_authority_v2_version
 
-    enabled = bool(
-        launcher_id or mips_root or admins or pending
-    )
+    enabled = bool(launcher_id)
+    has_hash_config = bool(mips_root or admins or pending)
+    chain_verifiable = bool(launcher_id and mips_root and admins)
+    if chain_verifiable:
+        deployment_status = "deployed-configured"
+    elif launcher_id:
+        deployment_status = "launcher-only"
+    elif has_hash_config:
+        deployment_status = "hash-config-only"
+    else:
+        deployment_status = "not-configured"
 
     state_hash_hex: Optional[str] = None
     if mips_root and admins:
@@ -212,6 +232,8 @@ def build_admin_authority_v2_snapshot(
             v1_authority_version=settings.protocol_admin_authority_version,
             v2_authority_version=version,
         ),
+        deployment_status=deployment_status,
+        chain_verifiable=chain_verifiable,
     )
 
 

@@ -78,6 +78,8 @@ class TestBuildV2Snapshot:
         assert snap.authority_version == 1  # default
         assert snap.state_hash_hex is None
         assert snap.phase == "1-not-deployed"
+        assert snap.deployment_status == "not-configured"
+        assert snap.chain_verifiable is False
 
     def test_only_launcher_set_marks_enabled_but_no_state_hash(
         self, fresh_settings, monkeypatch
@@ -95,6 +97,8 @@ class TestBuildV2Snapshot:
         assert snap.launcher_id_hex == LAUNCHER_HEX
         # Without mips_root + admins, state_hash is undefined.
         assert snap.state_hash_hex is None
+        assert snap.deployment_status == "launcher-only"
+        assert snap.chain_verifiable is False
 
     def test_full_config_computes_state_hash(self, fresh_settings, monkeypatch):
         """Happy path: all four hash fields + version → state_hash is
@@ -126,6 +130,8 @@ class TestBuildV2Snapshot:
         assert snap.admins_hash_hex == ADMINS_HASH_HEX
         assert snap.pending_ops_hash_hex == PENDING_OPS_HASH_HEX
         assert snap.authority_version == 5
+        assert snap.deployment_status == "deployed-configured"
+        assert snap.chain_verifiable is True
 
         # state_hash should match what compute_state_hash produces with
         # the same inputs — this is the cross-repo binding point with
@@ -160,6 +166,8 @@ class TestBuildV2Snapshot:
         snap = build_admin_authority_v2_snapshot(get_settings())
 
         assert snap.pending_ops_hash_hex is None
+        assert snap.deployment_status == "deployed-configured"
+        assert snap.chain_verifiable is True
         # state_hash should still be computed using EMPTY_LIST_HASH.
         expected = compute_state_hash(
             mips_root_hash=bytes.fromhex(MIPS_ROOT_HEX[2:]),
@@ -208,6 +216,26 @@ class TestBuildV2Snapshot:
         # Output is normalised to 0x-prefixed form regardless.
         assert snap.mips_root_hash_hex == "0x" + bare_hex
 
+    def test_hash_only_config_is_not_enabled_or_chain_verifiable(
+        self, fresh_settings, monkeypatch
+    ):
+        """Hash-only config may be useful diagnostics, but without a
+        launcher id auditors cannot locate a singleton to verify.
+        """
+        monkeypatch.setenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+        )
+        monkeypatch.setenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+        )
+        get_settings.cache_clear()
+        snap = build_admin_authority_v2_snapshot(get_settings())
+        assert snap.enabled is False
+        assert snap.deployment_status == "hash-config-only"
+        assert snap.chain_verifiable is False
+        assert snap.phase == "1-not-deployed"
+        assert snap.state_hash_hex is not None
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # /admin/auth/authority_v2 endpoint
@@ -236,6 +264,8 @@ class TestAuthorityV2Endpoint:
         assert body["pending_ops_hash"] is None
         assert body["state_hash"] is None
         assert body["phase"] == "1-not-deployed"
+        assert body["deployment_status"] == "not-configured"
+        assert body["chain_verifiable"] is False
         # Transparency disclaimer fields surface even when disabled.
         assert body["informational_only"] is True
         assert body["gating_source"] == "POPULIS_ADMIN_PUBKEY_ALLOWLIST"
@@ -277,7 +307,27 @@ class TestAuthorityV2Endpoint:
         assert body["authority_version"] == 7
         assert body["state_hash"] is not None and body["state_hash"].startswith("0x")
         assert body["phase"] == "2-informational-only"
+        assert body["deployment_status"] == "deployed-configured"
+        assert body["chain_verifiable"] is True
         assert body["informational_only"] is True
+
+    def test_endpoint_reports_hash_only_config_as_not_enabled(
+        self, fresh_settings, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+        )
+        monkeypatch.setenv(
+            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+        )
+        get_settings.cache_clear()
+        client = self._client()
+        resp = client.get("/admin/auth/authority_v2")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["enabled"] is False
+        assert body["deployment_status"] == "hash-config-only"
+        assert body["chain_verifiable"] is False
 
     def test_endpoint_does_not_require_authentication(self, fresh_settings):
         """The endpoint is intentionally public so external auditors

@@ -250,6 +250,8 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
                 f"Failed to load admin records from "
                 f"POPULIS_ADMIN_RECORDS_PATH={settings.admin_records_path!r}: {e}"
             ) from e
+        except AdminRecordsDriftError as e:
+            raise RuntimeError(str(e)) from e
         if records is None:
             # Should not happen — admin_records_path is set so loader
             # returns a config or raises.  Defensive belt-and-braces.
@@ -821,6 +823,8 @@ async def admin_authority_v2(
         "pending_ops_hash": snap.pending_ops_hash_hex,
         "authority_version": snap.authority_version,
         "state_hash": snap.state_hash_hex,
+        "deployment_status": snap.deployment_status,
+        "chain_verifiable": snap.chain_verifiable,
         # Migration phase indicator. Mirrors v1's `phase` field shape
         # so consumers can pick the same handling code path.
         "phase": snap.phase,
