@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "populis_api"
 version = "0.1.0"
-description = "Populis Protocol API — vault registration, coinset.org broker, EIP-712 pubkey recovery"
+description = "Populis faucet API for vault launcher funding, registration challenges, and legacy operator endpoints"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary - All Rights Reserved" }

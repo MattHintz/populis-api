@@ -1,51 +1,47 @@
 # Populis API
 
-Backend for the Populis Portal.  Turns EVM and Chia wallet signatures
-into launched vault singletons on Chia testnet11 (via coinset.org),
-plus operator endpoints for genesis deployment and mint-proposal
-persistence used by the admin desk.
+FastAPI service for the parts of Populis that still need a server-side
+wallet: faucet-funded vault launcher spends, EIP-712/BLS registration
+challenges, persisted vault registration status, and operator bootstrap
+helpers.
 
 > **Phase 9-Hermes-D**: the portal now owns the admin-desk UX (mint
-> proposals, trust roots, key rotation) and reads on-chain state
-> directly from coinset.org via WASM.  The endpoints under
-> `/admin/mint/*` and the `/admin/auth/*` flow remain for backward
-> compat with the legacy server-side admin tooling, but the canonical
-> operator path is now the portal's WASM-first flow.
+> proposal drafts, trust roots, admin-authority-v2 launch, and key
+> rotation flows) and reads Chia state directly from coinset.org via
+> `chia-wallet-sdk-wasm`.  The API's `/admin/auth/*` and
+> `/admin/mint/*` endpoints are compatibility surfaces for the older
+> server-side admin desk, not the canonical operator path.
 
 > **Operator audience?**  Skip ahead:
 > - **`GENESIS_README.md`** — first-time protocol bootstrap (PGT, pool, governance, A.2/A.3/A.4 singletons).
 > - **`ADMIN_README.md`** — day-to-day admin-desk operations (JWT, mint proposals, key rotation).
 > - **`SECURITY.md`** — full audit trail (POP-CANON-* findings, A.x phase status).
 
-## What it does
+## Current technical scope
 
-1. **User onboarding** — issues short-lived challenge nonces + EIP-712
-   typed-data envelopes for the frontend to sign.
-2. **Vault creation** — recovers the user's secp256k1 public key from
-   the signed EIP-712 payload (server-side ecrecover) — this is what
-   Populis curries into the vault singleton as `OWNER_PUBKEY` for
-   `AUTH_TYPE_SECP256K1`.
-3. **Launcher broadcast** — selects an unspent XCH coin from the
-   configured **faucet**, builds a signed two-coin launcher bundle
-   (parent + launcher), and broadcasts to coinset.org's `push_tx`.
-   The faucet's per-spend cap is enforced at coin selection time, and
-   a configurable opt-in worker periodically consolidates the
-   faucet's UTXO set so registration cost stays constant as volume
-   grows.
-4. **Registry persistence** — registered vaults live in a SQLite
-   database (WAL mode, indexed reverse lookup by EVM address) so
-   state survives process restart.  Frontends poll
-   `GET /vault/{launcher_id}` for confirmation status;
-   `GET /vault/by-evm/{address}` returns the vault for a given
-   owner key.
-5. **Admin desk + genesis deploy** — operator endpoints under
-   `/admin/*` provide the one-shot genesis deployment helper plus a
-   server-side mint-proposal store retained for backward compat.
-   Trust-root singleton state (admin-authority v1+v2, protocol-config,
-   property-registry, mint-proposal) is exposed read-only via
-   `/admin/auth/authority` and `/admin/auth/authority_v2` so the
-   portal (and any external monitor) can verify the on-chain quorum
-   without re-implementing the singleton-walker logic.
+1. **Registration challenges** — issues short-lived nonces plus the
+   EIP-712 typed data or BLS message the portal asks the wallet to
+   sign.
+2. **Faucet-funded vault launches** — verifies the wallet signature,
+   recovers or checks the owner pubkey, selects a faucet coin, builds
+   the parent + singleton-launcher spend bundle, signs the faucet
+   spend, and pushes the bundle to coinset.org.
+3. **Registration persistence** — records launched vaults in SQLite
+   so callers can look up the API-observed launch result by launcher
+   id or EVM address.  The current portal also performs chain-native
+   discovery after registration using CHIP-22 hints and singleton
+   lineage reads from coinset.org.
+4. **Protocol/bootstrap metadata** — exposes `/health`, `/protocol`,
+   the deployment manifest, faucet address/balance, protocol puzzle
+   hashes, and optional A.x trust-root coordinates.
+5. **Operator bootstrap** — keeps the static-token gated genesis
+   helper (`/admin/deploy/protocol`) for first-time testnet
+   deployments.
+6. **Legacy admin compatibility** — keeps JWT login and the
+   SQLite-backed mint-proposal CRUD endpoints for older tooling.
+   `propose`, `list`, `read`, and DRAFT `cancel` are implemented;
+   chain-moving `publish`, `execute`, and committee `vote` currently
+   return `501` placeholders.
 
 ## Quick start
 
@@ -83,20 +79,21 @@ Server docs at `http://localhost:8787/docs`.
 | GET    | `/admin/auth/authority` | **A.2 v1** public snapshot of the on-chain admin-authority singleton state (BLS m-of-n) |
 | GET    | `/admin/auth/authority_v2` | **A.2 v2** public snapshot of the CHIP-0043 MIPS quorum admin-authority singleton (used by the portal's `/admin/login` flow to cross-check the env-pinned MIPS root) |
 
-### Admin (JWT-gated — see `ADMIN_README.md`)
+### Legacy admin compatibility (JWT-gated — see `ADMIN_README.md`)
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST   | `/admin/auth/challenge` | Issue admin login nonce |
 | POST   | `/admin/auth/login` | Verify wallet sig → return short-lived JWT |
 | POST   | `/admin/auth/refresh` | Refresh active JWT |
+| POST   | `/admin/auth/eip712/compute_leaf_hash` | Deterministic Eip712Member leaf-hash helper for admin-authority-v2 records |
 | POST   | `/admin/mint/propose` | Create a mint proposal (DRAFT) |
 | GET    | `/admin/mint`, `/admin/mint/{id}` | List / read mint proposals |
 | POST   | `/admin/mint/{id}/cancel` | Cancel a DRAFT proposal |
-| POST   | `/admin/mint/{id}/publish` | DRAFT → APPROVED |
-| POST   | `/admin/mint/{id}/execute` | APPROVED → EXECUTED |
+| POST   | `/admin/mint/{id}/publish` | `501` placeholder; chain publish moved to client/WASM work |
+| POST   | `/admin/mint/{id}/execute` | `501` placeholder; chain execute moved to client/WASM work |
 | GET    | `/admin/committee/proposals` | Public committee view (no auth — for the PGT-VOTE flow) |
-| POST   | `/admin/committee/vote` | Submit a PGT-VOTE bundle |
+| POST   | `/admin/committee/vote` | `501` placeholder for PGT-VOTE bundle submission |
 
 ### Operator (admin-token-gated — see `GENESIS_README.md`)
 
