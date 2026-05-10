@@ -134,6 +134,48 @@ the displayed wallet committed on chain and mirrored by
 `admin_records.json`, not the operator token, a transient bootstrap
 cookie, or frontend environment injection.
 
+### Bootstrap finalize recordation contract
+
+The final bootstrap mutation is `POST /admin/bootstrap/finalize`.  It is
+the only browser-facing write that records the first-admin ceremony after
+the protocol deployment manifest already exists:
+
+1. It is authorized by `require_bootstrap_session` and therefore requires
+   a valid short-lived `populis_bootstrap_session` cookie.  A normal admin
+   JWT, bearer token, or raw `POPULIS_ADMIN_TOKEN` is not sufficient for
+   this endpoint.
+2. The request body contains the public first-admin artifacts and
+   commitments: `admin_records`, `admin_authority_launcher_id`,
+   `admins_hash`, `mips_root`, and optional read-only API/coinset URLs.
+   The endpoint loads the existing `deployment_manifest.json`; it must not
+   invent protocol coordinates from portal env.
+3. The API builds public-only artifacts, validates them against credential
+   markers, and persists them in this order:
+   `admin_records.json`, `portal_runtime_config.json`, then
+   `bootstrap_manifest.json`.
+4. `bootstrap_manifest.json` is the lock marker.  It is written last; once
+   present, challenge issuance and bootstrap finalization must fail closed
+   rather than overwrite permanent records.
+5. A successful response returns only public `bootstrap_manifest` and
+   `portal_runtime_config` objects and clears the bootstrap session cookie.
+   It never returns or persists raw wallet signatures, auth nonces,
+   bootstrap JWT/cookie material, bearer headers, faucet keys, or
+   `POPULIS_ADMIN_TOKEN`.
+6. The portal launch-authority flow calls `AdminBootstrapService.finalizeBootstrap`
+   only after the admin-authority launch has been submitted, first-admin
+   wallet metadata is known, `admins_hash` is live, and the MIPS root is
+   filled.  The request is cookie-only (`withCredentials`) and sends no
+   `Authorization` header.
+7. The portal displays returned `bootstrap_manifest.json` and
+   `portal_runtime_config.json` as read-only public artifacts and keeps
+   them visible after the bootstrapper flips to locked.  It must not store
+   the bootstrap token, session, raw signature, or finalized artifacts in
+   `localStorage` or `sessionStorage`.
+8. `/admin/genesis` treats locked bootstrap as terminal: it disables
+   starting another bootstrap session, hides the first-admin launch CTA,
+   names the durable public artifacts, and points the operator to
+   permanent admin login using the recorded admin slot `0` wallet.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony

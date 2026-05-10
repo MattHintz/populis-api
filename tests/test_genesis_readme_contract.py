@@ -124,3 +124,60 @@ def test_genesis_readme_forbids_first_admin_artifact_secret_leakage() -> None:
     assert "JWT secrets" in text
     assert "faucet private keys" in text
     assert "any bearer credential" in text
+
+
+def test_genesis_readme_pins_bootstrap_finalize_endpoint_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap finalize recordation contract" in text
+    assert "final bootstrap mutation is `POST /admin/bootstrap/finalize`" in text
+    assert "authorized by `require_bootstrap_session`" in text
+    assert "requires a valid short-lived `populis_bootstrap_session` cookie" in text
+    assert "A normal admin JWT, bearer token, or raw `POPULIS_ADMIN_TOKEN` is not sufficient" in text
+    for field in (
+        "`admin_records`",
+        "`admin_authority_launcher_id`",
+        "`admins_hash`",
+        "`mips_root`",
+    ):
+        assert field in text
+    assert "loads the existing `deployment_manifest.json`" in text
+    assert "must not invent protocol coordinates from portal env" in text
+
+
+def test_genesis_readme_pins_finalize_artifact_order_and_lock() -> None:
+    text = " ".join(_readme().split())
+
+    assert "persists them in this order: `admin_records.json`, `portal_runtime_config.json`, then `bootstrap_manifest.json`" in text
+    assert "`bootstrap_manifest.json` is the lock marker" in text
+    assert "It is written last" in text
+    assert "challenge issuance and bootstrap finalization must fail closed" in text
+    assert "rather than overwrite permanent records" in text
+    assert "clears the bootstrap session cookie" in text
+    assert "returns only public `bootstrap_manifest` and `portal_runtime_config` objects" in text
+
+
+def test_genesis_readme_pins_portal_finalize_ui_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "portal launch-authority flow calls `AdminBootstrapService.finalizeBootstrap`" in text
+    assert "only after the admin-authority launch has been submitted" in text
+    assert "first-admin wallet metadata is known" in text
+    assert "`admins_hash` is live" in text
+    assert "MIPS root is filled" in text
+    assert "request is cookie-only (`withCredentials`) and sends no `Authorization` header" in text
+    assert "displays returned `bootstrap_manifest.json` and `portal_runtime_config.json`" in text
+    assert "keeps them visible after the bootstrapper flips to locked" in text
+    assert "must not store the bootstrap token, session, raw signature, or finalized artifacts" in text
+    assert "`localStorage` or `sessionStorage`" in text
+
+
+def test_genesis_readme_pins_genesis_page_locked_bootstrap_terminal_state() -> None:
+    text = " ".join(_readme().split())
+
+    assert "`/admin/genesis` treats locked bootstrap as terminal" in text
+    assert "disables starting another bootstrap session" in text
+    assert "hides the first-admin launch CTA" in text
+    assert "names the durable public artifacts" in text
+    assert "points the operator to permanent admin login" in text
+    assert "recorded admin slot `0` wallet" in text
