@@ -4,8 +4,91 @@
 > from a fresh chain.  Once these steps are done, day-to-day operations
 > live in **`ADMIN_README.md`**.
 
-A complete Populis genesis comprises **seven** on-chain singletons /
-coins, deployed in two phases:
+## Bootstrap invariants
+
+Genesis has a hard chicken-or-egg boundary:
+
+- `POPULIS_ADMIN_TOKEN` is a bootstrap operator token, not a protocol
+  admin identity.
+- `POST /admin/deploy/protocol` deploys the base protocol stack; it
+  does not create the `admin_authority_v2` singleton and does not make
+  the caller the first admin.
+- The first protocol admin cannot be voted in by an existing admin,
+  because no protocol admin exists yet.
+- The first admin must be born at admin-authority genesis as admin slot
+  `0`, with its initial admin record, `admins_hash`, and MIPS root
+  committed into the first `admin_authority_v2` singleton state.
+- Later admin/key rotation is self-governed by the existing
+  admin-authority state and its cooldown paths.
+- PGT holders are committee/governance participants, not admin-desk
+  admins.  PGT voting can drive governance proposals, but it is a
+  separate authority system from admin login and admin-authority
+  rotation.
+
+Until Phase 0 is fully wired in the portal/API, treat Phase A protocol
+deployment and A.5 first-admin authority launch as two separate steps.
+The temporary legacy/env allowlist path may help operators reach the
+existing authority wizard, but it is not the desired final genesis
+ceremony.
+
+---
+
+## Phase 0 brick map — first-admin birth ceremony
+
+Extreme-atomic implementation order:
+
+```text
+Brick -1 — Genesis doctrine and docs-contract tests
+Repo: populis_api
+Layer: docs/test scaffolding
+Goal: Pin the bootstrap invariants before changing behavior.
+Outputs: This README section plus tests that fail if the doctrine is removed.
+Tests: pytest tests/test_genesis_readme_contract.py
+Stop condition: docs state that /admin/deploy/protocol is base protocol only
+and that first admin must be born at admin-authority genesis.
+
+Brick 0.1 — Portal copy/UX guardrails
+Repo: populis_portal
+Layer: /admin/genesis component
+Goal: Make the UI say plainly that base genesis does not create admin slot 0.
+Tests: focused component tests for the warning and next-step copy.
+
+Brick 0.2 — Bootstrap-accessible first-admin launch
+Repo: populis_portal
+Layer: routing/auth boundary
+Goal: Allow first-admin launch during bootstrap without requiring an admin JWT.
+Tests: route/guard tests proving bootstrap access does not open the normal desk.
+
+Brick 0.3 — First-admin wallet capture in genesis
+Repo: populis_portal
+Layer: EVM wallet/admin record preparation
+Goal: Capture the intended admin-0 wallet before launch and show the operator
+exactly which address/pubkey will become first admin.
+Tests: service/component tests around pubkey recovery, record preview, and
+no token persistence.
+
+Brick 0.4 — Combined bootstrap manifest
+Repo: populis_portal + populis_api
+Layer: manifest handoff
+Goal: Produce/export a single bootstrap manifest containing protocol
+deployment data, admin-authority launcher id, admin records, admins_hash,
+MIPS root, and required env/runtime values.
+Tests: pure manifest-builder tests plus API/admin-record hash validation tests.
+
+Brick 0.5 — Admin rotation semantics audit
+Repo: populis_protocol
+Layer: admin_authority_v2
+Goal: Confirm whether current KEY_ADD_* paths add keys to an existing admin
+slot only, or whether a distinct brand-new admin-slot add path is required.
+Tests: CLVM/unit tests that distinguish key addition, slot addition, removal,
+MIPS root updates, and operational authorization after activation.
+```
+
+---
+
+A complete Populis deployment currently comprises **seven** on-chain
+singletons / coins, deployed in two implementation phases after the
+bootstrap doctrine above is satisfied:
 
 ```
  Phase A — atomic genesis (one block)
