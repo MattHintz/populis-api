@@ -131,6 +131,57 @@ def test_genesis_readme_forbids_first_admin_artifact_secret_leakage() -> None:
     assert "any bearer credential" in text
 
 
+def test_genesis_readme_pins_admin_authority_artifact_boundary() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Admin-authority artifact boundary" in text
+    assert "`admin_records.json` is the canonical off-chain roster reveal" in text
+    assert "`admin_records` ordered by `admin_idx`" in text
+    assert "At genesis this file contains admin slot `0` only" in text
+    assert "`bootstrap_manifest.json` commits to `admin_authority_v2.launcher_id`" in text
+    assert "`admin_authority_v2.admins_hash`" in text
+    assert "`admin_authority_v2.mips_root`" in text
+    assert "`artifact_hashes.admin_records_json`" in text
+    assert "The initial authority version is `1`" in text
+    assert "must name the live `authority_version`" in text
+
+
+def test_genesis_readme_pins_runtime_config_as_read_only_discovery() -> None:
+    text = " ".join(_readme().split())
+
+    assert "`portal_runtime_config.json` may repeat public coordinates under `admin_authority_v2`" in text
+    for field in (
+        "`launcher_id`",
+        "`admins_hash`",
+        "`mips_root`",
+        "`admin_records_hash`",
+    ):
+        assert field in text
+    assert "read-only runtime discovery" in text
+    assert "not an authority source" in text
+    assert "not an authorization token" in text
+    assert "Mutable bootstrap routes must not edit `admin_records.json`" in text
+    assert "replace `bootstrap_manifest.json`" in text
+    assert "change the runtime-config authority coordinates" in text
+
+
+def test_genesis_readme_pins_post_genesis_roster_update_boundary() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Future roster additions are normal admin-authority spends, not a bootstrap mutation" in text
+    assert "`ADMIN_ROSTER_UPDATE`" in text
+    assert "`SPEND_ADMIN_ROSTER_UPDATE = 0x07`" in text
+    assert "authorized by the current MIPS admin authority" in text
+    assert "append exactly one new admin slot" in text
+    assert "update `ADMINS_HASH` and `MIPS_ROOT_HASH` atomically" in text
+    assert "preserve `PENDING_KEY_OPS_HASH`" in text
+    assert "bump `authority_version`" in text
+    assert "on-chain announced `ADMINS_HASH`" in text
+    assert "Local edits that do not correspond to a confirmed authority spend are invalid" in text
+    assert "Key-rotation paths (`KEY_ADD_*` and `KEY_REMOVE_*`) mutate keys inside existing admin slots only" in text
+    assert "not admin-slot creation paths" in text
+
+
 def test_genesis_readme_pins_bootstrap_finalize_endpoint_contract() -> None:
     text = " ".join(_readme().split())
 

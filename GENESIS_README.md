@@ -136,6 +136,45 @@ the displayed wallet committed on chain and mirrored by
 `admin_records.json`, not the operator token, a transient bootstrap
 cookie, or frontend environment injection.
 
+### Admin-authority artifact boundary
+
+The first-admin artifacts are also the root of the durable
+`admin_authority_v2` audit trail.  They must stay public, replayable, and
+strictly separated from any credential:
+
+1. `admin_records.json` is the canonical off-chain roster reveal.  It
+   contains `version`, `launcher_id`, and `admin_records` ordered by
+   `admin_idx`; each record contains `admin_idx`, `m_within`, and
+   kind-specific public leaves.  At genesis this file contains admin slot
+   `0` only.
+2. `bootstrap_manifest.json` commits to
+   `admin_authority_v2.launcher_id`, `admin_authority_v2.admins_hash`,
+   `admin_authority_v2.mips_root`, and
+   `artifact_hashes.admin_records_json`.  The initial authority version is
+   `1`; any later public authority snapshot must name the live
+   `authority_version` it corresponds to.
+3. `portal_runtime_config.json` may repeat public coordinates under
+   `admin_authority_v2`, including `launcher_id`, `admins_hash`,
+   `mips_root`, and `admin_records_hash`.  It is read-only runtime
+   discovery, not an authority source and not an authorization token.
+4. After `bootstrap_manifest.json` is written, the bootstrapper is locked.
+   Mutable bootstrap routes must not edit `admin_records.json`, replace
+   `bootstrap_manifest.json`, or change the runtime-config authority
+   coordinates.
+5. Future roster additions are normal admin-authority spends, not a
+   bootstrap mutation.  They must use `ADMIN_ROSTER_UPDATE`
+   (`SPEND_ADMIN_ROSTER_UPDATE = 0x07`), be authorized by the current
+   MIPS admin authority, append exactly one new admin slot, update
+   `ADMINS_HASH` and `MIPS_ROOT_HASH` atomically, preserve
+   `PENDING_KEY_OPS_HASH`, and bump `authority_version`.
+6. Any post-genesis replacement roster artifact must be a new versioned
+   `admin_records.json` snapshot whose canonical hash equals the
+   on-chain announced `ADMINS_HASH`.  Local edits that do not correspond
+   to a confirmed authority spend are invalid.
+7. Key-rotation paths (`KEY_ADD_*` and `KEY_REMOVE_*`) mutate keys inside
+   existing admin slots only.  They are not admin-slot creation paths and
+   must not be represented as appending admin records.
+
 ### Bootstrap finalize recordation contract
 
 The final bootstrap mutation is `POST /admin/bootstrap/finalize`.  It is
