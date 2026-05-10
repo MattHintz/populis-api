@@ -95,6 +95,45 @@ frontend secret:
 This gives the operator a browser workflow without converting the
 one-shot token into a long-lived frontend credential.
 
+### First-admin wallet capture contract
+
+The bootstrap-accessible first-admin launch ceremony must capture and
+display the intended first admin wallet before any permanent record is
+written:
+
+1. The operator proves control of the intended first admin wallet with a
+   one-shot wallet signature.  That raw wallet signature is
+   proof-of-possession only; it is not an authority artifact and must not
+   be stored as admin authority.
+2. Before launch, the UI must show the exact identity that will become
+   first admin: EVM address, compressed secp256k1 pubkey,
+   Eip712Member leaf hash, admin slot `0`, `m_within`, network/domain
+   binding, and the MIPS root that will govern the initial
+   `admin_authority_v2` state.
+3. The durable off-chain admin artifact is `admin_records.json`.  Its
+   initial record must be explicit: `"admin_idx": 0`, `"m_within": 1`
+   for the single-wallet bootstrap path, and an `eip712_member` leaf
+   containing `leaf_hash`, `evm_address`, `secp256k1_pubkey`,
+   `type_hash`, and `prefix_and_domain_separator`.
+4. `admins_hash` is computed from the displayed admin records, and the
+   MIPS root is computed from the displayed leaf/quorum tree.  Both must
+   be committed into the first `admin_authority_v2` singleton state; no
+   hidden env-injected admin and no implicit frontend config can become
+   first admin.
+5. `bootstrap_manifest.json` records public commitments to the result:
+   admin-authority launcher id, `admins_hash`, MIPS root, and the
+   content hash of `admin_records.json`.  `portal_runtime_config.json`
+   may repeat public coordinates only.
+6. Neither `admin_records.json`, `bootstrap_manifest.json`, nor
+   `portal_runtime_config.json` may contain `POPULIS_ADMIN_TOKEN`, the
+   bootstrap session cookie/JWT, raw wallet signatures, auth nonces,
+   JWT secrets, faucet private keys, or any bearer credential.
+
+This makes the permanent authority source auditable: admin slot `0` is
+the displayed wallet committed on chain and mirrored by
+`admin_records.json`, not the operator token, a transient bootstrap
+cookie, or frontend environment injection.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony

@@ -80,3 +80,47 @@ def test_genesis_readme_forbids_persisting_raw_bootstrap_token() -> None:
     assert "URLs" in text
     assert "manifests" in text
     assert "downloaded artifacts" in text
+
+
+def test_genesis_readme_pins_first_admin_wallet_capture_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "First-admin wallet capture contract" in text
+    assert "one-shot wallet signature" in text
+    assert "proof-of-possession only" in text
+    assert "not an authority artifact" in text
+    assert "admin slot `0`" in text
+    assert "`m_within`" in text
+    assert "network/domain binding" in text
+    assert "MIPS root that will govern the initial `admin_authority_v2` state" in text
+
+
+def test_genesis_readme_pins_initial_admin_records_artifact_shape() -> None:
+    text = " ".join(_readme().split())
+
+    assert "durable off-chain admin artifact is `admin_records.json`" in text
+    assert '"admin_idx": 0' in text
+    assert '"m_within": 1' in text
+    assert "`eip712_member` leaf" in text
+    for field in (
+        "`leaf_hash`",
+        "`evm_address`",
+        "`secp256k1_pubkey`",
+        "`type_hash`",
+        "`prefix_and_domain_separator`",
+    ):
+        assert field in text
+    assert "`admins_hash` is computed from the displayed admin records" in text
+
+
+def test_genesis_readme_forbids_first_admin_artifact_secret_leakage() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Neither `admin_records.json`, `bootstrap_manifest.json`, nor `portal_runtime_config.json` may contain" in text
+    assert "`POPULIS_ADMIN_TOKEN`" in text
+    assert "bootstrap session cookie/JWT" in text
+    assert "raw wallet signatures" in text
+    assert "auth nonces" in text
+    assert "JWT secrets" in text
+    assert "faucet private keys" in text
+    assert "any bearer credential" in text
