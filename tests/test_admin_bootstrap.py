@@ -298,7 +298,9 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
         "launcher_id": H("88"),
         "admins_hash": finalize_payload()["admins_hash"],
         "mips_root": H("cd"),
+        "authority_version": 1,
     }
+    assert body["portal_runtime_config"]["admin_authority_v2"]["authority_version"] == 1
     admin_records_path = bootstrap_env.with_name("admin_records.json")
     runtime_path = bootstrap_env.with_name("portal_runtime_config.json")
     assert json.loads(admin_records_path.read_text()) == admin_records()

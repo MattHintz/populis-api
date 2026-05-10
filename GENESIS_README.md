@@ -149,14 +149,16 @@ strictly separated from any credential:
    `0` only.
 2. `bootstrap_manifest.json` commits to
    `admin_authority_v2.launcher_id`, `admin_authority_v2.admins_hash`,
-   `admin_authority_v2.mips_root`, and
+   `admin_authority_v2.mips_root`,
+   `admin_authority_v2.authority_version`, and
    `artifact_hashes.admin_records_json`.  The initial authority version is
    `1`; any later public authority snapshot must name the live
    `authority_version` it corresponds to.
 3. `portal_runtime_config.json` may repeat public coordinates under
    `admin_authority_v2`, including `launcher_id`, `admins_hash`,
-   `mips_root`, and `admin_records_hash`.  It is read-only runtime
-   discovery, not an authority source and not an authorization token.
+   `mips_root`, `authority_version`, and `admin_records_hash`.  It is
+   read-only runtime discovery, not an authority source and not an
+   authorization token.
 4. After `bootstrap_manifest.json` is written, the bootstrapper is locked.
    Mutable bootstrap routes must not edit `admin_records.json`, replace
    `bootstrap_manifest.json`, or change the runtime-config authority

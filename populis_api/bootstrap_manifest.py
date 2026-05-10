@@ -63,6 +63,7 @@ def build_bootstrap_artifacts(
     admin_authority_launcher_id: str,
     admins_hash: str,
     mips_root: str,
+    authority_version: int = 1,
     read_only_api_url: str | None = None,
     read_only_coinset_url: str | None = None,
 ) -> BootstrapArtifacts:
@@ -75,6 +76,7 @@ def build_bootstrap_artifacts(
     admin_launcher = _normalize_hex32(admin_authority_launcher_id, "admin_authority_launcher_id")
     normalized_admins_hash = _normalize_hex32(admins_hash, "admins_hash")
     normalized_mips_root = _normalize_hex32(mips_root, "mips_root")
+    normalized_authority_version = _validate_authority_version(authority_version)
     records_launcher = _normalize_hex32(records.get("launcher_id"), "admin_records.launcher_id")
     if records_launcher != admin_launcher:
         raise BootstrapManifestError(
@@ -101,6 +103,7 @@ def build_bootstrap_artifacts(
             "launcher_id": admin_launcher,
             "admins_hash": normalized_admins_hash,
             "mips_root": normalized_mips_root,
+            "authority_version": normalized_authority_version,
             "admin_records_hash": records_hash,
         },
     }
@@ -118,6 +121,7 @@ def build_bootstrap_artifacts(
             "launcher_id": admin_launcher,
             "admins_hash": normalized_admins_hash,
             "mips_root": normalized_mips_root,
+            "authority_version": normalized_authority_version,
         },
         "artifact_hashes": {
             "deployment_manifest_json": deployment_hash,
@@ -192,6 +196,14 @@ def _normalize_hex32(value: object, field: str) -> str:
     except ValueError as e:
         raise BootstrapManifestError(f"{field} is not valid hex") from e
     return "0x" + body.lower()
+
+
+def _validate_authority_version(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BootstrapManifestError("authority_version must be a positive integer")
+    if value < 1:
+        raise BootstrapManifestError("authority_version must be >= 1")
+    return value
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:

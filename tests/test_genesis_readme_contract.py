@@ -141,6 +141,7 @@ def test_genesis_readme_pins_admin_authority_artifact_boundary() -> None:
     assert "`bootstrap_manifest.json` commits to `admin_authority_v2.launcher_id`" in text
     assert "`admin_authority_v2.admins_hash`" in text
     assert "`admin_authority_v2.mips_root`" in text
+    assert "`admin_authority_v2.authority_version`" in text
     assert "`artifact_hashes.admin_records_json`" in text
     assert "The initial authority version is `1`" in text
     assert "must name the live `authority_version`" in text
@@ -154,6 +155,7 @@ def test_genesis_readme_pins_runtime_config_as_read_only_discovery() -> None:
         "`launcher_id`",
         "`admins_hash`",
         "`mips_root`",
+        "`authority_version`",
         "`admin_records_hash`",
     ):
         assert field in text

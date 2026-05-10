@@ -108,13 +108,42 @@ def test_builds_public_bootstrap_manifest_and_runtime_config() -> None:
         "launcher_id": H("88"),
         "admins_hash": H("ab"),
         "mips_root": H("cd"),
+        "authority_version": 1,
     }
     assert bootstrap["artifact_hashes"]["deployment_manifest_json"] == content_hash(deployment)
     assert bootstrap["artifact_hashes"]["admin_records_json"] == content_hash(records)
     assert bootstrap["artifact_hashes"]["portal_runtime_config_json"] == content_hash(runtime)
+    assert runtime["admin_authority_v2"]["authority_version"] == 1
     assert runtime["admin_authority_v2"]["admin_records_hash"] == content_hash(records)
     assert runtime["read_only_api_url"] == "https://api.populis.example"
     assert runtime["read_only_coinset_url"] == "https://coinset.example"
+
+
+def test_builds_explicit_authority_version_for_future_snapshots() -> None:
+    artifacts = build_bootstrap_artifacts(
+        deployment_manifest=deployment_manifest(),
+        admin_records=admin_records(),
+        admin_authority_launcher_id=H("88"),
+        admins_hash=H("ab"),
+        mips_root=H("cd"),
+        authority_version=7,
+    )
+
+    assert artifacts.bootstrap_manifest["admin_authority_v2"]["authority_version"] == 7
+    assert artifacts.portal_runtime_config["admin_authority_v2"]["authority_version"] == 7
+
+
+@pytest.mark.parametrize("authority_version", [0, -1, True, "1"])
+def test_rejects_invalid_authority_version(authority_version) -> None:
+    with pytest.raises(BootstrapManifestError, match="authority_version"):
+        build_bootstrap_artifacts(
+            deployment_manifest=deployment_manifest(),
+            admin_records=admin_records(),
+            admin_authority_launcher_id=H("88"),
+            admins_hash=H("ab"),
+            mips_root=H("cd"),
+            authority_version=authority_version,
+        )
 
 
 @pytest.mark.parametrize(
