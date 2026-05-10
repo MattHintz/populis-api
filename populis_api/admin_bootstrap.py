@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 from .admin import require_admin_token
+from .bootstrap_manifest import (
+    BootstrapArtifactPaths,
+    BootstrapManifestError,
+    build_bootstrap_artifacts,
+    persist_bootstrap_artifacts,
+)
 from .config import Settings, get_settings
 
 
@@ -40,6 +47,21 @@ class BootstrapStatusResponse(BaseModel):
     expires_at: Optional[int] = None
 
 
+class BootstrapFinalizeRequest(BaseModel):
+    admin_records: dict[str, Any]
+    admin_authority_launcher_id: str
+    admins_hash: str
+    mips_root: str
+    read_only_api_url: Optional[str] = None
+    read_only_coinset_url: Optional[str] = None
+
+
+class BootstrapFinalizeResponse(BaseModel):
+    locked: bool
+    bootstrap_manifest: dict[str, Any]
+    portal_runtime_config: dict[str, Any]
+
+
 def reset_bootstrap_state_for_tests() -> None:
     global _resolved_bootstrap_secret
     _resolved_bootstrap_secret = None
@@ -51,6 +73,16 @@ def bootstrap_manifest_path(settings: Settings) -> Path:
 
 def bootstrap_locked(settings: Settings) -> bool:
     return bootstrap_manifest_path(settings).exists()
+
+
+def bootstrap_admin_records_path(settings: Settings) -> Path:
+    if settings.admin_records_path:
+        return Path(settings.admin_records_path)
+    return bootstrap_manifest_path(settings).with_name("admin_records.json")
+
+
+def portal_runtime_config_path(settings: Settings) -> Path:
+    return bootstrap_manifest_path(settings).with_name("portal_runtime_config.json")
 
 
 def get_bootstrap_secret(settings: Settings) -> str:
@@ -171,16 +203,86 @@ async def bootstrap_status(
     )
 
 
+@router.post("/finalize", response_model=BootstrapFinalizeResponse)
+async def bootstrap_finalize(
+    body: BootstrapFinalizeRequest,
+    response: Response,
+    settings: Annotated[Settings, Depends(get_settings)],
+    _claims: Annotated[BootstrapSessionClaims, Depends(require_bootstrap_session)],
+) -> BootstrapFinalizeResponse:
+    deployment_manifest_path = Path(settings.deployment_manifest_path)
+    if not deployment_manifest_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Protocol deployment manifest is required before bootstrap finalize.",
+        )
+
+    try:
+        deployment_manifest = json.loads(deployment_manifest_path.read_text())
+        if not isinstance(deployment_manifest, dict):
+            raise ValueError("deployment manifest top-level must be an object")
+        artifacts = build_bootstrap_artifacts(
+            deployment_manifest=deployment_manifest,
+            admin_records=body.admin_records,
+            admin_authority_launcher_id=body.admin_authority_launcher_id,
+            admins_hash=body.admins_hash,
+            mips_root=body.mips_root,
+            read_only_api_url=body.read_only_api_url,
+            read_only_coinset_url=body.read_only_coinset_url,
+        )
+        persist_bootstrap_artifacts(
+            artifacts=artifacts,
+            admin_records=body.admin_records,
+            paths=BootstrapArtifactPaths(
+                admin_records_json=bootstrap_admin_records_path(settings),
+                portal_runtime_config_json=portal_runtime_config_path(settings),
+                bootstrap_manifest_json=bootstrap_manifest_path(settings),
+            ),
+        )
+    except BootstrapManifestError as e:
+        detail = str(e)
+        if "already exists" in detail:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Bootstrapper is locked because bootstrap_manifest.json already exists.",
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Bootstrap finalize artifact validation failed: {detail}",
+        ) from e
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Protocol deployment manifest is corrupt or unreadable.",
+        ) from e
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist bootstrap artifacts.",
+        ) from e
+
+    response.delete_cookie(BOOTSTRAP_COOKIE_NAME, path=BOOTSTRAP_COOKIE_PATH)
+    return BootstrapFinalizeResponse(
+        locked=True,
+        bootstrap_manifest=artifacts.bootstrap_manifest,
+        portal_runtime_config=artifacts.portal_runtime_config,
+    )
+
+
 __all__ = [
     "BOOTSTRAP_COOKIE_NAME",
     "BOOTSTRAP_COOKIE_PATH",
     "BOOTSTRAP_SCOPE",
     "BootstrapChallengeResponse",
+    "BootstrapFinalizeRequest",
+    "BootstrapFinalizeResponse",
     "BootstrapStatusResponse",
     "BootstrapSessionClaims",
+    "bootstrap_admin_records_path",
     "bootstrap_locked",
     "bootstrap_manifest_path",
     "issue_bootstrap_session",
+    "portal_runtime_config_path",
     "require_bootstrap_session",
     "reset_bootstrap_state_for_tests",
     "router",
