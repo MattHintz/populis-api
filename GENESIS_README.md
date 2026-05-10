@@ -31,6 +31,44 @@ The temporary legacy/env allowlist path may help operators reach the
 existing authority wizard, but it is not the desired final genesis
 ceremony.
 
+## Hybrid bootstrapper target
+
+The target Phase 0 architecture is a **run-once bootstrapper** with a
+hybrid manifest + runtime-config handoff:
+
+- The bootstrapper is the only mutable surface that accepts
+  `POPULIS_ADMIN_TOKEN`.  It exists to launch Phase A protocol genesis,
+  launch/bind admin-authority-v2 admin slot `0`, and write the permanent
+  public deployment artifacts.
+- On success it writes immutable local artifacts:
+  `deployment_manifest.json`, `admin_records.json`,
+  `bootstrap_manifest.json`, and `portal_runtime_config.json`.
+- `bootstrap_manifest.json` records the network, protocol launcher ids,
+  admin-authority launcher id, `admins_hash`, MIPS root, and content
+  hashes of the generated artifacts so operators can detect local
+  tampering.
+- `portal_runtime_config.json` contains **public coordinates only**:
+  launcher ids, puzzle/mod hashes, MIPS root, admin records hash, network,
+  and read-only API/coinset URLs.  It must never contain
+  `POPULIS_ADMIN_TOKEN`, faucet private keys, JWT secrets, wallet
+  signatures, or any other bearer credential.
+- After the bootstrapper records success, every mutable bootstrap route
+  must fail closed.  Re-running `/admin/deploy/protocol` or any future
+  `/admin/bootstrap/*` mutation against the same manifest path should
+  return a locked/gone state rather than overwrite permanent records.
+- The post-genesis app consumes read-only runtime config derived from
+  those artifacts.  Runtime config can help the portal avoid a rebuild,
+  but it is not an authority source by itself; admin login still has to
+  verify against the admin-authority records/hash model.
+- No permanent admin membership is ever created by frontend env injection
+  alone.  The only permanent first admin is the wallet committed into the
+  `admin_authority_v2` genesis state and matching `admin_records.json`.
+
+This keeps the backend dependency narrow: during genesis the operator may
+run a privileged bootstrapper, but after successful recordation the
+mutable bootstrap authority shuts down and the remaining service surface
+is read-only public configuration plus normal protocol APIs.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony
@@ -53,7 +91,15 @@ Layer: /admin/genesis component
 Goal: Make the UI say plainly that base genesis does not create admin slot 0.
 Tests: focused component tests for the warning and next-step copy.
 
-Brick 0.2 — Bootstrap-accessible first-admin launch
+Brick 0.2A — Hybrid bootstrapper lifecycle contract
+Repo: populis_api
+Layer: docs/test scaffolding
+Goal: Pin the run-once bootstrapper model before opening more routes.
+Tests: pytest tests/test_genesis_readme_contract.py
+Stop condition: docs state that bootstrap mutation shuts down after success
+and portal runtime config is public/read-only, not an authority source.
+
+Brick 0.2B — Bootstrap-accessible first-admin launch
 Repo: populis_portal
 Layer: routing/auth boundary
 Goal: Allow first-admin launch during bootstrap without requiring an admin JWT.
