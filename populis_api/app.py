@@ -39,6 +39,7 @@ from .challenges import (
 )
 from .coinset_client import CoinsetClient
 from .config import Settings, get_settings
+from .cors import cors_middleware_options
 from .evm_auth import (
     eip712_domain,
     normalize_evm_address,
@@ -222,16 +223,9 @@ async def add_cors(request, call_next):
 # Allow any localhost / 127.0.0.1 / 0.0.0.0 origin on any port for local dev
 # (including Cascade's browser-preview proxy which uses an ephemeral port).
 # Production should pin exact origins via POPULIS_CORS_ORIGINS.
-_configured = get_settings().allowed_origins()
-_dev_regex = r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$"
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_configured,
-    allow_origin_regex=_dev_regex,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    **cors_middleware_options(get_settings()),
 )
 
 # Admin router (gated by POPULIS_ADMIN_TOKEN; returns 503 when token is unset).
