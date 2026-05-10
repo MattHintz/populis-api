@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
+from populis_api import bootstrap_manifest as bm
 from populis_api.bootstrap_manifest import (
+    BootstrapArtifactPaths,
     BootstrapManifestError,
     build_bootstrap_artifacts,
     canonical_json_bytes,
     content_hash,
+    persist_bootstrap_artifacts,
 )
 
 
@@ -50,6 +54,26 @@ def admin_records() -> dict:
             }
         ],
     }
+
+
+def artifact_paths(root: Path) -> BootstrapArtifactPaths:
+    return BootstrapArtifactPaths(
+        admin_records_json=root / "admin_records.json",
+        portal_runtime_config_json=root / "portal_runtime_config.json",
+        bootstrap_manifest_json=root / "bootstrap_manifest.json",
+    )
+
+
+def artifacts_and_records() -> tuple:
+    records = admin_records()
+    artifacts = build_bootstrap_artifacts(
+        deployment_manifest=deployment_manifest(),
+        admin_records=records,
+        admin_authority_launcher_id=records["launcher_id"],
+        admins_hash=H("ab"),
+        mips_root=H("cd"),
+    )
+    return artifacts, records
 
 
 def test_content_hash_uses_canonical_json_ordering() -> None:
@@ -158,3 +182,93 @@ def test_outputs_do_not_contain_secret_or_signature_material() -> None:
         "private_key",
     ):
         assert forbidden not in emitted
+
+
+def test_persists_public_artifacts_with_bootstrap_manifest_last(tmp_path, monkeypatch) -> None:
+    artifacts, records = artifacts_and_records()
+    paths = artifact_paths(tmp_path)
+    writes: list[str] = []
+    original = bm._atomic_write_json
+
+    def spy(path, value):
+        writes.append(Path(path).name)
+        original(path, value)
+
+    monkeypatch.setattr(bm, "_atomic_write_json", spy)
+
+    persist_bootstrap_artifacts(
+        artifacts=artifacts,
+        admin_records=records,
+        paths=paths,
+    )
+
+    assert writes == [
+        "admin_records.json",
+        "portal_runtime_config.json",
+        "bootstrap_manifest.json",
+    ]
+    assert json.loads(paths.admin_records_json.read_text()) == records
+    assert json.loads(paths.portal_runtime_config_json.read_text()) == artifacts.portal_runtime_config
+    assert json.loads(paths.bootstrap_manifest_json.read_text()) == artifacts.bootstrap_manifest
+
+
+def test_persistence_refuses_existing_bootstrap_manifest(tmp_path) -> None:
+    artifacts, records = artifacts_and_records()
+    paths = artifact_paths(tmp_path)
+    paths.bootstrap_manifest_json.write_text('{"locked": true}', encoding="utf-8")
+
+    with pytest.raises(BootstrapManifestError, match="already exists"):
+        persist_bootstrap_artifacts(
+            artifacts=artifacts,
+            admin_records=records,
+            paths=paths,
+        )
+
+    assert not paths.admin_records_json.exists()
+    assert not paths.portal_runtime_config_json.exists()
+
+
+def test_partial_failure_does_not_write_lock_manifest(tmp_path, monkeypatch) -> None:
+    artifacts, records = artifacts_and_records()
+    paths = artifact_paths(tmp_path)
+    original = bm._atomic_write_json
+
+    def fail_runtime(path, value):
+        if Path(path).name == "portal_runtime_config.json":
+            raise OSError("disk full")
+        original(path, value)
+
+    monkeypatch.setattr(bm, "_atomic_write_json", fail_runtime)
+
+    with pytest.raises(OSError, match="disk full"):
+        persist_bootstrap_artifacts(
+            artifacts=artifacts,
+            admin_records=records,
+            paths=paths,
+        )
+
+    assert paths.admin_records_json.exists()
+    assert not paths.portal_runtime_config_json.exists()
+    assert not paths.bootstrap_manifest_json.exists()
+
+
+def test_persistence_rechecks_lock_before_final_manifest_write(tmp_path, monkeypatch) -> None:
+    artifacts, records = artifacts_and_records()
+    paths = artifact_paths(tmp_path)
+    original = bm._atomic_write_json
+
+    def race_lock(path, value):
+        original(path, value)
+        if Path(path).name == "portal_runtime_config.json":
+            paths.bootstrap_manifest_json.write_text('{"locked": true}', encoding="utf-8")
+
+    monkeypatch.setattr(bm, "_atomic_write_json", race_lock)
+
+    with pytest.raises(BootstrapManifestError, match="already exists"):
+        persist_bootstrap_artifacts(
+            artifacts=artifacts,
+            admin_records=records,
+            paths=paths,
+        )
+
+    assert json.loads(paths.bootstrap_manifest_json.read_text()) == {"locked": True}

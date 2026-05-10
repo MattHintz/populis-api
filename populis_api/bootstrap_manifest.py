@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -31,6 +34,13 @@ class BootstrapManifestError(ValueError):
 class BootstrapArtifacts:
     bootstrap_manifest: dict[str, Any]
     portal_runtime_config: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BootstrapArtifactPaths:
+    admin_records_json: Path
+    portal_runtime_config_json: Path
+    bootstrap_manifest_json: Path
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -123,6 +133,34 @@ def build_bootstrap_artifacts(
     )
 
 
+def persist_bootstrap_artifacts(
+    *,
+    artifacts: BootstrapArtifacts,
+    admin_records: Mapping[str, Any],
+    paths: BootstrapArtifactPaths,
+) -> None:
+    admin_records_path = Path(paths.admin_records_json)
+    runtime_config_path = Path(paths.portal_runtime_config_json)
+    bootstrap_manifest_path = Path(paths.bootstrap_manifest_json)
+    if bootstrap_manifest_path.exists():
+        raise BootstrapManifestError(
+            f"bootstrap manifest already exists at {bootstrap_manifest_path}"
+        )
+
+    records = dict(admin_records)
+    _assert_public_artifact(records, "admin_records.json")
+    _assert_public_artifact(artifacts.portal_runtime_config, "portal_runtime_config.json")
+    _assert_public_artifact(artifacts.bootstrap_manifest, "bootstrap_manifest.json")
+
+    _atomic_write_json(admin_records_path, records)
+    _atomic_write_json(runtime_config_path, artifacts.portal_runtime_config)
+    if bootstrap_manifest_path.exists():
+        raise BootstrapManifestError(
+            f"bootstrap manifest already exists at {bootstrap_manifest_path}"
+        )
+    _atomic_write_json(bootstrap_manifest_path, artifacts.bootstrap_manifest)
+
+
 def _assert_public_artifact(value: Mapping[str, Any], label: str) -> None:
     text = canonical_json_bytes(value).decode("utf-8").lower()
     for marker in FORBIDDEN_ARTIFACT_MARKERS:
@@ -156,11 +194,39 @@ def _normalize_hex32(value: object, field: str) -> str:
     return "0x" + body.lower()
 
 
+def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as fh:
+            tmp_path = Path(fh.name)
+            fh.write(canonical_json_bytes(value))
+            fh.write(b"\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
 __all__ = [
     "BootstrapArtifacts",
+    "BootstrapArtifactPaths",
     "BootstrapManifestError",
     "FORBIDDEN_ARTIFACT_MARKERS",
     "build_bootstrap_artifacts",
     "canonical_json_bytes",
     "content_hash",
+    "persist_bootstrap_artifacts",
 ]
