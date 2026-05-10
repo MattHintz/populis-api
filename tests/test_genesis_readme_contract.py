@@ -33,14 +33,18 @@ def test_genesis_readme_has_extreme_atomic_phase_zero_brick_map() -> None:
         assert brick in text
 
     assert "pytest tests/test_genesis_readme_contract.py" in text
-    assert "Bootstrap-accessible first-admin launch" in text
+    assert "Bootstrap-accessible first-admin authority step" in text
     assert "Combined bootstrap manifest" in text
 
 
 def test_genesis_readme_pins_hybrid_bootstrapper_shutdown_model() -> None:
     text = _readme()
 
+    assert "Phase 0 is one genesis ceremony" in text
+    assert "two visible steps" in text
+    assert "genesis is incomplete until admin slot `0` is committed" in text
     assert "run-once bootstrapper" in text
+    assert "run one genesis ceremony" in text
     assert "hybrid manifest + runtime-config handoff" in text
     assert "`bootstrap_manifest.json`" in text
     assert "`portal_runtime_config.json`" in text
@@ -86,6 +90,7 @@ def test_genesis_readme_pins_first_admin_wallet_capture_contract() -> None:
     text = " ".join(_readme().split())
 
     assert "First-admin wallet capture contract" in text
+    assert "first-admin authority step of the genesis ceremony" in text
     assert "one-shot wallet signature" in text
     assert "proof-of-possession only" in text
     assert "not an authority artifact" in text
@@ -131,6 +136,7 @@ def test_genesis_readme_pins_bootstrap_finalize_endpoint_contract() -> None:
 
     assert "Bootstrap finalize recordation contract" in text
     assert "final bootstrap mutation is `POST /admin/bootstrap/finalize`" in text
+    assert "records completion of the same genesis ceremony" in text
     assert "authorized by `require_bootstrap_session`" in text
     assert "requires a valid short-lived `populis_bootstrap_session` cookie" in text
     assert "A normal admin JWT, bearer token, or raw `POPULIS_ADMIN_TOKEN` is not sufficient" in text
@@ -160,7 +166,7 @@ def test_genesis_readme_pins_finalize_artifact_order_and_lock() -> None:
 def test_genesis_readme_pins_portal_finalize_ui_contract() -> None:
     text = " ".join(_readme().split())
 
-    assert "portal launch-authority flow calls `AdminBootstrapService.finalizeBootstrap`" in text
+    assert "portal first-admin authority step calls `AdminBootstrapService.finalizeBootstrap`" in text
     assert "only after the admin-authority launch has been submitted" in text
     assert "first-admin wallet metadata is known" in text
     assert "`admins_hash` is live" in text

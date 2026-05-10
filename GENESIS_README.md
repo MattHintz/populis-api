@@ -25,11 +25,12 @@ Genesis has a hard chicken-or-egg boundary:
   separate authority system from admin login and admin-authority
   rotation.
 
-Until Phase 0 is fully wired in the portal/API, treat Phase A protocol
-deployment and A.5 first-admin authority launch as two separate steps.
-The temporary legacy/env allowlist path may help operators reach the
-existing authority wizard, but it is not the desired final genesis
-ceremony.
+Phase 0 is one genesis ceremony even though the current portal executes it
+through two visible steps: deploy the base protocol manifest, then create
+and finalize first-admin authority.  The implementation seam keeps the
+spend construction auditable, but the product boundary is the full
+ceremony; genesis is incomplete until admin slot `0` is committed and
+`bootstrap_manifest.json` locks the bootstrapper.
 
 ## Hybrid bootstrapper target
 
@@ -37,9 +38,9 @@ The target Phase 0 architecture is a **run-once bootstrapper** with a
 hybrid manifest + runtime-config handoff:
 
 - The bootstrapper is the only mutable surface that accepts
-  `POPULIS_ADMIN_TOKEN`.  It exists to launch Phase A protocol genesis,
-  launch/bind admin-authority-v2 admin slot `0`, and write the permanent
-  public deployment artifacts.
+  `POPULIS_ADMIN_TOKEN`.  It exists to run one genesis ceremony: launch
+  Phase A protocol genesis, create/bind admin-authority-v2 admin slot `0`,
+  and write the permanent public deployment artifacts.
 - On success it writes immutable local artifacts:
   `deployment_manifest.json`, `admin_records.json`,
   `bootstrap_manifest.json`, and `portal_runtime_config.json`.
@@ -77,8 +78,9 @@ frontend secret:
 1. The operator enters `POPULIS_ADMIN_TOKEN` once on the genesis page.
 2. The API verifies that the bootstrapper is not locked and issues a
    short-lived bootstrap session cookie scoped only to bootstrap routes.
-3. The browser may use that bootstrap session to access the first-admin
-   launch ceremony and bootstrap status surfaces.
+3. The browser may use that bootstrap session to continue the
+   first-admin authority step of the same genesis ceremony and to inspect
+   bootstrap status surfaces.
 4. The bootstrap session is never an admin-desk session.  It must not
    authorize mint proposals, property registration, normal `/admin/*`
    operations, or any post-genesis mutation.
@@ -97,9 +99,9 @@ one-shot token into a long-lived frontend credential.
 
 ### First-admin wallet capture contract
 
-The bootstrap-accessible first-admin launch ceremony must capture and
-display the intended first admin wallet before any permanent record is
-written:
+The bootstrap-accessible first-admin authority step of the genesis
+ceremony must capture and display the intended first admin wallet before
+any permanent record is written:
 
 1. The operator proves control of the intended first admin wallet with a
    one-shot wallet signature.  That raw wallet signature is
@@ -137,8 +139,8 @@ cookie, or frontend environment injection.
 ### Bootstrap finalize recordation contract
 
 The final bootstrap mutation is `POST /admin/bootstrap/finalize`.  It is
-the only browser-facing write that records the first-admin ceremony after
-the protocol deployment manifest already exists:
+the browser-facing write that records completion of the same genesis
+ceremony after the base protocol deployment manifest already exists:
 
 1. It is authorized by `require_bootstrap_session` and therefore requires
    a valid short-lived `populis_bootstrap_session` cookie.  A normal admin
@@ -161,7 +163,7 @@ the protocol deployment manifest already exists:
    It never returns or persists raw wallet signatures, auth nonces,
    bootstrap JWT/cookie material, bearer headers, faucet keys, or
    `POPULIS_ADMIN_TOKEN`.
-6. The portal launch-authority flow calls `AdminBootstrapService.finalizeBootstrap`
+6. The portal first-admin authority step calls `AdminBootstrapService.finalizeBootstrap`
    only after the admin-authority launch has been submitted, first-admin
    wallet metadata is known, `admins_hash` is live, and the MIPS root is
    filled.  The request is cookie-only (`withCredentials`) and sends no
@@ -206,17 +208,17 @@ Tests: pytest tests/test_genesis_readme_contract.py
 Stop condition: docs state that bootstrap mutation shuts down after success
 and portal runtime config is public/read-only, not an authority source.
 
-Brick 0.2B — Bootstrap-accessible first-admin launch
+Brick 0.2B — Bootstrap-accessible first-admin authority step
 Repo: populis_portal
 Layer: routing/auth boundary
-Goal: Allow first-admin launch during bootstrap without requiring an admin JWT.
+Goal: Continue the genesis ceremony into first-admin authority creation during bootstrap without requiring an admin JWT.
 Tests: route/guard tests proving bootstrap access does not open the normal desk.
 
 Brick 0.3 — First-admin wallet capture in genesis
 Repo: populis_portal
 Layer: EVM wallet/admin record preparation
-Goal: Capture the intended admin-0 wallet before launch and show the operator
-exactly which address/pubkey will become first admin.
+Goal: Capture the intended admin-0 wallet before the first-admin authority
+step and show the operator exactly which address/pubkey will become first admin.
 Tests: service/component tests around pubkey recovery, record preview, and
 no token persistence.
 
