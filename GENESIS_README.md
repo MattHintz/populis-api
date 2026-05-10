@@ -69,6 +69,32 @@ run a privileged bootstrapper, but after successful recordation the
 mutable bootstrap authority shuts down and the remaining service surface
 is read-only public configuration plus normal protocol APIs.
 
+### Bootstrap challenge boundary
+
+Bootstrap UI access should use a **two-step challenge**, not a permanent
+frontend secret:
+
+1. The operator enters `POPULIS_ADMIN_TOKEN` once on the genesis page.
+2. The API verifies that the bootstrapper is not locked and issues a
+   short-lived bootstrap session cookie scoped only to bootstrap routes.
+3. The browser may use that bootstrap session to access the first-admin
+   launch ceremony and bootstrap status surfaces.
+4. The bootstrap session is never an admin-desk session.  It must not
+   authorize mint proposals, property registration, normal `/admin/*`
+   operations, or any post-genesis mutation.
+5. The raw bootstrap token must never be stored in `localStorage`,
+   `sessionStorage`, URLs, runtime config, manifests, or downloaded
+   artifacts.
+6. The bootstrap session must expire quickly, use same-site cookie
+   protections, and be invalidated when the bootstrapper writes a success
+   `bootstrap_manifest.json`.
+7. Once success is recorded, challenge issuance and every mutable
+   bootstrap route must return a locked/gone response.  Only read-only
+   public runtime-config and normal non-bootstrap APIs remain.
+
+This gives the operator a browser workflow without converting the
+one-shot token into a long-lived frontend credential.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony

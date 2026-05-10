@@ -58,3 +58,25 @@ def test_genesis_readme_forbids_runtime_config_secret_injection() -> None:
     assert "faucet private keys" in text
     assert "JWT secrets" in text
     assert "No permanent admin membership is ever created by frontend env injection" in text
+
+
+def test_genesis_readme_pins_two_step_bootstrap_challenge_boundary() -> None:
+    text = " ".join(_readme().split())
+
+    assert "two-step challenge" in text
+    assert "short-lived bootstrap session cookie" in text
+    assert "scoped only to bootstrap routes" in text
+    assert "never an admin-desk session" in text
+    assert "must not authorize mint proposals" in text
+    assert "invalidated when the bootstrapper writes a success" in text
+
+
+def test_genesis_readme_forbids_persisting_raw_bootstrap_token() -> None:
+    text = " ".join(_readme().split())
+
+    assert "raw bootstrap token must never be stored" in text
+    assert "`localStorage`" in text
+    assert "`sessionStorage`" in text
+    assert "URLs" in text
+    assert "manifests" in text
+    assert "downloaded artifacts" in text
