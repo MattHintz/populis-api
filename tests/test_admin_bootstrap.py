@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from populis_api import admin_auth, admin_bootstrap
 from populis_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_PATH
+from populis_api.admin_records import load_admin_records_from_mapping
 from populis_api.config import get_settings
 
 
@@ -88,7 +89,6 @@ def admin_records() -> dict:
                 "leaves": [
                     {
                         "kind": "eip712_member",
-                        "leaf_hash": H("99"),
                         "evm_address": "0x" + "aa" * 20,
                         "secp256k1_pubkey": "0x02" + "bb" * 32,
                         "type_hash": H("cc"),
@@ -100,11 +100,17 @@ def admin_records() -> dict:
     }
 
 
+def admins_hash_for_records(records: dict) -> str:
+    config = load_admin_records_from_mapping(records)
+    return "0x" + config.compute_admins_hash().hex()
+
+
 def finalize_payload() -> dict:
+    records = admin_records()
     return {
-        "admin_records": admin_records(),
+        "admin_records": records,
         "admin_authority_launcher_id": H("88"),
-        "admins_hash": H("ab"),
+        "admins_hash": admins_hash_for_records(records),
         "mips_root": H("cd"),
         "read_only_api_url": "https://api.populis.example",
         "read_only_coinset_url": "https://coinset.example",
@@ -248,6 +254,30 @@ def test_bootstrap_finalize_rejects_expired_bootstrap_session(
     assert not bootstrap_env.exists()
 
 
+def test_bootstrap_finalize_rejects_admin_records_that_do_not_match_admins_hash(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+    payload = finalize_payload()
+    payload["admins_hash"] = H("ff")
+
+    resp = client.post("/admin/bootstrap/finalize", json=payload)
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"].lower()
+    assert "admin records validation failed" in detail
+    assert "drift" in detail
+    assert not bootstrap_env.exists()
+    assert not bootstrap_env.with_name("admin_records.json").exists()
+    assert not bootstrap_env.with_name("portal_runtime_config.json").exists()
+
+
 def test_bootstrap_finalize_persists_public_artifacts_and_locks(
     client: TestClient,
     bootstrap_env,
@@ -266,7 +296,7 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
     assert body["locked"] is True
     assert body["bootstrap_manifest"]["admin_authority_v2"] == {
         "launcher_id": H("88"),
-        "admins_hash": H("ab"),
+        "admins_hash": finalize_payload()["admins_hash"],
         "mips_root": H("cd"),
     }
     admin_records_path = bootstrap_env.with_name("admin_records.json")

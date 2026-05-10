@@ -259,29 +259,35 @@ def load_admin_records_from_path(path: str | Path) -> AdminRecordsConfig:
             f"admin records {path!r}: invalid JSON at line {e.lineno}: {e.msg}"
         ) from e
 
+    return load_admin_records_from_mapping(raw, f"admin records {path!r}")
+
+
+def load_admin_records_from_mapping(
+    raw: object,
+    label: str = "admin records",
+) -> AdminRecordsConfig:
     if not isinstance(raw, dict):
         raise AdminRecordsLoadError(
-            f"admin records {path!r}: top-level must be a JSON object"
+            f"{label}: top-level must be a JSON object"
         )
-
     version = raw.get("version")
     if version != 1:
         raise AdminRecordsLoadError(
-            f"admin records {path!r}: unsupported schema version {version!r} "
+            f"{label}: unsupported schema version {version!r} "
             f"(supported: 1)"
         )
 
     launcher_id_hex = raw.get("launcher_id")
     if not isinstance(launcher_id_hex, str):
         raise AdminRecordsLoadError(
-            f"admin records {path!r}: launcher_id must be a 0x-hex string"
+            f"{label}: launcher_id must be a 0x-hex string"
         )
     launcher_id = _parse_hex32(launcher_id_hex, field_path="launcher_id")
 
     records_raw = raw.get("admin_records")
     if not isinstance(records_raw, list) or not records_raw:
         raise AdminRecordsLoadError(
-            f"admin records {path!r}: admin_records must be a non-empty list"
+            f"{label}: admin_records must be a non-empty list"
         )
 
     records = tuple(
@@ -516,6 +522,16 @@ def verify_against_admins_hash(
         )
 
 
+def verify_against_admins_hash_hex(
+    config: AdminRecordsConfig,
+    expected_admins_hash_hex: str,
+) -> None:
+    verify_against_admins_hash(
+        config,
+        _parse_hex32(expected_admins_hash_hex, "admins_hash"),
+    )
+
+
 def verify_against_launcher_id(
     config: AdminRecordsConfig,
     expected_launcher_id_hex: Optional[str],
@@ -586,7 +602,9 @@ __all__ = [
     "AdminRecordsLoadError",
     "AdminRecordsDriftError",
     "load_admin_records_from_path",
+    "load_admin_records_from_mapping",
     "verify_against_admins_hash",
+    "verify_against_admins_hash_hex",
     "verify_against_launcher_id",
     "verify_admin_records_for_settings",
     "get_admin_records_for_settings",

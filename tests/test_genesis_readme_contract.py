@@ -149,6 +149,10 @@ def test_genesis_readme_pins_bootstrap_finalize_endpoint_contract() -> None:
         assert field in text
     assert "loads the existing `deployment_manifest.json`" in text
     assert "must not invent protocol coordinates from portal env" in text
+    assert "Before any artifact is written" in text
+    assert "strictly parses `admin_records`" in text
+    assert "recomputes the canonical protocol `admins_hash`" in text
+    assert "rejects the finalize request if the records do not hash to the submitted `admins_hash`" in text
 
 
 def test_genesis_readme_pins_finalize_artifact_order_and_lock() -> None:

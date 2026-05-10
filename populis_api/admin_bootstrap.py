@@ -12,6 +12,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from .admin import require_admin_token
+from .admin_records import (
+    AdminRecordsDriftError,
+    AdminRecordsLoadError,
+    load_admin_records_from_mapping,
+    verify_against_admins_hash_hex,
+)
 from .bootstrap_manifest import (
     BootstrapArtifactPaths,
     BootstrapManifestError,
@@ -221,6 +227,11 @@ async def bootstrap_finalize(
         deployment_manifest = json.loads(deployment_manifest_path.read_text())
         if not isinstance(deployment_manifest, dict):
             raise ValueError("deployment manifest top-level must be an object")
+        admin_records_config = load_admin_records_from_mapping(
+            body.admin_records,
+            "admin_records",
+        )
+        verify_against_admins_hash_hex(admin_records_config, body.admins_hash)
         artifacts = build_bootstrap_artifacts(
             deployment_manifest=deployment_manifest,
             admin_records=body.admin_records,
@@ -239,6 +250,11 @@ async def bootstrap_finalize(
                 bootstrap_manifest_json=bootstrap_manifest_path(settings),
             ),
         )
+    except (AdminRecordsLoadError, AdminRecordsDriftError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Bootstrap finalize admin records validation failed: {e}",
+        ) from e
     except BootstrapManifestError as e:
         detail = str(e)
         if "already exists" in detail:

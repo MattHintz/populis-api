@@ -25,6 +25,7 @@ from populis_api.admin_records import (
     AdminRecordsDriftError,
     AdminRecordsLoadError,
     Eip712LeafSpec,
+    load_admin_records_from_mapping,
     load_admin_records_from_path,
     verify_against_admins_hash,
     verify_against_launcher_id,
@@ -164,6 +165,13 @@ class TestLoadAdminRecords:
         assert leaf.type_hash == _hash(0xEE)
         assert len(leaf.prefix_and_domain_separator) == 34
         assert leaf.prefix_and_domain_separator[:2] == b"\x19\x01"
+
+    def test_loads_from_in_memory_mapping(self):
+        config = load_admin_records_from_mapping(_make_admin_records_dict())
+
+        assert config.version == 1
+        assert config.launcher_id == _hash(0x10)
+        assert len(config.admin_records) == 1
 
     def test_multi_admin_multi_leaf(self, tmp_path):
         """Multiple admins, each with several keys — m_within varies."""
