@@ -25,6 +25,7 @@ from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 
 from .admin import router as admin_router
+from .admin_bootstrap import router as admin_bootstrap_router
 from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
@@ -235,6 +236,7 @@ app.add_middleware(
 
 # Admin router (gated by POPULIS_ADMIN_TOKEN; returns 503 when token is unset).
 app.include_router(admin_router)
+app.include_router(admin_bootstrap_router)
 
 # Admin Desk: wallet-signed JWT auth + mint-proposal lifecycle.
 # Both routers return 503 when POPULIS_ADMIN_PUBKEY_ALLOWLIST is unset

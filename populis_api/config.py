@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     # the API loads the plan on startup so it can serve /admin/deployment and
     # the protocol-aware vault flows without re-deploying.
     deployment_manifest_path: str = "./deployment_manifest.json"
+    bootstrap_manifest_path: str = "./bootstrap_manifest.json"
+    bootstrap_session_secret: str = ""
+    bootstrap_session_ttl_seconds: int = Field(900, ge=1)
+    bootstrap_cookie_secure: bool = True
 
     # ── Protocol-config singleton (A.3) ───────────────────────────────────
     # On-chain replacement for the three trust-root env vars
