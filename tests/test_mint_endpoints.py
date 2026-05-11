@@ -125,13 +125,7 @@ def _propose_body(*, suffix: int = 0) -> dict[str, Any]:
     }
 
 
-def _admin_records_client(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-    *,
-    records_evm_addresses: list[str],
-    legacy_allowlist: str = "",
-) -> TestClient:
+def _write_admin_records(path, records_evm_addresses: list[str]):
     records = [
         {
             "admin_idx": i,
@@ -148,19 +142,16 @@ def _admin_records_client(
         }
         for i, evm in enumerate(records_evm_addresses)
     ]
-    path = tmp_path / "admin_records.json"
     path.write_text(json.dumps({
         "version": 1,
         "launcher_id": "0x" + "10" * 32,
         "admin_records": records,
     }))
-    config = load_admin_records_from_path(path)
+    return load_admin_records_from_path(path)
+
+
+def _pin_admin_records_env(monkeypatch: pytest.MonkeyPatch, path, config) -> None:
     monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
-    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", legacy_allowlist)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "k" * 64)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "900")
-    monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
-    monkeypatch.setenv("POPULIS_ADMIN_DB_PATH", str(tmp_path / "admin_records_proposals.db"))
     monkeypatch.setenv(
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
         "0x" + config.compute_admins_hash().hex(),
@@ -170,6 +161,23 @@ def _admin_records_client(
         "0x" + config.launcher_id.hex(),
     )
     get_settings.cache_clear()
+
+
+def _admin_records_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    *,
+    records_evm_addresses: list[str],
+    legacy_allowlist: str = "",
+) -> TestClient:
+    path = tmp_path / "admin_records.json"
+    config = _write_admin_records(path, records_evm_addresses)
+    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", legacy_allowlist)
+    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "k" * 64)
+    monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "900")
+    monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
+    monkeypatch.setenv("POPULIS_ADMIN_DB_PATH", str(tmp_path / "admin_records_proposals.db"))
+    _pin_admin_records_env(monkeypatch, path, config)
     a = FastAPI()
     a.include_router(admin_auth.router)
     a.include_router(mint_endpoints.router)
@@ -265,6 +273,38 @@ class TestAdminRecordsGating:
         token = _login(client, _TEST_ACCT)
         list_resp = client.get("/admin/mint", headers=_auth_header(token))
         assert list_resp.status_code == 200, list_resp.text
+
+    def test_records_path_rotation_revokes_existing_mint_jwt(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        client = _admin_records_client(
+            monkeypatch,
+            tmp_path,
+            records_evm_addresses=[_TEST_ADDRESS_LOWER],
+            legacy_allowlist="",
+        )
+        old_token = _login(client, _TEST_ACCT)
+        baseline = client.get("/admin/mint", headers=_auth_header(old_token))
+        assert baseline.status_code == 200, baseline.text
+
+        rotated_path = tmp_path / "admin_records_rotated.json"
+        rotated_config = _write_admin_records(rotated_path, [_OTHER_ADDRESS_LOWER])
+        _pin_admin_records_env(monkeypatch, rotated_path, rotated_config)
+
+        revoked = client.get("/admin/mint", headers=_auth_header(old_token))
+        assert revoked.status_code == 403, revoked.text
+        assert "no longer in the admin allowlist" in revoked.json()["detail"]
+
+        new_token = _login(client, _OTHER_ACCT)
+        accepted = client.post(
+            "/admin/mint/propose",
+            json=_propose_body(suffix=91),
+            headers=_auth_header(new_token),
+        )
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["owner_pubkey"] == _OTHER_ADDRESS_LOWER
 
 
 # ── Propose ─────────────────────────────────────────────────────────────────
