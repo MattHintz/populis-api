@@ -30,6 +30,7 @@ FORBIDDEN_ARTIFACT_MARKERS = (
 )
 BOOTSTRAP_RECOVERY_ANCHOR_TAG = "POPULIS_BOOTSTRAP_V1"
 BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS = 1
+CREATE_COIN_CONDITION_OPCODE = 51
 
 
 class BootstrapManifestError(ValueError):
@@ -78,6 +79,19 @@ class BootstrapRecoveryAnchorPublishIntent:
     tag_memo: bytes
     payload_memo: bytes
     memos: tuple[bytes, bytes]
+    payload_hash: str
+
+
+@dataclass(frozen=True)
+class BootstrapRecoveryAnchorCreateCoinPreview:
+    condition_opcode: int
+    marker_puzzle_hash: str
+    marker_coin_amount_mojos: int
+    tag_memo: bytes
+    payload_memo: bytes
+    memos: tuple[bytes, bytes]
+    condition: tuple[int, bytes, int, tuple[bytes, bytes]]
+    condition_hex: tuple[int, str, int, tuple[str, str]]
     payload_hash: str
 
 
@@ -331,6 +345,39 @@ def build_bootstrap_recovery_anchor_publish_intent(
     )
 
 
+def build_bootstrap_recovery_anchor_create_coin_preview(
+    *,
+    publish_intent: BootstrapRecoveryAnchorPublishIntent,
+    marker_puzzle_hash: str,
+) -> BootstrapRecoveryAnchorCreateCoinPreview:
+    intent = _validate_bootstrap_recovery_anchor_publish_intent(publish_intent)
+    marker_ph = _normalize_hex32(marker_puzzle_hash, "marker_puzzle_hash")
+    marker_ph_bytes = bytes.fromhex(marker_ph.removeprefix("0x"))
+    condition = (
+        CREATE_COIN_CONDITION_OPCODE,
+        marker_ph_bytes,
+        intent.marker_coin_amount_mojos,
+        intent.memos,
+    )
+    condition_hex = (
+        CREATE_COIN_CONDITION_OPCODE,
+        marker_ph,
+        intent.marker_coin_amount_mojos,
+        tuple("0x" + memo.hex() for memo in intent.memos),
+    )
+    return BootstrapRecoveryAnchorCreateCoinPreview(
+        condition_opcode=CREATE_COIN_CONDITION_OPCODE,
+        marker_puzzle_hash=marker_ph,
+        marker_coin_amount_mojos=intent.marker_coin_amount_mojos,
+        tag_memo=intent.tag_memo,
+        payload_memo=intent.payload_memo,
+        memos=intent.memos,
+        condition=condition,
+        condition_hex=condition_hex,
+        payload_hash=intent.payload_hash,
+    )
+
+
 def persist_bootstrap_artifacts(
     *,
     artifacts: BootstrapArtifacts,
@@ -421,6 +468,44 @@ def _validate_marker_coin_amount_mojos(value: object) -> int:
     return value
 
 
+def _validate_bootstrap_recovery_anchor_publish_intent(
+    intent: BootstrapRecoveryAnchorPublishIntent,
+) -> BootstrapRecoveryAnchorPublishIntent:
+    _validate_marker_coin_amount_mojos(intent.marker_coin_amount_mojos)
+    expected_tag = BOOTSTRAP_RECOVERY_ANCHOR_TAG.encode("utf-8")
+    if intent.tag_memo != expected_tag:
+        raise BootstrapManifestError(
+            f"publish intent tag memo must be {BOOTSTRAP_RECOVERY_ANCHOR_TAG}"
+        )
+    if intent.memos != (intent.tag_memo, intent.payload_memo):
+        raise BootstrapManifestError("publish intent memos must be tag memo then payload memo")
+    try:
+        payload_value = json.loads(intent.payload_memo.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise BootstrapManifestError(
+            "publish intent payload memo must be UTF-8 canonical JSON"
+        ) from e
+    if not isinstance(payload_value, Mapping):
+        raise BootstrapManifestError("publish intent payload memo must decode to a JSON object")
+    payload = _validate_bootstrap_recovery_anchor_payload(payload_value)
+    if intent.payload_memo != canonical_json_bytes(payload):
+        raise BootstrapManifestError("publish intent payload memo must be canonical JSON bytes")
+    if intent.payload_hash != content_hash(payload):
+        raise BootstrapManifestError("publish intent payload hash does not match payload memo")
+    expected_fields = {
+        "network": payload["network"],
+        "admin_authority_v2_launcher_id": payload["admin_authority_v2_launcher_id"],
+        "authority_version": payload["authority_version"],
+        "bootstrap_manifest_hash": payload["bootstrap_manifest_hash"],
+        "portal_runtime_config_hash": payload["portal_runtime_config_hash"],
+        "admin_records_hash": payload["admin_records_hash"],
+    }
+    for field, expected in expected_fields.items():
+        if getattr(intent, field) != expected:
+            raise BootstrapManifestError(f"publish intent {field} does not match payload memo")
+    return intent
+
+
 def _require_content_hash(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.startswith("sha256:"):
         raise BootstrapManifestError(f"{field} must be a sha256 content hash")
@@ -503,15 +588,18 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
 __all__ = [
     "BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS",
     "BOOTSTRAP_RECOVERY_ANCHOR_TAG",
+    "CREATE_COIN_CONDITION_OPCODE",
     "BootstrapArtifacts",
     "BootstrapArtifactPaths",
     "BootstrapManifestError",
     "BootstrapRecoveryAnchor",
     "BootstrapRecoveryAnchorCarrierMemos",
+    "BootstrapRecoveryAnchorCreateCoinPreview",
     "BootstrapRecoveryAnchorPublishIntent",
     "FORBIDDEN_ARTIFACT_MARKERS",
     "build_bootstrap_artifacts",
     "build_bootstrap_recovery_anchor",
+    "build_bootstrap_recovery_anchor_create_coin_preview",
     "build_bootstrap_recovery_anchor_memos",
     "build_bootstrap_recovery_anchor_publish_intent",
     "canonical_json_bytes",

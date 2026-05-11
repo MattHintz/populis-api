@@ -11,6 +11,7 @@ from populis_api.bootstrap_manifest import (
     BootstrapManifestError,
     build_bootstrap_artifacts,
     build_bootstrap_recovery_anchor,
+    build_bootstrap_recovery_anchor_create_coin_preview,
     build_bootstrap_recovery_anchor_memos,
     build_bootstrap_recovery_anchor_publish_intent,
     canonical_json_bytes,
@@ -380,6 +381,107 @@ def test_bootstrap_recovery_anchor_publish_intent_rejects_secret_material() -> N
     with pytest.raises(BootstrapManifestError, match="forbidden credential marker"):
         build_bootstrap_recovery_anchor_publish_intent(
             bootstrap_recovery_anchor=payload,
+        )
+
+
+def test_builds_bootstrap_recovery_anchor_create_coin_preview() -> None:
+    artifacts, _ = artifacts_and_records()
+    intent = build_bootstrap_recovery_anchor_publish_intent(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+        marker_coin_amount_mojos=42,
+    )
+
+    preview = build_bootstrap_recovery_anchor_create_coin_preview(
+        publish_intent=intent,
+        marker_puzzle_hash=H("ef"),
+    )
+
+    assert preview.condition_opcode == bm.CREATE_COIN_CONDITION_OPCODE == 51
+    assert preview.marker_puzzle_hash == H("ef")
+    assert preview.marker_coin_amount_mojos == 42
+    assert preview.tag_memo == intent.tag_memo
+    assert preview.payload_memo == intent.payload_memo
+    assert preview.memos == intent.memos
+    assert preview.condition == (
+        51,
+        bytes.fromhex("ef" * 32),
+        42,
+        intent.memos,
+    )
+    assert preview.condition_hex == (
+        51,
+        H("ef"),
+        42,
+        tuple("0x" + memo.hex() for memo in intent.memos),
+    )
+    assert preview.payload_hash == intent.payload_hash
+    for non_authority_field in (
+        "marker_coin_id",
+        "parent_coin_id",
+        "future_spend",
+        "spend_bundle",
+        "wallet_signature",
+    ):
+        assert not hasattr(preview, non_authority_field)
+
+
+@pytest.mark.parametrize("marker_puzzle_hash", ["ef" * 32, "0x" + "EF" * 32])
+def test_bootstrap_recovery_anchor_create_coin_preview_normalizes_marker_puzzle_hash(
+    marker_puzzle_hash: str,
+) -> None:
+    artifacts, _ = artifacts_and_records()
+    intent = build_bootstrap_recovery_anchor_publish_intent(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    )
+
+    preview = build_bootstrap_recovery_anchor_create_coin_preview(
+        publish_intent=intent,
+        marker_puzzle_hash=marker_puzzle_hash,
+    )
+
+    assert preview.marker_puzzle_hash == H("ef")
+    assert preview.condition[1] == bytes.fromhex("ef" * 32)
+
+
+@pytest.mark.parametrize("marker_puzzle_hash", ["0x1234", "0x" + "zz" * 32, 123])
+def test_bootstrap_recovery_anchor_create_coin_preview_rejects_invalid_marker_puzzle_hash(
+    marker_puzzle_hash: object,
+) -> None:
+    artifacts, _ = artifacts_and_records()
+    intent = build_bootstrap_recovery_anchor_publish_intent(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    )
+
+    with pytest.raises(BootstrapManifestError, match="marker_puzzle_hash"):
+        build_bootstrap_recovery_anchor_create_coin_preview(
+            publish_intent=intent,
+            marker_puzzle_hash=marker_puzzle_hash,
+        )
+
+
+def test_bootstrap_recovery_anchor_create_coin_preview_rejects_tampered_intent() -> None:
+    artifacts, _ = artifacts_and_records()
+    intent = build_bootstrap_recovery_anchor_publish_intent(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    )
+    tampered = bm.BootstrapRecoveryAnchorPublishIntent(
+        network=intent.network,
+        marker_coin_amount_mojos=intent.marker_coin_amount_mojos,
+        admin_authority_v2_launcher_id=intent.admin_authority_v2_launcher_id,
+        authority_version=intent.authority_version,
+        bootstrap_manifest_hash=intent.bootstrap_manifest_hash,
+        portal_runtime_config_hash=intent.portal_runtime_config_hash,
+        admin_records_hash=intent.admin_records_hash,
+        tag_memo=intent.tag_memo,
+        payload_memo=intent.payload_memo,
+        memos=(intent.payload_memo, intent.tag_memo),
+        payload_hash=intent.payload_hash,
+    )
+
+    with pytest.raises(BootstrapManifestError, match="memos must be tag memo then payload memo"):
+        build_bootstrap_recovery_anchor_create_coin_preview(
+            publish_intent=tampered,
+            marker_puzzle_hash=H("ef"),
         )
 
 
