@@ -357,3 +357,40 @@ def test_genesis_readme_pins_recovery_anchor_carrier_secret_boundaries() -> None
     ):
         assert forbidden in text
     assert "locators remain optional hints outside the authority boundary" in text
+
+
+def test_genesis_readme_pins_recovery_anchor_publish_intent_api_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap recovery anchor publish-intent API contract" in text
+    assert "`GET /admin/bootstrap/recovery-anchor/publish-intent` exposes a non-broadcasting operator handoff" in text
+    assert "available only after `bootstrap_manifest.json` exists and `bootstrap_recovery_anchor.json` is present" in text
+    assert "reads the persisted recovery anchor" in text
+    assert "never recomputes a different payload from portal env" in text
+    assert "authorized by `require_admin_jwt`" in text
+    assert "retired bootstrap session cookie and raw `POPULIS_ADMIN_TOKEN` are not accepted" in text
+    for field in (
+        "`network`",
+        "`marker_coin_amount_mojos`",
+        "`admin_authority_v2_launcher_id`",
+        "`authority_version`",
+        "`bootstrap_manifest_hash`",
+        "`portal_runtime_config_hash`",
+        "`admin_records_hash`",
+        "`tag_memo_utf8`",
+        "`tag_memo_hex`",
+        "`payload_memo_json`",
+        "`payload_memo_utf8`",
+        "`payload_memo_hex`",
+        "`memos_hex`",
+        "`payload_hash`",
+    ):
+        assert field in text
+    assert "`marker_coin_amount_mojos` defaults to `1`" in text
+    assert "does not include or require marker puzzle hash, marker coin id, parent coin id, future spend" in text
+    assert "raw wallet signature, spend bundle, or wallet private material" in text
+    assert "`tag_memo_utf8` must be `POPULIS_BOOTSTRAP_V1`" in text
+    assert "`payload_memo_json` must equal the persisted `bootstrap_recovery_anchor.json`" in text
+    assert "`payload_memo_utf8` must be canonical JSON bytes decoded as UTF-8" in text
+    assert "`memos_hex` must contain exactly the tag memo hex and payload memo hex in carrier order" in text
+    assert "does not submit to coinset, push a spend bundle, select a wallet coin, or create authority" in text

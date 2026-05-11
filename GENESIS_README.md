@@ -300,6 +300,34 @@ transaction wiring lands:
    URLs, or mutable service credentials.  HTTP/IPFS/Arweave/Git/GitHub
    locators remain optional hints outside the authority boundary.
 
+### Bootstrap recovery anchor publish-intent API contract
+
+`GET /admin/bootstrap/recovery-anchor/publish-intent` exposes a
+non-broadcasting operator handoff for the marker-coin carrier:
+
+1. The endpoint is available only after `bootstrap_manifest.json` exists and
+   `bootstrap_recovery_anchor.json` is present.  It reads the persisted
+   recovery anchor; it never recomputes a different payload from portal env.
+2. The endpoint is authorized by `require_admin_jwt`.  The retired bootstrap
+   session cookie and raw `POPULIS_ADMIN_TOKEN` are not accepted as publish
+   authority after lock.
+3. The response is JSON-safe and public-only: `network`,
+   `marker_coin_amount_mojos`, `admin_authority_v2_launcher_id`,
+   `authority_version`, `bootstrap_manifest_hash`,
+   `portal_runtime_config_hash`, `admin_records_hash`, `tag_memo_utf8`,
+   `tag_memo_hex`, `payload_memo_json`, `payload_memo_utf8`,
+   `payload_memo_hex`, `memos_hex`, and `payload_hash`.
+4. `marker_coin_amount_mojos` defaults to `1`; the API does not include or
+   require marker puzzle hash, marker coin id, parent coin id, future spend,
+   raw wallet signature, spend bundle, or wallet private material.
+5. `tag_memo_utf8` must be `POPULIS_BOOTSTRAP_V1`; `payload_memo_json` must
+   equal the persisted `bootstrap_recovery_anchor.json`; `payload_memo_utf8`
+   must be canonical JSON bytes decoded as UTF-8; and `memos_hex` must contain
+   exactly the tag memo hex and payload memo hex in carrier order.
+6. The endpoint does not submit to coinset, push a spend bundle, select a
+   wallet coin, or create authority.  It only exports deterministic inputs for
+   later operator wallet tooling.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony

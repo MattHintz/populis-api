@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 from populis_api import admin_auth, admin_bootstrap
 from populis_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_PATH
 from populis_api.admin_records import load_admin_records_from_mapping
-from populis_api.bootstrap_manifest import BOOTSTRAP_RECOVERY_ANCHOR_TAG, content_hash
+from populis_api.bootstrap_manifest import (
+    BOOTSTRAP_RECOVERY_ANCHOR_TAG,
+    canonical_json_bytes,
+    content_hash,
+)
 from populis_api.config import get_settings
 
 
@@ -123,6 +127,15 @@ def write_deployment_manifest(bootstrap_manifest_path) -> None:
         json.dumps(deployment_manifest()),
         encoding="utf-8",
     )
+
+
+def admin_authorization_header() -> dict[str, str]:
+    token, _ = admin_auth.issue_jwt(
+        sub="0x1111111111111111111111111111111111111111",
+        auth_type="evm",
+        settings=get_settings(),
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def resolve_schema(openapi: dict, schema: dict) -> dict:
@@ -420,6 +433,141 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
         "portal_runtime_config_hash",
         "admin_records_hash",
     }.issubset(set(recovery_anchor_schema["required"]))
+
+
+def test_recovery_anchor_publish_intent_requires_admin_jwt_after_lock(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+    ok = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert ok.status_code == 200
+
+    missing = client.get("/admin/bootstrap/recovery-anchor/publish-intent")
+    static_token = client.get(
+        "/admin/bootstrap/recovery-anchor/publish-intent",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+
+    assert missing.status_code == 401
+    assert static_token.status_code == 403
+
+
+def test_recovery_anchor_publish_intent_requires_locked_artifacts(
+    client: TestClient,
+) -> None:
+    resp = client.get(
+        "/admin/bootstrap/recovery-anchor/publish-intent",
+        headers=admin_authorization_header(),
+    )
+
+    assert resp.status_code == 409
+    assert "only after bootstrap_manifest.json exists" in resp.json()["detail"]
+
+
+def test_recovery_anchor_publish_intent_rejects_missing_anchor_after_lock(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    bootstrap_env.write_text('{"locked": true}', encoding="utf-8")
+
+    resp = client.get(
+        "/admin/bootstrap/recovery-anchor/publish-intent",
+        headers=admin_authorization_header(),
+    )
+
+    assert resp.status_code == 409
+    assert "bootstrap_recovery_anchor.json is required" in resp.json()["detail"]
+
+
+def test_recovery_anchor_publish_intent_returns_json_safe_marker_inputs(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+    finalized = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert finalized.status_code == 200
+    anchor = finalized.json()["bootstrap_recovery_anchor"]
+    payload_bytes = canonical_json_bytes(anchor)
+
+    resp = client.get(
+        "/admin/bootstrap/recovery-anchor/publish-intent",
+        headers=admin_authorization_header(),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["network"] == "testnet11"
+    assert body["marker_coin_amount_mojos"] == 1
+    assert body["admin_authority_v2_launcher_id"] == H("88")
+    assert body["authority_version"] == 1
+    assert body["bootstrap_manifest_hash"] == anchor["bootstrap_manifest_hash"]
+    assert body["portal_runtime_config_hash"] == anchor["portal_runtime_config_hash"]
+    assert body["admin_records_hash"] == anchor["admin_records_hash"]
+    assert body["tag_memo_utf8"] == BOOTSTRAP_RECOVERY_ANCHOR_TAG
+    assert body["tag_memo_hex"] == "0x" + BOOTSTRAP_RECOVERY_ANCHOR_TAG.encode(
+        "utf-8"
+    ).hex()
+    assert body["payload_memo_json"] == anchor
+    assert body["payload_memo_utf8"] == payload_bytes.decode("utf-8")
+    assert body["payload_memo_hex"] == "0x" + payload_bytes.hex()
+    assert body["memos_hex"] == [body["tag_memo_hex"], body["payload_memo_hex"]]
+    assert body["payload_hash"] == content_hash(anchor)
+    emitted = json.dumps(body).lower()
+    for forbidden in (
+        "bootstrap-secret",
+        "populis_bootstrap_session",
+        "jwt_secret",
+        "private_key",
+        "spend_bundle",
+        "marker_coin_id",
+        "marker_puzzle_hash",
+        "parent_coin_id",
+        "future_spend",
+    ):
+        assert forbidden not in emitted
+
+
+def test_recovery_anchor_publish_intent_openapi_schema_pins_json_safe_handoff(
+    client: TestClient,
+) -> None:
+    openapi = client.app.openapi()
+    schema = resolve_schema(
+        openapi,
+        openapi["paths"]["/admin/bootstrap/recovery-anchor/publish-intent"]["get"][
+            "responses"
+        ]["200"]["content"]["application/json"]["schema"],
+    )
+
+    assert set(schema["required"]) == {
+        "network",
+        "marker_coin_amount_mojos",
+        "admin_authority_v2_launcher_id",
+        "authority_version",
+        "bootstrap_manifest_hash",
+        "portal_runtime_config_hash",
+        "admin_records_hash",
+        "tag_memo_utf8",
+        "tag_memo_hex",
+        "payload_memo_json",
+        "payload_memo_utf8",
+        "payload_memo_hex",
+        "memos_hex",
+        "payload_hash",
+    }
+    assert "spend_bundle" not in schema["properties"]
+    assert "marker_coin_id" not in schema["properties"]
+    assert "marker_puzzle_hash" not in schema["properties"]
 
 
 def test_bootstrap_finalize_fails_closed_after_lock(

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict
 
 from .admin import require_admin_token
+from .admin_auth import require_admin_jwt
 from .admin_records import (
     AdminRecordsDriftError,
     AdminRecordsLoadError,
@@ -22,6 +23,7 @@ from .bootstrap_manifest import (
     BootstrapArtifactPaths,
     BootstrapManifestError,
     build_bootstrap_artifacts,
+    build_bootstrap_recovery_anchor_publish_intent,
     persist_bootstrap_artifacts,
 )
 from .config import Settings, get_settings
@@ -112,6 +114,23 @@ class BootstrapFinalizeResponse(BaseModel):
     bootstrap_manifest: BootstrapManifestArtifact
     portal_runtime_config: PortalRuntimeConfigArtifact
     bootstrap_recovery_anchor: BootstrapRecoveryAnchorArtifact
+
+
+class BootstrapRecoveryAnchorPublishIntentResponse(BaseModel):
+    network: str
+    marker_coin_amount_mojos: int
+    admin_authority_v2_launcher_id: str
+    authority_version: int
+    bootstrap_manifest_hash: str
+    portal_runtime_config_hash: str
+    admin_records_hash: str
+    tag_memo_utf8: str
+    tag_memo_hex: str
+    payload_memo_json: BootstrapRecoveryAnchorArtifact
+    payload_memo_utf8: str
+    payload_memo_hex: str
+    memos_hex: list[str]
+    payload_hash: str
 
 
 def reset_bootstrap_state_for_tests() -> None:
@@ -337,6 +356,65 @@ async def bootstrap_finalize(
     )
 
 
+@router.get(
+    "/recovery-anchor/publish-intent",
+    response_model=BootstrapRecoveryAnchorPublishIntentResponse,
+)
+async def bootstrap_recovery_anchor_publish_intent(
+    settings: Annotated[Settings, Depends(get_settings)],
+    _claims: Annotated[Any, Depends(require_admin_jwt)],
+) -> BootstrapRecoveryAnchorPublishIntentResponse:
+    if not bootstrap_locked(settings):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bootstrap recovery anchor publish intent is available only after bootstrap_manifest.json exists.",
+        )
+    recovery_anchor_path = bootstrap_recovery_anchor_path(settings)
+    if not recovery_anchor_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="bootstrap_recovery_anchor.json is required before publishing the recovery anchor.",
+        )
+    try:
+        recovery_anchor = json.loads(recovery_anchor_path.read_text(encoding="utf-8"))
+        if not isinstance(recovery_anchor, dict):
+            raise BootstrapManifestError(
+                "bootstrap_recovery_anchor.json top-level must be an object"
+            )
+        intent = build_bootstrap_recovery_anchor_publish_intent(
+            bootstrap_recovery_anchor=recovery_anchor,
+        )
+        tag_memo_utf8 = intent.tag_memo.decode("utf-8")
+        payload_memo_utf8 = intent.payload_memo.decode("utf-8")
+        payload_memo_json = json.loads(payload_memo_utf8)
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to read bootstrap_recovery_anchor.json.",
+        ) from e
+    except (BootstrapManifestError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Persisted bootstrap_recovery_anchor.json is invalid: {e}",
+        ) from e
+    return BootstrapRecoveryAnchorPublishIntentResponse(
+        network=intent.network,
+        marker_coin_amount_mojos=intent.marker_coin_amount_mojos,
+        admin_authority_v2_launcher_id=intent.admin_authority_v2_launcher_id,
+        authority_version=intent.authority_version,
+        bootstrap_manifest_hash=intent.bootstrap_manifest_hash,
+        portal_runtime_config_hash=intent.portal_runtime_config_hash,
+        admin_records_hash=intent.admin_records_hash,
+        tag_memo_utf8=tag_memo_utf8,
+        tag_memo_hex="0x" + intent.tag_memo.hex(),
+        payload_memo_json=payload_memo_json,
+        payload_memo_utf8=payload_memo_utf8,
+        payload_memo_hex="0x" + intent.payload_memo.hex(),
+        memos_hex=["0x" + memo.hex() for memo in intent.memos],
+        payload_hash=intent.payload_hash,
+    )
+
+
 __all__ = [
     "BOOTSTRAP_COOKIE_NAME",
     "BOOTSTRAP_COOKIE_PATH",
@@ -345,12 +423,14 @@ __all__ = [
     "BootstrapFinalizeRequest",
     "BootstrapFinalizeResponse",
     "BootstrapRecoveryAnchorArtifact",
+    "BootstrapRecoveryAnchorPublishIntentResponse",
     "BootstrapStatusResponse",
     "BootstrapSessionClaims",
     "bootstrap_admin_records_path",
     "bootstrap_locked",
     "bootstrap_manifest_path",
     "bootstrap_recovery_anchor_path",
+    "bootstrap_recovery_anchor_publish_intent",
     "issue_bootstrap_session",
     "portal_runtime_config_path",
     "require_bootstrap_session",
