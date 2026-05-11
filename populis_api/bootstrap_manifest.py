@@ -24,6 +24,7 @@ FORBIDDEN_ARTIFACT_MARKERS = (
     "faucet_seed",
     "faucet_master_sk",
 )
+BOOTSTRAP_RECOVERY_ANCHOR_TAG = "POPULIS_BOOTSTRAP_V1"
 
 
 class BootstrapManifestError(ValueError):
@@ -41,6 +42,13 @@ class BootstrapArtifactPaths:
     admin_records_json: Path
     portal_runtime_config_json: Path
     bootstrap_manifest_json: Path
+
+
+@dataclass(frozen=True)
+class BootstrapRecoveryAnchor:
+    payload: dict[str, Any]
+    payload_bytes: bytes
+    payload_hash: str
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -137,6 +145,118 @@ def build_bootstrap_artifacts(
     )
 
 
+def build_bootstrap_recovery_anchor(
+    *,
+    bootstrap_manifest: Mapping[str, Any],
+    portal_runtime_config: Mapping[str, Any],
+    version: int = 1,
+) -> BootstrapRecoveryAnchor:
+    normalized_version = _validate_recovery_anchor_version(version)
+    manifest = dict(bootstrap_manifest)
+    runtime = dict(portal_runtime_config)
+    _assert_public_artifact(manifest, "bootstrap_manifest.json")
+    _assert_public_artifact(runtime, "portal_runtime_config.json")
+
+    network = _require_str(manifest, "network")
+    runtime_network = _require_str(runtime, "network")
+    if runtime_network != network:
+        raise BootstrapManifestError(
+            "portal_runtime_config network does not match bootstrap manifest"
+        )
+
+    manifest_authority = _require_mapping(
+        manifest.get("admin_authority_v2"),
+        "bootstrap_manifest.admin_authority_v2",
+    )
+    runtime_authority = _require_mapping(
+        runtime.get("admin_authority_v2"),
+        "portal_runtime_config.admin_authority_v2",
+    )
+    artifact_hashes = _require_mapping(
+        manifest.get("artifact_hashes"),
+        "bootstrap_manifest.artifact_hashes",
+    )
+
+    admin_launcher = _normalize_hex32(
+        manifest_authority.get("launcher_id"),
+        "bootstrap_manifest.admin_authority_v2.launcher_id",
+    )
+    runtime_admin_launcher = _normalize_hex32(
+        runtime_authority.get("launcher_id"),
+        "portal_runtime_config.admin_authority_v2.launcher_id",
+    )
+    if runtime_admin_launcher != admin_launcher:
+        raise BootstrapManifestError(
+            "portal_runtime_config admin authority launcher does not match bootstrap manifest"
+        )
+
+    for field in ("admins_hash", "mips_root"):
+        manifest_value = _normalize_hex32(
+            manifest_authority.get(field),
+            f"bootstrap_manifest.admin_authority_v2.{field}",
+        )
+        runtime_value = _normalize_hex32(
+            runtime_authority.get(field),
+            f"portal_runtime_config.admin_authority_v2.{field}",
+        )
+        if runtime_value != manifest_value:
+            raise BootstrapManifestError(
+                f"portal_runtime_config admin authority {field} does not match bootstrap manifest"
+            )
+
+    authority_version = _validate_authority_version(
+        manifest_authority.get("authority_version")
+    )
+    runtime_authority_version = _validate_authority_version(
+        runtime_authority.get("authority_version")
+    )
+    if runtime_authority_version != authority_version:
+        raise BootstrapManifestError(
+            "portal_runtime_config authority_version does not match bootstrap manifest"
+        )
+
+    admin_records_hash = _require_content_hash(
+        runtime_authority.get("admin_records_hash"),
+        "portal_runtime_config.admin_authority_v2.admin_records_hash",
+    )
+    manifest_admin_records_hash = _require_content_hash(
+        artifact_hashes.get("admin_records_json"),
+        "bootstrap_manifest.artifact_hashes.admin_records_json",
+    )
+    if manifest_admin_records_hash != admin_records_hash:
+        raise BootstrapManifestError(
+            "bootstrap manifest admin_records_json hash does not match portal_runtime_config"
+        )
+
+    runtime_hash = content_hash(runtime)
+    manifest_runtime_hash = _require_content_hash(
+        artifact_hashes.get("portal_runtime_config_json"),
+        "bootstrap_manifest.artifact_hashes.portal_runtime_config_json",
+    )
+    if manifest_runtime_hash != runtime_hash:
+        raise BootstrapManifestError(
+            "bootstrap manifest portal_runtime_config_json hash does not match portal_runtime_config"
+        )
+
+    payload = {
+        "version": normalized_version,
+        "tag": BOOTSTRAP_RECOVERY_ANCHOR_TAG,
+        "network": network,
+        "admin_authority_v2_launcher_id": admin_launcher,
+        "authority_version": authority_version,
+        "bootstrap_manifest_hash": content_hash(manifest),
+        "portal_runtime_config_hash": runtime_hash,
+        "admin_records_hash": admin_records_hash,
+    }
+    _assert_public_artifact(payload, "bootstrap_recovery_anchor")
+    payload_bytes = canonical_json_bytes(payload)
+    return BootstrapRecoveryAnchor(
+        payload=payload,
+        payload_bytes=payload_bytes,
+        payload_hash=content_hash(payload),
+    )
+
+
 def persist_bootstrap_artifacts(
     *,
     artifacts: BootstrapArtifacts,
@@ -174,6 +294,25 @@ def _assert_public_artifact(value: Mapping[str, Any], label: str) -> None:
             )
 
 
+def _require_mapping(value: object, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BootstrapManifestError(f"{field} must be an object")
+    return value
+
+
+def _require_content_hash(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        raise BootstrapManifestError(f"{field} must be a sha256 content hash")
+    digest = value.removeprefix("sha256:")
+    if len(digest) != 64:
+        raise BootstrapManifestError(f"{field} must be a sha256 content hash")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as e:
+        raise BootstrapManifestError(f"{field} must be a sha256 content hash") from e
+    return "sha256:" + digest.lower()
+
+
 def _require_str(manifest: Mapping[str, Any], key: str) -> str:
     value = manifest.get(key)
     if not isinstance(value, str) or not value:
@@ -206,6 +345,14 @@ def _validate_authority_version(value: object) -> int:
     return value
 
 
+def _validate_recovery_anchor_version(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BootstrapManifestError("recovery anchor version must be a positive integer")
+    if value < 1:
+        raise BootstrapManifestError("recovery anchor version must be >= 1")
+    return value
+
+
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
@@ -233,11 +380,14 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "BOOTSTRAP_RECOVERY_ANCHOR_TAG",
     "BootstrapArtifacts",
     "BootstrapArtifactPaths",
     "BootstrapManifestError",
+    "BootstrapRecoveryAnchor",
     "FORBIDDEN_ARTIFACT_MARKERS",
     "build_bootstrap_artifacts",
+    "build_bootstrap_recovery_anchor",
     "canonical_json_bytes",
     "content_hash",
     "persist_bootstrap_artifacts",

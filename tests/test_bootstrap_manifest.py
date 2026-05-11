@@ -10,6 +10,7 @@ from populis_api.bootstrap_manifest import (
     BootstrapArtifactPaths,
     BootstrapManifestError,
     build_bootstrap_artifacts,
+    build_bootstrap_recovery_anchor,
     canonical_json_bytes,
     content_hash,
     persist_bootstrap_artifacts,
@@ -76,6 +77,10 @@ def artifacts_and_records() -> tuple:
     return artifacts, records
 
 
+def clone_json(value: dict) -> dict:
+    return json.loads(json.dumps(value))
+
+
 def test_content_hash_uses_canonical_json_ordering() -> None:
     left = {"b": [2, 1], "a": {"z": True, "m": None}}
     right = {"a": {"m": None, "z": True}, "b": [2, 1]}
@@ -117,6 +122,102 @@ def test_builds_public_bootstrap_manifest_and_runtime_config() -> None:
     assert runtime["admin_authority_v2"]["admin_records_hash"] == content_hash(records)
     assert runtime["read_only_api_url"] == "https://api.populis.example"
     assert runtime["read_only_coinset_url"] == "https://coinset.example"
+
+
+def test_builds_bootstrap_recovery_anchor_from_finalized_artifacts() -> None:
+    artifacts, records = artifacts_and_records()
+
+    anchor = build_bootstrap_recovery_anchor(
+        bootstrap_manifest=artifacts.bootstrap_manifest,
+        portal_runtime_config=artifacts.portal_runtime_config,
+    )
+
+    expected_payload = {
+        "version": 1,
+        "tag": bm.BOOTSTRAP_RECOVERY_ANCHOR_TAG,
+        "network": "testnet11",
+        "admin_authority_v2_launcher_id": H("88"),
+        "authority_version": 1,
+        "bootstrap_manifest_hash": content_hash(artifacts.bootstrap_manifest),
+        "portal_runtime_config_hash": content_hash(artifacts.portal_runtime_config),
+        "admin_records_hash": content_hash(records),
+    }
+    assert anchor.payload == expected_payload
+    assert anchor.payload_bytes == canonical_json_bytes(expected_payload)
+    assert anchor.payload_hash == content_hash(expected_payload)
+    assert json.loads(anchor.payload_bytes) == expected_payload
+
+
+def test_bootstrap_recovery_anchor_accepts_explicit_payload_version() -> None:
+    artifacts, _ = artifacts_and_records()
+
+    anchor = build_bootstrap_recovery_anchor(
+        bootstrap_manifest=artifacts.bootstrap_manifest,
+        portal_runtime_config=artifacts.portal_runtime_config,
+        version=2,
+    )
+
+    assert anchor.payload["version"] == 2
+
+
+@pytest.mark.parametrize("version", [0, -1, True, "1"])
+def test_bootstrap_recovery_anchor_rejects_invalid_payload_version(version) -> None:
+    artifacts, _ = artifacts_and_records()
+
+    with pytest.raises(BootstrapManifestError, match="recovery anchor version"):
+        build_bootstrap_recovery_anchor(
+            bootstrap_manifest=artifacts.bootstrap_manifest,
+            portal_runtime_config=artifacts.portal_runtime_config,
+            version=version,
+        )
+
+
+def test_bootstrap_recovery_anchor_rejects_runtime_config_hash_drift() -> None:
+    artifacts, _ = artifacts_and_records()
+    runtime = clone_json(artifacts.portal_runtime_config)
+    runtime["read_only_api_url"] = "https://mirror.populis.example"
+
+    with pytest.raises(BootstrapManifestError, match="portal_runtime_config_json hash"):
+        build_bootstrap_recovery_anchor(
+            bootstrap_manifest=artifacts.bootstrap_manifest,
+            portal_runtime_config=runtime,
+        )
+
+
+def test_bootstrap_recovery_anchor_rejects_admin_records_hash_drift() -> None:
+    artifacts, _ = artifacts_and_records()
+    runtime = clone_json(artifacts.portal_runtime_config)
+    runtime["admin_authority_v2"]["admin_records_hash"] = f"sha256:{'ff' * 32}"
+
+    with pytest.raises(BootstrapManifestError, match="admin_records_json hash"):
+        build_bootstrap_recovery_anchor(
+            bootstrap_manifest=artifacts.bootstrap_manifest,
+            portal_runtime_config=runtime,
+        )
+
+
+def test_bootstrap_recovery_anchor_rejects_authority_coordinate_mismatch() -> None:
+    artifacts, _ = artifacts_and_records()
+    runtime = clone_json(artifacts.portal_runtime_config)
+    runtime["admin_authority_v2"]["authority_version"] = 2
+
+    with pytest.raises(BootstrapManifestError, match="authority_version"):
+        build_bootstrap_recovery_anchor(
+            bootstrap_manifest=artifacts.bootstrap_manifest,
+            portal_runtime_config=runtime,
+        )
+
+
+def test_bootstrap_recovery_anchor_rejects_secret_bearing_artifacts() -> None:
+    artifacts, _ = artifacts_and_records()
+    manifest = clone_json(artifacts.bootstrap_manifest)
+    manifest["forbidden"] = "POPULIS_ADMIN_TOKEN"
+
+    with pytest.raises(BootstrapManifestError, match="forbidden credential marker"):
+        build_bootstrap_recovery_anchor(
+            bootstrap_manifest=manifest,
+            portal_runtime_config=artifacts.portal_runtime_config,
+        )
 
 
 def test_builds_explicit_authority_version_for_future_snapshots() -> None:
