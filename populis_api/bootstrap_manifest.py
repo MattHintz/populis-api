@@ -35,12 +35,14 @@ class BootstrapManifestError(ValueError):
 class BootstrapArtifacts:
     bootstrap_manifest: dict[str, Any]
     portal_runtime_config: dict[str, Any]
+    bootstrap_recovery_anchor: dict[str, Any]
 
 
 @dataclass(frozen=True)
 class BootstrapArtifactPaths:
     admin_records_json: Path
     portal_runtime_config_json: Path
+    bootstrap_recovery_anchor_json: Path
     bootstrap_manifest_json: Path
 
 
@@ -137,11 +139,17 @@ def build_bootstrap_artifacts(
             "portal_runtime_config_json": runtime_hash,
         },
     }
+    recovery_anchor = build_bootstrap_recovery_anchor(
+        bootstrap_manifest=bootstrap_manifest,
+        portal_runtime_config=portal_runtime_config,
+    )
     _assert_public_artifact(portal_runtime_config, "portal_runtime_config.json")
     _assert_public_artifact(bootstrap_manifest, "bootstrap_manifest.json")
+    _assert_public_artifact(recovery_anchor.payload, "bootstrap_recovery_anchor.json")
     return BootstrapArtifacts(
         bootstrap_manifest=bootstrap_manifest,
         portal_runtime_config=portal_runtime_config,
+        bootstrap_recovery_anchor=recovery_anchor.payload,
     )
 
 
@@ -265,6 +273,7 @@ def persist_bootstrap_artifacts(
 ) -> None:
     admin_records_path = Path(paths.admin_records_json)
     runtime_config_path = Path(paths.portal_runtime_config_json)
+    recovery_anchor_path = Path(paths.bootstrap_recovery_anchor_json)
     bootstrap_manifest_path = Path(paths.bootstrap_manifest_json)
     if bootstrap_manifest_path.exists():
         raise BootstrapManifestError(
@@ -274,10 +283,16 @@ def persist_bootstrap_artifacts(
     records = dict(admin_records)
     _assert_public_artifact(records, "admin_records.json")
     _assert_public_artifact(artifacts.portal_runtime_config, "portal_runtime_config.json")
+    _assert_public_artifact(artifacts.bootstrap_recovery_anchor, "bootstrap_recovery_anchor.json")
     _assert_public_artifact(artifacts.bootstrap_manifest, "bootstrap_manifest.json")
 
     _atomic_write_json(admin_records_path, records)
     _atomic_write_json(runtime_config_path, artifacts.portal_runtime_config)
+    if bootstrap_manifest_path.exists():
+        raise BootstrapManifestError(
+            f"bootstrap manifest already exists at {bootstrap_manifest_path}"
+        )
+    _atomic_write_json(recovery_anchor_path, artifacts.bootstrap_recovery_anchor)
     if bootstrap_manifest_path.exists():
         raise BootstrapManifestError(
             f"bootstrap manifest already exists at {bootstrap_manifest_path}"

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from populis_api import admin_auth, admin_bootstrap
 from populis_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_PATH
 from populis_api.admin_records import load_admin_records_from_mapping
+from populis_api.bootstrap_manifest import BOOTSTRAP_RECOVERY_ANCHOR_TAG, content_hash
 from populis_api.config import get_settings
 
 
@@ -310,10 +311,22 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
         "authority_version": 1,
     }
     assert body["portal_runtime_config"]["admin_authority_v2"]["authority_version"] == 1
+    assert body["bootstrap_recovery_anchor"] == {
+        "version": 1,
+        "tag": BOOTSTRAP_RECOVERY_ANCHOR_TAG,
+        "network": "testnet11",
+        "admin_authority_v2_launcher_id": H("88"),
+        "authority_version": 1,
+        "bootstrap_manifest_hash": content_hash(body["bootstrap_manifest"]),
+        "portal_runtime_config_hash": content_hash(body["portal_runtime_config"]),
+        "admin_records_hash": content_hash(admin_records()),
+    }
     admin_records_path = bootstrap_env.with_name("admin_records.json")
     runtime_path = bootstrap_env.with_name("portal_runtime_config.json")
+    recovery_anchor_path = bootstrap_env.with_name("bootstrap_recovery_anchor.json")
     assert json.loads(admin_records_path.read_text()) == admin_records()
     assert json.loads(runtime_path.read_text()) == body["portal_runtime_config"]
+    assert json.loads(recovery_anchor_path.read_text()) == body["bootstrap_recovery_anchor"]
     assert json.loads(bootstrap_env.read_text()) == body["bootstrap_manifest"]
     assert body["portal_runtime_config"]["read_only_api_url"] == "https://api.populis.example"
     emitted = json.dumps(body).lower()
@@ -352,6 +365,10 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
         openapi,
         response_schema["properties"]["portal_runtime_config"],
     )
+    recovery_anchor_schema = resolve_schema(
+        openapi,
+        response_schema["properties"]["bootstrap_recovery_anchor"],
+    )
     manifest_authority_schema = resolve_schema(
         openapi,
         bootstrap_schema["properties"]["admin_authority_v2"],
@@ -365,6 +382,7 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
         "locked",
         "bootstrap_manifest",
         "portal_runtime_config",
+        "bootstrap_recovery_anchor",
     }
     assert {
         "version",
@@ -392,6 +410,16 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
         "authority_version",
         "admin_records_hash",
     }.issubset(set(runtime_authority_schema["required"]))
+    assert {
+        "version",
+        "tag",
+        "network",
+        "admin_authority_v2_launcher_id",
+        "authority_version",
+        "bootstrap_manifest_hash",
+        "portal_runtime_config_hash",
+        "admin_records_hash",
+    }.issubset(set(recovery_anchor_schema["required"]))
 
 
 def test_bootstrap_finalize_fails_closed_after_lock(

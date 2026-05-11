@@ -61,6 +61,7 @@ def artifact_paths(root: Path) -> BootstrapArtifactPaths:
     return BootstrapArtifactPaths(
         admin_records_json=root / "admin_records.json",
         portal_runtime_config_json=root / "portal_runtime_config.json",
+        bootstrap_recovery_anchor_json=root / "bootstrap_recovery_anchor.json",
         bootstrap_manifest_json=root / "bootstrap_manifest.json",
     )
 
@@ -122,6 +123,10 @@ def test_builds_public_bootstrap_manifest_and_runtime_config() -> None:
     assert runtime["admin_authority_v2"]["admin_records_hash"] == content_hash(records)
     assert runtime["read_only_api_url"] == "https://api.populis.example"
     assert runtime["read_only_coinset_url"] == "https://coinset.example"
+    assert artifacts.bootstrap_recovery_anchor["tag"] == bm.BOOTSTRAP_RECOVERY_ANCHOR_TAG
+    assert artifacts.bootstrap_recovery_anchor["bootstrap_manifest_hash"] == content_hash(bootstrap)
+    assert artifacts.bootstrap_recovery_anchor["portal_runtime_config_hash"] == content_hash(runtime)
+    assert artifacts.bootstrap_recovery_anchor["admin_records_hash"] == content_hash(records)
 
 
 def test_builds_bootstrap_recovery_anchor_from_finalized_artifacts() -> None:
@@ -297,6 +302,7 @@ def test_outputs_do_not_contain_secret_or_signature_material() -> None:
         {
             "bootstrap_manifest": artifacts.bootstrap_manifest,
             "portal_runtime_config": artifacts.portal_runtime_config,
+            "bootstrap_recovery_anchor": artifacts.bootstrap_recovery_anchor,
         },
         sort_keys=True,
     ).lower()
@@ -335,10 +341,14 @@ def test_persists_public_artifacts_with_bootstrap_manifest_last(tmp_path, monkey
     assert writes == [
         "admin_records.json",
         "portal_runtime_config.json",
+        "bootstrap_recovery_anchor.json",
         "bootstrap_manifest.json",
     ]
     assert json.loads(paths.admin_records_json.read_text()) == records
     assert json.loads(paths.portal_runtime_config_json.read_text()) == artifacts.portal_runtime_config
+    assert json.loads(paths.bootstrap_recovery_anchor_json.read_text()) == (
+        artifacts.bootstrap_recovery_anchor
+    )
     assert json.loads(paths.bootstrap_manifest_json.read_text()) == artifacts.bootstrap_manifest
 
 
@@ -356,6 +366,7 @@ def test_persistence_refuses_existing_bootstrap_manifest(tmp_path) -> None:
 
     assert not paths.admin_records_json.exists()
     assert not paths.portal_runtime_config_json.exists()
+    assert not paths.bootstrap_recovery_anchor_json.exists()
 
 
 def test_partial_failure_does_not_write_lock_manifest(tmp_path, monkeypatch) -> None:
@@ -379,6 +390,7 @@ def test_partial_failure_does_not_write_lock_manifest(tmp_path, monkeypatch) -> 
 
     assert paths.admin_records_json.exists()
     assert not paths.portal_runtime_config_json.exists()
+    assert not paths.bootstrap_recovery_anchor_json.exists()
     assert not paths.bootstrap_manifest_json.exists()
 
 
@@ -389,7 +401,7 @@ def test_persistence_rechecks_lock_before_final_manifest_write(tmp_path, monkeyp
 
     def race_lock(path, value):
         original(path, value)
-        if Path(path).name == "portal_runtime_config.json":
+        if Path(path).name == "bootstrap_recovery_anchor.json":
             paths.bootstrap_manifest_json.write_text('{"locked": true}', encoding="utf-8")
 
     monkeypatch.setattr(bm, "_atomic_write_json", race_lock)
@@ -401,4 +413,5 @@ def test_persistence_rechecks_lock_before_final_manifest_write(tmp_path, monkeyp
             paths=paths,
         )
 
+    assert paths.bootstrap_recovery_anchor_json.exists()
     assert json.loads(paths.bootstrap_manifest_json.read_text()) == {"locked": True}

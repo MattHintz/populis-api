@@ -94,10 +94,24 @@ class PortalRuntimeConfigArtifact(BaseModel):
     admin_authority_v2: AdminAuthorityV2RuntimeArtifact
 
 
+class BootstrapRecoveryAnchorArtifact(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    version: int
+    tag: str
+    network: str
+    admin_authority_v2_launcher_id: str
+    authority_version: int
+    bootstrap_manifest_hash: str
+    portal_runtime_config_hash: str
+    admin_records_hash: str
+
+
 class BootstrapFinalizeResponse(BaseModel):
     locked: bool
     bootstrap_manifest: BootstrapManifestArtifact
     portal_runtime_config: PortalRuntimeConfigArtifact
+    bootstrap_recovery_anchor: BootstrapRecoveryAnchorArtifact
 
 
 def reset_bootstrap_state_for_tests() -> None:
@@ -121,6 +135,10 @@ def bootstrap_admin_records_path(settings: Settings) -> Path:
 
 def portal_runtime_config_path(settings: Settings) -> Path:
     return bootstrap_manifest_path(settings).with_name("portal_runtime_config.json")
+
+
+def bootstrap_recovery_anchor_path(settings: Settings) -> Path:
+    return bootstrap_manifest_path(settings).with_name("bootstrap_recovery_anchor.json")
 
 
 def get_bootstrap_secret(settings: Settings) -> str:
@@ -279,6 +297,7 @@ async def bootstrap_finalize(
             paths=BootstrapArtifactPaths(
                 admin_records_json=bootstrap_admin_records_path(settings),
                 portal_runtime_config_json=portal_runtime_config_path(settings),
+                bootstrap_recovery_anchor_json=bootstrap_recovery_anchor_path(settings),
                 bootstrap_manifest_json=bootstrap_manifest_path(settings),
             ),
         )
@@ -314,6 +333,7 @@ async def bootstrap_finalize(
         locked=True,
         bootstrap_manifest=artifacts.bootstrap_manifest,
         portal_runtime_config=artifacts.portal_runtime_config,
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
     )
 
 
@@ -324,11 +344,13 @@ __all__ = [
     "BootstrapChallengeResponse",
     "BootstrapFinalizeRequest",
     "BootstrapFinalizeResponse",
+    "BootstrapRecoveryAnchorArtifact",
     "BootstrapStatusResponse",
     "BootstrapSessionClaims",
     "bootstrap_admin_records_path",
     "bootstrap_locked",
     "bootstrap_manifest_path",
+    "bootstrap_recovery_anchor_path",
     "issue_bootstrap_session",
     "portal_runtime_config_path",
     "require_bootstrap_session",
