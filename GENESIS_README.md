@@ -198,26 +198,26 @@ ceremony after the base protocol deployment manifest already exists:
    submitted `admins_hash`.
 4. The API builds public-only artifacts, validates them against credential
    markers, and persists them in this order:
-   `admin_records.json`, `portal_runtime_config.json`, then
-   `bootstrap_manifest.json`.
+   `admin_records.json`, `portal_runtime_config.json`,
+   `bootstrap_recovery_anchor.json`, then `bootstrap_manifest.json`.
 5. `bootstrap_manifest.json` is the lock marker.  It is written last; once
    present, challenge issuance and bootstrap finalization must fail closed
    rather than overwrite permanent records.
-6. A successful response returns only public `bootstrap_manifest` and
-   `portal_runtime_config` objects and clears the bootstrap session cookie.
-   It never returns or persists raw wallet signatures, auth nonces,
-   bootstrap JWT/cookie material, bearer headers, faucet keys, or
-   `POPULIS_ADMIN_TOKEN`.
+6. A successful response returns only public `bootstrap_manifest`,
+   `portal_runtime_config`, and `bootstrap_recovery_anchor` objects and clears
+   the bootstrap session cookie.  It never returns or persists raw wallet
+   signatures, auth nonces, bootstrap JWT/cookie material, bearer headers,
+   faucet keys, or `POPULIS_ADMIN_TOKEN`.
 7. The portal first-admin authority step calls `AdminBootstrapService.finalizeBootstrap`
    only after the admin-authority launch has been submitted, first-admin
    wallet metadata is known, `admins_hash` is live, and the MIPS root is
    filled.  The request is cookie-only (`withCredentials`) and sends no
    `Authorization` header.
-8. The portal displays returned `bootstrap_manifest.json` and
-   `portal_runtime_config.json` as read-only public artifacts and keeps
-   them visible after the bootstrapper flips to locked.  It must not store
-   the bootstrap token, session, raw signature, or finalized artifacts in
-   `localStorage` or `sessionStorage`.
+8. The portal displays returned `bootstrap_manifest.json`,
+   `portal_runtime_config.json`, and `bootstrap_recovery_anchor.json` as
+   read-only public artifacts and keeps them visible after the bootstrapper
+   flips to locked.  It must not store the bootstrap token, session, raw
+   signature, or finalized artifacts in `localStorage` or `sessionStorage`.
 9. `/admin/genesis` treats locked bootstrap as terminal: it disables
    starting another bootstrap session, hides the first-admin launch CTA,
    names the durable public artifacts, and points the operator to
@@ -238,10 +238,10 @@ future operator can discover without trusting the original server:
    a chain indexer can observe the anchor, the ceremony is recorded but not
    disaster-recoverable from chain alone.
 3. The discoverable marker tag is the ASCII string
-   `POPULIS_BOOTSTRAP_V1`.  The first implementation may carry it as a
-   memo-bearing marker coin, puzzle announcement payload, or equivalent
-   chain-visible spend record, but external recovery tooling must be able to
-   scan for that tag.
+   `POPULIS_BOOTSTRAP_V1`.  The first implementation carries it as a
+   memo-bearing marker coin.  Puzzle announcement payloads or other
+   chain-visible spend records may be added later only if they preserve the
+   same canonical payload and tag discoverability.
 4. The payload is canonical JSON using the same canonical byte rules as
    `canonical_json_bytes`: sorted keys, compact separators, UTF-8.  It must
    include `version`, `tag`, `network`,
@@ -260,6 +260,45 @@ future operator can discover without trusting the original server:
    session cookies/JWTs, raw wallet signatures, auth nonces, bearer tokens,
    admin JWT secrets, faucet private keys, private mnemonics, or any material
    that can authenticate as an admin or spend funds.
+
+### Bootstrap recovery anchor carrier contract
+
+The v1 on-chain carrier for `bootstrap_recovery_anchor.json` is a
+memo-bearing marker coin.  This freezes the first discoverability path before
+transaction wiring lands:
+
+1. The carrier transaction is the post-finalize bootstrap recovery-anchor
+   publish transaction in the same genesis ceremony.  It must be emitted only
+   after `/admin/bootstrap/finalize` has returned the final
+   `bootstrap_recovery_anchor.json` payload.  The original first-admin launch
+   transaction cannot carry the final anchor unless it already knows the final
+   artifact hashes.
+2. The marker coin is an ordinary XCH output created by a `CREATE_COIN`
+   condition with amount at least `1` mojo.  Its puzzle hash, amount, parent
+   coin, and future spend are not authority and must not be used as
+   validation inputs.
+3. The marker output memo list must contain exactly one UTF-8 tag memo equal
+   to `POPULIS_BOOTSTRAP_V1` and one payload memo equal to the canonical JSON
+   bytes of `bootstrap_recovery_anchor.json`.  The payload memo must parse as
+   JSON and must be byte-for-byte equal to `canonical_json_bytes(payload)`.
+4. Recovery tooling discovers candidates by scanning chain-visible output
+   memos for `POPULIS_BOOTSTRAP_V1`, then parsing the payload memo from the
+   same marker output.  Tooling must not require the original API host,
+   original portal host, marker puzzle hash, or marker coin id.
+5. A candidate anchor is valid only if the payload has the pinned v1 fields,
+   `tag == "POPULIS_BOOTSTRAP_V1"`, the payload bytes are canonical, mirrored
+   artifact hashes match `bootstrap_manifest_hash`,
+   `portal_runtime_config_hash`, and `admin_records_hash`, and the artifact
+   authority coordinates match the live `admin_authority_v2` singleton.
+6. Re-publishing the exact same payload is idempotent.  Conflicting anchors
+   for the same `network`, `admin_authority_v2_launcher_id`, and
+   `authority_version` are not automatically resolved; clients must reject
+   them or require manual operator/auditor review.
+7. The carrier transaction and memos must never include `POPULIS_ADMIN_TOKEN`,
+   bootstrap session cookies/JWTs, raw wallet signatures, auth nonces, bearer
+   tokens, admin JWT secrets, faucet private keys, private mnemonics, private
+   URLs, or mutable service credentials.  HTTP/IPFS/Arweave/Git/GitHub
+   locators remain optional hints outside the authority boundary.
 
 ---
 

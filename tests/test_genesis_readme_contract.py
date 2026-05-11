@@ -211,13 +211,13 @@ def test_genesis_readme_pins_bootstrap_finalize_endpoint_contract() -> None:
 def test_genesis_readme_pins_finalize_artifact_order_and_lock() -> None:
     text = " ".join(_readme().split())
 
-    assert "persists them in this order: `admin_records.json`, `portal_runtime_config.json`, then `bootstrap_manifest.json`" in text
+    assert "persists them in this order: `admin_records.json`, `portal_runtime_config.json`, `bootstrap_recovery_anchor.json`, then `bootstrap_manifest.json`" in text
     assert "`bootstrap_manifest.json` is the lock marker" in text
     assert "It is written last" in text
     assert "challenge issuance and bootstrap finalization must fail closed" in text
     assert "rather than overwrite permanent records" in text
     assert "clears the bootstrap session cookie" in text
-    assert "returns only public `bootstrap_manifest` and `portal_runtime_config` objects" in text
+    assert "returns only public `bootstrap_manifest`, `portal_runtime_config`, and `bootstrap_recovery_anchor` objects" in text
 
 
 def test_genesis_readme_pins_portal_finalize_ui_contract() -> None:
@@ -229,7 +229,7 @@ def test_genesis_readme_pins_portal_finalize_ui_contract() -> None:
     assert "`admins_hash` is live" in text
     assert "MIPS root is filled" in text
     assert "request is cookie-only (`withCredentials`) and sends no `Authorization` header" in text
-    assert "displays returned `bootstrap_manifest.json` and `portal_runtime_config.json`" in text
+    assert "displays returned `bootstrap_manifest.json`, `portal_runtime_config.json`, and `bootstrap_recovery_anchor.json`" in text
     assert "keeps them visible after the bootstrapper flips to locked" in text
     assert "must not store the bootstrap token, session, raw signature, or finalized artifacts" in text
     assert "`localStorage` or `sessionStorage`" in text
@@ -264,8 +264,8 @@ def test_genesis_readme_pins_recovery_anchor_marker_and_payload_shape() -> None:
     assert "same first-admin bootstrap ceremony after the final public artifact hashes are known" in text
     assert "`POPULIS_BOOTSTRAP_V1`" in text
     assert "memo-bearing marker coin" in text
-    assert "puzzle announcement payload" in text
-    assert "external recovery tooling must be able to scan for that tag" in text
+    assert "Puzzle announcement payloads or other chain-visible spend records may be added later" in text
+    assert "preserve the same canonical payload and tag discoverability" in text
     assert "`canonical_json_bytes`: sorted keys, compact separators, UTF-8" in text
     for field in (
         "`version`",
@@ -300,3 +300,60 @@ def test_genesis_readme_pins_recovery_anchor_hash_and_secret_rules() -> None:
         "private mnemonics",
     ):
         assert forbidden in text
+
+
+def test_genesis_readme_pins_recovery_anchor_carrier_boundary() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap recovery anchor carrier contract" in text
+    assert "The v1 on-chain carrier for `bootstrap_recovery_anchor.json` is a memo-bearing marker coin" in text
+    assert "post-finalize bootstrap recovery-anchor publish transaction in the same genesis ceremony" in text
+    assert "emitted only after `/admin/bootstrap/finalize` has returned the final `bootstrap_recovery_anchor.json` payload" in text
+    assert "original first-admin launch transaction cannot carry the final anchor unless it already knows the final artifact hashes" in text
+    assert "ordinary XCH output created by a `CREATE_COIN` condition with amount at least `1` mojo" in text
+    assert "puzzle hash, amount, parent coin, and future spend are not authority" in text
+    assert "must not be used as validation inputs" in text
+
+
+def test_genesis_readme_pins_recovery_anchor_carrier_memos_and_discovery() -> None:
+    text = " ".join(_readme().split())
+
+    assert "marker output memo list must contain exactly one UTF-8 tag memo equal to `POPULIS_BOOTSTRAP_V1`" in text
+    assert "one payload memo equal to the canonical JSON bytes of `bootstrap_recovery_anchor.json`" in text
+    assert "payload memo must parse as JSON" in text
+    assert "byte-for-byte equal to `canonical_json_bytes(payload)`" in text
+    assert "scanning chain-visible output memos for `POPULIS_BOOTSTRAP_V1`" in text
+    assert "parsing the payload memo from the same marker output" in text
+    assert "must not require the original API host, original portal host, marker puzzle hash, or marker coin id" in text
+
+
+def test_genesis_readme_pins_recovery_anchor_carrier_validation_and_conflicts() -> None:
+    text = " ".join(_readme().split())
+
+    assert "payload has the pinned v1 fields" in text
+    assert '`tag == "POPULIS_BOOTSTRAP_V1"`' in text
+    assert "payload bytes are canonical" in text
+    assert "mirrored artifact hashes match `bootstrap_manifest_hash`, `portal_runtime_config_hash`, and `admin_records_hash`" in text
+    assert "artifact authority coordinates match the live `admin_authority_v2` singleton" in text
+    assert "Re-publishing the exact same payload is idempotent" in text
+    assert "Conflicting anchors for the same `network`, `admin_authority_v2_launcher_id`, and `authority_version`" in text
+    assert "clients must reject them or require manual operator/auditor review" in text
+
+
+def test_genesis_readme_pins_recovery_anchor_carrier_secret_boundaries() -> None:
+    text = " ".join(_readme().split())
+
+    assert "carrier transaction and memos must never include `POPULIS_ADMIN_TOKEN`" in text
+    for forbidden in (
+        "bootstrap session cookies/JWTs",
+        "raw wallet signatures",
+        "auth nonces",
+        "bearer tokens",
+        "admin JWT secrets",
+        "faucet private keys",
+        "private mnemonics",
+        "private URLs",
+        "mutable service credentials",
+    ):
+        assert forbidden in text
+    assert "locators remain optional hints outside the authority boundary" in text
