@@ -431,6 +431,58 @@ def test_genesis_readme_pins_recovery_anchor_create_coin_preview_api_contract() 
     assert "request or return wallet signatures, push to coinset, or broadcast" in text
 
 
+def test_genesis_readme_pins_genesis_completion_and_handoff_bundle_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Genesis ceremony completion and handoff bundle contract" in text
+    assert "Completion has separate, visible stages" in text
+    assert "Genesis is **recorded and locked** when `POST /admin/bootstrap/finalize` succeeds" in text
+    assert "persists `admin_records.json`, `portal_runtime_config.json`, `bootstrap_recovery_anchor.json`, then `bootstrap_manifest.json`" in text
+    assert "Genesis is **locally verified** when recovery tooling verifies the returned public artifacts" in text
+    assert "compares the recovered `admin_authority_v2` launcher/state hash against live chain state" in text
+    assert "Genesis is **operator-exported** when the operator saves `recovery_handoff_bundle.json`" in text
+    assert "convenience container, not a new authority source" in text
+    assert "validate the contained public artifacts exactly as if each JSON file was supplied separately" in text
+    assert "Genesis is **chain-discoverable** only after an operator wallet actually signs and broadcasts the marker-coin transaction" in text
+    assert "Portal publish-intent, `CREATE_COIN` preview, and bundle export do not sign, broadcast, create marker coins, or grant admin authority" in text
+    assert "Post-genesis admin operation is complete only when normal admin actions are gated by the live `admin_authority_v2` authority" in text
+
+
+def test_genesis_readme_pins_recovery_handoff_bundle_public_only_shape() -> None:
+    text = " ".join(_readme().split())
+
+    assert "The portal-produced `recovery_handoff_bundle.json` must remain public-only" in text
+    for field in (
+        "`artifacts.bootstrap_manifest`",
+        "`artifacts.portal_runtime_config`",
+        "`artifacts.bootstrap_recovery_anchor`",
+        "`artifacts.admin_records`",
+        "current recovery verifier status",
+        "current chain-state comparison status",
+        "`recovery_anchor_publish_intent`",
+        "`recovery_anchor_create_coin_preview`",
+    ):
+        assert field in text
+    for forbidden in (
+        "`POPULIS_ADMIN_TOKEN`",
+        "bootstrap cookies/JWTs",
+        "bearer tokens",
+        "raw wallet signatures",
+        "auth nonces",
+        "admin JWT secrets",
+        "faucet private keys",
+        "private mnemonics",
+        "private URLs",
+        "spend bundles",
+        "marker coin ids",
+        "parent coin ids",
+        "future spends",
+    ):
+        assert forbidden in text
+    assert "downloaded as an explicit operator action" in text
+    assert "must not persist it to `localStorage` or `sessionStorage`" in text
+
+
 def test_genesis_readme_pins_bootstrap_off_chain_dependency_ledger() -> None:
     text = " ".join(_readme().split())
 

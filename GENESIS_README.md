@@ -360,6 +360,46 @@ next non-broadcasting handoff: a JSON-safe preview of the marker
    coinset, or broadcast.  It only previews the condition that later wallet
    tooling may include in a spend.
 
+### Genesis ceremony completion and handoff bundle contract
+
+Completion has separate, visible stages.  Tooling must name the stage it has
+reached instead of collapsing every recovery surface into "admin authority":
+
+1. Genesis is **recorded and locked** when `POST /admin/bootstrap/finalize`
+   succeeds, persists `admin_records.json`, `portal_runtime_config.json`,
+   `bootstrap_recovery_anchor.json`, then `bootstrap_manifest.json`, and all
+   mutable bootstrap routes fail closed.
+2. Genesis is **locally verified** when recovery tooling verifies the returned
+   public artifacts, recomputes the artifact hash chain, verifies
+   `admin_records.json` against `admins_hash`, and compares the recovered
+   `admin_authority_v2` launcher/state hash against live chain state when that
+   chain state is available.
+3. Genesis is **operator-exported** when the operator saves
+   `recovery_handoff_bundle.json`.  This bundle is a convenience container, not
+   a new authority source.  Verifiers must unpack it and validate the contained
+   public artifacts exactly as if each JSON file was supplied separately.
+4. Genesis is **chain-discoverable** only after an operator wallet actually
+   signs and broadcasts the marker-coin transaction and the recovery anchor
+   memo is observable on chain.  Portal publish-intent, `CREATE_COIN` preview,
+   and bundle export do not sign, broadcast, create marker coins, or grant admin
+   authority.
+5. Post-genesis admin operation is complete only when normal admin actions are
+   gated by the live `admin_authority_v2` authority and verified
+   `admin_records.json`, not by the bootstrap token, bootstrap cookie, runtime
+   config, recovery verifier result, marker coin, or handoff bundle.
+
+The portal-produced `recovery_handoff_bundle.json` must remain public-only.  It
+may contain `artifacts.bootstrap_manifest`, `artifacts.portal_runtime_config`,
+`artifacts.bootstrap_recovery_anchor`, `artifacts.admin_records`, current
+recovery verifier status, current chain-state comparison status,
+`recovery_anchor_publish_intent`, and optional
+`recovery_anchor_create_coin_preview`.  It must never contain
+`POPULIS_ADMIN_TOKEN`, bootstrap cookies/JWTs, bearer tokens, raw wallet
+signatures, auth nonces, admin JWT secrets, faucet private keys, private
+mnemonics, private URLs, spend bundles, marker coin ids, parent coin ids, or
+future spends.  It must be downloaded as an explicit operator action; the portal
+must not persist it to `localStorage` or `sessionStorage`.
+
 ### Bootstrap off-chain dependency ledger
 
 The recovery-anchor stack must remain small and auditable.  New off-chain
