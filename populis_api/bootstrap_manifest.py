@@ -29,6 +29,7 @@ FORBIDDEN_ARTIFACT_MARKERS = (
     "faucet_master_sk",
 )
 BOOTSTRAP_RECOVERY_ANCHOR_TAG = "POPULIS_BOOTSTRAP_V1"
+BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS = 1
 
 
 class BootstrapManifestError(ValueError):
@@ -59,6 +60,21 @@ class BootstrapRecoveryAnchor:
 
 @dataclass(frozen=True)
 class BootstrapRecoveryAnchorCarrierMemos:
+    tag_memo: bytes
+    payload_memo: bytes
+    memos: tuple[bytes, bytes]
+    payload_hash: str
+
+
+@dataclass(frozen=True)
+class BootstrapRecoveryAnchorPublishIntent:
+    network: str
+    marker_coin_amount_mojos: int
+    admin_authority_v2_launcher_id: str
+    authority_version: int
+    bootstrap_manifest_hash: str
+    portal_runtime_config_hash: str
+    admin_records_hash: str
     tag_memo: bytes
     payload_memo: bytes
     memos: tuple[bytes, bytes]
@@ -292,6 +308,29 @@ def build_bootstrap_recovery_anchor_memos(
     )
 
 
+def build_bootstrap_recovery_anchor_publish_intent(
+    *,
+    bootstrap_recovery_anchor: Mapping[str, Any],
+    marker_coin_amount_mojos: int = BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS,
+) -> BootstrapRecoveryAnchorPublishIntent:
+    amount = _validate_marker_coin_amount_mojos(marker_coin_amount_mojos)
+    payload = _validate_bootstrap_recovery_anchor_payload(bootstrap_recovery_anchor)
+    carrier = build_bootstrap_recovery_anchor_memos(bootstrap_recovery_anchor=payload)
+    return BootstrapRecoveryAnchorPublishIntent(
+        network=_require_str(payload, "network"),
+        marker_coin_amount_mojos=amount,
+        admin_authority_v2_launcher_id=payload["admin_authority_v2_launcher_id"],
+        authority_version=payload["authority_version"],
+        bootstrap_manifest_hash=payload["bootstrap_manifest_hash"],
+        portal_runtime_config_hash=payload["portal_runtime_config_hash"],
+        admin_records_hash=payload["admin_records_hash"],
+        tag_memo=carrier.tag_memo,
+        payload_memo=carrier.payload_memo,
+        memos=carrier.memos,
+        payload_hash=carrier.payload_hash,
+    )
+
+
 def persist_bootstrap_artifacts(
     *,
     artifacts: BootstrapArtifacts,
@@ -370,6 +409,16 @@ def _validate_bootstrap_recovery_anchor_payload(value: Mapping[str, Any]) -> dic
         if payload.get(field) != normalized_hash:
             raise BootstrapManifestError(f"{field} must be a canonical sha256 content hash")
     return payload
+
+
+def _validate_marker_coin_amount_mojos(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BootstrapManifestError("marker coin amount must be an integer number of mojos")
+    if value < BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS:
+        raise BootstrapManifestError(
+            f"marker coin amount must be at least {BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS} mojo"
+        )
+    return value
 
 
 def _require_content_hash(value: object, field: str) -> str:
@@ -452,16 +501,19 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS",
     "BOOTSTRAP_RECOVERY_ANCHOR_TAG",
     "BootstrapArtifacts",
     "BootstrapArtifactPaths",
     "BootstrapManifestError",
     "BootstrapRecoveryAnchor",
     "BootstrapRecoveryAnchorCarrierMemos",
+    "BootstrapRecoveryAnchorPublishIntent",
     "FORBIDDEN_ARTIFACT_MARKERS",
     "build_bootstrap_artifacts",
     "build_bootstrap_recovery_anchor",
     "build_bootstrap_recovery_anchor_memos",
+    "build_bootstrap_recovery_anchor_publish_intent",
     "canonical_json_bytes",
     "content_hash",
     "persist_bootstrap_artifacts",

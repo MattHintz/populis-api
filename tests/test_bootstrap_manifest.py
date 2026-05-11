@@ -12,6 +12,7 @@ from populis_api.bootstrap_manifest import (
     build_bootstrap_artifacts,
     build_bootstrap_recovery_anchor,
     build_bootstrap_recovery_anchor_memos,
+    build_bootstrap_recovery_anchor_publish_intent,
     canonical_json_bytes,
     content_hash,
     persist_bootstrap_artifacts,
@@ -296,6 +297,88 @@ def test_bootstrap_recovery_anchor_marker_memos_reject_secret_material() -> None
 
     with pytest.raises(BootstrapManifestError, match="forbidden credential marker"):
         build_bootstrap_recovery_anchor_memos(
+            bootstrap_recovery_anchor=payload,
+        )
+
+
+def test_builds_bootstrap_recovery_anchor_publish_intent() -> None:
+    artifacts, _ = artifacts_and_records()
+    carrier = build_bootstrap_recovery_anchor_memos(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    )
+
+    intent = build_bootstrap_recovery_anchor_publish_intent(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    )
+
+    assert intent.network == "testnet11"
+    assert intent.marker_coin_amount_mojos == 1
+    assert intent.admin_authority_v2_launcher_id == H("88")
+    assert intent.authority_version == 1
+    assert intent.bootstrap_manifest_hash == artifacts.bootstrap_recovery_anchor[
+        "bootstrap_manifest_hash"
+    ]
+    assert intent.portal_runtime_config_hash == artifacts.bootstrap_recovery_anchor[
+        "portal_runtime_config_hash"
+    ]
+    assert intent.admin_records_hash == artifacts.bootstrap_recovery_anchor["admin_records_hash"]
+    assert intent.tag_memo == carrier.tag_memo
+    assert intent.payload_memo == carrier.payload_memo
+    assert intent.memos == carrier.memos
+    assert intent.payload_hash == carrier.payload_hash
+    for non_authority_field in (
+        "marker_puzzle_hash",
+        "marker_coin_id",
+        "parent_coin_id",
+        "future_spend",
+        "spend_bundle",
+    ):
+        assert not hasattr(intent, non_authority_field)
+
+
+def test_bootstrap_recovery_anchor_publish_intent_accepts_custom_marker_amount() -> None:
+    artifacts, _ = artifacts_and_records()
+
+    intent = build_bootstrap_recovery_anchor_publish_intent(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+        marker_coin_amount_mojos=42,
+    )
+
+    assert intent.marker_coin_amount_mojos == 42
+    assert intent.memos == build_bootstrap_recovery_anchor_memos(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    ).memos
+
+
+@pytest.mark.parametrize(
+    ("amount", "match"),
+    [
+        (0, "at least 1 mojo"),
+        (-1, "at least 1 mojo"),
+        (True, "integer number of mojos"),
+        ("1", "integer number of mojos"),
+    ],
+)
+def test_bootstrap_recovery_anchor_publish_intent_rejects_invalid_marker_amount(
+    amount: object,
+    match: str,
+) -> None:
+    artifacts, _ = artifacts_and_records()
+
+    with pytest.raises(BootstrapManifestError, match=match):
+        build_bootstrap_recovery_anchor_publish_intent(
+            bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+            marker_coin_amount_mojos=amount,
+        )
+
+
+def test_bootstrap_recovery_anchor_publish_intent_rejects_secret_material() -> None:
+    artifacts, _ = artifacts_and_records()
+    payload = clone_json(artifacts.bootstrap_recovery_anchor)
+    payload["mutable_service_credentials"] = {"token": "not-public"}
+
+    with pytest.raises(BootstrapManifestError, match="forbidden credential marker"):
+        build_bootstrap_recovery_anchor_publish_intent(
             bootstrap_recovery_anchor=payload,
         )
 
