@@ -244,3 +244,59 @@ def test_genesis_readme_pins_genesis_page_locked_bootstrap_terminal_state() -> N
     assert "names the durable public artifacts" in text
     assert "points the operator to permanent admin login" in text
     assert "recorded admin slot `0` wallet" in text
+
+
+def test_genesis_readme_pins_bootstrap_recovery_anchor_boundary() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap recovery anchor contract" in text
+    assert "public JSON artifacts are necessary but not sufficient for disaster recovery" in text
+    assert "chain-visible bootstrap recovery anchor" in text
+    assert "future operator can discover without trusting the original server" in text
+    assert "public discovery marker, not an authority source" in text
+    assert "not an authorization credential" in text
+    assert "live `admin_authority_v2` singleton state and verified admin records" in text
+
+
+def test_genesis_readme_pins_recovery_anchor_marker_and_payload_shape() -> None:
+    text = " ".join(_readme().split())
+
+    assert "same first-admin bootstrap ceremony after the final public artifact hashes are known" in text
+    assert "`POPULIS_BOOTSTRAP_V1`" in text
+    assert "memo-bearing marker coin" in text
+    assert "puzzle announcement payload" in text
+    assert "external recovery tooling must be able to scan for that tag" in text
+    assert "`canonical_json_bytes`: sorted keys, compact separators, UTF-8" in text
+    for field in (
+        "`version`",
+        "`tag`",
+        "`network`",
+        "`admin_authority_v2_launcher_id`",
+        "`authority_version`",
+        "`bootstrap_manifest_hash`",
+        "`portal_runtime_config_hash`",
+        "`admin_records_hash`",
+    ):
+        assert field in text
+
+
+def test_genesis_readme_pins_recovery_anchor_hash_and_secret_rules() -> None:
+    text = " ".join(_readme().split())
+
+    assert "`bootstrap_manifest_hash`, `portal_runtime_config_hash`, and `admin_records_hash` are `sha256:` content-hash strings" in text
+    assert "mirrored artifacts only when their canonical hashes match the anchor" in text
+    assert "artifact coordinates match the live on-chain singleton" in text
+    assert "URLs are never authority" in text
+    assert "If all locators disappear" in text
+    assert "verify any independently mirrored artifact copies" in text
+    for forbidden in (
+        "`POPULIS_ADMIN_TOKEN`",
+        "bootstrap session cookies/JWTs",
+        "raw wallet signatures",
+        "auth nonces",
+        "bearer tokens",
+        "admin JWT secrets",
+        "faucet private keys",
+        "private mnemonics",
+    ):
+        assert forbidden in text

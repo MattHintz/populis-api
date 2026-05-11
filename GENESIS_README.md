@@ -223,6 +223,44 @@ ceremony after the base protocol deployment manifest already exists:
    names the durable public artifacts, and points the operator to
    permanent admin login using the recorded admin slot `0` wallet.
 
+### Bootstrap recovery anchor contract
+
+The public JSON artifacts are necessary but not sufficient for disaster
+recovery if the original API/portal host disappears.  A completed genesis
+ceremony must also leave a chain-visible bootstrap recovery anchor that a
+future operator can discover without trusting the original server:
+
+1. The recovery anchor is a public discovery marker, not an authority source
+   and not an authorization credential.  Admin authority still comes from the
+   live `admin_authority_v2` singleton state and verified admin records.
+2. The anchor must be emitted by a transaction in the same first-admin
+   bootstrap ceremony after the final public artifact hashes are known.  Until
+   a chain indexer can observe the anchor, the ceremony is recorded but not
+   disaster-recoverable from chain alone.
+3. The discoverable marker tag is the ASCII string
+   `POPULIS_BOOTSTRAP_V1`.  The first implementation may carry it as a
+   memo-bearing marker coin, puzzle announcement payload, or equivalent
+   chain-visible spend record, but external recovery tooling must be able to
+   scan for that tag.
+4. The payload is canonical JSON using the same canonical byte rules as
+   `canonical_json_bytes`: sorted keys, compact separators, UTF-8.  It must
+   include `version`, `tag`, `network`,
+   `admin_authority_v2_launcher_id`, `authority_version`,
+   `bootstrap_manifest_hash`, `portal_runtime_config_hash`, and
+   `admin_records_hash`.
+5. `bootstrap_manifest_hash`, `portal_runtime_config_hash`, and
+   `admin_records_hash` are `sha256:` content-hash strings.  A rehosted portal
+   may accept mirrored artifacts only when their canonical hashes match the
+   anchor and the artifact coordinates match the live on-chain singleton.
+6. Optional HTTP/IPFS/Arweave/Git/GitHub locators may be published later as
+   hints, but URLs are never authority.  If all locators disappear, the
+   anchor hash values still let operators verify any independently mirrored
+   artifact copies.
+7. The recovery anchor must never contain `POPULIS_ADMIN_TOKEN`, bootstrap
+   session cookies/JWTs, raw wallet signatures, auth nonces, bearer tokens,
+   admin JWT secrets, faucet private keys, private mnemonics, or any material
+   that can authenticate as an admin or spend funds.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony
