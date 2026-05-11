@@ -88,11 +88,14 @@ frontend secret:
    `sessionStorage`, URLs, runtime config, manifests, or downloaded
    artifacts.
 6. The bootstrap session must expire quickly, use same-site cookie
-   protections, and be invalidated when the bootstrapper writes a success
-   `bootstrap_manifest.json`.
+   protections, and be invalidated for every mutable bootstrap route when the
+   bootstrapper writes a success `bootstrap_manifest.json`.  The same
+   still-live cookie may authorize only the read-only recovery-anchor handoff
+   endpoints until normal expiry.
 7. Once success is recorded, challenge issuance and every mutable
    bootstrap route must return a locked/gone response.  Only read-only
-   public runtime-config and normal non-bootstrap APIs remain.
+   public runtime-config, read-only recovery handoff endpoints, and normal
+   non-bootstrap APIs remain.
 
 This gives the operator a browser workflow without converting the
 one-shot token into a long-lived frontend credential.
@@ -204,10 +207,11 @@ ceremony after the base protocol deployment manifest already exists:
    present, challenge issuance and bootstrap finalization must fail closed
    rather than overwrite permanent records.
 6. A successful response returns only public `bootstrap_manifest`,
-   `portal_runtime_config`, and `bootstrap_recovery_anchor` objects and clears
-   the bootstrap session cookie.  It never returns or persists raw wallet
-   signatures, auth nonces, bootstrap JWT/cookie material, bearer headers,
-   faucet keys, or `POPULIS_ADMIN_TOKEN`.
+   `portal_runtime_config`, and `bootstrap_recovery_anchor` objects and keeps
+   the short-lived bootstrap session cookie usable only for read-only
+   recovery-anchor handoff until expiry.  It never returns or persists raw
+   wallet signatures, auth nonces, bootstrap JWT/cookie material, bearer
+   headers, faucet keys, or `POPULIS_ADMIN_TOKEN`.
 7. The portal first-admin authority step calls `AdminBootstrapService.finalizeBootstrap`
    only after the admin-authority launch has been submitted, first-admin
    wallet metadata is known, `admins_hash` is live, and the MIPS root is
@@ -355,6 +359,82 @@ next non-broadcasting handoff: a JSON-safe preview of the marker
    create a spend bundle, request or return wallet signatures, push to
    coinset, or broadcast.  It only previews the condition that later wallet
    tooling may include in a spend.
+
+### Bootstrap off-chain dependency ledger
+
+The recovery-anchor stack must remain small and auditable.  New off-chain
+materials are not authority unless this ledger names them and a hash/validation
+boundary pins them:
+
+1. The complete genesis audit artifact set is exactly
+   `deployment_manifest.json`, `admin_records.json`,
+   `portal_runtime_config.json`, `bootstrap_manifest.json`, and
+   `bootstrap_recovery_anchor.json`.
+2. `deployment_manifest.json` is the base protocol deployment input.  It is
+   committed by `bootstrap_manifest.artifact_hashes.deployment_manifest_json`;
+   it is needed for full genesis replay, but the compact recovery anchor does
+   not duplicate every deployment field.
+3. `admin_records.json` is the recovery-critical roster reveal.  Its
+   `admin_records_hash` proves integrity, but the hash alone cannot reconstruct
+   admin slots, leaves, or quorum metadata if every mirrored copy is lost.
+4. `portal_runtime_config.json` is read-only discovery config.  It may repeat
+   public coordinates, `authority_version`, and `admin_records_hash`, but it is
+   not an authority source and not an authorization token.
+5. `bootstrap_manifest.json` is the local lock and commitment bundle.
+   `bootstrap_recovery_anchor.json` is the compact chain-visible payload that
+   points back to the canonical hashes.
+6. The publish intent and `CREATE_COIN` preview are derived, non-authority
+   handoff views.  They can be regenerated from `bootstrap_recovery_anchor.json`
+   plus an operator-supplied marker puzzle hash and must not become required
+   durable authority artifacts.
+7. HTTP, GitHub, Git, IPFS, Arweave, API, portal, and coinset URLs are optional
+   locators only.  They help find bytes; they never decide whether bytes are
+   valid.
+8. Marker puzzle hash, marker coin id, parent coin id, future spend, spend
+   bundle, wallet signatures, bearer tokens, cookies, and private keys are not
+   off-chain commitments and must not be added to the recovery authority set.
+
+### Bootstrap recovery verification contract
+
+Recovery tooling must verify the hash chain before trusting a recovered
+genesis package:
+
+1. Discover candidates by scanning chain-visible output memos for the UTF-8 tag
+   `POPULIS_BOOTSTRAP_V1`, then parse the payload memo from the same marker
+   output.
+2. Require the payload memo to parse as JSON, have the pinned v1 recovery-anchor
+   fields, set `tag` to `POPULIS_BOOTSTRAP_V1`, and be byte-for-byte equal to
+   `canonical_json_bytes(payload)`.
+3. Require `bootstrap_manifest_hash`, `portal_runtime_config_hash`, and
+   `admin_records_hash` to be canonical `sha256:` content hashes and require
+   `authority_version` to match the live authority state being recovered.
+4. Obtain candidate `bootstrap_manifest.json`, `portal_runtime_config.json`,
+   and `admin_records.json` from local backup or optional locators; obtain
+   `deployment_manifest.json` when full genesis replay is required.
+5. Recompute canonical content hashes and require them to match the recovery
+   anchor and each other:
+   `content_hash(bootstrap_manifest.json) == bootstrap_manifest_hash`,
+   `content_hash(portal_runtime_config.json) == portal_runtime_config_hash`,
+   `content_hash(admin_records.json) == admin_records_hash`,
+   `bootstrap_manifest.artifact_hashes.portal_runtime_config_json ==
+   portal_runtime_config_hash`, and
+   `bootstrap_manifest.artifact_hashes.admin_records_json ==
+   admin_records_hash`.
+6. Verify that `bootstrap_manifest.json` and `portal_runtime_config.json`
+   agree on `admin_authority_v2.launcher_id`, `admins_hash`, `mips_root`, and
+   `authority_version`, and verify those coordinates against the live
+   `admin_authority_v2` singleton state.
+7. Reject any recovered artifact or memo containing forbidden credential
+   markers such as `POPULIS_ADMIN_TOKEN`, bootstrap cookies/JWTs, bearer tokens,
+   raw signatures, auth nonces, admin JWT secrets, faucet private keys, private
+   mnemonics, private URLs, or mutable service credentials.
+8. Ignore non-authority carrier and transport fields during validation:
+   marker puzzle hash, marker coin id, parent coin id, future spend,
+   transaction id, spend bundle, API host, portal host, coinset host, and
+   locator URL.  Conflicting anchors for the same `network`,
+   `admin_authority_v2_launcher_id`, and `authority_version` with different
+   payload hashes must be rejected or escalated for manual operator/auditor
+   review.
 
 ---
 

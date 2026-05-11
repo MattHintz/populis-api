@@ -72,7 +72,8 @@ def test_genesis_readme_pins_two_step_bootstrap_challenge_boundary() -> None:
     assert "scoped only to bootstrap routes" in text
     assert "never an admin-desk session" in text
     assert "must not authorize mint proposals" in text
-    assert "invalidated when the bootstrapper writes a success" in text
+    assert "invalidated for every mutable bootstrap route when the bootstrapper writes a success" in text
+    assert "still-live cookie may authorize only the read-only recovery-anchor handoff endpoints until normal expiry" in text
 
 
 def test_genesis_readme_forbids_persisting_raw_bootstrap_token() -> None:
@@ -216,7 +217,7 @@ def test_genesis_readme_pins_finalize_artifact_order_and_lock() -> None:
     assert "It is written last" in text
     assert "challenge issuance and bootstrap finalization must fail closed" in text
     assert "rather than overwrite permanent records" in text
-    assert "clears the bootstrap session cookie" in text
+    assert "keeps the short-lived bootstrap session cookie usable only for read-only recovery-anchor handoff until expiry" in text
     assert "returns only public `bootstrap_manifest`, `portal_runtime_config`, and `bootstrap_recovery_anchor` objects" in text
 
 
@@ -428,3 +429,80 @@ def test_genesis_readme_pins_recovery_anchor_create_coin_preview_api_contract() 
     assert "`memos_hex` in the same carrier order" in text
     assert "does not select funding coins, compute a marker coin id, create a spend bundle" in text
     assert "request or return wallet signatures, push to coinset, or broadcast" in text
+
+
+def test_genesis_readme_pins_bootstrap_off_chain_dependency_ledger() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap off-chain dependency ledger" in text
+    assert "recovery-anchor stack must remain small and auditable" in text
+    assert "New off-chain materials are not authority unless this ledger names them" in text
+    assert "hash/validation boundary pins them" in text
+    assert "complete genesis audit artifact set is exactly" in text
+    for artifact in (
+        "`deployment_manifest.json`",
+        "`admin_records.json`",
+        "`portal_runtime_config.json`",
+        "`bootstrap_manifest.json`",
+        "`bootstrap_recovery_anchor.json`",
+    ):
+        assert artifact in text
+    assert "`deployment_manifest.json` is the base protocol deployment input" in text
+    assert "`bootstrap_manifest.artifact_hashes.deployment_manifest_json`" in text
+    assert "needed for full genesis replay" in text
+    assert "compact recovery anchor does not duplicate every deployment field" in text
+    assert "`admin_records.json` is the recovery-critical roster reveal" in text
+    assert "`admin_records_hash` proves integrity" in text
+    assert "hash alone cannot reconstruct admin slots, leaves, or quorum metadata" in text
+    assert "`portal_runtime_config.json` is read-only discovery config" in text
+    assert "not an authority source and not an authorization token" in text
+    assert "`bootstrap_manifest.json` is the local lock and commitment bundle" in text
+    assert "`bootstrap_recovery_anchor.json` is the compact chain-visible payload" in text
+    assert "publish intent and `CREATE_COIN` preview are derived, non-authority handoff views" in text
+    assert "must not become required durable authority artifacts" in text
+    assert "HTTP, GitHub, Git, IPFS, Arweave, API, portal, and coinset URLs are optional locators only" in text
+    assert "They help find bytes; they never decide whether bytes are valid" in text
+    assert "Marker puzzle hash, marker coin id, parent coin id, future spend, spend bundle" in text
+    assert "must not be added to the recovery authority set" in text
+
+
+def test_genesis_readme_pins_bootstrap_recovery_verification_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap recovery verification contract" in text
+    assert "Recovery tooling must verify the hash chain before trusting a recovered genesis package" in text
+    assert "scanning chain-visible output memos for the UTF-8 tag `POPULIS_BOOTSTRAP_V1`" in text
+    assert "parse the payload memo from the same marker output" in text
+    assert "payload memo to parse as JSON" in text
+    assert "pinned v1 recovery-anchor fields" in text
+    assert "byte-for-byte equal to `canonical_json_bytes(payload)`" in text
+    assert "`bootstrap_manifest_hash`, `portal_runtime_config_hash`, and `admin_records_hash` to be canonical `sha256:` content hashes" in text
+    assert "`authority_version` to match the live authority state being recovered" in text
+    assert "Obtain candidate `bootstrap_manifest.json`, `portal_runtime_config.json`, and `admin_records.json`" in text
+    assert "obtain `deployment_manifest.json` when full genesis replay is required" in text
+    assert "`content_hash(bootstrap_manifest.json) == bootstrap_manifest_hash`" in text
+    assert "`content_hash(portal_runtime_config.json) == portal_runtime_config_hash`" in text
+    assert "`content_hash(admin_records.json) == admin_records_hash`" in text
+    assert "`bootstrap_manifest.artifact_hashes.portal_runtime_config_json == portal_runtime_config_hash`" in text
+    assert "`bootstrap_manifest.artifact_hashes.admin_records_json == admin_records_hash`" in text
+    assert "agree on `admin_authority_v2.launcher_id`, `admins_hash`, `mips_root`, and `authority_version`" in text
+    assert "verify those coordinates against the live `admin_authority_v2` singleton state" in text
+    assert "Reject any recovered artifact or memo containing forbidden credential markers" in text
+    for forbidden in (
+        "`POPULIS_ADMIN_TOKEN`",
+        "bootstrap cookies/JWTs",
+        "bearer tokens",
+        "raw signatures",
+        "auth nonces",
+        "admin JWT secrets",
+        "faucet private keys",
+        "private mnemonics",
+        "private URLs",
+        "mutable service credentials",
+    ):
+        assert forbidden in text
+    assert "Ignore non-authority carrier and transport fields during validation" in text
+    assert "marker puzzle hash, marker coin id, parent coin id, future spend" in text
+    assert "transaction id, spend bundle, API host, portal host, coinset host, and locator URL" in text
+    assert "Conflicting anchors for the same `network`, `admin_authority_v2_launcher_id`, and `authority_version`" in text
+    assert "must be rejected or escalated for manual operator/auditor review" in text
