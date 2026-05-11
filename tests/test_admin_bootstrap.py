@@ -435,7 +435,7 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
     }.issubset(set(recovery_anchor_schema["required"]))
 
 
-def test_recovery_anchor_publish_intent_requires_admin_jwt_after_lock(
+def test_recovery_anchor_publish_intent_accepts_bootstrap_cookie_after_lock(
     client: TestClient,
     bootstrap_env,
 ) -> None:
@@ -447,13 +447,18 @@ def test_recovery_anchor_publish_intent_requires_admin_jwt_after_lock(
     assert challenge.status_code == 200
     ok = client.post("/admin/bootstrap/finalize", json=finalize_payload())
     assert ok.status_code == 200
+    assert client.cookies.get(BOOTSTRAP_COOKIE_NAME)
 
-    missing = client.get("/admin/bootstrap/recovery-anchor/publish-intent")
+    cookie_auth = client.get("/admin/bootstrap/recovery-anchor/publish-intent")
     static_token = client.get(
         "/admin/bootstrap/recovery-anchor/publish-intent",
         headers={"Authorization": "Bearer bootstrap-secret"},
     )
+    client.cookies.clear()
+    missing = client.get("/admin/bootstrap/recovery-anchor/publish-intent")
 
+    assert cookie_auth.status_code == 200
+    assert cookie_auth.json()["tag_memo_utf8"] == BOOTSTRAP_RECOVERY_ANCHOR_TAG
     assert missing.status_code == 401
     assert static_token.status_code == 403
 
@@ -570,7 +575,7 @@ def test_recovery_anchor_publish_intent_openapi_schema_pins_json_safe_handoff(
     assert "marker_puzzle_hash" not in schema["properties"]
 
 
-def test_recovery_anchor_create_coin_preview_requires_admin_jwt_after_lock(
+def test_recovery_anchor_create_coin_preview_accepts_bootstrap_cookie_after_lock(
     client: TestClient,
     bootstrap_env,
 ) -> None:
@@ -582,8 +587,9 @@ def test_recovery_anchor_create_coin_preview_requires_admin_jwt_after_lock(
     assert challenge.status_code == 200
     ok = client.post("/admin/bootstrap/finalize", json=finalize_payload())
     assert ok.status_code == 200
+    assert client.cookies.get(BOOTSTRAP_COOKIE_NAME)
 
-    missing = client.post(
+    cookie_auth = client.post(
         "/admin/bootstrap/recovery-anchor/create-coin-preview",
         json={"marker_puzzle_hash": H("ef")},
     )
@@ -592,7 +598,14 @@ def test_recovery_anchor_create_coin_preview_requires_admin_jwt_after_lock(
         json={"marker_puzzle_hash": H("ef")},
         headers={"Authorization": "Bearer bootstrap-secret"},
     )
+    client.cookies.clear()
+    missing = client.post(
+        "/admin/bootstrap/recovery-anchor/create-coin-preview",
+        json={"marker_puzzle_hash": H("ef")},
+    )
 
+    assert cookie_auth.status_code == 200
+    assert cookie_auth.json()["condition_opcode"] == 51
     assert missing.status_code == 401
     assert static_token.status_code == 403
 

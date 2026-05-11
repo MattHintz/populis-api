@@ -269,6 +269,25 @@ def require_bootstrap_session(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
 
 
+def require_recovery_anchor_handoff_auth(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> Any:
+    if authorization:
+        return require_admin_jwt(settings, authorization)
+    token = request.cookies.get(BOOTSTRAP_COOKIE_NAME)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing admin bearer token or bootstrap session cookie.",
+        )
+    try:
+        return verify_bootstrap_session(token, settings)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+
+
 @router.post("/challenge", response_model=BootstrapChallengeResponse)
 async def bootstrap_challenge(
     response: Response,
@@ -329,7 +348,6 @@ async def bootstrap_status(
 @router.post("/finalize", response_model=BootstrapFinalizeResponse)
 async def bootstrap_finalize(
     body: BootstrapFinalizeRequest,
-    response: Response,
     settings: Annotated[Settings, Depends(get_settings)],
     _claims: Annotated[BootstrapSessionClaims, Depends(require_bootstrap_session)],
 ) -> BootstrapFinalizeResponse:
@@ -395,7 +413,6 @@ async def bootstrap_finalize(
             detail="Failed to persist bootstrap artifacts.",
         ) from e
 
-    response.delete_cookie(BOOTSTRAP_COOKIE_NAME, path=BOOTSTRAP_COOKIE_PATH)
     return BootstrapFinalizeResponse(
         locked=True,
         bootstrap_manifest=artifacts.bootstrap_manifest,
@@ -410,7 +427,7 @@ async def bootstrap_finalize(
 )
 async def bootstrap_recovery_anchor_publish_intent(
     settings: Annotated[Settings, Depends(get_settings)],
-    _claims: Annotated[Any, Depends(require_admin_jwt)],
+    _auth: Annotated[Any, Depends(require_recovery_anchor_handoff_auth)],
 ) -> BootstrapRecoveryAnchorPublishIntentResponse:
     try:
         recovery_anchor = load_persisted_bootstrap_recovery_anchor(settings)
@@ -450,7 +467,7 @@ async def bootstrap_recovery_anchor_publish_intent(
 async def bootstrap_recovery_anchor_create_coin_preview(
     body: BootstrapRecoveryAnchorCreateCoinPreviewRequest,
     settings: Annotated[Settings, Depends(get_settings)],
-    _claims: Annotated[Any, Depends(require_admin_jwt)],
+    _auth: Annotated[Any, Depends(require_recovery_anchor_handoff_auth)],
 ) -> BootstrapRecoveryAnchorCreateCoinPreviewResponse:
     try:
         recovery_anchor = load_persisted_bootstrap_recovery_anchor(settings)
@@ -508,6 +525,7 @@ __all__ = [
     "issue_bootstrap_session",
     "load_persisted_bootstrap_recovery_anchor",
     "portal_runtime_config_path",
+    "require_recovery_anchor_handoff_auth",
     "require_bootstrap_session",
     "reset_bootstrap_state_for_tests",
     "router",

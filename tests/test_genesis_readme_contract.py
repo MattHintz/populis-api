@@ -367,8 +367,9 @@ def test_genesis_readme_pins_recovery_anchor_publish_intent_api_contract() -> No
     assert "available only after `bootstrap_manifest.json` exists and `bootstrap_recovery_anchor.json` is present" in text
     assert "reads the persisted recovery anchor" in text
     assert "never recomputes a different payload from portal env" in text
-    assert "authorized by `require_admin_jwt`" in text
-    assert "retired bootstrap session cookie and raw `POPULIS_ADMIN_TOKEN` are not accepted" in text
+    assert "authorized by the recovery-anchor handoff guard" in text
+    assert "valid admin JWT or the still-live `populis_bootstrap_session` cookie" in text
+    assert "raw `POPULIS_ADMIN_TOKEN` is not accepted as publish authority after lock" in text
     for field in (
         "`network`",
         "`marker_coin_amount_mojos`",
@@ -402,9 +403,11 @@ def test_genesis_readme_pins_recovery_anchor_create_coin_preview_api_contract() 
     assert "Bootstrap recovery anchor CREATE_COIN preview API contract" in text
     assert "`POST /admin/bootstrap/recovery-anchor/create-coin-preview` exposes the next non-broadcasting handoff" in text
     assert "JSON-safe preview of the marker `CREATE_COIN` condition" in text
-    assert "authorized by `require_admin_jwt`" in text
+    assert "authorized by the recovery-anchor handoff guard" in text
+    assert "valid admin JWT or the still-live `populis_bootstrap_session` cookie" in text
     assert "available only after `bootstrap_manifest.json` and `bootstrap_recovery_anchor.json` exist" in text
     assert "reads the persisted recovery anchor and derives the publish intent from that payload" in text
+    assert "raw `POPULIS_ADMIN_TOKEN` is not accepted" in text
     assert "request contains only `marker_puzzle_hash`" in text
     assert "32-byte hex puzzle hash for the ordinary marker coin output" in text
     assert "marker puzzle hash is a carrier address only" in text

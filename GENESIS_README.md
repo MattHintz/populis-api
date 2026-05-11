@@ -308,9 +308,10 @@ non-broadcasting operator handoff for the marker-coin carrier:
 1. The endpoint is available only after `bootstrap_manifest.json` exists and
    `bootstrap_recovery_anchor.json` is present.  It reads the persisted
    recovery anchor; it never recomputes a different payload from portal env.
-2. The endpoint is authorized by `require_admin_jwt`.  The retired bootstrap
-   session cookie and raw `POPULIS_ADMIN_TOKEN` are not accepted as publish
-   authority after lock.
+2. The endpoint is authorized by the recovery-anchor handoff guard: either a
+   valid admin JWT or the still-live `populis_bootstrap_session` cookie from
+   the finalize ceremony.  The raw `POPULIS_ADMIN_TOKEN` is not accepted as
+   publish authority after lock.
 3. The response is JSON-safe and public-only: `network`,
    `marker_coin_amount_mojos`, `admin_authority_v2_launcher_id`,
    `authority_version`, `bootstrap_manifest_hash`,
@@ -334,10 +335,12 @@ non-broadcasting operator handoff for the marker-coin carrier:
 next non-broadcasting handoff: a JSON-safe preview of the marker
 `CREATE_COIN` condition:
 
-1. The endpoint is authorized by `require_admin_jwt` and is available only
-   after `bootstrap_manifest.json` and `bootstrap_recovery_anchor.json` exist.
-   It reads the persisted recovery anchor and derives the publish intent from
-   that payload.
+1. The endpoint is authorized by the recovery-anchor handoff guard: either a
+   valid admin JWT or the still-live `populis_bootstrap_session` cookie from
+   the finalize ceremony.  It is available only after `bootstrap_manifest.json`
+   and `bootstrap_recovery_anchor.json` exist.  It reads the persisted recovery
+   anchor and derives the publish intent from that payload.  The raw
+   `POPULIS_ADMIN_TOKEN` is not accepted.
 2. The request contains only `marker_puzzle_hash`, a 32-byte hex puzzle hash
    for the ordinary marker coin output.  The marker puzzle hash is a carrier
    address only; it is not authority and clients must not validate anchors by
