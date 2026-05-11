@@ -570,6 +570,136 @@ def test_recovery_anchor_publish_intent_openapi_schema_pins_json_safe_handoff(
     assert "marker_puzzle_hash" not in schema["properties"]
 
 
+def test_recovery_anchor_create_coin_preview_requires_admin_jwt_after_lock(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+    ok = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert ok.status_code == 200
+
+    missing = client.post(
+        "/admin/bootstrap/recovery-anchor/create-coin-preview",
+        json={"marker_puzzle_hash": H("ef")},
+    )
+    static_token = client.post(
+        "/admin/bootstrap/recovery-anchor/create-coin-preview",
+        json={"marker_puzzle_hash": H("ef")},
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+
+    assert missing.status_code == 401
+    assert static_token.status_code == 403
+
+
+def test_recovery_anchor_create_coin_preview_returns_json_safe_condition(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+    finalized = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert finalized.status_code == 200
+    anchor = finalized.json()["bootstrap_recovery_anchor"]
+    payload_memo_hex = "0x" + canonical_json_bytes(anchor).hex()
+    tag_memo_hex = "0x" + BOOTSTRAP_RECOVERY_ANCHOR_TAG.encode("utf-8").hex()
+
+    resp = client.post(
+        "/admin/bootstrap/recovery-anchor/create-coin-preview",
+        json={"marker_puzzle_hash": "EF" * 32},
+        headers=admin_authorization_header(),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["condition_opcode"] == 51
+    assert body["marker_puzzle_hash"] == H("ef")
+    assert body["marker_coin_amount_mojos"] == 1
+    assert body["tag_memo_hex"] == tag_memo_hex
+    assert body["payload_memo_hex"] == payload_memo_hex
+    assert body["memos_hex"] == [tag_memo_hex, payload_memo_hex]
+    assert body["condition_hex"] == [51, H("ef"), 1, [tag_memo_hex, payload_memo_hex]]
+    assert body["payload_hash"] == content_hash(anchor)
+    emitted = json.dumps(body).lower()
+    for forbidden in (
+        "bootstrap-secret",
+        "populis_bootstrap_session",
+        "jwt_secret",
+        "private_key",
+        "spend_bundle",
+        "marker_coin_id",
+        "parent_coin_id",
+        "future_spend",
+        "wallet_signature",
+    ):
+        assert forbidden not in emitted
+
+
+def test_recovery_anchor_create_coin_preview_rejects_bad_marker_puzzle_hash(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+    finalized = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert finalized.status_code == 200
+
+    resp = client.post(
+        "/admin/bootstrap/recovery-anchor/create-coin-preview",
+        json={"marker_puzzle_hash": "0x1234"},
+        headers=admin_authorization_header(),
+    )
+
+    assert resp.status_code == 400
+    assert "marker_puzzle_hash" in resp.json()["detail"]
+
+
+def test_recovery_anchor_create_coin_preview_openapi_schema_pins_preview_handoff(
+    client: TestClient,
+) -> None:
+    openapi = client.app.openapi()
+    operation = openapi["paths"]["/admin/bootstrap/recovery-anchor/create-coin-preview"][
+        "post"
+    ]
+    request_schema = resolve_schema(
+        openapi,
+        operation["requestBody"]["content"]["application/json"]["schema"],
+    )
+    response_schema = resolve_schema(
+        openapi,
+        operation["responses"]["200"]["content"]["application/json"]["schema"],
+    )
+
+    assert set(request_schema["required"]) == {"marker_puzzle_hash"}
+    assert set(response_schema["required"]) == {
+        "condition_opcode",
+        "marker_puzzle_hash",
+        "marker_coin_amount_mojos",
+        "tag_memo_hex",
+        "payload_memo_hex",
+        "memos_hex",
+        "condition_hex",
+        "payload_hash",
+    }
+    assert "spend_bundle" not in response_schema["properties"]
+    assert "marker_coin_id" not in response_schema["properties"]
+    assert "parent_coin_id" not in response_schema["properties"]
+    assert "future_spend" not in response_schema["properties"]
+
+
 def test_bootstrap_finalize_fails_closed_after_lock(
     client: TestClient,
     bootstrap_env,

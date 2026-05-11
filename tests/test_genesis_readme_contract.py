@@ -394,3 +394,34 @@ def test_genesis_readme_pins_recovery_anchor_publish_intent_api_contract() -> No
     assert "`payload_memo_utf8` must be canonical JSON bytes decoded as UTF-8" in text
     assert "`memos_hex` must contain exactly the tag memo hex and payload memo hex in carrier order" in text
     assert "does not submit to coinset, push a spend bundle, select a wallet coin, or create authority" in text
+
+
+def test_genesis_readme_pins_recovery_anchor_create_coin_preview_api_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap recovery anchor CREATE_COIN preview API contract" in text
+    assert "`POST /admin/bootstrap/recovery-anchor/create-coin-preview` exposes the next non-broadcasting handoff" in text
+    assert "JSON-safe preview of the marker `CREATE_COIN` condition" in text
+    assert "authorized by `require_admin_jwt`" in text
+    assert "available only after `bootstrap_manifest.json` and `bootstrap_recovery_anchor.json` exist" in text
+    assert "reads the persisted recovery anchor and derives the publish intent from that payload" in text
+    assert "request contains only `marker_puzzle_hash`" in text
+    assert "32-byte hex puzzle hash for the ordinary marker coin output" in text
+    assert "marker puzzle hash is a carrier address only" in text
+    assert "not authority and clients must not validate anchors by this value" in text
+    for field in (
+        "`condition_opcode`",
+        "`marker_puzzle_hash`",
+        "`marker_coin_amount_mojos`",
+        "`tag_memo_hex`",
+        "`payload_memo_hex`",
+        "`memos_hex`",
+        "`condition_hex`",
+        "`payload_hash`",
+    ):
+        assert field in text
+    assert "`condition_opcode` must be `51` (`CREATE_COIN`)" in text
+    assert "`condition_hex` must be `[51, marker_puzzle_hash, marker_coin_amount_mojos, [tag_memo_hex, payload_memo_hex]]`" in text
+    assert "`memos_hex` in the same carrier order" in text
+    assert "does not select funding coins, compute a marker coin id, create a spend bundle" in text
+    assert "request or return wallet signatures, push to coinset, or broadcast" in text

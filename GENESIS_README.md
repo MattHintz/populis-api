@@ -328,6 +328,31 @@ non-broadcasting operator handoff for the marker-coin carrier:
    wallet coin, or create authority.  It only exports deterministic inputs for
    later operator wallet tooling.
 
+### Bootstrap recovery anchor CREATE_COIN preview API contract
+
+`POST /admin/bootstrap/recovery-anchor/create-coin-preview` exposes the
+next non-broadcasting handoff: a JSON-safe preview of the marker
+`CREATE_COIN` condition:
+
+1. The endpoint is authorized by `require_admin_jwt` and is available only
+   after `bootstrap_manifest.json` and `bootstrap_recovery_anchor.json` exist.
+   It reads the persisted recovery anchor and derives the publish intent from
+   that payload.
+2. The request contains only `marker_puzzle_hash`, a 32-byte hex puzzle hash
+   for the ordinary marker coin output.  The marker puzzle hash is a carrier
+   address only; it is not authority and clients must not validate anchors by
+   this value.
+3. The response is JSON-safe and public-only: `condition_opcode`,
+   `marker_puzzle_hash`, `marker_coin_amount_mojos`, `tag_memo_hex`,
+   `payload_memo_hex`, `memos_hex`, `condition_hex`, and `payload_hash`.
+4. `condition_opcode` must be `51` (`CREATE_COIN`).  `condition_hex` must be
+   `[51, marker_puzzle_hash, marker_coin_amount_mojos, [tag_memo_hex,
+   payload_memo_hex]]`, with `memos_hex` in the same carrier order.
+5. The endpoint does not select funding coins, compute a marker coin id,
+   create a spend bundle, request or return wallet signatures, push to
+   coinset, or broadcast.  It only previews the condition that later wallet
+   tooling may include in a spend.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony

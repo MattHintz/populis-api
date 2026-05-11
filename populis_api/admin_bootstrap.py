@@ -23,6 +23,7 @@ from .bootstrap_manifest import (
     BootstrapArtifactPaths,
     BootstrapManifestError,
     build_bootstrap_artifacts,
+    build_bootstrap_recovery_anchor_create_coin_preview,
     build_bootstrap_recovery_anchor_publish_intent,
     persist_bootstrap_artifacts,
 )
@@ -133,6 +134,21 @@ class BootstrapRecoveryAnchorPublishIntentResponse(BaseModel):
     payload_hash: str
 
 
+class BootstrapRecoveryAnchorCreateCoinPreviewRequest(BaseModel):
+    marker_puzzle_hash: str
+
+
+class BootstrapRecoveryAnchorCreateCoinPreviewResponse(BaseModel):
+    condition_opcode: int
+    marker_puzzle_hash: str
+    marker_coin_amount_mojos: int
+    tag_memo_hex: str
+    payload_memo_hex: str
+    memos_hex: list[str]
+    condition_hex: tuple[int, str, int, tuple[str, str]]
+    payload_hash: str
+
+
 def reset_bootstrap_state_for_tests() -> None:
     global _resolved_bootstrap_secret
     _resolved_bootstrap_secret = None
@@ -158,6 +174,38 @@ def portal_runtime_config_path(settings: Settings) -> Path:
 
 def bootstrap_recovery_anchor_path(settings: Settings) -> Path:
     return bootstrap_manifest_path(settings).with_name("bootstrap_recovery_anchor.json")
+
+
+def load_persisted_bootstrap_recovery_anchor(settings: Settings) -> dict[str, Any]:
+    if not bootstrap_locked(settings):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bootstrap recovery anchor publish intent is available only after bootstrap_manifest.json exists.",
+        )
+    recovery_anchor_path = bootstrap_recovery_anchor_path(settings)
+    if not recovery_anchor_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="bootstrap_recovery_anchor.json is required before publishing the recovery anchor.",
+        )
+    try:
+        recovery_anchor = json.loads(recovery_anchor_path.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to read bootstrap_recovery_anchor.json.",
+        ) from e
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Persisted bootstrap_recovery_anchor.json is invalid: {e}",
+        ) from e
+    if not isinstance(recovery_anchor, dict):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Persisted bootstrap_recovery_anchor.json is invalid: bootstrap_recovery_anchor.json top-level must be an object",
+        )
+    return recovery_anchor
 
 
 def get_bootstrap_secret(settings: Settings) -> str:
@@ -364,34 +412,14 @@ async def bootstrap_recovery_anchor_publish_intent(
     settings: Annotated[Settings, Depends(get_settings)],
     _claims: Annotated[Any, Depends(require_admin_jwt)],
 ) -> BootstrapRecoveryAnchorPublishIntentResponse:
-    if not bootstrap_locked(settings):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Bootstrap recovery anchor publish intent is available only after bootstrap_manifest.json exists.",
-        )
-    recovery_anchor_path = bootstrap_recovery_anchor_path(settings)
-    if not recovery_anchor_path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="bootstrap_recovery_anchor.json is required before publishing the recovery anchor.",
-        )
     try:
-        recovery_anchor = json.loads(recovery_anchor_path.read_text(encoding="utf-8"))
-        if not isinstance(recovery_anchor, dict):
-            raise BootstrapManifestError(
-                "bootstrap_recovery_anchor.json top-level must be an object"
-            )
+        recovery_anchor = load_persisted_bootstrap_recovery_anchor(settings)
         intent = build_bootstrap_recovery_anchor_publish_intent(
             bootstrap_recovery_anchor=recovery_anchor,
         )
         tag_memo_utf8 = intent.tag_memo.decode("utf-8")
         payload_memo_utf8 = intent.payload_memo.decode("utf-8")
         payload_memo_json = json.loads(payload_memo_utf8)
-    except OSError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to read bootstrap_recovery_anchor.json.",
-        ) from e
     except (BootstrapManifestError, UnicodeDecodeError, json.JSONDecodeError) as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -415,11 +443,56 @@ async def bootstrap_recovery_anchor_publish_intent(
     )
 
 
+@router.post(
+    "/recovery-anchor/create-coin-preview",
+    response_model=BootstrapRecoveryAnchorCreateCoinPreviewResponse,
+)
+async def bootstrap_recovery_anchor_create_coin_preview(
+    body: BootstrapRecoveryAnchorCreateCoinPreviewRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    _claims: Annotated[Any, Depends(require_admin_jwt)],
+) -> BootstrapRecoveryAnchorCreateCoinPreviewResponse:
+    try:
+        recovery_anchor = load_persisted_bootstrap_recovery_anchor(settings)
+        intent = build_bootstrap_recovery_anchor_publish_intent(
+            bootstrap_recovery_anchor=recovery_anchor,
+        )
+    except BootstrapManifestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Persisted bootstrap_recovery_anchor.json is invalid: {e}",
+        ) from e
+    try:
+        preview = build_bootstrap_recovery_anchor_create_coin_preview(
+            publish_intent=intent,
+            marker_puzzle_hash=body.marker_puzzle_hash,
+        )
+    except BootstrapManifestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Bootstrap recovery anchor CREATE_COIN preview failed: {e}",
+        ) from e
+    tag_memo_hex = "0x" + preview.tag_memo.hex()
+    payload_memo_hex = "0x" + preview.payload_memo.hex()
+    return BootstrapRecoveryAnchorCreateCoinPreviewResponse(
+        condition_opcode=preview.condition_opcode,
+        marker_puzzle_hash=preview.marker_puzzle_hash,
+        marker_coin_amount_mojos=preview.marker_coin_amount_mojos,
+        tag_memo_hex=tag_memo_hex,
+        payload_memo_hex=payload_memo_hex,
+        memos_hex=[tag_memo_hex, payload_memo_hex],
+        condition_hex=preview.condition_hex,
+        payload_hash=preview.payload_hash,
+    )
+
+
 __all__ = [
     "BOOTSTRAP_COOKIE_NAME",
     "BOOTSTRAP_COOKIE_PATH",
     "BOOTSTRAP_SCOPE",
     "BootstrapChallengeResponse",
+    "BootstrapRecoveryAnchorCreateCoinPreviewRequest",
+    "BootstrapRecoveryAnchorCreateCoinPreviewResponse",
     "BootstrapFinalizeRequest",
     "BootstrapFinalizeResponse",
     "BootstrapRecoveryAnchorArtifact",
@@ -429,9 +502,11 @@ __all__ = [
     "bootstrap_admin_records_path",
     "bootstrap_locked",
     "bootstrap_manifest_path",
+    "bootstrap_recovery_anchor_create_coin_preview",
     "bootstrap_recovery_anchor_path",
     "bootstrap_recovery_anchor_publish_intent",
     "issue_bootstrap_session",
+    "load_persisted_bootstrap_recovery_anchor",
     "portal_runtime_config_path",
     "require_bootstrap_session",
     "reset_bootstrap_state_for_tests",
