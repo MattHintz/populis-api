@@ -9,7 +9,7 @@ from typing import Annotated, Any, Optional
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .admin import require_admin_token
 from .admin_records import (
@@ -62,10 +62,42 @@ class BootstrapFinalizeRequest(BaseModel):
     read_only_coinset_url: Optional[str] = None
 
 
+class AdminAuthorityV2ManifestArtifact(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    launcher_id: str
+    admins_hash: str
+    mips_root: str
+    authority_version: int
+
+
+class AdminAuthorityV2RuntimeArtifact(AdminAuthorityV2ManifestArtifact):
+    admin_records_hash: str
+
+
+class BootstrapManifestArtifact(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    version: int
+    network: str
+    protocol: dict[str, Any]
+    admin_authority_v2: AdminAuthorityV2ManifestArtifact
+    artifact_hashes: dict[str, str]
+
+
+class PortalRuntimeConfigArtifact(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    version: int
+    network: str
+    protocol: dict[str, Any]
+    admin_authority_v2: AdminAuthorityV2RuntimeArtifact
+
+
 class BootstrapFinalizeResponse(BaseModel):
     locked: bool
-    bootstrap_manifest: dict[str, Any]
-    portal_runtime_config: dict[str, Any]
+    bootstrap_manifest: BootstrapManifestArtifact
+    portal_runtime_config: PortalRuntimeConfigArtifact
 
 
 def reset_bootstrap_state_for_tests() -> None:

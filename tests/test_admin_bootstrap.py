@@ -124,6 +124,15 @@ def write_deployment_manifest(bootstrap_manifest_path) -> None:
     )
 
 
+def resolve_schema(openapi: dict, schema: dict) -> dict:
+    ref = schema.get("$ref")
+    if ref is None:
+        return schema
+    prefix = "#/components/schemas/"
+    assert ref.startswith(prefix)
+    return openapi["components"]["schemas"][ref.removeprefix(prefix)]
+
+
 def test_bootstrap_challenge_rejects_bad_token(client: TestClient) -> None:
     resp = client.post(
         "/admin/bootstrap/challenge",
@@ -323,6 +332,66 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
     status = client.get("/admin/bootstrap/status")
     assert status.status_code == 200
     assert status.json() == {"locked": True, "authenticated": False, "expires_at": None}
+
+
+def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
+    client: TestClient,
+) -> None:
+    openapi = client.app.openapi()
+    response_schema = resolve_schema(
+        openapi,
+        openapi["paths"]["/admin/bootstrap/finalize"]["post"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"],
+    )
+    bootstrap_schema = resolve_schema(
+        openapi,
+        response_schema["properties"]["bootstrap_manifest"],
+    )
+    runtime_schema = resolve_schema(
+        openapi,
+        response_schema["properties"]["portal_runtime_config"],
+    )
+    manifest_authority_schema = resolve_schema(
+        openapi,
+        bootstrap_schema["properties"]["admin_authority_v2"],
+    )
+    runtime_authority_schema = resolve_schema(
+        openapi,
+        runtime_schema["properties"]["admin_authority_v2"],
+    )
+
+    assert set(response_schema["required"]) == {
+        "locked",
+        "bootstrap_manifest",
+        "portal_runtime_config",
+    }
+    assert {
+        "version",
+        "network",
+        "protocol",
+        "admin_authority_v2",
+        "artifact_hashes",
+    }.issubset(set(bootstrap_schema["required"]))
+    assert {
+        "version",
+        "network",
+        "protocol",
+        "admin_authority_v2",
+    }.issubset(set(runtime_schema["required"]))
+    assert {
+        "launcher_id",
+        "admins_hash",
+        "mips_root",
+        "authority_version",
+    }.issubset(set(manifest_authority_schema["required"]))
+    assert {
+        "launcher_id",
+        "admins_hash",
+        "mips_root",
+        "authority_version",
+        "admin_records_hash",
+    }.issubset(set(runtime_authority_schema["required"]))
 
 
 def test_bootstrap_finalize_fails_closed_after_lock(
