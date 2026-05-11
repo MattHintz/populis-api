@@ -441,6 +441,31 @@ genesis package:
    verifier, or an equivalent chain-backed verifier, before displaying an admin
    roster as trusted or using it for admin login decisions.
 
+### Bootstrap recovery verifier API contract
+
+`POST /admin/bootstrap/recovery-anchor/verify` is a public, non-mutating
+verification boundary for rehosted portals and operator tooling:
+
+1. It accepts caller-supplied `bootstrap_recovery_anchor`, `bootstrap_manifest`,
+   `portal_runtime_config`, `admin_records`, optional `deployment_manifest`, and
+   optional `live_admin_authority_v2` JSON objects.  Every supplied object is
+   treated as untrusted input.
+2. It calls `verify_bootstrap_recovery_artifacts` and returns `verified: true`
+   only when the canonical content hashes, artifact cross-links, admin-authority
+   coordinates, admin-records protocol `admins_hash`, and any supplied live
+   authority state all agree.
+3. It requires no bootstrap cookie, admin JWT, bearer token, or
+   `POPULIS_ADMIN_TOKEN`, because a verifier endpoint grants no authority and
+   reads no private server state.
+4. It must not read or write persisted bootstrap artifacts, mutate
+   `bootstrap_manifest.json`, sign, broadcast, mint, create marker coins, or
+   grant admin login.  Failures return `verified: false` with an error string
+   suitable for operator display.
+5. Its response may echo verified public authority coordinates and content
+   hashes only.  It must not include spend bundles, marker coin ids, marker
+   puzzle hashes, parent coin ids, future spends, wallet signatures, cookies,
+   bearer credentials, or private locators.
+
 ---
 
 ## Phase 0 brick map — first-admin birth ceremony

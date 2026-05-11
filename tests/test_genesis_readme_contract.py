@@ -509,3 +509,39 @@ def test_genesis_readme_pins_bootstrap_recovery_verification_contract() -> None:
     assert "first code boundary for this contract is the pure `verify_bootstrap_recovery_artifacts` helper" in text
     assert "treat fetched JSON as untrusted input and call this verifier" in text
     assert "before displaying an admin roster as trusted or using it for admin login decisions" in text
+
+
+def test_genesis_readme_pins_recovery_verifier_api_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Bootstrap recovery verifier API contract" in text
+    assert "`POST /admin/bootstrap/recovery-anchor/verify` is a public, non-mutating verification boundary" in text
+    for field in (
+        "`bootstrap_recovery_anchor`",
+        "`bootstrap_manifest`",
+        "`portal_runtime_config`",
+        "`admin_records`",
+        "`deployment_manifest`",
+        "`live_admin_authority_v2`",
+    ):
+        assert field in text
+    assert "Every supplied object is treated as untrusted input" in text
+    assert "calls `verify_bootstrap_recovery_artifacts`" in text
+    assert "returns `verified: true` only when the canonical content hashes" in text
+    assert "requires no bootstrap cookie, admin JWT, bearer token, or `POPULIS_ADMIN_TOKEN`" in text
+    assert "grants no authority and reads no private server state" in text
+    assert "must not read or write persisted bootstrap artifacts" in text
+    assert "sign, broadcast, mint, create marker coins, or grant admin login" in text
+    assert "Failures return `verified: false` with an error string" in text
+    for forbidden in (
+        "spend bundles",
+        "marker coin ids",
+        "marker puzzle hashes",
+        "parent coin ids",
+        "future spends",
+        "wallet signatures",
+        "cookies",
+        "bearer credentials",
+        "private locators",
+    ):
+        assert forbidden in text

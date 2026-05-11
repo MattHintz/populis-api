@@ -26,6 +26,7 @@ from .bootstrap_manifest import (
     build_bootstrap_recovery_anchor_create_coin_preview,
     build_bootstrap_recovery_anchor_publish_intent,
     persist_bootstrap_artifacts,
+    verify_bootstrap_recovery_artifacts,
 )
 from .config import Settings, get_settings
 
@@ -147,6 +148,31 @@ class BootstrapRecoveryAnchorCreateCoinPreviewResponse(BaseModel):
     memos_hex: list[str]
     condition_hex: tuple[int, str, int, tuple[str, str]]
     payload_hash: str
+
+
+class BootstrapRecoveryAnchorVerifyRequest(BaseModel):
+    bootstrap_recovery_anchor: BootstrapRecoveryAnchorArtifact
+    bootstrap_manifest: BootstrapManifestArtifact
+    portal_runtime_config: PortalRuntimeConfigArtifact
+    admin_records: dict[str, Any]
+    deployment_manifest: Optional[dict[str, Any]] = None
+    live_admin_authority_v2: Optional[AdminAuthorityV2ManifestArtifact] = None
+
+
+class BootstrapRecoveryAnchorVerifyResponse(BaseModel):
+    verified: bool
+    deployment_manifest_verified: bool
+    live_authority_verified: bool
+    network: Optional[str] = None
+    admin_authority_v2_launcher_id: Optional[str] = None
+    admins_hash: Optional[str] = None
+    mips_root: Optional[str] = None
+    authority_version: Optional[int] = None
+    bootstrap_manifest_hash: Optional[str] = None
+    portal_runtime_config_hash: Optional[str] = None
+    admin_records_hash: Optional[str] = None
+    deployment_manifest_hash: Optional[str] = None
+    error: Optional[str] = None
 
 
 def reset_bootstrap_state_for_tests() -> None:
@@ -503,6 +529,49 @@ async def bootstrap_recovery_anchor_create_coin_preview(
     )
 
 
+@router.post(
+    "/recovery-anchor/verify",
+    response_model=BootstrapRecoveryAnchorVerifyResponse,
+)
+async def bootstrap_recovery_anchor_verify(
+    body: BootstrapRecoveryAnchorVerifyRequest,
+) -> BootstrapRecoveryAnchorVerifyResponse:
+    try:
+        verification = verify_bootstrap_recovery_artifacts(
+            bootstrap_recovery_anchor=body.bootstrap_recovery_anchor.model_dump(),
+            bootstrap_manifest=body.bootstrap_manifest.model_dump(),
+            portal_runtime_config=body.portal_runtime_config.model_dump(),
+            admin_records=body.admin_records,
+            deployment_manifest=body.deployment_manifest,
+            live_admin_authority_v2=(
+                body.live_admin_authority_v2.model_dump()
+                if body.live_admin_authority_v2 is not None
+                else None
+            ),
+        )
+    except BootstrapManifestError as e:
+        return BootstrapRecoveryAnchorVerifyResponse(
+            verified=False,
+            deployment_manifest_verified=False,
+            live_authority_verified=False,
+            error=str(e),
+        )
+    return BootstrapRecoveryAnchorVerifyResponse(
+        verified=True,
+        deployment_manifest_verified=body.deployment_manifest is not None,
+        live_authority_verified=body.live_admin_authority_v2 is not None,
+        network=verification.network,
+        admin_authority_v2_launcher_id=verification.admin_authority_v2_launcher_id,
+        admins_hash=verification.admins_hash,
+        mips_root=verification.mips_root,
+        authority_version=verification.authority_version,
+        bootstrap_manifest_hash=verification.bootstrap_manifest_hash,
+        portal_runtime_config_hash=verification.portal_runtime_config_hash,
+        admin_records_hash=verification.admin_records_hash,
+        deployment_manifest_hash=verification.deployment_manifest_hash,
+    )
+
+
 __all__ = [
     "BOOTSTRAP_COOKIE_NAME",
     "BOOTSTRAP_COOKIE_PATH",
@@ -510,6 +579,8 @@ __all__ = [
     "BootstrapChallengeResponse",
     "BootstrapRecoveryAnchorCreateCoinPreviewRequest",
     "BootstrapRecoveryAnchorCreateCoinPreviewResponse",
+    "BootstrapRecoveryAnchorVerifyRequest",
+    "BootstrapRecoveryAnchorVerifyResponse",
     "BootstrapFinalizeRequest",
     "BootstrapFinalizeResponse",
     "BootstrapRecoveryAnchorArtifact",
@@ -522,6 +593,7 @@ __all__ = [
     "bootstrap_recovery_anchor_create_coin_preview",
     "bootstrap_recovery_anchor_path",
     "bootstrap_recovery_anchor_publish_intent",
+    "bootstrap_recovery_anchor_verify",
     "issue_bootstrap_session",
     "load_persisted_bootstrap_recovery_anchor",
     "portal_runtime_config_path",

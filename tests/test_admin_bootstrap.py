@@ -12,6 +12,7 @@ from populis_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_
 from populis_api.admin_records import load_admin_records_from_mapping
 from populis_api.bootstrap_manifest import (
     BOOTSTRAP_RECOVERY_ANCHOR_TAG,
+    build_bootstrap_artifacts,
     canonical_json_bytes,
     content_hash,
 )
@@ -119,6 +120,26 @@ def finalize_payload() -> dict:
         "mips_root": H("cd"),
         "read_only_api_url": "https://api.populis.example",
         "read_only_coinset_url": "https://coinset.example",
+    }
+
+
+def recovery_verify_payload() -> dict:
+    records = admin_records()
+    deployment = deployment_manifest()
+    artifacts = build_bootstrap_artifacts(
+        deployment_manifest=deployment,
+        admin_records=records,
+        admin_authority_launcher_id=records["launcher_id"],
+        admins_hash=admins_hash_for_records(records),
+        mips_root=H("cd"),
+    )
+    return {
+        "bootstrap_recovery_anchor": artifacts.bootstrap_recovery_anchor,
+        "bootstrap_manifest": artifacts.bootstrap_manifest,
+        "portal_runtime_config": artifacts.portal_runtime_config,
+        "admin_records": records,
+        "deployment_manifest": deployment,
+        "live_admin_authority_v2": artifacts.bootstrap_manifest["admin_authority_v2"],
     }
 
 
@@ -711,6 +732,108 @@ def test_recovery_anchor_create_coin_preview_openapi_schema_pins_preview_handoff
     assert "marker_coin_id" not in response_schema["properties"]
     assert "parent_coin_id" not in response_schema["properties"]
     assert "future_spend" not in response_schema["properties"]
+
+
+def test_recovery_anchor_verify_accepts_untrusted_artifacts_without_auth(
+    client: TestClient,
+) -> None:
+    payload = recovery_verify_payload()
+    client.cookies.clear()
+
+    resp = client.post("/admin/bootstrap/recovery-anchor/verify", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "verified": True,
+        "deployment_manifest_verified": True,
+        "live_authority_verified": True,
+        "network": "testnet11",
+        "admin_authority_v2_launcher_id": H("88"),
+        "admins_hash": payload["bootstrap_manifest"]["admin_authority_v2"]["admins_hash"],
+        "mips_root": H("cd"),
+        "authority_version": 1,
+        "bootstrap_manifest_hash": content_hash(payload["bootstrap_manifest"]),
+        "portal_runtime_config_hash": content_hash(payload["portal_runtime_config"]),
+        "admin_records_hash": content_hash(payload["admin_records"]),
+        "deployment_manifest_hash": content_hash(payload["deployment_manifest"]),
+        "error": None,
+    }
+
+
+def test_recovery_anchor_verify_returns_false_for_tampered_admin_records(
+    client: TestClient,
+) -> None:
+    payload = recovery_verify_payload()
+    payload["admin_records"]["admin_records"][0]["leaves"][0]["evm_address"] = (
+        "0x" + "ee" * 20
+    )
+
+    resp = client.post("/admin/bootstrap/recovery-anchor/verify", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verified"] is False
+    assert body["deployment_manifest_verified"] is False
+    assert body["live_authority_verified"] is False
+    assert "admin_records.json content hash" in body["error"]
+    assert body["admin_records_hash"] is None
+
+
+def test_recovery_anchor_verify_does_not_require_server_lock_or_files(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    assert not bootstrap_env.exists()
+
+    resp = client.post(
+        "/admin/bootstrap/recovery-anchor/verify",
+        json=recovery_verify_payload(),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["verified"] is True
+    assert not bootstrap_env.exists()
+    assert not bootstrap_env.with_name("admin_records.json").exists()
+    assert not bootstrap_env.with_name("portal_runtime_config.json").exists()
+
+
+def test_recovery_anchor_verify_openapi_schema_pins_verifier_boundary(
+    client: TestClient,
+) -> None:
+    openapi = client.app.openapi()
+    operation = openapi["paths"]["/admin/bootstrap/recovery-anchor/verify"]["post"]
+    request_schema = resolve_schema(
+        openapi,
+        operation["requestBody"]["content"]["application/json"]["schema"],
+    )
+    response_schema = resolve_schema(
+        openapi,
+        operation["responses"]["200"]["content"]["application/json"]["schema"],
+    )
+
+    assert "security" not in operation
+    assert set(request_schema["required"]) == {
+        "bootstrap_recovery_anchor",
+        "bootstrap_manifest",
+        "portal_runtime_config",
+        "admin_records",
+    }
+    assert set(response_schema["required"]) == {
+        "verified",
+        "deployment_manifest_verified",
+        "live_authority_verified",
+    }
+    assert "error" in response_schema["properties"]
+    for forbidden in (
+        "spend_bundle",
+        "marker_coin_id",
+        "marker_puzzle_hash",
+        "parent_coin_id",
+        "future_spend",
+        "wallet_signature",
+    ):
+        assert forbidden not in response_schema["properties"]
 
 
 def test_bootstrap_finalize_fails_closed_after_lock(
