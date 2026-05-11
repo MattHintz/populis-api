@@ -10,6 +10,7 @@ and the authorization plumbing is validated as a side-effect.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from populis_api import admin_auth, mint_endpoints
+from populis_api.admin_records import load_admin_records_from_path
 from populis_api.config import get_settings
 
 
@@ -123,6 +125,57 @@ def _propose_body(*, suffix: int = 0) -> dict[str, Any]:
     }
 
 
+def _admin_records_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    *,
+    records_evm_addresses: list[str],
+    legacy_allowlist: str = "",
+) -> TestClient:
+    records = [
+        {
+            "admin_idx": i,
+            "m_within": 1,
+            "leaves": [
+                {
+                    "kind": "eip712_member",
+                    "evm_address": evm,
+                    "secp256k1_pubkey": "0x02" + bytes([i + 1]).hex() + "11" * 31,
+                    "type_hash": "0x" + "ee" * 32,
+                    "prefix_and_domain_separator": "0x1901" + "ff" * 32,
+                },
+            ],
+        }
+        for i, evm in enumerate(records_evm_addresses)
+    ]
+    path = tmp_path / "admin_records.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "launcher_id": "0x" + "10" * 32,
+        "admin_records": records,
+    }))
+    config = load_admin_records_from_path(path)
+    monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", legacy_allowlist)
+    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "k" * 64)
+    monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "900")
+    monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
+    monkeypatch.setenv("POPULIS_ADMIN_DB_PATH", str(tmp_path / "admin_records_proposals.db"))
+    monkeypatch.setenv(
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "0x" + config.compute_admins_hash().hex(),
+    )
+    monkeypatch.setenv(
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        "0x" + config.launcher_id.hex(),
+    )
+    get_settings.cache_clear()
+    a = FastAPI()
+    a.include_router(admin_auth.router)
+    a.include_router(mint_endpoints.router)
+    return TestClient(a)
+
+
 # ── Auth gating ─────────────────────────────────────────────────────────────
 class TestAuthGating:
     @pytest.mark.parametrize("path,method", [
@@ -156,6 +209,62 @@ class TestAuthGating:
     ):
         resp = client.request(method, path, json={})
         assert resp.status_code == expected, resp.text
+
+
+class TestAdminRecordsGating:
+    def test_records_path_admin_can_create_mint_proposal(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        client = _admin_records_client(
+            monkeypatch,
+            tmp_path,
+            records_evm_addresses=[_TEST_ADDRESS_LOWER],
+            legacy_allowlist="",
+        )
+        token = _login(client, _TEST_ACCT)
+
+        resp = client.post(
+            "/admin/mint/propose",
+            json=_propose_body(suffix=90),
+            headers=_auth_header(token),
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["owner_pubkey"] == _TEST_ADDRESS_LOWER
+
+    def test_records_path_does_not_union_legacy_env_admins(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        client = _admin_records_client(
+            monkeypatch,
+            tmp_path,
+            records_evm_addresses=[_TEST_ADDRESS_LOWER],
+            legacy_allowlist=_OTHER_ADDRESS_LOWER,
+        )
+
+        ch = client.post(
+            "/admin/auth/challenge",
+            json={"owner": _OTHER_ADDRESS, "auth_type": "evm"},
+        ).json()
+        signed = _OTHER_ACCT.sign_message(encode_typed_data(full_message=ch["typed_data"]))
+        resp = client.post(
+            "/admin/auth/login",
+            json={
+                "owner": _OTHER_ADDRESS,
+                "nonce": ch["nonce"],
+                "signature": "0x" + signed.signature.hex().replace("0x", ""),
+                "auth_type": "evm",
+            },
+        )
+
+        assert resp.status_code == 403, resp.text
+        token = _login(client, _TEST_ACCT)
+        list_resp = client.get("/admin/mint", headers=_auth_header(token))
+        assert list_resp.status_code == 200, list_resp.text
 
 
 # ── Propose ─────────────────────────────────────────────────────────────────
