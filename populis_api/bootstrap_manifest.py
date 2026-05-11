@@ -20,6 +20,10 @@ FORBIDDEN_ARTIFACT_MARKERS = (
     "signature",
     "nonce",
     "private_key",
+    "private_url",
+    "service_credential",
+    "service_credentials",
+    "mutable_service_credentials",
     "faucet_mnemonic",
     "faucet_seed",
     "faucet_master_sk",
@@ -50,6 +54,14 @@ class BootstrapArtifactPaths:
 class BootstrapRecoveryAnchor:
     payload: dict[str, Any]
     payload_bytes: bytes
+    payload_hash: str
+
+
+@dataclass(frozen=True)
+class BootstrapRecoveryAnchorCarrierMemos:
+    tag_memo: bytes
+    payload_memo: bytes
+    memos: tuple[bytes, bytes]
     payload_hash: str
 
 
@@ -265,6 +277,21 @@ def build_bootstrap_recovery_anchor(
     )
 
 
+def build_bootstrap_recovery_anchor_memos(
+    *,
+    bootstrap_recovery_anchor: Mapping[str, Any],
+) -> BootstrapRecoveryAnchorCarrierMemos:
+    payload = _validate_bootstrap_recovery_anchor_payload(bootstrap_recovery_anchor)
+    tag_memo = BOOTSTRAP_RECOVERY_ANCHOR_TAG.encode("utf-8")
+    payload_memo = canonical_json_bytes(payload)
+    return BootstrapRecoveryAnchorCarrierMemos(
+        tag_memo=tag_memo,
+        payload_memo=payload_memo,
+        memos=(tag_memo, payload_memo),
+        payload_hash=content_hash(payload),
+    )
+
+
 def persist_bootstrap_artifacts(
     *,
     artifacts: BootstrapArtifacts,
@@ -313,6 +340,36 @@ def _require_mapping(value: object, field: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise BootstrapManifestError(f"{field} must be an object")
     return value
+
+
+def _validate_bootstrap_recovery_anchor_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+    _assert_public_artifact(payload, "bootstrap_recovery_anchor.json")
+    _validate_recovery_anchor_version(payload.get("version"))
+    tag = _require_str(payload, "tag")
+    if tag != BOOTSTRAP_RECOVERY_ANCHOR_TAG:
+        raise BootstrapManifestError(
+            f"bootstrap_recovery_anchor tag must be {BOOTSTRAP_RECOVERY_ANCHOR_TAG}"
+        )
+    _require_str(payload, "network")
+    normalized_launcher = _normalize_hex32(
+        payload.get("admin_authority_v2_launcher_id"),
+        "admin_authority_v2_launcher_id",
+    )
+    if payload.get("admin_authority_v2_launcher_id") != normalized_launcher:
+        raise BootstrapManifestError(
+            "admin_authority_v2_launcher_id must be a canonical 0x-prefixed 32-byte hex string"
+        )
+    _validate_authority_version(payload.get("authority_version"))
+    for field in (
+        "bootstrap_manifest_hash",
+        "portal_runtime_config_hash",
+        "admin_records_hash",
+    ):
+        normalized_hash = _require_content_hash(payload.get(field), field)
+        if payload.get(field) != normalized_hash:
+            raise BootstrapManifestError(f"{field} must be a canonical sha256 content hash")
+    return payload
 
 
 def _require_content_hash(value: object, field: str) -> str:
@@ -400,9 +457,11 @@ __all__ = [
     "BootstrapArtifactPaths",
     "BootstrapManifestError",
     "BootstrapRecoveryAnchor",
+    "BootstrapRecoveryAnchorCarrierMemos",
     "FORBIDDEN_ARTIFACT_MARKERS",
     "build_bootstrap_artifacts",
     "build_bootstrap_recovery_anchor",
+    "build_bootstrap_recovery_anchor_memos",
     "canonical_json_bytes",
     "content_hash",
     "persist_bootstrap_artifacts",

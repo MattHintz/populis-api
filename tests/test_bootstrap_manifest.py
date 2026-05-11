@@ -11,6 +11,7 @@ from populis_api.bootstrap_manifest import (
     BootstrapManifestError,
     build_bootstrap_artifacts,
     build_bootstrap_recovery_anchor,
+    build_bootstrap_recovery_anchor_memos,
     canonical_json_bytes,
     content_hash,
     persist_bootstrap_artifacts,
@@ -222,6 +223,80 @@ def test_bootstrap_recovery_anchor_rejects_secret_bearing_artifacts() -> None:
         build_bootstrap_recovery_anchor(
             bootstrap_manifest=manifest,
             portal_runtime_config=artifacts.portal_runtime_config,
+        )
+
+
+def test_builds_bootstrap_recovery_anchor_marker_memos() -> None:
+    artifacts, _ = artifacts_and_records()
+
+    carrier = build_bootstrap_recovery_anchor_memos(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+    )
+
+    assert carrier.tag_memo == b"POPULIS_BOOTSTRAP_V1"
+    assert carrier.payload_memo == canonical_json_bytes(artifacts.bootstrap_recovery_anchor)
+    assert carrier.memos == (carrier.tag_memo, carrier.payload_memo)
+    assert carrier.payload_hash == content_hash(artifacts.bootstrap_recovery_anchor)
+    assert json.loads(carrier.payload_memo) == artifacts.bootstrap_recovery_anchor
+
+
+def test_bootstrap_recovery_anchor_marker_memos_canonicalize_input_order() -> None:
+    artifacts, _ = artifacts_and_records()
+    payload = artifacts.bootstrap_recovery_anchor
+    reordered = {
+        "tag": payload["tag"],
+        "version": payload["version"],
+        "portal_runtime_config_hash": payload["portal_runtime_config_hash"],
+        "network": payload["network"],
+        "admin_records_hash": payload["admin_records_hash"],
+        "authority_version": payload["authority_version"],
+        "bootstrap_manifest_hash": payload["bootstrap_manifest_hash"],
+        "admin_authority_v2_launcher_id": payload["admin_authority_v2_launcher_id"],
+    }
+
+    carrier = build_bootstrap_recovery_anchor_memos(
+        bootstrap_recovery_anchor=reordered,
+    )
+
+    assert carrier.payload_memo == canonical_json_bytes(payload)
+    assert carrier.payload_hash == content_hash(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("tag", "WRONG", "tag"),
+        ("version", 0, "recovery anchor version"),
+        ("admin_authority_v2_launcher_id", "88" * 32, "canonical 0x-prefixed"),
+        ("authority_version", "1", "authority_version"),
+        ("bootstrap_manifest_hash", "sha256:" + "AA" * 32, "canonical sha256"),
+        ("portal_runtime_config_hash", "sha256:" + "zz" * 32, "sha256 content hash"),
+        ("admin_records_hash", "0x" + "12" * 32, "sha256 content hash"),
+    ],
+)
+def test_bootstrap_recovery_anchor_marker_memos_reject_invalid_payload(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    artifacts, _ = artifacts_and_records()
+    payload = clone_json(artifacts.bootstrap_recovery_anchor)
+    payload[field] = value
+
+    with pytest.raises(BootstrapManifestError, match=match):
+        build_bootstrap_recovery_anchor_memos(
+            bootstrap_recovery_anchor=payload,
+        )
+
+
+def test_bootstrap_recovery_anchor_marker_memos_reject_secret_material() -> None:
+    artifacts, _ = artifacts_and_records()
+    payload = clone_json(artifacts.bootstrap_recovery_anchor)
+    payload["private_url"] = "https://secret.example/bootstrap"
+
+    with pytest.raises(BootstrapManifestError, match="forbidden credential marker"):
+        build_bootstrap_recovery_anchor_memos(
+            bootstrap_recovery_anchor=payload,
         )
 
 
