@@ -506,3 +506,6 @@ def test_genesis_readme_pins_bootstrap_recovery_verification_contract() -> None:
     assert "transaction id, spend bundle, API host, portal host, coinset host, and locator URL" in text
     assert "Conflicting anchors for the same `network`, `admin_authority_v2_launcher_id`, and `authority_version`" in text
     assert "must be rejected or escalated for manual operator/auditor review" in text
+    assert "first code boundary for this contract is the pure `verify_bootstrap_recovery_artifacts` helper" in text
+    assert "treat fetched JSON as untrusted input and call this verifier" in text
+    assert "before displaying an admin roster as trusted or using it for admin login decisions" in text

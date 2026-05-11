@@ -435,6 +435,11 @@ genesis package:
    `admin_authority_v2_launcher_id`, and `authority_version` with different
    payload hashes must be rejected or escalated for manual operator/auditor
    review.
+9. The first code boundary for this contract is the pure
+   `verify_bootstrap_recovery_artifacts` helper.  Portal, API, and future CLI
+   recovery flows must treat fetched JSON as untrusted input and call this
+   verifier, or an equivalent chain-backed verifier, before displaying an admin
+   roster as trusted or using it for admin login decisions.
 
 ---
 

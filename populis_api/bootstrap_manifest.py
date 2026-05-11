@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .admin_records import (
+    AdminRecordsDriftError,
+    AdminRecordsLoadError,
+    load_admin_records_from_mapping,
+    verify_against_admins_hash_hex,
+)
+
 
 FORBIDDEN_ARTIFACT_MARKERS = (
     "populis_admin_token",
@@ -93,6 +100,19 @@ class BootstrapRecoveryAnchorCreateCoinPreview:
     condition: tuple[int, bytes, int, tuple[bytes, bytes]]
     condition_hex: tuple[int, str, int, tuple[str, str]]
     payload_hash: str
+
+
+@dataclass(frozen=True)
+class BootstrapRecoveryVerification:
+    network: str
+    admin_authority_v2_launcher_id: str
+    admins_hash: str
+    mips_root: str
+    authority_version: int
+    bootstrap_manifest_hash: str
+    portal_runtime_config_hash: str
+    admin_records_hash: str
+    deployment_manifest_hash: str | None
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -378,6 +398,143 @@ def build_bootstrap_recovery_anchor_create_coin_preview(
     )
 
 
+def verify_bootstrap_recovery_artifacts(
+    *,
+    bootstrap_recovery_anchor: Mapping[str, Any],
+    bootstrap_manifest: Mapping[str, Any],
+    portal_runtime_config: Mapping[str, Any],
+    admin_records: Mapping[str, Any],
+    deployment_manifest: Mapping[str, Any] | None = None,
+    live_admin_authority_v2: Mapping[str, Any] | None = None,
+) -> BootstrapRecoveryVerification:
+    payload = _validate_bootstrap_recovery_anchor_payload(bootstrap_recovery_anchor)
+    manifest = dict(_require_mapping(bootstrap_manifest, "bootstrap_manifest.json"))
+    runtime = dict(_require_mapping(portal_runtime_config, "portal_runtime_config.json"))
+    records = dict(_require_mapping(admin_records, "admin_records.json"))
+
+    _assert_public_artifact(manifest, "bootstrap_manifest.json")
+    _assert_public_artifact(runtime, "portal_runtime_config.json")
+    _assert_public_artifact(records, "admin_records.json")
+
+    actual_manifest_hash = content_hash(manifest)
+    if actual_manifest_hash != payload["bootstrap_manifest_hash"]:
+        raise BootstrapManifestError(
+            "bootstrap_manifest.json content hash does not match recovery anchor"
+        )
+    actual_runtime_hash = content_hash(runtime)
+    if actual_runtime_hash != payload["portal_runtime_config_hash"]:
+        raise BootstrapManifestError(
+            "portal_runtime_config.json content hash does not match recovery anchor"
+        )
+    actual_records_hash = content_hash(records)
+    if actual_records_hash != payload["admin_records_hash"]:
+        raise BootstrapManifestError(
+            "admin_records.json content hash does not match recovery anchor"
+        )
+
+    artifact_hashes = _require_mapping(
+        manifest.get("artifact_hashes"),
+        "bootstrap_manifest.artifact_hashes",
+    )
+    deployment_hash = _require_content_hash(
+        artifact_hashes.get("deployment_manifest_json"),
+        "bootstrap_manifest.artifact_hashes.deployment_manifest_json",
+    )
+    if deployment_manifest is not None:
+        deployment = dict(_require_mapping(deployment_manifest, "deployment_manifest.json"))
+        _assert_public_artifact(deployment, "deployment_manifest.json")
+        if content_hash(deployment) != deployment_hash:
+            raise BootstrapManifestError(
+                "deployment_manifest.json content hash does not match bootstrap manifest"
+            )
+
+    expected_anchor = build_bootstrap_recovery_anchor(
+        bootstrap_manifest=manifest,
+        portal_runtime_config=runtime,
+    )
+    if expected_anchor.payload != payload:
+        raise BootstrapManifestError(
+            "bootstrap_recovery_anchor.json does not match verified bootstrap artifacts"
+        )
+
+    manifest_authority = _require_mapping(
+        manifest.get("admin_authority_v2"),
+        "bootstrap_manifest.admin_authority_v2",
+    )
+    admins_hash = _normalize_hex32(
+        manifest_authority.get("admins_hash"),
+        "bootstrap_manifest.admin_authority_v2.admins_hash",
+    )
+    mips_root = _normalize_hex32(
+        manifest_authority.get("mips_root"),
+        "bootstrap_manifest.admin_authority_v2.mips_root",
+    )
+    records_launcher = _normalize_hex32(
+        records.get("launcher_id"),
+        "admin_records.launcher_id",
+    )
+    if records_launcher != payload["admin_authority_v2_launcher_id"]:
+        raise BootstrapManifestError(
+            "admin_records.json launcher_id does not match recovery anchor"
+        )
+    try:
+        admin_records_config = load_admin_records_from_mapping(
+            records,
+            "admin_records.json",
+        )
+        verify_against_admins_hash_hex(admin_records_config, admins_hash)
+    except (AdminRecordsLoadError, AdminRecordsDriftError) as e:
+        raise BootstrapManifestError(
+            f"admin_records.json does not match verified admin authority: {e}"
+        ) from e
+
+    if live_admin_authority_v2 is not None:
+        live = _require_mapping(live_admin_authority_v2, "live_admin_authority_v2")
+        live_launcher = _normalize_hex32(
+            live.get("launcher_id"),
+            "live_admin_authority_v2.launcher_id",
+        )
+        live_admins_hash = _normalize_hex32(
+            live.get("admins_hash"),
+            "live_admin_authority_v2.admins_hash",
+        )
+        live_mips_root = _normalize_hex32(
+            live.get("mips_root"),
+            "live_admin_authority_v2.mips_root",
+        )
+        live_authority_version = _validate_authority_version(
+            live.get("authority_version")
+        )
+        if live_launcher != payload["admin_authority_v2_launcher_id"]:
+            raise BootstrapManifestError(
+                "live admin_authority_v2 launcher_id does not match recovery anchor"
+            )
+        if live_admins_hash != admins_hash:
+            raise BootstrapManifestError(
+                "live admin_authority_v2 admins_hash does not match recovered artifacts"
+            )
+        if live_mips_root != mips_root:
+            raise BootstrapManifestError(
+                "live admin_authority_v2 mips_root does not match recovered artifacts"
+            )
+        if live_authority_version != payload["authority_version"]:
+            raise BootstrapManifestError(
+                "live admin_authority_v2 authority_version does not match recovery anchor"
+            )
+
+    return BootstrapRecoveryVerification(
+        network=payload["network"],
+        admin_authority_v2_launcher_id=payload["admin_authority_v2_launcher_id"],
+        admins_hash=admins_hash,
+        mips_root=mips_root,
+        authority_version=payload["authority_version"],
+        bootstrap_manifest_hash=payload["bootstrap_manifest_hash"],
+        portal_runtime_config_hash=payload["portal_runtime_config_hash"],
+        admin_records_hash=payload["admin_records_hash"],
+        deployment_manifest_hash=deployment_hash,
+    )
+
+
 def persist_bootstrap_artifacts(
     *,
     artifacts: BootstrapArtifacts,
@@ -596,6 +753,7 @@ __all__ = [
     "BootstrapRecoveryAnchorCarrierMemos",
     "BootstrapRecoveryAnchorCreateCoinPreview",
     "BootstrapRecoveryAnchorPublishIntent",
+    "BootstrapRecoveryVerification",
     "FORBIDDEN_ARTIFACT_MARKERS",
     "build_bootstrap_artifacts",
     "build_bootstrap_recovery_anchor",
@@ -605,4 +763,5 @@ __all__ = [
     "canonical_json_bytes",
     "content_hash",
     "persist_bootstrap_artifacts",
+    "verify_bootstrap_recovery_artifacts",
 ]

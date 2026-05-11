@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from populis_api import bootstrap_manifest as bm
+from populis_api.admin_records import load_admin_records_from_mapping
 from populis_api.bootstrap_manifest import (
     BootstrapArtifactPaths,
     BootstrapManifestError,
@@ -17,6 +18,7 @@ from populis_api.bootstrap_manifest import (
     canonical_json_bytes,
     content_hash,
     persist_bootstrap_artifacts,
+    verify_bootstrap_recovery_artifacts,
 )
 
 
@@ -76,6 +78,20 @@ def artifacts_and_records() -> tuple:
         admin_records=records,
         admin_authority_launcher_id=records["launcher_id"],
         admins_hash=H("ab"),
+        mips_root=H("cd"),
+    )
+    return artifacts, records
+
+
+def verifiable_artifacts_and_records() -> tuple:
+    records = admin_records()
+    del records["admin_records"][0]["leaves"][0]["leaf_hash"]
+    config = load_admin_records_from_mapping(records)
+    artifacts = build_bootstrap_artifacts(
+        deployment_manifest=deployment_manifest(),
+        admin_records=records,
+        admin_authority_launcher_id=records["launcher_id"],
+        admins_hash="0x" + config.compute_admins_hash().hex(),
         mips_root=H("cd"),
     )
     return artifacts, records
@@ -482,6 +498,95 @@ def test_bootstrap_recovery_anchor_create_coin_preview_rejects_tampered_intent()
         build_bootstrap_recovery_anchor_create_coin_preview(
             publish_intent=tampered,
             marker_puzzle_hash=H("ef"),
+        )
+
+
+def test_verifies_bootstrap_recovery_artifacts_against_hash_chain() -> None:
+    artifacts, records = verifiable_artifacts_and_records()
+    deployment = deployment_manifest()
+
+    verification = verify_bootstrap_recovery_artifacts(
+        bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+        bootstrap_manifest=artifacts.bootstrap_manifest,
+        portal_runtime_config=artifacts.portal_runtime_config,
+        admin_records=records,
+        deployment_manifest=deployment,
+        live_admin_authority_v2=artifacts.bootstrap_manifest["admin_authority_v2"],
+    )
+
+    assert verification == bm.BootstrapRecoveryVerification(
+        network="testnet11",
+        admin_authority_v2_launcher_id=H("88"),
+        admins_hash=artifacts.bootstrap_manifest["admin_authority_v2"]["admins_hash"],
+        mips_root=H("cd"),
+        authority_version=1,
+        bootstrap_manifest_hash=content_hash(artifacts.bootstrap_manifest),
+        portal_runtime_config_hash=content_hash(artifacts.portal_runtime_config),
+        admin_records_hash=content_hash(records),
+        deployment_manifest_hash=content_hash(deployment),
+    )
+
+
+def test_recovery_verifier_rejects_admin_records_metadata_tamper() -> None:
+    artifacts, records = verifiable_artifacts_and_records()
+    tampered_records = clone_json(records)
+    tampered_records["admin_records"][0]["leaves"][0]["evm_address"] = "0x" + "ee" * 20
+
+    with pytest.raises(BootstrapManifestError, match="admin_records.json content hash"):
+        verify_bootstrap_recovery_artifacts(
+            bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+            bootstrap_manifest=artifacts.bootstrap_manifest,
+            portal_runtime_config=artifacts.portal_runtime_config,
+            admin_records=tampered_records,
+        )
+
+
+def test_recovery_verifier_rejects_admin_records_protocol_hash_forgery() -> None:
+    artifacts, records = verifiable_artifacts_and_records()
+    forged_records = clone_json(records)
+    forged_records["admin_records"][0]["leaves"][0]["secp256k1_pubkey"] = (
+        "0x02" + "ee" * 32
+    )
+    forged_records_hash = content_hash(forged_records)
+    forged_manifest = clone_json(artifacts.bootstrap_manifest)
+    forged_runtime = clone_json(artifacts.portal_runtime_config)
+    forged_runtime["admin_authority_v2"]["admin_records_hash"] = forged_records_hash
+    forged_manifest["artifact_hashes"]["admin_records_json"] = forged_records_hash
+    forged_manifest["artifact_hashes"]["portal_runtime_config_json"] = content_hash(
+        forged_runtime
+    )
+    forged_anchor = build_bootstrap_recovery_anchor(
+        bootstrap_manifest=forged_manifest,
+        portal_runtime_config=forged_runtime,
+    )
+
+    with pytest.raises(
+        BootstrapManifestError,
+        match="admin_records.json does not match verified admin authority",
+    ):
+        verify_bootstrap_recovery_artifacts(
+            bootstrap_recovery_anchor=forged_anchor.payload,
+            bootstrap_manifest=forged_manifest,
+            portal_runtime_config=forged_runtime,
+            admin_records=forged_records,
+        )
+
+
+def test_recovery_verifier_rejects_live_authority_mismatch() -> None:
+    artifacts, records = verifiable_artifacts_and_records()
+    live_authority = clone_json(artifacts.bootstrap_manifest["admin_authority_v2"])
+    live_authority["authority_version"] = 2
+
+    with pytest.raises(
+        BootstrapManifestError,
+        match="live admin_authority_v2 authority_version",
+    ):
+        verify_bootstrap_recovery_artifacts(
+            bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
+            bootstrap_manifest=artifacts.bootstrap_manifest,
+            portal_runtime_config=artifacts.portal_runtime_config,
+            admin_records=records,
+            live_admin_authority_v2=live_authority,
         )
 
 
