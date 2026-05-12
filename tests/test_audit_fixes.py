@@ -409,6 +409,190 @@ class TestPushOrFail:
         assert exc_info.value.status_code == 502
 
 
+class TestVaultRegistrationSafetyFalsifiers:
+    def _faucet(self):
+        from populis_api.faucet import Faucet
+
+        return Faucet.from_seed_hex("00" * 32, "testnet11")
+
+    def _settings(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(faucet_max_spend_mojos=10_000_000)
+
+    def _coin_records(self, faucet):
+        return [
+            {
+                "spent_block_index": 0,
+                "coin": {
+                    "parent_coin_info": "0x" + "11" * 32,
+                    "puzzle_hash": "0x" + faucet.address_puzzle_hash.hex(),
+                    "amount": 1000,
+                },
+            }
+        ]
+
+    def _signed_request(self):
+        from populis_api.app import RegisterEvmVaultRequest
+
+        acct = Account.from_key(b"\x42" * 32)
+        store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=10)
+        ch = store.issue(
+            acct.address,
+            "evm",
+            pool_launcher_id_hex="0x" + "00" * 32,
+            chia_network="testnet11",
+        )
+        typed_data = registration_typed_data(
+            acct.address,
+            ch.nonce,
+            pool_launcher_id_hex=ch.pool_launcher_id_hex,
+            auth_type="secp256k1",
+            chia_network=ch.chia_network,
+        )
+        signed = acct.sign_typed_data(
+            domain_data=typed_data["domain"],
+            message_types={
+                k: v for k, v in typed_data["types"].items() if k != "EIP712Domain"
+            },
+            message_data=typed_data["message"],
+        )
+        body = RegisterEvmVaultRequest(
+            address=acct.address,
+            nonce=ch.nonce,
+            signature="0x" + signed.signature.hex().replace("0x", ""),
+        )
+        return acct, store, body
+
+    @pytest.mark.asyncio
+    async def test_rejected_push_does_not_persist_registry_record(self):
+        from fastapi import HTTPException
+        from populis_api.app import register_evm_vault
+
+        _acct, store, body = self._signed_request()
+        faucet = self._faucet()
+        coinset = MagicMock()
+        coinset.get_coin_records_by_puzzle_hash = AsyncMock(
+            return_value=self._coin_records(faucet)
+        )
+        coinset.push_tx = AsyncMock(
+            return_value={"success": False, "error": "DOUBLE_SPEND"}
+        )
+        registry = MagicMock()
+        registry.get_by_evm = MagicMock(return_value=None)
+
+        try:
+            result = await register_evm_vault(
+                body,
+                self._settings(),
+                coinset,
+                faucet,
+                store,
+                registry,
+            )
+        except HTTPException as e:
+            assert e.status_code == 502
+        else:
+            assert result.accepted is False
+        registry.record.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_evm_registration_rejected_before_push(self):
+        from fastapi import HTTPException
+        from populis_api.app import register_evm_vault
+
+        _acct, store, body = self._signed_request()
+        faucet = self._faucet()
+        coinset = MagicMock()
+        coinset.get_coin_records_by_puzzle_hash = AsyncMock(
+            return_value=self._coin_records(faucet)
+        )
+        coinset.push_tx = AsyncMock(return_value={"success": True})
+        registry = MagicMock()
+        registry.get_by_evm = MagicMock(return_value=object())
+
+        with pytest.raises(HTTPException) as exc_info:
+            await register_evm_vault(
+                body,
+                self._settings(),
+                coinset,
+                faucet,
+                store,
+                registry,
+            )
+
+        assert exc_info.value.status_code == 409
+        coinset.push_tx.assert_not_called()
+        registry.record.assert_not_called()
+
+
+class TestChallengeDoSFalsifiers:
+    def _settings(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            deployment_manifest_path="/tmp/no-populis-test-manifest.json",
+            pool_launcher_id=None,
+            network="testnet11",
+        )
+
+    def _request(self, *, xff: str, peer: str = "203.0.113.10"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            headers={"x-forwarded-for": xff},
+            client=SimpleNamespace(host=peer),
+        )
+
+    @pytest.mark.asyncio
+    async def test_xff_spoofing_does_not_bypass_per_peer_rate_limit(self):
+        from fastapi import HTTPException
+        from populis_api.app import ChallengeRequest, request_challenge
+
+        store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=1)
+        settings = self._settings()
+        await request_challenge(
+            ChallengeRequest(
+                address="0x1234567890123456789012345678901234567890",
+                auth_type="evm",
+            ),
+            self._request(xff="198.51.100.1"),
+            settings,
+            store,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await request_challenge(
+                ChallengeRequest(
+                    address="0x1234567890123456789012345678901234567890",
+                    auth_type="evm",
+                ),
+                self._request(xff="198.51.100.2"),
+                settings,
+                store,
+            )
+
+        assert exc_info.value.status_code == 429
+        assert len(store) == 1
+
+    def test_unbounded_passkey_challenge_rejected_before_allocation(self):
+        from fastapi.testclient import TestClient
+        from populis_api.app import app, get_challenge_store
+
+        store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=10)
+        app.dependency_overrides[get_challenge_store] = lambda: store
+        try:
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/auth/challenge",
+                    json={"address": "p" * 100_000, "auth_type": "passkey"},
+                )
+            assert resp.status_code in (400, 422)
+            assert len(store) == 0
+        finally:
+            app.dependency_overrides.clear()
+
+
 # ============================================================================
 # POP-CANON-009 — faucet_max_spend_mojos enforced via Faucet.select_coin
 # ============================================================================

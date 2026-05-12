@@ -321,13 +321,23 @@ class ProtocolInfo(BaseModel):
 
 
 class ChallengeRequest(BaseModel):
-    address: str = Field(..., description="EVM address or Chia BLS pubkey hex")
+    address: str = Field(
+        ..., min_length=1, max_length=1024, description="EVM address or Chia BLS pubkey hex"
+    )
     auth_type: str = Field(..., pattern="^(evm|chia_bls|passkey)$")
 
     @model_validator(mode="after")
     def validate_address_for_auth_type(self):
         if self.auth_type == "evm":
             self.address = normalize_evm_address(self.address, "address")
+        elif self.auth_type == "chia_bls":
+            raw = self.address[2:] if self.address.startswith("0x") else self.address
+            try:
+                pk_bytes = bytes.fromhex(raw)
+            except ValueError as e:
+                raise ValueError("BLS pubkey must be hex") from e
+            if len(pk_bytes) != 48:
+                raise ValueError("BLS pubkey must be 48 bytes")
         return self
 
 
@@ -564,6 +574,11 @@ async def register_evm_vault(
             ),
         )
 
+    if registry.get_by_evm(recovery.address) is not None:
+        raise HTTPException(
+            status_code=409, detail="EVM address is already registered."
+        )
+
     # Look up an unspent faucet coin
     coins = await coinset.get_coin_records_by_puzzle_hash(
         "0x" + faucet.address_puzzle_hash.hex(), include_spent=False
@@ -609,6 +624,11 @@ async def register_evm_vault(
     # cannot silently believe a vault was registered when the spend was
     # never accepted into the mempool.
     accepted, push_status = await _push_or_fail(coinset, launched.spend_bundle)
+    if not accepted:
+        raise HTTPException(
+            status_code=502,
+            detail=f"coinset.org rejected the spend: {push_status}",
+        )
 
     now = time.time()
     p2 = puzzle_for_p2_vault(launched.vault_launcher_id)
@@ -704,6 +724,11 @@ async def register_chia_vault(
 
     # POP-CANON-004 fix: hard-fail on push_tx rejection.
     accepted, push_status = await _push_or_fail(coinset, launched.spend_bundle)
+    if not accepted:
+        raise HTTPException(
+            status_code=502,
+            detail=f"coinset.org rejected the spend: {push_status}",
+        )
 
     now = time.time()
     p2 = puzzle_for_p2_vault(launched.vault_launcher_id)
@@ -869,15 +894,9 @@ def _pool_launcher_id_hex(settings: Settings) -> str:
 def _client_ip(request: Request) -> str:
     """Extract the client IP for per-IP rate limiting.
 
-    Honours ``X-Forwarded-For`` when present (comma-separated; we take the
-    first hop, the original client).  Falls back to the immediate peer.
-    Operators behind a reverse proxy that does NOT pass XFF will see all
-    requests as coming from a single internal IP — that's a fail-closed
-    rate-limit posture, which is the safer default.
+    Uses the immediate peer address rather than trusting client-supplied
+    forwarding headers.
     """
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
     if request.client is not None:
         return request.client.host
     return "unknown"

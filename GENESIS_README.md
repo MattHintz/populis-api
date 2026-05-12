@@ -393,12 +393,17 @@ may contain `artifacts.bootstrap_manifest`, `artifacts.portal_runtime_config`,
 `artifacts.bootstrap_recovery_anchor`, `artifacts.admin_records`, current
 recovery verifier status, current chain-state comparison status,
 `recovery_anchor_publish_intent`, and optional
-`recovery_anchor_create_coin_preview`.  It must never contain
+`recovery_anchor_create_coin_preview`.  After a successful portal broadcast it
+may also contain `recovery_anchor_broadcast` with public audit metadata:
+`funding_coin_id`, `marker_coin_id`, `marker_puzzle_hash`,
+`marker_coin_amount_mojos`, `payload_hash`, and `push_status`.  These fields are
+not authority and verifiers must still re-discover or re-derive marker evidence
+from chain when making recovery decisions.  It must never contain
 `POPULIS_ADMIN_TOKEN`, bootstrap cookies/JWTs, bearer tokens, raw wallet
 signatures, auth nonces, admin JWT secrets, faucet private keys, private
-mnemonics, private URLs, spend bundles, marker coin ids, parent coin ids, or
-future spends.  It must be downloaded as an explicit operator action; the portal
-must not persist it to `localStorage` or `sessionStorage`.
+mnemonics, private URLs, spend bundles, future spends, or private wallet
+material.  It must be downloaded as an explicit operator action; the portal must
+not persist it to `localStorage` or `sessionStorage`.
 
 ### Bootstrap off-chain dependency ledger
 
@@ -505,6 +510,46 @@ verification boundary for rehosted portals and operator tooling:
    hashes only.  It must not include spend bundles, marker coin ids, marker
    puzzle hashes, parent coin ids, future spends, wallet signatures, cookies,
    bearer credentials, or private locators.
+
+### Portal Path A recovery flow contract
+
+The portal implements Path A as a three-brick self-service flow:
+
+1. R1 runs inside `/admin/launch-authority-v2` after bootstrap finalization.
+   The page fetches the publish intent and `CREATE_COIN` preview, then a
+   connected Chia wallet may broadcast the marker coin.  The wallet receives
+   only a one-mojo transfer target plus the UTF-8 tag and canonical JSON payload
+   memos.  The portal must validate that the wallet-signed bundle actually
+   contains `CREATE_COIN(marker_puzzle_hash, 1, [tag_memo, payload_memo])`
+   before pushing to coinset.org.
+2. R1 never handles private keys and must abort before `push_tx` if the wallet
+   strips, reorders, or omits the recovery memos.  After coinset accepts the
+   transaction, the handoff bundle may record only public broadcast audit fields:
+   marker coin id, funding coin id, marker puzzle hash, amount, payload hash,
+   and push status.  It must not record the signed spend bundle or wallet
+   signatures.
+3. R2 is `RecoveryAnchorDiscoveryService`.  It discovers candidates by scanning
+   chain-visible memos for `POPULIS_BOOTSTRAP_V1`, replays the candidate
+   marker's parent spend, extracts the actual `CREATE_COIN` memo pair from the
+   parent spend conditions, requires canonical payload JSON, and returns only
+   anchors whose payload hashes and pinned v1 fields validate.  Malformed
+   candidates are reported as rejected candidates, not trusted anchors.
+4. R3 is the public `/admin/recovery` page.  It requires no admin JWT and no
+   bootstrap cookie to scan anchors, display the selected
+   `bootstrap_recovery_anchor.json` payload, or perform local canonical
+   `sha256:` checks on pasted `bootstrap_manifest.json`,
+   `portal_runtime_config.json`, and `admin_records.json`.
+5. `/admin/recovery` may call the public verifier endpoint with pasted artifacts
+   after local hashes match the selected anchor.  `deployment_manifest.json` is
+   optional but should be accepted when supplied for full replay.  A verified
+   result is evidence that the recovered public artifacts are internally
+   consistent; it does not mint, broadcast, mutate bootstrap files, grant admin
+   login, or replace the live `admin_authority_v2` singleton as authority.
+6. `/admin/recovery` must not write recovered artifacts, anchors, bootstrap
+   tokens, cookies, verifier responses, or handoff bundles into
+   `localStorage` or `sessionStorage`.  Recovery succeeds by re-establishing
+   trust roots and then using the recorded admin slot `0` wallet through normal
+   permanent admin login.
 
 ---
 

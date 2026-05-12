@@ -157,7 +157,7 @@ def build_and_sign_launch(
         + bytes(parent_coin.name())
         + faucet.agg_sig_me_data
     )
-    aggregated_sig = AugSchemeMPL.sign(faucet.key.synthetic_sk, sig_message)
+    aggregated_sig = AugSchemeMPL.sign(faucet.key.wallet_sk, sig_message)
 
     return LaunchedVault(
         vault_launcher_id=vault_launcher_id,

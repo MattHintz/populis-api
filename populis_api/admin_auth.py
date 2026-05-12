@@ -233,7 +233,8 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
     # check itself loads the records (via ``effective_admin_allowlist_set``);
     # surfacing the load error here gives the operator a single clean
     # boot-time message instead of a half-loaded fallback path.
-    if settings.admin_records_path:
+    effective_records_path = settings.effective_admin_records_path()
+    if effective_records_path:
         from .admin_records import (
             AdminRecordsDriftError,
             AdminRecordsLoadError,
@@ -248,7 +249,7 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
         except AdminRecordsLoadError as e:
             raise RuntimeError(
                 f"Failed to load admin records from "
-                f"POPULIS_ADMIN_RECORDS_PATH={settings.admin_records_path!r}: {e}"
+                f"admin records path {effective_records_path!r}: {e}"
             ) from e
         except AdminRecordsDriftError as e:
             raise RuntimeError(str(e)) from e
@@ -257,14 +258,14 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
             # returns a config or raises.  Defensive belt-and-braces.
             raise RuntimeError(
                 f"admin_records_path set but loader returned None: "
-                f"{settings.admin_records_path!r}"
+                f"{effective_records_path!r}"
             )
 
         # Cross-check launcher id against env (catches deployment mix-ups).
         try:
             verify_against_launcher_id(
                 records,
-                settings.protocol_admin_authority_v2_launcher_id,
+                settings.effective_protocol_admin_authority_v2_launcher_id(),
             )
         except AdminRecordsDriftError as e:
             raise RuntimeError(str(e)) from e
@@ -272,8 +273,11 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
         # Cross-check admins_hash.  Operator supplies this via
         # POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH today; Phase
         # 2.5b-2 will replace with a direct coinset.org fetch.
-        if settings.protocol_admin_authority_v2_admins_hash:
-            expected_hex = settings.protocol_admin_authority_v2_admins_hash
+        effective_admins_hash = (
+            settings.effective_protocol_admin_authority_v2_admins_hash()
+        )
+        if effective_admins_hash:
+            expected_hex = effective_admins_hash
             if expected_hex.startswith(("0x", "0X")):
                 expected_hex = expected_hex[2:]
             try:
@@ -348,7 +352,7 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
     # transparency-drift trap (env says X EVMs, on-chain says 0 BLS
     # keys) doesn't apply — both sides come from the same JSON file
     # whose hash is verified against chain.
-    if settings.admin_records_path:
+    if effective_records_path:
         return
 
     bls_pubkeys = settings.admin_authority_pubkeys_list()
@@ -840,14 +844,14 @@ async def admin_authority_v2(
         # PREFERRED when set; the env var is the legacy/fallback path.
         "gating_source": (
             "POPULIS_ADMIN_RECORDS_PATH"
-            if settings.admin_records_path
+            if settings.effective_admin_records_path()
             else "POPULIS_ADMIN_PUBKEY_ALLOWLIST"
         ),
         # ``informational_only`` flips to False when v2 is the actual
         # gating source AND its records JSON is hash-verified against
         # chain.  Phase 2.5b achieves the latter; Phase 4 (v2 quorum
         # actively authorises spends) finishes the former.
-        "informational_only": not bool(settings.admin_records_path),
+        "informational_only": not bool(settings.effective_admin_records_path()),
     }
 
 

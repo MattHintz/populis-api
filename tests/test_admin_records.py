@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from chia_rs.sized_bytes import bytes32
+from eth_keys import keys as eth_keys
 
 from populis_api.admin_records import (
     AdminRecordSpec,
@@ -47,20 +48,38 @@ def _hash(byte: int) -> bytes32:
 
 
 def _pubkey(seed: int) -> str:
-    """Build a deterministic 33-byte 'compressed' pubkey hex.
+    """Build a deterministic real compressed secp256k1 pubkey hex."""
+    return _real_pubkey(seed)
 
-    These are NOT real secp256k1 pubkeys — they're 33-byte values
-    distinct enough that the curry-and-treehash produces unique leaf
-    hashes per seed.  Real secp256k1 pubkey validation happens at
-    sign-in time, not at admin records loading.
-    """
-    return "0x02" + bytes([seed]).hex() + "11" * 31
+
+def _real_pubkey(seed: int) -> str:
+    return (
+        "0x"
+        + eth_keys.PrivateKey(bytes([seed]) * 32)
+        .public_key.to_compressed_bytes()
+        .hex()
+    )
+
+
+def _evm_address(seed: int) -> str:
+    return (
+        eth_keys.PrivateKey(bytes([seed]) * 32)
+        .public_key.to_checksum_address()
+        .lower()
+    )
+
+
+def _evm_address_from_pubkey(pubkey: str) -> str:
+    raw = pubkey[2:] if pubkey.startswith(("0x", "0X")) else pubkey
+    return eth_keys.PublicKey.from_compressed_bytes(
+        bytes.fromhex(raw)
+    ).to_checksum_address().lower()
 
 
 def _make_leaf_dict(
     *,
     leaf_hash: str | None = None,
-    evm: str = "0x" + "ab" * 20,
+    evm: str | None = None,
     pubkey: str | None = None,
     type_hash: str = "0x" + "ee" * 32,
     domain: str = "0x1901" + "ff" * 32,  # 34 bytes, 0x1901 prefix
@@ -77,10 +96,14 @@ def _make_leaf_dict(
     leaves produce different curried tree hashes; tests that need
     distinct leaves should pass distinct seeds.
     """
+    resolved_pubkey = pubkey if pubkey is not None else _pubkey(pubkey_seed)
+    resolved_evm = (
+        evm if evm is not None else _evm_address_from_pubkey(resolved_pubkey)
+    )
     leaf: dict = {
         "kind": "eip712_member",
-        "evm_address": evm,
-        "secp256k1_pubkey": pubkey if pubkey is not None else _pubkey(pubkey_seed),
+        "evm_address": resolved_evm,
+        "secp256k1_pubkey": resolved_pubkey,
         "type_hash": type_hash,
         "prefix_and_domain_separator": domain,
     }
@@ -160,7 +183,7 @@ class TestLoadAdminRecords:
         # deterministic for the same inputs.
         assert isinstance(leaf.leaf_hash, bytes)
         assert len(leaf.leaf_hash) == 32
-        assert leaf.evm_address == "0x" + "ab" * 20  # already lowercase
+        assert leaf.evm_address == _evm_address(0xaa)
         assert len(leaf.secp256k1_pubkey) == 33
         assert leaf.type_hash == _hash(0xEE)
         assert len(leaf.prefix_and_domain_separator) == 34
@@ -205,15 +228,12 @@ class TestLoadAdminRecords:
     def test_lowercases_evm_address(self, tmp_path):
         """Mixed-case EVM addresses are normalised to lowercase so the
         gating set check is case-insensitive."""
-        leaf = _make_leaf_dict(
-            pubkey_seed=0xaa,
-            evm="0xABcDeF0000000000000000000000000000000000",
-        )
+        leaf = _make_leaf_dict(pubkey_seed=0xaa, evm=_evm_address(0xaa).upper())
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         config = load_admin_records_from_path(path)
         assert config.admin_records[0].leaves[0].evm_address == (
-            "0xabcdef0000000000000000000000000000000000"
+            _evm_address(0xaa)
         )
 
     def test_eip712_evm_address_set_aggregates_across_admins(self, tmp_path):
@@ -223,34 +243,37 @@ class TestLoadAdminRecords:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(
-                        pubkey_seed=0x01,
-                        evm="0x" + "11" * 20,
-                    ),
+                    _make_leaf_dict(pubkey_seed=0x01),
                 ],
             },
             {
                 "admin_idx": 1,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(
-                        pubkey_seed=0x02,
-                        evm="0x" + "22" * 20,
-                    ),
-                    _make_leaf_dict(
-                        pubkey_seed=0x03,
-                        evm="0x" + "33" * 20,
-                    ),
+                    _make_leaf_dict(pubkey_seed=0x02),
+                    _make_leaf_dict(pubkey_seed=0x03),
                 ],
             },
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         config = load_admin_records_from_path(path)
         assert config.eip712_evm_address_set() == {
-            "0x" + "11" * 20,
-            "0x" + "22" * 20,
-            "0x" + "33" * 20,
+            _evm_address(0x01),
+            _evm_address(0x02),
+            _evm_address(0x03),
         }
+
+    def test_rejects_evm_address_not_derived_from_pubkey(self, tmp_path):
+        real_pubkey = _real_pubkey(0x01)
+        leaf = _make_leaf_dict(
+            pubkey=real_pubkey,
+            evm="0x000000000000000000000000000000000000dEaD",
+        )
+        records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
+        path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
+
+        with pytest.raises(AdminRecordsLoadError, match="evm_address"):
+            load_admin_records_from_path(path)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -481,6 +504,7 @@ class TestLoadErrors:
         leaf = _make_leaf_dict(
             pubkey_seed=0xaa,
             pubkey="0x" + "11" * 32,  # 32 bytes, not 33
+            evm=_evm_address(0xaa),
         )
         records = [{"admin_idx": 0, "m_within": 1, "leaves": [leaf]}]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
@@ -630,8 +654,8 @@ class TestSettingsIntegration:
         """
         from populis_api.config import get_settings
 
-        evm_a = "0x" + "11" * 20
-        evm_b = "0x" + "22" * 20
+        evm_a = _evm_address(0x01)
+        evm_b = _evm_address(0x02)
         records = [
             {
                 "admin_idx": 0,
@@ -666,14 +690,14 @@ class TestSettingsIntegration:
         """
         from populis_api.config import get_settings
 
-        records_evm = "0x" + "11" * 20
+        records_evm = _evm_address(0x01)
         env_evm = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
         records = [
             {
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(pubkey_seed=0x01, evm=records_evm),
+                    _make_leaf_dict(pubkey_seed=0x01),
                 ],
             },
         ]
@@ -712,7 +736,7 @@ class TestSettingsIntegration:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(pubkey_seed=0x01, evm="0x" + "11" * 20),
+                    _make_leaf_dict(pubkey_seed=0x01),
                 ],
             }
         ]
@@ -721,7 +745,7 @@ class TestSettingsIntegration:
                 "admin_idx": 0,
                 "m_within": 1,
                 "leaves": [
-                    _make_leaf_dict(pubkey_seed=0x02, evm="0x" + "22" * 20),
+                    _make_leaf_dict(pubkey_seed=0x02),
                 ],
             }
         ]
@@ -730,7 +754,7 @@ class TestSettingsIntegration:
         monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
         get_settings.cache_clear()
         s = get_settings()
-        assert s.effective_admin_allowlist_set() == {"0x" + "11" * 20}
+        assert s.effective_admin_allowlist_set() == {_evm_address(0x01)}
 
         path.write_text(json.dumps(_make_admin_records_dict(admin_records=records_b)))
         stat = path.stat()
@@ -785,6 +809,62 @@ class TestSettingsIntegration:
         get_settings.cache_clear()
         # Should not raise.
         admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_boot_validator_auto_loads_finalized_bootstrap_artifacts(
+        self, tmp_path, monkeypatch
+    ):
+        """After bootstrap finalize, colocated public artifacts should
+        become the default admin source without copying their values back
+        into env vars.
+        """
+        from populis_api import admin_auth
+        from populis_api.config import get_settings
+
+        launcher_id = "0x" + "10" * 32
+        records_path = _write_json(
+            tmp_path,
+            _make_admin_records_dict(launcher_id=launcher_id),
+            "admin_records.json",
+        )
+        config = load_admin_records_from_path(records_path)
+        mips_root = "0x" + "77" * 32
+        _write_json(
+            tmp_path,
+            {
+                "version": 1,
+                "network": "testnet11",
+                "protocol": {},
+                "admin_authority_v2": {
+                    "launcher_id": launcher_id,
+                    "admins_hash": "0x" + config.compute_admins_hash().hex(),
+                    "mips_root": mips_root,
+                    "authority_version": 3,
+                    "admin_records_hash": "sha256:" + "12" * 32,
+                },
+            },
+            "portal_runtime_config.json",
+        )
+        monkeypatch.setenv(
+            "POPULIS_BOOTSTRAP_MANIFEST_PATH",
+            str(tmp_path / "bootstrap_manifest.json"),
+        )
+        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", "")
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", "")
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "")
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        get_settings.cache_clear()
+
+        settings = get_settings()
+        assert settings.effective_admin_records_path() == str(records_path)
+        assert settings.effective_protocol_admin_authority_v2_launcher_id() == launcher_id
+        assert settings.effective_protocol_admin_authority_v2_admins_hash() == (
+            "0x" + config.compute_admins_hash().hex()
+        )
+        assert settings.effective_protocol_admin_authority_v2_mips_root_hash() == mips_root
+        assert settings.effective_protocol_admin_authority_v2_version() == 3
+        admin_auth.validate_admin_config_at_startup(settings)
+        assert settings.effective_admin_allowlist_set() == {_evm_address(0xaa)}
 
     def test_boot_validator_catches_admins_hash_drift(self, tmp_path, monkeypatch):
         """Operator updates the JSON without rotating the singleton →
@@ -875,6 +955,67 @@ class TestSettingsIntegration:
             r = client.get("/admin/auth/authority_v2")
         assert r.status_code == 200
         body = r.json()
+        assert body["gating_source"] == "POPULIS_ADMIN_RECORDS_PATH"
+        assert body["informational_only"] is False
+
+    def test_authority_v2_endpoint_uses_finalized_bootstrap_artifacts(
+        self, tmp_path, monkeypatch
+    ):
+        """The public authority endpoint should surface finalized
+        launcher/hash coordinates even when the legacy env vars are not
+        re-entered by hand.
+        """
+        from fastapi.testclient import TestClient
+        from populis_api.app import app
+        from populis_api.config import get_settings
+
+        launcher_id = "0x" + "10" * 32
+        records_path = _write_json(
+            tmp_path,
+            _make_admin_records_dict(launcher_id=launcher_id),
+            "admin_records.json",
+        )
+        config = load_admin_records_from_path(records_path)
+        admins_hash = "0x" + config.compute_admins_hash().hex()
+        mips_root = "0x" + "88" * 32
+        _write_json(
+            tmp_path,
+            {
+                "version": 1,
+                "network": "testnet11",
+                "protocol": {},
+                "admin_authority_v2": {
+                    "launcher_id": launcher_id,
+                    "admins_hash": admins_hash,
+                    "mips_root": mips_root,
+                    "authority_version": 4,
+                    "admin_records_hash": "sha256:" + "34" * 32,
+                },
+            },
+            "portal_runtime_config.json",
+        )
+        monkeypatch.setenv(
+            "POPULIS_BOOTSTRAP_MANIFEST_PATH",
+            str(tmp_path / "bootstrap_manifest.json"),
+        )
+        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", "")
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", "")
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
+        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "")
+        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        get_settings.cache_clear()
+
+        with TestClient(app) as client:
+            r = client.get("/admin/auth/authority_v2")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["enabled"] is True
+        assert body["launcher_id"] == launcher_id
+        assert body["admins_hash"] == admins_hash
+        assert body["mips_root_hash"] == mips_root
+        assert body["authority_version"] == 4
+        assert body["deployment_status"] == "deployed-configured"
+        assert body["chain_verifiable"] is True
         assert body["gating_source"] == "POPULIS_ADMIN_RECORDS_PATH"
         assert body["informational_only"] is False
 

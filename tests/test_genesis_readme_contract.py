@@ -463,6 +463,18 @@ def test_genesis_readme_pins_recovery_handoff_bundle_public_only_shape() -> None
         "`recovery_anchor_create_coin_preview`",
     ):
         assert field in text
+    assert "may also contain `recovery_anchor_broadcast` with public audit metadata" in text
+    for field in (
+        "`funding_coin_id`",
+        "`marker_coin_id`",
+        "`marker_puzzle_hash`",
+        "`marker_coin_amount_mojos`",
+        "`payload_hash`",
+        "`push_status`",
+    ):
+        assert field in text
+    assert "These fields are not authority" in text
+    assert "re-discover or re-derive marker evidence from chain" in text
     for forbidden in (
         "`POPULIS_ADMIN_TOKEN`",
         "bootstrap cookies/JWTs",
@@ -474,9 +486,8 @@ def test_genesis_readme_pins_recovery_handoff_bundle_public_only_shape() -> None
         "private mnemonics",
         "private URLs",
         "spend bundles",
-        "marker coin ids",
-        "parent coin ids",
         "future spends",
+        "private wallet material",
     ):
         assert forbidden in text
     assert "downloaded as an explicit operator action" in text
@@ -597,3 +608,28 @@ def test_genesis_readme_pins_recovery_verifier_api_contract() -> None:
         "private locators",
     ):
         assert forbidden in text
+
+
+def test_genesis_readme_pins_portal_path_a_recovery_flow_contract() -> None:
+    text = " ".join(_readme().split())
+
+    assert "Portal Path A recovery flow contract" in text
+    assert "portal implements Path A as a three-brick self-service flow" in text
+    assert "R1 runs inside `/admin/launch-authority-v2` after bootstrap finalization" in text
+    assert "fetches the publish intent and `CREATE_COIN` preview" in text
+    assert "connected Chia wallet may broadcast the marker coin" in text
+    assert "one-mojo transfer target plus the UTF-8 tag and canonical JSON payload memos" in text
+    assert "validate that the wallet-signed bundle actually contains `CREATE_COIN(marker_puzzle_hash, 1, [tag_memo, payload_memo])`" in text
+    assert "abort before `push_tx` if the wallet strips, reorders, or omits the recovery memos" in text
+    assert "It must not record the signed spend bundle or wallet signatures" in text
+    assert "R2 is `RecoveryAnchorDiscoveryService`" in text
+    assert "replays the candidate marker's parent spend" in text
+    assert "extracts the actual `CREATE_COIN` memo pair from the parent spend conditions" in text
+    assert "Malformed candidates are reported as rejected candidates, not trusted anchors" in text
+    assert "R3 is the public `/admin/recovery` page" in text
+    assert "requires no admin JWT and no bootstrap cookie to scan anchors" in text
+    assert "perform local canonical `sha256:` checks on pasted `bootstrap_manifest.json`, `portal_runtime_config.json`, and `admin_records.json`" in text
+    assert "`deployment_manifest.json` is optional" in text
+    assert "does not mint, broadcast, mutate bootstrap files, grant admin login" in text
+    assert "must not write recovered artifacts, anchors, bootstrap tokens, cookies, verifier responses, or handoff bundles into `localStorage` or `sessionStorage`" in text
+    assert "using the recorded admin slot `0` wallet through normal permanent admin login" in text

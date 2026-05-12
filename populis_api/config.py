@@ -6,7 +6,9 @@ are the two values that MUST be set in production.
 """
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic import Field, field_validator
@@ -234,6 +236,53 @@ class Settings(BaseSettings):
     # a launch wizard run.
     admin_records_path: Optional[str] = None
 
+    def effective_admin_records_path(self) -> Optional[str]:
+        if self.admin_records_path:
+            return self.admin_records_path
+        path = Path(self.bootstrap_manifest_path).with_name("admin_records.json")
+        return str(path) if path.exists() else None
+
+    def _finalized_admin_authority_v2(self) -> dict[str, object]:
+        path = Path(self.bootstrap_manifest_path).with_name("portal_runtime_config.json")
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        authority = raw.get("admin_authority_v2")
+        return authority if isinstance(authority, dict) else {}
+
+    def effective_protocol_admin_authority_v2_launcher_id(self) -> Optional[str]:
+        if self.protocol_admin_authority_v2_launcher_id:
+            return self.protocol_admin_authority_v2_launcher_id
+        value = self._finalized_admin_authority_v2().get("launcher_id")
+        return value if isinstance(value, str) and value.strip() else None
+
+    def effective_protocol_admin_authority_v2_mips_root_hash(self) -> Optional[str]:
+        if self.protocol_admin_authority_v2_mips_root_hash:
+            return self.protocol_admin_authority_v2_mips_root_hash
+        value = self._finalized_admin_authority_v2().get("mips_root")
+        return value if isinstance(value, str) and value.strip() else None
+
+    def effective_protocol_admin_authority_v2_admins_hash(self) -> Optional[str]:
+        if self.protocol_admin_authority_v2_admins_hash:
+            return self.protocol_admin_authority_v2_admins_hash
+        value = self._finalized_admin_authority_v2().get("admins_hash")
+        return value if isinstance(value, str) and value.strip() else None
+
+    def effective_protocol_admin_authority_v2_version(self) -> int:
+        authority = self._finalized_admin_authority_v2()
+        value = authority.get("authority_version")
+        if (
+            self.protocol_admin_authority_v2_version != 1
+            or not isinstance(value, int)
+        ):
+            return self.protocol_admin_authority_v2_version
+        return value
+
     # HS256 secret used to sign admin-desk JWTs.  Generate with
     # `openssl rand -hex 32`.  When empty, a random per-process secret is
     # generated; that's fine for local dev but means tokens don't survive
@@ -336,7 +385,7 @@ class Settings(BaseSettings):
         JSON file sees the new allowlist on the next request without
         restart (subject to ``get_settings`` cache clearing in tests).
         """
-        if self.admin_records_path:
+        if self.effective_admin_records_path():
             from .admin_records import get_admin_records_for_settings
             records = get_admin_records_for_settings(self)
             if records is None:

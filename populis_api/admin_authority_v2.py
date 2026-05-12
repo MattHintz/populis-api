@@ -178,20 +178,20 @@ def build_admin_authority_v2_snapshot(
             wrong length). Surface as a 500 on the endpoint so
             operators see misconfiguration immediately.
     """
-    launcher_id = settings.protocol_admin_authority_v2_launcher_id
+    launcher_id = settings.effective_protocol_admin_authority_v2_launcher_id()
     mips_root = _decode_hash_setting(
-        settings.protocol_admin_authority_v2_mips_root_hash,
+        settings.effective_protocol_admin_authority_v2_mips_root_hash(),
         "protocol_admin_authority_v2_mips_root_hash",
     )
     admins = _decode_hash_setting(
-        settings.protocol_admin_authority_v2_admins_hash,
+        settings.effective_protocol_admin_authority_v2_admins_hash(),
         "protocol_admin_authority_v2_admins_hash",
     )
     pending = _decode_hash_setting(
         settings.protocol_admin_authority_v2_pending_ops_hash,
         "protocol_admin_authority_v2_pending_ops_hash",
     )
-    version = settings.protocol_admin_authority_v2_version
+    version = settings.effective_protocol_admin_authority_v2_version()
 
     enabled = bool(launcher_id)
     has_hash_config = bool(mips_root or admins or pending)

@@ -378,6 +378,20 @@ def _parse_leaf(raw: object, record_pos: int, leaf_pos: int) -> Eip712LeafSpec:
             f"{base_path}.secp256k1_pubkey must be 33 bytes (compressed), "
             f"got {len(pubkey)}"
         )
+    derived_evm_address = _derive_evm_address_from_compressed_pubkey(
+        pubkey,
+        f"{base_path}.secp256k1_pubkey",
+    )
+    if evm_address.lower() != derived_evm_address:
+        raise AdminRecordsLoadError(
+            f"{base_path}.evm_address mismatch:\n"
+            f"  JSON-supplied: {evm_address.lower()}\n"
+            f"  derived from secp256k1_pubkey: {derived_evm_address}\n"
+            f"\n"
+            f"The EVM address used for admin login must be the address "
+            f"derived from the same compressed secp256k1_pubkey curried "
+            f"into the on-chain Eip712Member leaf."
+        )
 
     domain = _parse_hex(
         raw.get("prefix_and_domain_separator"),
@@ -477,6 +491,24 @@ def _looks_like_evm_address(s: str) -> bool:
     return True
 
 
+def _derive_evm_address_from_compressed_pubkey(
+    pubkey: bytes,
+    field_path: str,
+) -> str:
+    try:
+        from eth_keys import keys as eth_keys
+
+        return (
+            eth_keys.PublicKey.from_compressed_bytes(pubkey)
+            .to_checksum_address()
+            .lower()
+        )
+    except Exception as e:
+        raise AdminRecordsLoadError(
+            f"{field_path} must be a valid compressed secp256k1 public key"
+        ) from e
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Verification
 # ──────────────────────────────────────────────────────────────────────
@@ -573,24 +605,36 @@ def verify_admin_records_for_settings(
     drift must not bypass the same launcher/admins-hash checks that the
     startup validator performs.
     """
-    expected_hash_hex = getattr(
+    effective_hash = getattr(
         settings,
-        "protocol_admin_authority_v2_admins_hash",
+        "effective_protocol_admin_authority_v2_admins_hash",
         None,
+    )
+    expected_hash_hex = (
+        effective_hash()
+        if callable(effective_hash)
+        else getattr(settings, "protocol_admin_authority_v2_admins_hash", None)
     )
     if not expected_hash_hex:
         raise AdminRecordsDriftError(
             "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH is required "
-            "when POPULIS_ADMIN_RECORDS_PATH is the live admin gating source. "
+            "when admin records are the live admin gating source. "
             "Refusing to use unverifiable admin records as an allowlist."
         )
     expected_hash = _parse_hex32(
         expected_hash_hex,
         "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
     )
+    effective_launcher = getattr(
+        settings,
+        "effective_protocol_admin_authority_v2_launcher_id",
+        None,
+    )
     verify_against_launcher_id(
         config,
-        getattr(settings, "protocol_admin_authority_v2_launcher_id", None),
+        effective_launcher()
+        if callable(effective_launcher)
+        else getattr(settings, "protocol_admin_authority_v2_launcher_id", None),
     )
     verify_against_admins_hash(config, expected_hash)
 
@@ -644,7 +688,12 @@ def get_admin_records_for_settings(settings: object) -> Optional[AdminRecordsCon
     avoid a circular import — the ``Settings`` class is what calls
     *us*.  We only read ``settings.admin_records_path``.
     """
-    path_str = getattr(settings, "admin_records_path", None)
+    effective_path = getattr(settings, "effective_admin_records_path", None)
+    path_str = (
+        effective_path()
+        if callable(effective_path)
+        else getattr(settings, "admin_records_path", None)
+    )
     if not path_str:
         return None
     p = Path(path_str)

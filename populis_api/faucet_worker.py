@@ -275,7 +275,7 @@ class FaucetConsolidationWorker:
                 + bytes(coin.name())
                 + self.faucet.agg_sig_me_data
             )
-            sig_bytes = AugSchemeMPL.sign(self.faucet.key.synthetic_sk, sig_msg)
+            sig_bytes = AugSchemeMPL.sign(self.faucet.key.wallet_sk, sig_msg)
             sigs.append(G2Element.from_bytes(bytes(sig_bytes)) if isinstance(sig_bytes, bytes) else sig_bytes)
 
         aggregated = AugSchemeMPL.aggregate(sigs)

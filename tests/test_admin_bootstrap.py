@@ -6,6 +6,7 @@ import jwt as pyjwt
 import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_keys import keys as eth_keys
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -68,6 +69,12 @@ _TEST_PRIVKEY_HEX = (
 )
 _TEST_ACCT = Account.from_key(_TEST_PRIVKEY_HEX)
 _TEST_ADDRESS_LOWER = _TEST_ACCT.address.lower()
+_TEST_COMPRESSED_PUBKEY = (
+    "0x"
+    + eth_keys.PrivateKey(bytes.fromhex(_TEST_PRIVKEY_HEX[2:]))
+    .public_key.to_compressed_bytes()
+    .hex()
+)
 
 
 def deployment_manifest() -> dict:
@@ -105,8 +112,8 @@ def admin_records() -> dict:
                 "leaves": [
                     {
                         "kind": "eip712_member",
-                        "evm_address": "0x" + "aa" * 20,
-                        "secp256k1_pubkey": "0x02" + "bb" * 32,
+                        "evm_address": _TEST_ADDRESS_LOWER,
+                        "secp256k1_pubkey": _TEST_COMPRESSED_PUBKEY,
                         "type_hash": H("cc"),
                         "prefix_and_domain_separator": "0x1901" + "dd" * 32,
                     }
@@ -161,10 +168,16 @@ def write_deployment_manifest(bootstrap_manifest_path) -> None:
 
 
 def admin_authorization_header() -> dict[str, str]:
+    settings = get_settings()
+    admin_subject = (
+        _TEST_ADDRESS_LOWER
+        if settings.effective_admin_records_path()
+        else "0x1111111111111111111111111111111111111111"
+    )
     token, _ = admin_auth.issue_jwt(
-        sub="0x1111111111111111111111111111111111111111",
+        sub=admin_subject,
         auth_type="evm",
-        settings=get_settings(),
+        settings=settings,
     )
     return {"Authorization": f"Bearer {token}"}
 

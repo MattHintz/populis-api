@@ -226,7 +226,7 @@ class Faucet:
 
         For `p2_delegated_puzzle_or_hidden_puzzle`, the AGG_SIG_ME message is:
             sha256tree(delegated_puzzle) + coin.name() + AGG_SIG_ME_ADDITIONAL_DATA
-        and the signer is the synthetic secret key.
+        and the signer is the wallet secret key.
         """
         delegated_puzzle = Program.to((1, conditions))  # (q . conditions)
         message = (
@@ -234,7 +234,7 @@ class Faucet:
             + bytes(coin.name())
             + self.agg_sig_me_data
         )
-        sig = AugSchemeMPL.sign(self.key.synthetic_sk, message)
+        sig = AugSchemeMPL.sign(self.key.wallet_sk, message)
         return bytes(sig)
 
 
