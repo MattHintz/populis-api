@@ -4,12 +4,17 @@ import json
 
 import jwt as pyjwt
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from populis_api import admin_auth, admin_bootstrap
 from populis_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_PATH
-from populis_api.admin_records import load_admin_records_from_mapping
+from populis_api.admin_records import (
+    clear_admin_records_cache,
+    load_admin_records_from_mapping,
+)
 from populis_api.bootstrap_manifest import (
     BOOTSTRAP_RECOVERY_ANCHOR_TAG,
     build_bootstrap_artifacts,
@@ -58,6 +63,11 @@ def client(bootstrap_env) -> TestClient:
 
 
 H = lambda byte: "0x" + byte * 32
+_TEST_PRIVKEY_HEX = (
+    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+)
+_TEST_ACCT = Account.from_key(_TEST_PRIVKEY_HEX)
+_TEST_ADDRESS_LOWER = _TEST_ACCT.address.lower()
 
 
 def deployment_manifest() -> dict:
@@ -157,6 +167,24 @@ def admin_authorization_header() -> dict[str, str]:
         settings=get_settings(),
     )
     return {"Authorization": f"Bearer {token}"}
+
+
+def admin_login_body(client: TestClient, owner: str) -> dict[str, str]:
+    challenge = client.post(
+        "/admin/auth/challenge",
+        json={"owner": owner, "auth_type": "evm"},
+    )
+    assert challenge.status_code == 200, challenge.text
+    body = challenge.json()
+    signed = _TEST_ACCT.sign_message(
+        encode_typed_data(full_message=body["typed_data"])
+    )
+    return {
+        "owner": owner,
+        "nonce": body["nonce"],
+        "signature": "0x" + signed.signature.hex().replace("0x", ""),
+        "auth_type": "evm",
+    }
 
 
 def resolve_schema(openapi: dict, schema: dict) -> dict:
@@ -379,6 +407,81 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
     status = client.get("/admin/bootstrap/status")
     assert status.status_code == 200
     assert status.json() == {"locked": True, "authenticated": False, "expires_at": None}
+
+
+def test_bootstrap_finalize_artifacts_become_records_backed_slot0_admin_source(
+    client: TestClient,
+    bootstrap_env,
+    monkeypatch,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
+
+    records = admin_records()
+    records["admin_records"][0]["leaves"][0]["evm_address"] = _TEST_ADDRESS_LOWER
+    payload = {
+        "admin_records": records,
+        "admin_authority_launcher_id": H("88"),
+        "admins_hash": admins_hash_for_records(records),
+        "mips_root": H("cd"),
+        "read_only_api_url": "https://api.populis.example",
+        "read_only_coinset_url": "https://coinset.example",
+    }
+    resp = client.post("/admin/bootstrap/finalize", json=payload)
+    assert resp.status_code == 200
+
+    admin_records_path = bootstrap_env.with_name("admin_records.json")
+    slot0_evm = _TEST_ADDRESS_LOWER
+    legacy_env_evm = "0x1111111111111111111111111111111111111111"
+    monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(admin_records_path))
+    monkeypatch.setenv(
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        payload["admin_authority_launcher_id"],
+    )
+    monkeypatch.setenv(
+        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        payload["admins_hash"],
+    )
+    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", legacy_env_evm)
+    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "j" * 64)
+    get_settings.cache_clear()
+    clear_admin_records_cache()
+    admin_auth.reset_admin_state_for_tests()
+    settings = get_settings()
+
+    admin_auth.validate_admin_config_at_startup(settings)
+    assert settings.effective_admin_allowlist_set() == {slot0_evm}
+
+    login = client.post(
+        "/admin/auth/login",
+        json=admin_login_body(client, _TEST_ACCT.address),
+    )
+    assert login.status_code == 200, login.text
+    assert login.json()["owner"] == slot0_evm
+
+    refresh = client.post(
+        "/admin/auth/refresh",
+        headers={"Authorization": f"Bearer {login.json()['jwt']}"},
+    )
+    assert refresh.status_code == 200
+    refreshed = admin_auth.verify_jwt(refresh.json()["jwt"], settings)
+    assert refreshed.sub == slot0_evm
+
+    legacy_env_jwt, _ = admin_auth.issue_jwt(
+        sub=legacy_env_evm,
+        auth_type="evm",
+        settings=settings,
+    )
+    rejected = client.post(
+        "/admin/auth/refresh",
+        headers={"Authorization": f"Bearer {legacy_env_jwt}"},
+    )
+    assert rejected.status_code == 403
+    assert "no longer in the admin allowlist" in rejected.json()["detail"]
 
 
 def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
