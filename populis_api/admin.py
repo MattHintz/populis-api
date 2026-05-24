@@ -181,6 +181,20 @@ class ManifestResponse(BaseModel):
     manifest: Optional[dict[str, Any]] = None
 
 
+class ProtocolConfigFinalizeRequest(BaseModel):
+    launcher_id: str = Field(..., min_length=1)
+
+
+class ProtocolConfigFinalizeResponse(BaseModel):
+    updated: bool
+    env_file_path: str
+    previous_protocol_config_launcher_id: Optional[str]
+    protocol_config_launcher_id: str
+    protocol_config_hash: Optional[str]
+    protocol_config_version: int
+    network: str
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @router.get("/deployment", response_model=ManifestResponse,
             dependencies=[Depends(require_admin_token)])
@@ -202,6 +216,35 @@ async def get_deployment(
             detail=f"Manifest at {path} is corrupt: {e}",
         ) from e
     return ManifestResponse(deployed=True, manifest=manifest)
+
+
+@router.post("/protocol-config/finalize", response_model=ProtocolConfigFinalizeResponse,
+             dependencies=[Depends(require_admin_token)])
+async def finalize_protocol_config(
+    body: ProtocolConfigFinalizeRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ProtocolConfigFinalizeResponse:
+    launcher_id = _normalize_32_byte_hex(body.launcher_id, "launcher_id")
+    env_path = _settings_env_file_path()
+    previous = settings.protocol_config_launcher_id
+    _upsert_env_assignment(env_path, "POPULIS_PROTOCOL_CONFIG_LAUNCHER_ID", launcher_id)
+    get_settings.cache_clear()
+    reloaded = get_settings()
+    if reloaded.protocol_config_launcher_id != launcher_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Protocol config launcher id was written but settings reload did not observe it.",
+        )
+    snapshot = _protocol_config_snapshot(reloaded)
+    return ProtocolConfigFinalizeResponse(
+        updated=previous != launcher_id,
+        env_file_path=str(env_path),
+        previous_protocol_config_launcher_id=previous,
+        protocol_config_launcher_id=reloaded.protocol_config_launcher_id,
+        protocol_config_hash=snapshot.content_hash_hex,
+        protocol_config_version=snapshot.config_version,
+        network=snapshot.chia_network,
+    )
 
 
 @router.post("/deploy/protocol", response_model=DeployResponse,
@@ -334,6 +377,72 @@ async def deploy_protocol(
         spend_bundle_id=deployment.spend_bundle_id,
         pushed=True,
         manifest=plan_to_manifest_dict(plan),
+    )
+
+
+def _settings_env_file_path() -> Path:
+    configured = Settings.model_config.get("env_file", ".env")
+    if isinstance(configured, (list, tuple)):
+        configured = configured[0] if configured else ".env"
+    return Path(str(configured))
+
+
+def _normalize_32_byte_hex(value: str, label: str) -> str:
+    raw = value.strip()
+    if raw.startswith("0X"):
+        raw = "0x" + raw[2:]
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    if len(raw) != 64:
+        raise HTTPException(status_code=400, detail=f"{label} must be a 32-byte hex string.")
+    try:
+        bytes.fromhex(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"{label} must be hex.") from e
+    return "0x" + raw.lower()
+
+
+def _upsert_env_assignment(path: Path, key: str, value: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    out: list[str] = []
+    seen = False
+    for line in lines:
+        stripped = line.strip()
+        candidate = stripped.removeprefix("export ").split("=", 1)[0].strip() if "=" in stripped else ""
+        if candidate == key:
+            out.append(f"{key}={value}")
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        if out and out[-1].strip():
+            out.append("")
+        out.append(f"{key}={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    path.chmod(0o600)
+
+
+def _protocol_config_snapshot(settings: Settings):
+    from .protocol_config import build_snapshot
+    pool_launcher_id = settings.pool_launcher_id
+    governance_launcher_id = settings.governance_launcher_id
+    try:
+        from populis_puzzles.protocol_deployment import load_manifest_dict
+        manifest_path = Path(settings.deployment_manifest_path)
+        if manifest_path.exists():
+            manifest = load_manifest_dict(manifest_path)
+            pool_launcher_id = manifest["pool_launcher_id"]
+            governance_launcher_id = manifest["tracker_launcher_id"]
+    except Exception:
+        pass
+    return build_snapshot(
+        settings,
+        pool_launcher_id_hex=pool_launcher_id,
+        governance_launcher_id_hex=governance_launcher_id,
     )
 
 
