@@ -7,12 +7,65 @@ are the two values that MUST be set in production.
 from __future__ import annotations
 
 import json
+import stat
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+SECRET_ENV_FILE_KEYS = frozenset(
+    {
+        "POPULIS_ADMIN_JWT_SECRET",
+        "POPULIS_ADMIN_TOKEN",
+        "POPULIS_FAUCET_MASTER_SK_HEX",
+        "POPULIS_FAUCET_SEED_HEX",
+        "POPULIS_FAUCET_MNEMONIC",
+        "POPULIS_CHALLENGE_SECRET",
+        "POPULIS_BOOTSTRAP_SESSION_SECRET",
+        "POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX",
+    }
+)
+
+
+def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
+    path = env_file or Path(str(Settings.model_config.get("env_file", ".env")))
+    if not path.exists() or not path.is_file():
+        return
+    secret_keys = _secret_keys_present_in_env_file(path)
+    if not secret_keys:
+        return
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        keys = ", ".join(sorted(secret_keys))
+        raise RuntimeError(
+            f"{path} contains secret env vars ({keys}) but is readable or writable "
+            f"by group/other (mode {mode:03o}). Run `chmod 600 {path}` or move "
+            "secrets into a secret store before starting the API."
+        )
+
+
+def _secret_keys_present_in_env_file(path: Path) -> set[str]:
+    keys: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return keys
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if key in SECRET_ENV_FILE_KEYS and value.strip().strip("\"'"):
+            keys.add(key)
+    return keys
 
 
 class Settings(BaseSettings):
@@ -42,6 +95,7 @@ class Settings(BaseSettings):
         "protocol_config_launcher_id",
         "protocol_property_registry_launcher_id",
         "admin_records_path",
+        "zkpassport_validator_seed_hex",
         mode="before",
     )
     @classmethod
@@ -190,6 +244,14 @@ class Settings(BaseSettings):
     # registration time — making duplicate property registrations
     # consensus-impossible.
     protocol_property_registry_launcher_id: Optional[str] = None
+
+    # ── zkPassport validator node ─────────────────────────────────────────
+    # 32-byte hex seed for the BLS validator keypair that countersigns
+    # VaultAttestationVerified EVM events.  Generate with:
+    #   python3 -c "import secrets; print(secrets.token_bytes(32).hex())"
+    # Store as POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX in .env (mode 0600).
+    # When unset, POST /zkpassport/sign returns 503.
+    zkpassport_validator_seed_hex: Optional[str] = None
 
     # ── Admin auth ────────────────────────────────────────────────────────
     # Bearer token required by `/admin/deploy/*` and other one-shot operator

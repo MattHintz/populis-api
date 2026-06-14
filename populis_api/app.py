@@ -7,7 +7,21 @@ Endpoints:
   POST /vault/register/evm
   POST /vault/register/chia
   GET  /vault/{launcher_id}
-  GET  /vault/by-evm/{address}
+  GET  /zkpassport/validator
+  POST /zkpassport/sign
+
+Removed endpoints:
+  GET  /vault/by-evm/{address}  --  POP-CANON-014: removed in this brick.
+      The endpoint enumerated the EVM ↔ vault_launcher_id binding and
+      its on-chain state for any caller knowing the EVM address, turning
+      the registry into a global doxxing oracle for member identities
+      and amplifying unauthenticated coinset.org queries.  The portal's
+      ``findVaultByEvmAddress`` consumer was already removed in Phase
+      9-Hermes-D (vault discovery moved client-side via
+      ``VaultDiscoveryService`` / CHIP-22 hint scan), so removal is
+      consumer-safe.  ``VaultRegistry.get_by_evm`` remains as an
+      internal helper used by ``register_evm_vault`` to reject
+      duplicate registrations — it is no longer exposed over HTTP.
 """
 from __future__ import annotations
 
@@ -30,7 +44,9 @@ from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
 )
+from .admin_roster_update import router as admin_roster_update_router
 from .mint_endpoints import router as mint_endpoints_router
+from .zkpassport_validator import router as zkpassport_validator_router
 from .challenges import (
     ChallengeStore,
     ChallengeStoreFullError,
@@ -38,7 +54,7 @@ from .challenges import (
     get_store as get_challenge_store,
 )
 from .coinset_client import CoinsetClient
-from .config import Settings, get_settings
+from .config import Settings, get_settings, validate_secret_env_file_permissions
 from .cors import cors_middleware_options
 from .evm_auth import (
     eip712_domain,
@@ -137,6 +153,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_secret_env_file_permissions()
     settings = get_settings()
 
     # POP-CANON-016: fail fast at boot if the admin desk is enabled but
@@ -236,7 +253,11 @@ app.include_router(admin_bootstrap_router)
 # Both routers return 503 when POPULIS_ADMIN_PUBKEY_ALLOWLIST is unset
 # (admin desk disabled by default).  See docs/ADMIN_DESK_DESIGN.md.
 app.include_router(admin_auth_router)
+app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
+
+# zkPassport validator signer (unauthenticated; 503 when seed is unset).
+app.include_router(zkpassport_validator_router)
 
 
 # ─── Dependency injectors ───────────────────────────────────────────────
@@ -500,7 +521,7 @@ async def request_challenge(
     Per-IP rate limited and capped at ``challenge_store_max_pending`` to
     bound memory under DoS load (POP-CANON-003).
     """
-    pool_id_hex = _pool_launcher_id_hex(settings)
+    pool_id_hex = _require_vault_protocol_ready(settings)
     network = settings.network
     source_ip = _client_ip(request)
     try:
@@ -541,11 +562,17 @@ async def register_evm_vault(
     store: Annotated[ChallengeStore, Depends(get_challenge_store)],
     registry: Annotated[VaultRegistry, Depends(get_registry)],
 ) -> VaultCreationResponse:
+    current_pool_id_hex = _require_vault_protocol_ready(settings)
     ch = store.pop(body.nonce, body.address, "evm")
     if ch is None:
         raise HTTPException(
             status_code=400,
             detail="Challenge is missing, expired, or does not match this address/auth_type.",
+        )
+    if ch.pool_launcher_id_hex.lower() != current_pool_id_hex.lower():
+        raise HTTPException(
+            status_code=409,
+            detail="Challenge no longer matches the active A.3 protocol config. Request a new challenge.",
         )
 
     # POP-CANON-002 fix: rebuild the typed_data using the SNAPSHOT recorded
@@ -668,11 +695,17 @@ async def register_chia_vault(
     registry: Annotated[VaultRegistry, Depends(get_registry)],
 ) -> VaultCreationResponse:
     pk_hex = body.bls_pubkey
+    current_pool_id_hex = _require_vault_protocol_ready(settings)
     ch = store.pop(body.nonce, pk_hex, "chia_bls")
     if ch is None:
         raise HTTPException(
             status_code=400,
             detail="Challenge is missing, expired, or does not match this pubkey.",
+        )
+    if ch.pool_launcher_id_hex.lower() != current_pool_id_hex.lower():
+        raise HTTPException(
+            status_code=409,
+            detail="Challenge no longer matches the active A.3 protocol config. Request a new challenge.",
         )
 
     pk_bytes = bytes.fromhex(pk_hex[2:] if pk_hex.startswith("0x") else pk_hex)
@@ -708,7 +741,16 @@ async def register_chia_vault(
     if selected is None:
         raise HTTPException(status_code=503, detail="Faucet has no spendable coins")
 
-    pool_launcher_id = _pool_launcher_id_or_zero(settings)
+    # POP-CANON-002 parity: use the snapshotted pool_launcher_id_hex from
+    # the challenge, not live settings. BLS users sign only the raw nonce
+    # bytes (no EIP-712 envelope), so the user's signature does not
+    # cryptographically commit to the pool — but the snapshot still
+    # records operator intent at challenge time, and using it removes the
+    # asymmetry with /vault/register/evm. Without this parity, an operator
+    # who changes pool_launcher_id between /auth/challenge and
+    # /vault/register/chia would silently launch a BLS vault bound to a
+    # different pool than the one snapshotted at challenge issuance.
+    pool_launcher_id = bytes32.fromhex(_strip0x(ch.pool_launcher_id_hex))
     launched = build_and_sign_launch(
         faucet=faucet,
         faucet_coin_json={
@@ -805,19 +847,11 @@ async def get_vault(
     )
 
 
-@app.get("/vault/by-evm/{address}")
-async def get_vault_by_evm(
-    address: str,
-    coinset: Annotated[CoinsetClient, Depends(get_coinset)],
-    registry: Annotated[VaultRegistry, Depends(get_registry)],
-) -> Optional[VaultStateResponse]:
-    record = registry.get_by_evm(address)
-    if record is None:
-        return None
-    return await get_vault("0x" + record.launcher_id.hex(), coinset, registry)
+# POP-CANON-014: /vault/by-evm/{address} removed.  See module docstring.
+# ``VaultRegistry.get_by_evm`` remains an internal-only helper.
 
 
-# ─── Helpers ────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────────
 
 def _strip0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
@@ -889,6 +923,68 @@ def _read_pool_launcher_from_manifest(manifest_path: str) -> Optional[str]:
 def _pool_launcher_id_hex(settings: Settings) -> str:
     """Hex form of the pool launcher id, snapshotted into challenges."""
     return "0x" + _pool_launcher_id_or_zero(settings).hex()
+
+
+def _require_vault_protocol_ready(settings: Settings) -> str:
+    protocol_config_launcher_id = getattr(settings, "protocol_config_launcher_id", None)
+    if not protocol_config_launcher_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Vault registration is disabled until the A.3 protocol-config singleton is launched.",
+        )
+    _require_nonzero_bytes32_hex(
+        protocol_config_launcher_id,
+        "POPULIS_PROTOCOL_CONFIG_LAUNCHER_ID",
+    )
+
+    try:
+        from pathlib import Path
+        from populis_puzzles.protocol_deployment import load_manifest_dict
+
+        manifest = load_manifest_dict(Path(settings.deployment_manifest_path))
+    except Exception as e:
+        raise HTTPException(
+            status_code=409,
+            detail="Vault registration is disabled until protocol genesis has a valid deployment manifest.",
+        ) from e
+
+    pool_id_hex = _require_nonzero_bytes32_hex(
+        manifest.get("pool_launcher_id"),
+        "deployment_manifest.pool_launcher_id",
+    )
+    governance_id_hex = _require_nonzero_bytes32_hex(
+        manifest.get("tracker_launcher_id"),
+        "deployment_manifest.tracker_launcher_id",
+    )
+
+    from .protocol_config import build_snapshot
+
+    snapshot = build_snapshot(
+        settings,
+        pool_launcher_id_hex=pool_id_hex,
+        governance_launcher_id_hex=governance_id_hex,
+    )
+    if snapshot.content_hash_hex is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Vault registration is disabled until A.3 commits to pool, governance, network, and version.",
+        )
+    return pool_id_hex
+
+
+def _require_nonzero_bytes32_hex(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=409, detail=f"{field_name} is required.")
+    clean = _strip0x(value.strip())
+    if len(clean) != 64:
+        raise HTTPException(status_code=409, detail=f"{field_name} must be 32 bytes.")
+    try:
+        parsed = bytes32.fromhex(clean)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=f"{field_name} is not valid hex.") from e
+    if parsed == bytes32(b"\x00" * 32):
+        raise HTTPException(status_code=409, detail=f"{field_name} cannot be zero.")
+    return "0x" + parsed.hex()
 
 
 def _client_ip(request: Request) -> str:
