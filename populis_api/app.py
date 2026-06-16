@@ -648,6 +648,9 @@ async def register_evm_vault(
         owner_pubkey=recovery.compressed_pubkey,
         auth_type=AUTH_TYPE_SECP256K1,
         pool_launcher_id=pool_launcher_id,
+        zkpassport_bridge_policy_hash=bytes32.fromhex(
+            _strip0x(settings.zkpassport_bridge_policy_hash)
+        ),
         fee=fee,
     )
 
@@ -765,6 +768,9 @@ async def register_chia_vault(
         owner_pubkey=pk_bytes,
         auth_type=AUTH_TYPE_BLS,
         pool_launcher_id=pool_launcher_id,
+        zkpassport_bridge_policy_hash=bytes32.fromhex(
+            _strip0x(settings.zkpassport_bridge_policy_hash)
+        ),
         fee=fee,
     )
 

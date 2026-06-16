@@ -255,6 +255,17 @@ class Settings(BaseSettings):
     # When unset, POST /zkpassport/sign returns 503.
     zkpassport_validator_seed_hex: Optional[str] = None
 
+    # ── zkPassport vault bridge policy hash ───────────────────────────
+    # Canonical validator-set commitment curried into every vault at mint so
+    # the on-chain spend_update_identity ('z') can assert the validator bridge
+    # coin announcement.  MUST equal the deployed emitter's bridgePolicyHash and
+    # the portal's environment.zkPassport bridgePolicyHash.  Vaults minted before
+    # this was wired (the old zero default) are NOT enrollable and must be
+    # re-registered.
+    zkpassport_bridge_policy_hash: str = (
+        "0xc87f45cd23d052c88256de8823a4a01f40da4e2066156f48f3b3dfc0a50350d7"
+    )
+
     # ── zkPassport gasless relayer (ERC-2771 meta-transactions) ────────
     # The relayer submits forwarder.execute() on behalf of users so alpha
     # testers never need Sepolia ETH.  Users still sign an EIP-712

@@ -66,6 +66,7 @@ def build_and_sign_launch(
     owner_pubkey: bytes,
     auth_type: int,
     pool_launcher_id: bytes32,
+    zkpassport_bridge_policy_hash: bytes32,
     fee: int = 0,
 ) -> LaunchedVault:
     """Build and sign the vault launch SpendBundle.
@@ -98,6 +99,7 @@ def build_and_sign_launch(
         auth_type,
         members_root,
         pool_launcher_id,
+        zkpassport_bridge_policy_hash=zkpassport_bridge_policy_hash,
     )
     vault_full_puzhash = bytes32(vault_full_puzzle.get_tree_hash())
 
