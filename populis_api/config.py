@@ -26,6 +26,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "POPULIS_CHALLENGE_SECRET",
         "POPULIS_BOOTSTRAP_SESSION_SECRET",
         "POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX",
+        "POPULIS_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
     }
 )
 
@@ -96,6 +97,7 @@ class Settings(BaseSettings):
         "protocol_property_registry_launcher_id",
         "admin_records_path",
         "zkpassport_validator_seed_hex",
+        "zkpassport_relayer_private_key_hex",
         mode="before",
     )
     @classmethod
@@ -252,6 +254,26 @@ class Settings(BaseSettings):
     # Store as POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX in .env (mode 0600).
     # When unset, POST /zkpassport/sign returns 503.
     zkpassport_validator_seed_hex: Optional[str] = None
+
+    # ── zkPassport gasless relayer (ERC-2771 meta-transactions) ────────
+    # The relayer submits forwarder.execute() on behalf of users so alpha
+    # testers never need Sepolia ETH.  Users still sign an EIP-712
+    # ForwardRequest in their wallet (gasless); this key only pays gas.
+    #
+    # SECRET — 0x-prefixed 32-byte key of a funded EOA.  When unset, POST
+    # /zkpassport/relay returns 503.  Store in .env (mode 0600); on testnet you
+    # may reuse the EVM deployer key.
+    zkpassport_relayer_private_key_hex: Optional[str] = None
+    # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
+    zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
+    # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).
+    zkpassport_evm_chain_id: int = 11155111
+    # ERC-2771 forwarder the user's ForwardRequest is submitted through.
+    zkpassport_forwarder_address: str = "0x84DBC9bcEDfD9920da91eDcfBeb0eebd44104aB3"
+    # Emitter the forwarder must target; the relayer rejects any other `to`.
+    zkpassport_emitter_address: str = "0x77bD869AB5e363eb5Fe533B2852D1693C8448EdF"
+    # Per-signer relay rate limit (requests per signer address per minute).
+    zkpassport_relay_per_signer_per_minute: int = 6
 
     # ── Admin auth ────────────────────────────────────────────────────────
     # Bearer token required by `/admin/deploy/*` and other one-shot operator
