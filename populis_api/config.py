@@ -95,6 +95,7 @@ class Settings(BaseSettings):
         "governance_launcher_id",
         "protocol_config_launcher_id",
         "protocol_property_registry_launcher_id",
+        "vault_version_registry_launcher_id",
         "admin_records_path",
         "zkpassport_validator_seed_hex",
         "zkpassport_relayer_private_key_hex",
@@ -246,6 +247,23 @@ class Settings(BaseSettings):
     # registration time — making duplicate property registrations
     # consensus-impossible.
     protocol_property_registry_launcher_id: Optional[str] = None
+
+    # ── Vault-version registry singleton (vault upgrade / Brick 4d) ────────
+    # On-chain ``vault_version_registry_inner.clsp`` singleton that publishes
+    # the canonical current vault descriptor (vault inner mod hash, canonical
+    # params hash, vault version).  Backend-free clients walk its lineage on
+    # coinset.org to detect outdated vaults and offer a decentralized upgrade.
+    # When the operator has launched the registry, set this to its 32-byte
+    # launcher coin id (0x-prefixed hex); the API then surfaces a deterministic
+    # ``vault_version_registry_content_hash`` clients can independently verify
+    # against the singleton's on-chain ``CREATE_PUZZLE_ANNOUNCEMENT``.  ``None``
+    # until the registry is deployed (clients treat the protocol as
+    # "registry-less" and skip the upgrade banner).
+    vault_version_registry_launcher_id: Optional[str] = None
+    # Monotonically increasing vault descriptor version stamped into the
+    # registry's curried state.  Bumped by the authorizer on every publish
+    # spend; default 1 = "initial deployment".
+    vault_version_registry_version: int = 1
 
     # ── zkPassport validator node ─────────────────────────────────────────
     # 32-byte hex seed for the BLS validator keypair that countersigns
