@@ -67,6 +67,10 @@ from .evm_auth import (
 from .faucet import Faucet
 from .state import VaultRecord, VaultRegistry, get_registry
 from .vault_launcher import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1, build_and_sign_launch
+from .vault_version_registry import (
+    VaultVersionRegistrySnapshot,
+    build_vault_version_registry_snapshot,
+)
 from populis_puzzles.vault_driver import (
     VAULT_INNER_MOD,
     puzzle_for_p2_vault,
@@ -109,22 +113,27 @@ def _warm_chia_puzzle_templates() -> None:
     import chia.wallet.trading.offer  # noqa: F401 — import for side-effect
     import chia.wallet.util.puzzle_compression  # noqa: F401
 
-    # populis_puzzles A.1, A.2, A.3, A.4 inner mods — same threading
+    # populis_puzzles A.1, A.2, A.3, A.4, A.5 inner mods — same threading
     # hazard.  Touching them here on the import thread caches each
     # mod's serialised bytes + tree hash so cross-thread access in
     # request handlers is safe.  Without this, /protocol's call to
-    # build_singletons_snapshot panics on the second hit.
+    # build_singletons_snapshot or build_vault_version_registry_snapshot
+    # panics on the second hit.
     from populis_puzzles.admin_authority_driver import admin_authority_inner_mod
     from populis_puzzles.mint_proposal_driver import mint_proposal_inner_mod
     from populis_puzzles.property_registry_driver import (
         property_registry_inner_mod,
     )
     from populis_puzzles.protocol_config_driver import protocol_config_inner_mod
+    from populis_puzzles.vault_version_registry_driver import (
+        vault_version_registry_inner_mod,
+    )
     for mod in (
         admin_authority_inner_mod(),
         mint_proposal_inner_mod(),
         property_registry_inner_mod(),
         protocol_config_inner_mod(),
+        vault_version_registry_inner_mod(),
     ):
         bytes(mod)
         mod.get_tree_hash()
@@ -343,6 +352,26 @@ class ProtocolInfo(BaseModel):
     # exposed here — that's per-proposal, not protocol-level).
     # See SECURITY.md §A.1.
     mint_proposal_mod_hash: Optional[str] = None
+    # ── A.5 vault-version registry singleton fields ───────────────────
+    # Launcher coin id of the on-chain vault-version registry singleton,
+    # when the operator has set ``POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID``.
+    # Off-chain consumers walk this singleton's lineage on coinset.org to
+    # discover the current canonical vault descriptor (vault inner mod hash,
+    # canonical params hash, version).  Returned as ``None`` until the
+    # registry is deployed.  See SECURITY.md §A.5.
+    vault_version_registry_launcher_id: Optional[str] = None
+    # Tree hash of the uncurried ``vault_version_registry_inner.clsp`` mod;
+    # clients use this to verify they found the canonical registry puzzle.
+    vault_version_registry_mod_hash: Optional[str] = None
+    # Monotonic vault descriptor version.  Default 1 = initial deployment.
+    vault_version: int = 1
+    # ``sha256tree`` of the protocol-wide vault params (pool singleton mod,
+    # pool launcher id, pool launcher puzzle hash, zkPassport bridge policy
+    # hash).  ``None`` when pool launcher is not configured.
+    vault_canonical_params_hash: Optional[str] = None
+    # ``sha256tree`` of ``[vault_inner_mod_hash, canonical_params_hash, vault_version]``.
+    # The on-chain registry publishes this exact value via its announcement.
+    vault_version_registry_content_hash: Optional[str] = None
 
 
 class ChallengeRequest(BaseModel):
@@ -489,6 +518,16 @@ async def protocol(
     from .singletons import build_singletons_snapshot as _build_singletons_snapshot
     singletons_snapshot = _build_singletons_snapshot(settings)
 
+    # POP-CANON-A.5: surface the on-chain vault-version registry singleton
+    # descriptor.  Mod-hash and current vault code are static across the
+    # deployment; launcher_id, canonical params hash and content hash are
+    # computable only when the pool launcher is configured (the params hash
+    # binds the pool launcher id).
+    vault_registry_snapshot = build_vault_version_registry_snapshot(
+        settings,
+        pool_launcher_id_hex=pool_launcher_from_manifest,
+    )
+
     return ProtocolInfo(
         network=settings.network,
         pool_launcher_id=pool_launcher_from_manifest,
@@ -506,6 +545,11 @@ async def protocol(
         property_registry_launcher_id=singletons_snapshot.property_registry_launcher_id_hex,
         property_registry_mod_hash=singletons_snapshot.property_registry_mod_hash_hex,
         mint_proposal_mod_hash=singletons_snapshot.mint_proposal_mod_hash_hex,
+        vault_version_registry_launcher_id=vault_registry_snapshot.vault_version_registry_launcher_id_hex,
+        vault_version_registry_mod_hash=vault_registry_snapshot.vault_version_registry_mod_hash_hex,
+        vault_version=vault_registry_snapshot.vault_version,
+        vault_canonical_params_hash=vault_registry_snapshot.canonical_params_hash_hex,
+        vault_version_registry_content_hash=vault_registry_snapshot.content_hash_hex,
     )
 
 

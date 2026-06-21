@@ -73,12 +73,16 @@ def fresh_settings(monkeypatch):
     """Reset env + cached settings for every test."""
     for key in (
         "POPULIS_POOL_LAUNCHER_ID",
-        "POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID",
         "POPULIS_VAULT_VERSION_REGISTRY_VERSION",
         "POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH",
         "POPULIS_NETWORK",
     ):
         monkeypatch.delenv(key, raising=False)
+    # The operator's local ``.env`` pins the deployed registry launcher id.
+    # ``delenv`` would let pydantic fall back to that ``.env`` value, so
+    # force the empty-string mask (coerced to ``None`` by the Settings
+    # validator) to override it for the registry-less default path.
+    monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
     monkeypatch.setenv("POPULIS_NETWORK", "testnet11")
     get_settings.cache_clear()
     yield get_settings()
