@@ -3,22 +3,24 @@
 Backed by ``MintProposalStore`` for the lifecycle CRUD; gated by
 ``require_admin_jwt`` from ``admin_auth``.
 
-Step A.2 scope:
+Step A.2 / B scope:
   * /admin/mint/propose          DRAFT — full implementation
   * /admin/mint                  list  — full implementation
   * /admin/mint/{id}             read  — full implementation
   * /admin/mint/{id}/cancel      DRAFT → CANCELED — full implementation
-  * /admin/mint/{id}/publish     501 — chain integration is Step B work
-  * /admin/mint/{id}/execute     501 — chain integration is Step B work
+  * /admin/mint/{id}/publish     501 — mint-side Step B work (PGT lock + EXECUTE_MINT builder)
+  * /admin/mint/{id}/execute     501 — mint-side Step B work
   * /admin/committee/proposals   list filtered for committee — full impl
-  * /admin/committee/vote        501 — chain integration is Step B work
+  * /admin/committee/vote        publish-only forwarder (Brick 3.5c-3)
 
-The 501 endpoints surface a deliberate boundary: the API tracks
-proposal state in SQLite for the desk UI's sake, but the actual
-on-chain spend builders (PGT lock, EXECUTE_MINT, vote forwarding)
-are non-trivial driver code that lands in Step B.  Returning 501
-with a clear "see Step B" message keeps the API contract honest
-without blocking frontend development on /propose, /list, /cancel.
+Per POP-CANON-013 the committee-vote endpoint is **publish-only** and **not
+gated by admin JWT** — the PGT signature embedded in the spend bundle is the
+authority, and any PGT holder (not just allowlisted admins) must be able to
+participate.  The voter's wallet builds the bundle client-side using the
+governance/registry drivers in populis-protocol (e.g.
+``pgt_driver.build_tracker_execute_coin_spend`` + the registry routine
+co-spend, sim-proven in ``test_governance_vault_version_execute_sim.py``);
+this endpoint validates structure and forwards to coinset.org's mempool.
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
+from .coinset_client import CoinsetClient
 from .mint_proposals import (
     DuplicateProperty,
     InvalidTransition,
@@ -354,21 +357,139 @@ async def list_committee_proposals(
     )
 
 
+class CommitteeVoteRequest(BaseModel):
+    """Publish-only committee-vote payload.
+
+    ``spend_bundle`` is a JSON object matching ``chia_rs.SpendBundle``'s
+    ``to_json_dict()`` shape — i.e. ``{coin_spends: [...], aggregated_signature:
+    "0x..."}`` — built and signed by the voter's wallet client-side using the
+    PGT lock + governance tracker drivers (mirrors of
+    ``pgt_driver.build_tracker_execute_coin_spend`` etc.).  The API neither
+    constructs nor signs governance spends; it only forwards.
+
+    ``proposal_id`` is purely informational (logged for correlation); the
+    proposal binding is enforced on-chain by the bundle's own coin spends
+    against the governance tracker singleton's proposal_hash.
+    """
+
+    spend_bundle: dict[str, Any] = Field(
+        ...,
+        description=(
+            "SpendBundle JSON dict (chia_rs.SpendBundle.to_json_dict shape)."
+        ),
+    )
+    proposal_id: Optional[str] = Field(
+        None,
+        max_length=256,
+        description="Optional informational proposal id for logging/correlation.",
+    )
+
+
+class CommitteeVoteResponse(BaseModel):
+    pushed: bool
+    status: str
+    spend_bundle_id: str = Field(..., description="0x-prefixed sha256 id of the bundle.")
+    proposal_id: Optional[str] = None
+
+
+async def _get_coinset_dep() -> Optional[CoinsetClient]:
+    """Lazy ``app.state.coinset`` lookup.
+
+    Defined locally (rather than imported from ``app.py``) to avoid a circular
+    import — ``app.py`` includes this router.  Returns ``None`` rather than
+    raising so request-body validation errors (422) fire BEFORE the missing-
+    coinset 502; the endpoint itself raises 502 when ``coinset is None``.
+
+    Async so the dep runs on the event loop thread (FastAPI dispatches sync
+    deps to a worker pool, which would touch chia_rs LazyNodes bound to the
+    lifespan thread → pyo3 panic — same constraint as
+    :func:`populis_api.app.get_coinset`).
+
+    Tests override this via ``app.dependency_overrides[_get_coinset_dep] =
+    lambda: mock``.
+    """
+    # Local import: app.py imports this module at top level.
+    from .app import app  # noqa: WPS433
+    return getattr(app.state, "coinset", None)
+
+
 @router.post(
     "/admin/committee/vote",
-    response_model=dict[str, Any],
+    response_model=CommitteeVoteResponse,
 )
-async def cast_committee_vote(proposal_id: str = "") -> dict[str, Any]:
-    """Forward a committee vote bundle to chain.  Step B implementation.
+async def cast_committee_vote(
+    body: CommitteeVoteRequest,
+    coinset: Annotated[Optional[CoinsetClient], Depends(_get_coinset_dep)],
+) -> CommitteeVoteResponse:
+    """Forward a committee-action spend bundle (PROPOSE / VOTE / EXECUTE) to chain.
 
-    The PGT-VOTE signature inside the spend bundle is the authority —
-    the API does not require admin JWT authentication for this
-    endpoint.  Voters who hold PGT but are not allowlisted admins must
-    be able to participate in governance.
+    Publish-only forwarder.  The PGT signature embedded in the bundle's coin
+    spends is the authority (POP-CANON-013): governance voting is open to any
+    PGT holder, NOT gated by the admin allowlist — locking it behind admin JWT
+    would conflate operator desk authority with token-holder governance.
+
+    The API performs only **structural** validation (the bundle parses as a
+    well-formed ``chia_rs.SpendBundle`` with at least one coin spend) before
+    handing off to ``coinset.org``'s mempool, which enforces all semantic rules
+    (signatures, announcements, quorum, deadlines, lineage).  Mempool rejection
+    is surfaced as ``pushed=false`` with the chain's status string so the
+    portal can render a precise error; coinset transport failures are 502.
     """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=f"/admin/committee/vote is not implemented yet. {_STEP_B_NOTE}",
+    # Lazy import — chia_rs is heavy and only this endpoint deserializes a
+    # SpendBundle on the API side.
+    from chia_rs import SpendBundle
+
+    if coinset is None:
+        raise HTTPException(
+            status_code=502, detail="Coinset client not initialised.",
+        )
+
+    try:
+        bundle = SpendBundle.from_json_dict(body.spend_bundle)
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"spend_bundle is not a valid SpendBundle JSON: {e}",
+        ) from e
+    if len(bundle.coin_spends) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="spend_bundle must contain at least one coin_spend.",
+        )
+    bundle_id = "0x" + bytes(bundle.name()).hex()
+
+    try:
+        push_result = await coinset.push_tx(bundle.to_json_dict())
+    except Exception as e:
+        logger.exception(
+            "coinset push_tx failed for committee vote %s (proposal_id=%r): %s",
+            bundle_id, body.proposal_id, e,
+        )
+        raise HTTPException(
+            status_code=502, detail=f"coinset.org error forwarding committee vote: {e}",
+        ) from e
+
+    accepted = bool(push_result.get("success"))
+    if accepted:
+        status_str = str(push_result.get("status") or "SUCCESS")
+        logger.info(
+            "committee vote %s accepted (proposal_id=%r, status=%s)",
+            bundle_id, body.proposal_id, status_str,
+        )
+    else:
+        status_str = str(
+            push_result.get("status") or push_result.get("error") or push_result
+        )
+        logger.warning(
+            "committee vote %s rejected (proposal_id=%r, status=%s)",
+            bundle_id, body.proposal_id, status_str,
+        )
+
+    return CommitteeVoteResponse(
+        pushed=accepted,
+        status=status_str,
+        spend_bundle_id=bundle_id,
+        proposal_id=body.proposal_id,
     )
 
 
@@ -377,6 +498,8 @@ __all__ = [
     "ProposeMintRequest",
     "CancelMintRequest",
     "MintProposalListResponse",
+    "CommitteeVoteRequest",
+    "CommitteeVoteResponse",
     "get_mint_proposal_store",
     "reset_mint_store_for_tests",
 ]

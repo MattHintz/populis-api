@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from eth_account import Account
@@ -207,10 +208,13 @@ class TestAuthGating:
 
     @pytest.mark.parametrize("path,method,expected", [
         # POP-CANON-013: committee endpoints are intentionally public.
-        # /committee/proposals is a 200 read; /committee/vote is a 501
-        # stub but reachable without admin JWT.
+        # /committee/proposals is a 200 read; /committee/vote is a
+        # publish-only forwarder (Brick 3.5c-3) — without a body the
+        # Pydantic schema rejects with 422, NOT 401: i.e. the endpoint
+        # is reachable past the missing admin JWT and only fails at the
+        # input-validation layer, proving the no-admin-auth contract.
         ("/admin/committee/proposals", "GET",  200),
-        ("/admin/committee/vote",      "POST", 501),
+        ("/admin/committee/vote",      "POST", 422),
     ])
     def test_committee_paths_do_not_require_admin_auth(
         self, client, path, method, expected,
@@ -556,10 +560,152 @@ class TestStepBStubs:
         )
         assert resp.status_code == 501
 
-    def test_committee_vote_returns_501(self, client):
-        # POP-CANON-013: no admin JWT required.
+# ── Committee vote forwarder (Brick 3.5c-3) ─────────────────────────────────
+class TestCommitteeVote:
+    """POP-CANON-013: ``/admin/committee/vote`` is a publish-only forwarder.
+
+    The endpoint:
+      * is NOT gated by admin JWT (the PGT signature in the bundle is the
+        authority — any PGT holder must be able to participate),
+      * validates only **structure** (well-formed ``chia_rs.SpendBundle`` JSON
+        with at least one coin spend), then
+      * forwards to ``coinset.org``'s mempool and faithfully surfaces the
+        chain's accept/reject (transport errors are 502; mempool rejects are
+        ``pushed=false`` with the chain status string).
+
+    A minimal but structurally valid SpendBundle JSON is used as the fixture;
+    the actual governance / registry semantics are tested end-to-end in
+    populis_protocol's ``test_governance_vault_version_execute_sim.py``.
+    """
+
+    @staticmethod
+    def _valid_bundle_json() -> dict:
+        """Minimal structurally-valid SpendBundle JSON.
+
+        Uses Program ``(q . 1)`` (CLVM bytes ``ff0180``) as the puzzle reveal
+        and ``()`` (``80``) as the solution.  ``chia_rs.SpendBundle`` accepts
+        these as well-formed; the chain would reject the spend (bad puzzle
+        hash, no signature etc.), which is exactly the boundary this endpoint
+        is meant to expose to the caller, not silently swallow.
+        """
+        return {
+            "coin_spends": [{
+                "coin": {
+                    "parent_coin_info": "0x" + "00" * 32,
+                    "puzzle_hash": "0x" + "11" * 32,
+                    "amount": 1,
+                },
+                "puzzle_reveal": "0xff0180",
+                "solution": "0x80",
+            }],
+            "aggregated_signature": "0x" + "c0" + "00" * 95,
+        }
+
+    @staticmethod
+    def _override_coinset(app, *, success: bool, status_str: str = "SUCCESS",
+                          error: str | None = None, raises: Exception | None = None):
+        """Install an AsyncMock CoinsetClient on the test app's dependency."""
+        from populis_api.mint_endpoints import _get_coinset_dep
+
+        coinset = MagicMock()
+        if raises is not None:
+            coinset.push_tx = AsyncMock(side_effect=raises)
+        else:
+            payload: dict = {"success": success, "status": status_str}
+            if error is not None:
+                payload["error"] = error
+            coinset.push_tx = AsyncMock(return_value=payload)
+        app.dependency_overrides[_get_coinset_dep] = lambda: coinset
+        return coinset
+
+    def test_does_not_require_admin_jwt(self, app, client):
+        # The endpoint is public.  No Authorization header — must reach the
+        # forwarder (not be 401'd at the auth layer).
+        coinset = self._override_coinset(app, success=True)
+        resp = client.post(
+            "/admin/committee/vote",
+            json={"spend_bundle": self._valid_bundle_json()},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["pushed"] is True
+        coinset.push_tx.assert_awaited_once()
+
+    def test_missing_spend_bundle_field_rejected(self, app, client):
+        # Pydantic body validation: spend_bundle is required.
+        self._override_coinset(app, success=True)
         resp = client.post("/admin/committee/vote", json={})
-        assert resp.status_code == 501
+        assert resp.status_code == 422, resp.text
+
+    def test_malformed_spend_bundle_rejected_as_400(self, app, client):
+        # Structural validation: the JSON dict is the wrong shape.
+        coinset = self._override_coinset(app, success=True)
+        resp = client.post(
+            "/admin/committee/vote",
+            json={"spend_bundle": {"not_a_bundle": True}},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "SpendBundle" in resp.json()["detail"]
+        coinset.push_tx.assert_not_called()
+
+    def test_empty_coin_spends_rejected_as_400(self, app, client):
+        coinset = self._override_coinset(app, success=True)
+        bundle = self._valid_bundle_json()
+        bundle["coin_spends"] = []
+        resp = client.post(
+            "/admin/committee/vote", json={"spend_bundle": bundle},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "at least one coin_spend" in resp.json()["detail"]
+        coinset.push_tx.assert_not_called()
+
+    def test_accepted_by_mempool_returns_pushed_true(self, app, client):
+        coinset = self._override_coinset(
+            app, success=True, status_str="SUCCESS",
+        )
+        bundle_json = self._valid_bundle_json()
+        resp = client.post(
+            "/admin/committee/vote",
+            json={"spend_bundle": bundle_json, "proposal_id": "vault-v2-2026-06"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pushed"] is True
+        assert body["status"] == "SUCCESS"
+        assert body["proposal_id"] == "vault-v2-2026-06"
+        assert body["spend_bundle_id"].startswith("0x")
+        assert len(body["spend_bundle_id"]) == 2 + 64  # "0x" + sha256 hex
+        # The endpoint forwarded the deserialized + canonicalised bundle.
+        coinset.push_tx.assert_awaited_once()
+        (forwarded,), _ = coinset.push_tx.call_args
+        assert "coin_spends" in forwarded
+        assert "aggregated_signature" in forwarded
+
+    def test_rejected_by_mempool_surfaces_status(self, app, client):
+        # POP-CANON-004 contract: mempool rejection MUST be surfaced to the
+        # caller (not silently logged), so the portal can render the error.
+        self._override_coinset(
+            app, success=False, status_str="REJECTED", error="DOUBLE_SPEND",
+        )
+        resp = client.post(
+            "/admin/committee/vote",
+            json={"spend_bundle": self._valid_bundle_json()},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pushed"] is False
+        # The chain's status (or error string) flows through.
+        assert "REJECTED" in body["status"] or "DOUBLE_SPEND" in body["status"]
+
+    def test_coinset_transport_error_is_502(self, app, client):
+        self._override_coinset(
+            app, success=False, raises=ConnectionError("coinset down"),
+        )
+        resp = client.post(
+            "/admin/committee/vote",
+            json={"spend_bundle": self._valid_bundle_json()},
+        )
+        assert resp.status_code == 502, resp.text
+        assert "coinset" in resp.json()["detail"].lower()
 
 
 # ── Committee proposal listing ──────────────────────────────────────────────
