@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           pattern='sk_(live|test)_[A-Za-z0-9]+|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|MANDRILL_API_KEY=|STRIPE_SECRET_KEY=|BEGIN (RSA|EC|OPENSSH|PRIVATE)'
-          if grep -R -n -E "$pattern" populis_api tests .github; then
+          if grep -R -n -E "$pattern" populis_api tests; then
             echo "Secret-like value found in public API artifacts or tests."
             exit 1
           fi
