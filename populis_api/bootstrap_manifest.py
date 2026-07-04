@@ -34,6 +34,10 @@ FORBIDDEN_ARTIFACT_MARKERS = (
     "faucet_mnemonic",
     "faucet_seed",
     "faucet_master_sk",
+    "api_key",
+    "mandrill",
+    "smtp_password",
+    "stripe_secret",
 )
 BOOTSTRAP_RECOVERY_ANCHOR_TAG = "POPULIS_BOOTSTRAP_V1"
 BOOTSTRAP_RECOVERY_ANCHOR_MARKER_MIN_MOJOS = 1

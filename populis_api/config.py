@@ -27,6 +27,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "POPULIS_BOOTSTRAP_SESSION_SECRET",
         "POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX",
         "POPULIS_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
+        "POPULIS_PROTOCOL_ARTIFACT_API_TOKEN",
     }
 )
 
@@ -99,6 +100,7 @@ class Settings(BaseSettings):
         "admin_records_path",
         "zkpassport_validator_seed_hex",
         "zkpassport_relayer_private_key_hex",
+        "protocol_artifact_api_token",
         mode="before",
     )
     @classmethod
@@ -293,6 +295,13 @@ class Settings(BaseSettings):
     # /zkpassport/relay returns 503.  Store in .env (mode 0600); on testnet you
     # may reuse the EVM deployer key.
     zkpassport_relayer_private_key_hex: Optional[str] = None
+
+    # ── Sols Lot protocol artifact server-to-server guard ────────────────
+    # Optional bearer token for endpoints that *build* or *finalize*
+    # protocol purchase artifacts.  Public verification remains open so
+    # wallets, portals, and auditors can recompute artifact hashes without
+    # holding any service credential.
+    protocol_artifact_api_token: Optional[str] = None
     # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
     zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
     # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).

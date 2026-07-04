@@ -44,8 +44,14 @@ from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
 )
-from .admin_roster_update import router as admin_roster_update_router
+try:
+    from .admin_roster_update import router as admin_roster_update_router
+except ModuleNotFoundError as e:
+    if e.name != "populis_api.admin_roster_update":
+        raise
+    admin_roster_update_router = None
 from .mint_endpoints import router as mint_endpoints_router
+from .protocol_artifacts import router as protocol_artifacts_router
 from .zkpassport_validator import router as zkpassport_validator_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .challenges import (
@@ -263,8 +269,10 @@ app.include_router(admin_bootstrap_router)
 # Both routers return 503 when POPULIS_ADMIN_PUBKEY_ALLOWLIST is unset
 # (admin desk disabled by default).  See docs/ADMIN_DESK_DESIGN.md.
 app.include_router(admin_auth_router)
-app.include_router(admin_roster_update_router)
+if admin_roster_update_router is not None:
+    app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
+app.include_router(protocol_artifacts_router)
 
 # zkPassport validator signer (unauthenticated; 503 when seed is unset).
 app.include_router(zkpassport_validator_router)
