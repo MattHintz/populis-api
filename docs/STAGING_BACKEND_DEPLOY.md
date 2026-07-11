@@ -55,7 +55,22 @@ curl -fsS -X POST https://testnet11.api.coinset.org/get_coin_records_by_puzzle_h
 ```
 
 2. If the pool is empty or fully reserved, create more bridge coins from the
-   staging faucet. Use `dry_run` first:
+   staging faucet. Prefer the GitHub operator workflow so the admin token never
+   leaves the staging host:
+
+```bash
+gh workflow run bridge-pool-topup.yml \
+  -R MattHintz/solslot-api \
+  --ref staging \
+  -f count=6 \
+  -f start_amount=1 \
+  -f dry_run=true
+```
+
+Then run the same workflow with `dry_run=false`.
+
+If SSH is unavailable but you already have the admin token locally, the
+equivalent direct API call is:
 
 ```bash
 curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/bridge-pool/top-up \
@@ -65,7 +80,7 @@ curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/brid
   | python3 -m json.tool
 ```
 
-Then push:
+Then push directly:
 
 ```bash
 curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/bridge-pool/top-up \

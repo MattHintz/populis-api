@@ -1,0 +1,72 @@
+name: Staging Bridge Pool Top-Up
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: Number of bridge coins to create
+        required: true
+        default: "6"
+      start_amount:
+        description: First bridge coin amount in mojos
+        required: true
+        default: "1"
+      dry_run:
+        description: Preview without pushing to Coinset
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  top-up:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Top up staging zkPassport bridge pool
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+
+            env_file="/opt/solslot/api-staging/shared/.env"
+            app_port="5001"
+            count="${{ inputs.count }}"
+            start_amount="${{ inputs.start_amount }}"
+            dry_run="${{ inputs.dry_run }}"
+
+            case "$count" in
+              ''|*[!0-9]*) echo "count must be numeric" >&2; exit 1 ;;
+            esac
+            case "$start_amount" in
+              ''|*[!0-9]*) echo "start_amount must be numeric" >&2; exit 1 ;;
+            esac
+
+            test -f "$env_file" || (echo "Missing $env_file" >&2; exit 1)
+            set -a
+            . "$env_file"
+            set +a
+            admin_token="${SOLSLOT_ADMIN_TOKEN:-${POPULIS_ADMIN_TOKEN:-}}"
+            test -n "$admin_token" || (echo "No admin token configured in $env_file" >&2; exit 1)
+
+            body="$(python3 - <<PY
+            import json
+            print(json.dumps({
+                "count": int("$count"),
+                "start_amount": int("$start_amount"),
+                "dry_run": "$dry_run".lower() == "true",
+            }))
+            PY
+            )"
+
+            curl -fsS \
+              -X POST "http://127.0.0.1:${app_port}/admin/zkpassport/bridge-pool/top-up" \
+              -H "authorization: Bearer ${admin_token}" \
+              -H "content-type: application/json" \
+              --data "$body" \
+              | python3 -m json.tool
