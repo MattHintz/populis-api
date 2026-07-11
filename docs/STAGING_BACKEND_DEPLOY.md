@@ -39,11 +39,13 @@ protocol migration replaces that in-puzzle spend type.
 
 ## zkPassport Bridge Pool
 
-The enrollment endpoint fails closed with HTTP 503 until a bridge coin pool is
-configured. Configure public bridge parent ids through the GitHub staging
-environment, not by editing the server manually.
+The enrollment endpoint fails closed until unspent bridge coins exist at the
+configured bridge policy hash. The API now auto-discovers those coins from
+Coinset and reserves by full bridge coin id. The old
+`SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS` environment variable remains only as an
+emergency static override.
 
-1. Confirm one-mojo bridge coins exist at the configured bridge policy hash:
+1. Confirm bridge coins exist at the configured bridge policy hash:
 
 ```bash
 curl -fsS -X POST https://testnet11.api.coinset.org/get_coin_records_by_puzzle_hash \
@@ -52,22 +54,28 @@ curl -fsS -X POST https://testnet11.api.coinset.org/get_coin_records_by_puzzle_h
   | python3 -m json.tool
 ```
 
-2. Use each unspent bridge coin's `coin.parent_coin_info` as a parent id.
-   Do not use the bridge coin id, and do not use faucet fan-out coin ids unless
-   they actually created a coin at the bridge policy hash.
-
-3. Set the staging environment variable:
+2. If the pool is empty or fully reserved, create more bridge coins from the
+   staging faucet. Use `dry_run` first:
 
 ```bash
-gh variable set SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS \
-  -R MattHintz/solslot-api \
-  --env staging \
-  --body "0xc17c5ec22db8c526a99ef77d899d0134d06cef4992f4b3d67fa2caf25aa52ee2"
+curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/bridge-pool/top-up \
+  -H "authorization: Bearer $SOLSLOT_ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  --data '{"count":6,"start_amount":1,"dry_run":true}' \
+  | python3 -m json.tool
 ```
 
-4. Rerun the staging backend workflow from `staging`.
+Then push:
 
-5. Verify reservation succeeds:
+```bash
+curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/bridge-pool/top-up \
+  -H "authorization: Bearer $SOLSLOT_ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  --data '{"count":6,"start_amount":1,"dry_run":false}' \
+  | python3 -m json.tool
+```
+
+3. Verify reservation succeeds:
 
 ```bash
 curl -fsS -X POST https://staging.solslot.com/protocol-api/zkpassport/enrollments \
@@ -76,8 +84,9 @@ curl -fsS -X POST https://staging.solslot.com/protocol-api/zkpassport/enrollment
   | python3 -m json.tool
 ```
 
-One parent id reserves one vault enrollment. Add more unspent bridge parent ids
-before broader testing.
+Each top-up creates several bridge coins from one faucet parent with distinct
+amounts. The amount is part of the coin id and EVM attestation, so those bridge
+coins can be reserved independently without hand-editing server config.
 
 ## Rollback
 

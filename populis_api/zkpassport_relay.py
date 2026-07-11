@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import time
 from functools import cache
+import re
 from threading import Lock
 
 from eth_account import Account
@@ -43,6 +44,19 @@ router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
 # First 4 bytes of keccak256("verifyAndEmit((bytes32,bytes32,uint16,bytes32,
 # bytes32,uint64,bytes32,bytes32,bytes32,uint64,bytes32,bytes32),bytes)").
 _VERIFY_AND_EMIT_SELECTOR = "0x7fca187c"
+_REVERT_SELECTOR_RE = re.compile(r"0x[0-9a-fA-F]{8}")
+_KNOWN_REVERT_SELECTORS = {
+    "0xd6bda275": (
+        "OpenZeppelin FailedCall(): the trusted forwarder accepted the request, "
+        "but the emitter call reverted. Refresh the enrollment and QR; if it "
+        "persists, the proof domain/scope or bridge coin fields do not match "
+        "the deployed emitter."
+    ),
+    "0xd611c318": "ProofVerificationFailed(): zkPassport verifier rejected the proof.",
+    "0xa54999ed": "ScopeMismatch(): zkPassport proof scope does not match this vault.",
+    "0x8c7f1d8f": "InvalidZkPassportProof(): emitter rejected the zkPassport proof.",
+    "0x4db028fe": "InvalidBridgeCoinId(): bridge parent, amount, or policy hash mismatch.",
+}
 
 # verifyAndEmit measures ~1.05M gas; cap the forwarded gas to leave headroom
 # without letting a caller drain the relayer through an oversized inner call.
@@ -151,6 +165,22 @@ def _require_relayer_account(settings: Settings):
         ) from exc
 
 
+def _describe_revert(exc: BaseException) -> str:
+    text = str(exc)
+    selectors = []
+    for match in _REVERT_SELECTOR_RE.findall(text):
+        selector = match.lower()
+        if selector not in selectors:
+            selectors.append(selector)
+    if not selectors:
+        return text
+    decoded = [
+        _KNOWN_REVERT_SELECTORS.get(selector, f"Unknown EVM revert selector {selector}.")
+        for selector in selectors
+    ]
+    return f"{'; '.join(decoded)} Raw error: {text}"
+
+
 @router.post(
     "/relay",
     response_model=RelayResponse,
@@ -215,7 +245,7 @@ def relay(req: RelayRequest) -> RelayResponse:
     try:
         forwarder.functions.execute(request_tuple).call({"from": account.address, "value": 0})
     except ContractLogicError as exc:
-        raise HTTPException(status_code=400, detail=f"Simulation reverted: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Simulation reverted: {_describe_revert(exc)}") from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"RPC simulation failed: {exc}") from exc
 

@@ -12,6 +12,7 @@ import json
 import re
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -29,6 +30,13 @@ router = APIRouter(prefix="/zkpassport/enrollments", tags=["zkpassport"])
 _HEX32_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 _EMPTY_ATTEST_ROOT = "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
 _STORE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class BridgeCoinCandidate:
+    parent_id: str
+    amount: int
+    coin_id: str
 
 
 class AttestationProof(BaseModel):
@@ -291,6 +299,79 @@ def _bridge_parent_pool(settings: Settings) -> list[str]:
     return parents
 
 
+def _fetch_bridge_coin_records(settings: Settings, bridge_policy_hash: str) -> list[dict[str, Any]]:
+    base_url = settings.coinset_base_url.rstrip("/")
+    try:
+        with httpx.Client(
+            base_url=base_url,
+            timeout=20.0,
+            headers={"content-type": "application/json"},
+        ) as client:
+            response = client.post(
+                "/get_coin_records_by_puzzle_hash",
+                json={
+                    "puzzle_hash": bridge_policy_hash,
+                    "include_spent_coins": False,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Coinset could not discover zkPassport bridge coins: {exc}",
+        ) from exc
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("coin_records") or []
+    return records if isinstance(records, list) else []
+
+
+def _bridge_coin_candidates(
+    settings: Settings,
+    *,
+    bridge_policy_hash: str,
+    default_amount: int,
+) -> list[BridgeCoinCandidate]:
+    candidates_by_id: dict[str, BridgeCoinCandidate] = {}
+
+    for parent in _bridge_parent_pool(settings):
+        coin_id = _coin_id(parent, bridge_policy_hash, default_amount)
+        candidates_by_id[coin_id] = BridgeCoinCandidate(
+            parent_id=parent,
+            amount=default_amount,
+            coin_id=coin_id,
+        )
+
+    for record in _fetch_bridge_coin_records(settings, bridge_policy_hash):
+        if not isinstance(record, dict):
+            continue
+        if record.get("spent_block_index") not in (0, None) or record.get("spent") is True:
+            continue
+        coin = record.get("coin")
+        if not isinstance(coin, dict):
+            continue
+        try:
+            parent = _normalize_hex32(coin.get("parent_coin_info"), "bridge.parent_coin_info")
+            puzzle_hash = _normalize_hex32(coin.get("puzzle_hash"), "bridge.puzzle_hash")
+            amount = int(coin.get("amount"))
+        except (TypeError, ValueError):
+            continue
+        if puzzle_hash != bridge_policy_hash or amount <= 0:
+            continue
+        coin_id = _coin_id(parent, puzzle_hash, amount)
+        candidates_by_id[coin_id] = BridgeCoinCandidate(
+            parent_id=parent,
+            amount=amount,
+            coin_id=coin_id,
+        )
+
+    return sorted(
+        candidates_by_id.values(),
+        key=lambda item: (item.amount, item.parent_id),
+    )
+
+
 def _public_record(record: dict[str, Any]) -> EnrollmentRecord:
     return EnrollmentRecord.model_validate(record)
 
@@ -321,11 +402,15 @@ def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="zkPassport bridge amount is not configured.",
         )
-    parents = _bridge_parent_pool(settings)
-    if not parents:
+    bridge_candidates = _bridge_coin_candidates(
+        settings,
+        bridge_policy_hash=bridge_policy_hash,
+        default_amount=bridge_amount,
+    )
+    if not bridge_candidates:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="zkPassport bridge coin pool is not configured.",
+            detail="No unspent zkPassport bridge coins are available; top up the bridge pool.",
         )
 
     with _STORE_LOCK:
@@ -335,16 +420,19 @@ def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
         if existing:
             return _public_record(existing)
 
-        used = {
-            str(record.get("bridgeParentId", "")).lower()
+        used_coin_ids = {
+            str(record.get("bridgeCoinId", "")).lower()
             for record in records.values()
             if isinstance(record, dict)
         }
-        bridge_parent_id = next((parent for parent in parents if parent not in used), None)
-        if bridge_parent_id is None:
+        bridge_candidate = next(
+            (candidate for candidate in bridge_candidates if candidate.coin_id not in used_coin_ids),
+            None,
+        )
+        if bridge_candidate is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="No unreserved zkPassport bridge coins remain.",
+                detail="No unreserved zkPassport bridge coins remain; top up the bridge pool.",
             )
 
         now = int(time.time())
@@ -354,9 +442,9 @@ def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
             policyVersion=1,
             status="reserved",
             bridgePolicyHash=bridge_policy_hash,
-            bridgeParentId=bridge_parent_id,
-            bridgeAmount=bridge_amount,
-            bridgeCoinId=_coin_id(bridge_parent_id, bridge_policy_hash, bridge_amount),
+            bridgeParentId=bridge_candidate.parent_id,
+            bridgeAmount=bridge_candidate.amount,
+            bridgeCoinId=bridge_candidate.coin_id,
             createdAt=now,
             updatedAt=now,
         )

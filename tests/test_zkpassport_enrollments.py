@@ -32,11 +32,33 @@ def _coin_id(parent: str, policy_hash: str, amount: int = 1) -> str:
     ).name().hex()
 
 
-def _client(monkeypatch, tmp_path, parents: str = "") -> TestClient:
+def _bridge_record(parent: str = PARENT_A, *, amount: int = 1, puzzle_hash: str = POLICY_HASH) -> dict:
+    return {
+        "coin": {
+            "parent_coin_info": parent,
+            "puzzle_hash": puzzle_hash,
+            "amount": amount,
+        },
+        "confirmed_block_index": 123,
+        "spent_block_index": 0,
+    }
+
+
+def _client(
+    monkeypatch,
+    tmp_path,
+    parents: str = "",
+    bridge_records: list[dict] | None = None,
+) -> TestClient:
     monkeypatch.setenv("POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH", str(tmp_path / "enrollments.json"))
     monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS", parents)
     monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", POLICY_HASH)
     monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AMOUNT", "1")
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_fetch_bridge_coin_records",
+        lambda _settings, _bridge_policy_hash: list(bridge_records or []),
+    )
     return TestClient(app)
 
 
@@ -45,7 +67,18 @@ def test_create_enrollment_fails_closed_without_bridge_pool(monkeypatch, tmp_pat
         resp = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
 
     assert resp.status_code == 503
-    assert "bridge coin pool" in resp.json()["detail"]
+    assert "bridge coins" in resp.json()["detail"]
+
+
+def test_create_enrollment_discovers_unspent_bridge_coins(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path, parents="", bridge_records=[_bridge_record(amount=2)]) as client:
+        created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["bridgeParentId"] == PARENT_A
+    assert body["bridgeAmount"] == 2
+    assert body["bridgeCoinId"] == _coin_id(PARENT_A, POLICY_HASH, 2)
 
 
 def test_create_enrollment_reserves_bridge_coin_and_gets_same_record(monkeypatch, tmp_path):

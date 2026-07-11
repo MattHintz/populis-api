@@ -24,8 +24,10 @@ import pytest
 from fastapi import HTTPException
 
 from populis_api.admin import (
+    BridgePoolTopUpRequest,
     DeployRequest,
     ManifestResponse,
+    _coin_id_from_fields,
     _select_coin_by_id,
     require_admin_token,
 )
@@ -175,6 +177,28 @@ class TestDeployRequestSchema:
         DeployRequest(fee_per_spend=1000)
         with pytest.raises(ValueError):
             DeployRequest(fee_per_spend=-1)
+
+
+class TestBridgePoolTopUpRequest:
+    def test_defaults_create_six_one_mojo_series(self) -> None:
+        body = BridgePoolTopUpRequest()
+        assert body.count == 6
+        assert body.start_amount == 1
+        assert body.fee == 0
+        assert body.dry_run is False
+
+    def test_bounds_reject_empty_batch(self) -> None:
+        with pytest.raises(ValueError):
+            BridgePoolTopUpRequest(count=0)
+
+    def test_bridge_coin_id_includes_amount(self) -> None:
+        parent = bytes.fromhex("aa" * 32)
+        puzzle_hash = bytes.fromhex("bb" * 32)
+        one = _coin_id_from_fields(parent, puzzle_hash, 1)
+        two = _coin_id_from_fields(parent, puzzle_hash, 2)
+        assert one != two
+        assert one.startswith("0x")
+        assert len(one) == 66
 
 
 # ── Manifest response shape ──────────────────────────────────────────────────

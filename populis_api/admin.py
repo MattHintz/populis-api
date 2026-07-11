@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+_CREATE_COIN = 51
+_RESERVE_FEE = 52
+
+
 # ── Auth dependency ──────────────────────────────────────────────────────────
 def require_admin_token(
     settings: Annotated[Settings, Depends(get_settings)],
@@ -193,6 +197,29 @@ class ProtocolConfigFinalizeResponse(BaseModel):
     protocol_config_hash: Optional[str]
     protocol_config_version: int
     network: str
+
+
+class BridgePoolTopUpRequest(BaseModel):
+    count: int = Field(6, ge=1, le=50)
+    start_amount: int = Field(1, ge=1)
+    fee: int = Field(0, ge=0)
+    dry_run: bool = False
+    source_coin_id: Optional[str] = None
+
+
+class BridgePoolCoin(BaseModel):
+    parentId: str
+    bridgeAmount: int
+    bridgeCoinId: str
+
+
+class BridgePoolTopUpResponse(BaseModel):
+    pushed: bool
+    spend_bundle_id: Optional[str]
+    source_coin_id: str
+    bridgePolicyHash: str
+    coins: list[BridgePoolCoin]
+    push_status: Optional[Any] = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -380,6 +407,102 @@ async def deploy_protocol(
     )
 
 
+@router.post(
+    "/zkpassport/bridge-pool/top-up",
+    response_model=BridgePoolTopUpResponse,
+    dependencies=[Depends(require_admin_token)],
+)
+async def top_up_zkpassport_bridge_pool(
+    body: BridgePoolTopUpRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> BridgePoolTopUpResponse:
+    """Create a batch of Chia bridge coins for zkPassport enrollments.
+
+    Each bridge coin is created at the configured bridge policy hash with a
+    distinct positive amount.  The amount is part of the coin id and EVM
+    attestation, so this lets a single faucet parent safely create many
+    enrollable bridge coins without parent-id collisions.
+    """
+    faucet = _faucet_or_503()
+    coinset = _coinset_or_502()
+    bridge_policy_hash = _normalize_32_byte_hex(
+        settings.zkpassport_bridge_policy_hash,
+        "zkpassport_bridge_policy_hash",
+    )
+
+    amounts = [body.start_amount + offset for offset in range(body.count)]
+    total_required = sum(amounts) + body.fee
+    coin_records = await coinset.get_coin_records_by_puzzle_hash(
+        "0x" + faucet.address_puzzle_hash.hex(), include_spent=False
+    )
+    unspent = [
+        _coin_from_record(rec)
+        for rec in coin_records
+        if rec.get("spent_block_index") in (0, None)
+    ]
+
+    if body.source_coin_id is None and settings.faucet_max_spend_mojos > 0:
+        unspent = [coin for coin in unspent if int(coin.amount) <= settings.faucet_max_spend_mojos]
+
+    source_coin = _select_coin_by_id(
+        unspent,
+        body.source_coin_id,
+        total_required,
+        "bridge_pool_source_coin",
+    )
+    bridge_policy_b32 = _bytes32_from_hex(bridge_policy_hash)
+    coins = [
+        BridgePoolCoin(
+            parentId="0x" + bytes(source_coin.name()).hex(),
+            bridgeAmount=amount,
+            bridgeCoinId=_coin_id_from_fields(source_coin.name(), bridge_policy_b32, amount),
+        )
+        for amount in amounts
+    ]
+
+    if body.dry_run:
+        return BridgePoolTopUpResponse(
+            pushed=False,
+            spend_bundle_id=None,
+            source_coin_id="0x" + bytes(source_coin.name()).hex(),
+            bridgePolicyHash=bridge_policy_hash,
+            coins=coins,
+        )
+
+    spend_bundle = _build_single_coin_create_bundle(
+        faucet=faucet,
+        source_coin=source_coin,
+        outputs=[(bridge_policy_b32, amount) for amount in amounts],
+        change_puzzle_hash=faucet.address_puzzle_hash,
+        fee=body.fee,
+    )
+    try:
+        push_result = await coinset.push_tx(_spend_bundle_to_json(spend_bundle))
+    except Exception as exc:
+        logger.exception("zkPassport bridge pool push_tx failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bridge pool top-up was rejected by Coinset: {exc}",
+        ) from exc
+
+    if not push_result.get("success"):
+        status_msg = push_result.get("status") or push_result.get("error") or push_result
+        logger.warning("Bridge pool top-up push_tx returned non-success: %s", status_msg)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bridge pool top-up bundle was rejected: {status_msg}",
+        )
+
+    return BridgePoolTopUpResponse(
+        pushed=True,
+        spend_bundle_id="0x" + bytes(spend_bundle.name()).hex(),
+        source_coin_id="0x" + bytes(source_coin.name()).hex(),
+        bridgePolicyHash=bridge_policy_hash,
+        coins=coins,
+        push_status=push_result,
+    )
+
+
 def _settings_env_file_path() -> Path:
     configured = Settings.model_config.get("env_file", ".env")
     if isinstance(configured, (list, tuple)):
@@ -493,6 +616,65 @@ def _select_coin_by_id(
     chosen = fitting[0]
     candidates.remove(chosen)
     return chosen
+
+
+def _bytes32_from_hex(value: str):
+    from chia_rs.sized_bytes import bytes32
+
+    return bytes32.fromhex(value.removeprefix("0x"))
+
+
+def _coin_id_from_fields(parent_id, puzzle_hash, amount: int) -> str:
+    from chia.types.blockchain_format.coin import Coin
+    from chia_rs.sized_bytes import bytes32
+    from chia_rs.sized_ints import uint64
+
+    parent = bytes32(parent_id) if isinstance(parent_id, (bytes, bytearray)) else parent_id
+    puzzle = bytes32(puzzle_hash) if isinstance(puzzle_hash, (bytes, bytearray)) else puzzle_hash
+    coin = Coin(parent_coin_info=parent, puzzle_hash=puzzle, amount=uint64(amount))
+    return "0x" + bytes(coin.name()).hex()
+
+
+def _build_single_coin_create_bundle(
+    *,
+    faucet,
+    source_coin,
+    outputs: list[tuple[object, int]],
+    change_puzzle_hash,
+    fee: int,
+):
+    from chia.types.blockchain_format.program import Program
+    from chia.types.coin_spend import make_spend
+    from chia_rs import AugSchemeMPL, SpendBundle
+
+    total_outputs = sum(int(amount) for _, amount in outputs)
+    change = int(source_coin.amount) - total_outputs - fee
+    if change < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="bridge_pool_source_coin does not have enough mojo for outputs and fee.",
+        )
+
+    conditions_list = [
+        Program.to([_CREATE_COIN, puzzle_hash, int(amount)])
+        for puzzle_hash, amount in outputs
+    ]
+    if change > 0:
+        conditions_list.append(Program.to([_CREATE_COIN, change_puzzle_hash, change]))
+    if fee > 0:
+        conditions_list.append(Program.to([_RESERVE_FEE, fee]))
+
+    conditions = Program.to(conditions_list)
+    delegated_puzzle = Program.to((1, conditions))
+    solution = Program.to([0, delegated_puzzle, Program.to(0)])
+    coin_spend = make_spend(source_coin, faucet.key.puzzle, solution)
+    sig_msg = (
+        bytes(delegated_puzzle.get_tree_hash())
+        + bytes(source_coin.name())
+        + faucet.agg_sig_me_data
+    )
+    signature = AugSchemeMPL.sign(faucet.key.wallet_sk, sig_msg)
+    return SpendBundle([coin_spend], signature)
 
 
 __all__ = ["router", "require_admin_token"]
