@@ -21,7 +21,7 @@ env:
   LEGACY_PM2_PROCESS_NAME: solslot-api
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'feat/pool-economic-v2' }}
+  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'main' }}
 
 jobs:
   build-release:
@@ -197,6 +197,8 @@ jobs:
                 /usr/local/bin/pm2 \
                 /usr/bin/pm2 \
                 "$home_dir"/.local/bin/pm2 \
+                "$home_dir"/.npm-global/bin/pm2 \
+                "$home_dir"/.yarn/bin/pm2 \
                 "$home_dir"/.nvm/versions/node/*/bin/pm2
               do
                 if [ -x "$candidate" ]; then
@@ -204,6 +206,9 @@ jobs:
                   return 0
                 fi
               done
+              if [ -s "$home_dir/.nvm/nvm.sh" ]; then
+                sudo -H -u "$user" bash -lc ". '$home_dir/.nvm/nvm.sh' && command -v pm2" 2>/dev/null || true
+              fi
               sudo -H -u "$user" bash -lc 'command -v pm2' 2>/dev/null || true
             }
 
@@ -374,7 +379,10 @@ jobs:
               pm2_owner=ec2-user
             fi
             owner_home="$(getent passwd "$pm2_owner" | cut -d: -f6)"
-            pm2_bin="$(for c in /usr/local/bin/pm2 /usr/bin/pm2 "$owner_home"/.nvm/versions/node/*/bin/pm2; do [ -x "$c" ] && echo "$c" && break; done)"
+            pm2_bin="$(for c in /usr/local/bin/pm2 /usr/bin/pm2 "$owner_home"/.local/bin/pm2 "$owner_home"/.npm-global/bin/pm2 "$owner_home"/.yarn/bin/pm2 "$owner_home"/.nvm/versions/node/*/bin/pm2; do [ -x "$c" ] && echo "$c" && break; done)"
+            if [ -z "$pm2_bin" ] && [ -s "$owner_home/.nvm/nvm.sh" ]; then
+              pm2_bin="$(sudo -H -u "$pm2_owner" bash -lc ". '$owner_home/.nvm/nvm.sh' && command -v pm2" 2>/dev/null || true)"
+            fi
             test -n "$pm2_bin" || (echo "pm2 not found for rollback owner $pm2_owner" && exit 1)
 
             ln -sfn "$release_dir" "$release_root/current"
