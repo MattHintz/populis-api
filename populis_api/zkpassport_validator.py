@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from .config import Settings
+from .zkpassport_enrollments import indexed_validator_message, _normalize_hex32
 
 router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
 
@@ -70,6 +71,7 @@ class ValidatorInfoResponse(BaseModel):
 
 class SignRequest(BaseModel):
     validator_message_hex: str
+    vault_launcher_id: str | None = None
 
 
 class SignResponse(BaseModel):
@@ -132,6 +134,22 @@ def sign_validator_message(req: SignRequest) -> SignResponse:
             detail=f"validator_message_hex must decode to exactly 32 bytes, got {len(raw)}.",
         )
     msg = bytes32(raw)
+    if req.vault_launcher_id:
+        try:
+            vault_launcher_id = _normalize_hex32(req.vault_launcher_id, "vault_launcher_id")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        indexed = indexed_validator_message(vault_launcher_id)
+        if indexed is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No indexed zkPassport proof exists for this vault.",
+            )
+        if indexed.lower() != ("0x" + msg.hex()):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="validator_message_hex does not match the indexed vault proof.",
+            )
     sig = AugSchemeMPL.sign(sk, bytes(msg))
     pk: G1Element = sk.get_g1()
     return SignResponse(

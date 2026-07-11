@@ -285,6 +285,15 @@ class Settings(BaseSettings):
     zkpassport_bridge_policy_hash: str = (
         "0xc87f45cd23d052c88256de8823a4a01f40da4e2066156f48f3b3dfc0a50350d7"
     )
+    # Comma-separated 32-byte parent coin ids for one-mojo zkPassport bridge
+    # coins created by the ceremony/operator wallet. Enrollment reserves one
+    # unused parent id per vault. Empty = fail closed.
+    zkpassport_bridge_parent_ids: Optional[str] = None
+    zkpassport_bridge_amount: int = 1
+    # Local public receipt/index used for recovery. Chia vault state remains
+    # final authority; this index only lets the API/frontend recover receipt
+    # material after refresh or wallet reconnect.
+    zkpassport_enrollment_store_path: str = "./zkpassport_enrollments.json"
 
     # ── zkPassport gasless relayer (ERC-2771 meta-transactions) ────────
     # The relayer submits forwarder.execute() on behalf of users so alpha

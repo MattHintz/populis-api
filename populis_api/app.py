@@ -54,6 +54,7 @@ from .mint_endpoints import router as mint_endpoints_router
 from .protocol_artifacts import router as protocol_artifacts_router
 from .zkpassport_validator import router as zkpassport_validator_router
 from .zkpassport_relay import router as zkpassport_relay_router
+from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
     ChallengeStore,
     ChallengeStoreFullError,
@@ -276,6 +277,9 @@ app.include_router(protocol_artifacts_router)
 
 # zkPassport validator signer (unauthenticated; 503 when seed is unset).
 app.include_router(zkpassport_validator_router)
+
+# zkPassport vault bridge enrollment index (public receipt material only).
+app.include_router(zkpassport_enrollments_router)
 
 # zkPassport gasless relayer (ERC-2771 meta-tx; 503 when relayer key is unset).
 app.include_router(zkpassport_relay_router)
