@@ -1,0 +1,390 @@
+name: Staging Backend Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollback_sha:
+        description: "Existing release SHA to roll back to. Leave blank for a normal deploy."
+        required: false
+        type: string
+  push:
+    branches:
+      - staging
+
+concurrency:
+  group: solslot-api-staging
+  cancel-in-progress: false
+
+env:
+  RELEASE_ROOT: /opt/solslot/api-staging
+  PM2_PROCESS_NAME: solslot-api-staging
+  LEGACY_PM2_PROCESS_NAME: solslot-api
+  PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
+  PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
+  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'feat/pool-economic-v2' }}
+
+jobs:
+  build-release:
+    if: ${{ github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout API
+        uses: actions/checkout@v4
+
+      - name: Checkout protocol package
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PROTOCOL_REPOSITORY }}
+          ref: ${{ env.PROTOCOL_REF }}
+          path: protocol
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Detect app package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d solslot_api ]; then
+            package_name=solslot_api
+          elif [ -d populis_api ]; then
+            package_name=populis_api
+          else
+            echo "No solslot_api or populis_api package directory found." >&2
+            exit 1
+          fi
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "app_module=$package_name.app:app" >> "$GITHUB_OUTPUT"
+
+      - name: Install and test
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel
+          python -m pip install -e protocol -e '.[dev]'
+          python -m compileall -q "$APP_PACKAGE"
+          python - <<'PY'
+          import importlib
+          import os
+          package = os.environ["APP_PACKAGE"]
+          module = importlib.import_module(f"{package}.app")
+          app = module.app
+          paths = app.openapi().get("paths", {})
+          assert "Solslot" in app.title, app.title
+          assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
+          PY
+          if [ -f tests/test_zkpassport_enrollments.py ]; then
+            pytest tests/test_zkpassport_enrollments.py -q
+          fi
+
+      - name: Secret scan
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          pattern='sk_(live|test)_[A-Za-z0-9]+|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|MANDRILL_API_KEY=|STRIPE_SECRET_KEY=|BEGIN (RSA|EC|OPENSSH|PRIVATE)'
+          if grep -R -n -E "$pattern" "$APP_PACKAGE" tests .github; then
+            echo "Secret-like value found in API source, tests, or workflows."
+            exit 1
+          fi
+
+      - name: Write release metadata
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+          APP_MODULE: ${{ steps.package.outputs.app_module }}
+        run: |
+          set -euo pipefail
+          protocol_commit="$(git -C protocol rev-parse HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python - <<PY
+          import json
+          data = {
+              "api_commit": "${GITHUB_SHA}",
+              "api_repository": "${GITHUB_REPOSITORY}",
+              "protocol_repository": "${PROTOCOL_REPOSITORY}",
+              "protocol_ref": "${PROTOCOL_REF}",
+              "protocol_commit": "${protocol_commit}",
+              "built_at_utc": "${built_at}",
+              "package_name": "${APP_PACKAGE}",
+              "app_module": "${APP_MODULE}",
+          }
+          with open("release.json", "w", encoding="utf-8") as fh:
+              json.dump(data, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          PY
+
+      - name: Package release
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.pytest_cache' \
+            --exclude='__pycache__' \
+            --exclude='.venv' \
+            --exclude='*.pyc' \
+            -czf "solslot-api-release-${GITHUB_SHA}.tgz" \
+            "$APP_PACKAGE" \
+            protocol \
+            pyproject.toml \
+            README.md \
+            release.json
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solslot-api-release-${{ github.sha }}
+          path: solslot-api-release-${{ github.sha }}.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Copy release to staging
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          source: solslot-api-release-${{ github.sha }}.tgz
+          target: /tmp
+          rm: false
+
+  deploy-release:
+    needs: build-release
+    if: ${{ github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Deploy release atomically
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+
+            release_root="${{ env.RELEASE_ROOT }}"
+            release_sha="${{ github.sha }}"
+            release_dir="$release_root/releases/$release_sha"
+            archive="/tmp/solslot-api-release-$release_sha.tgz"
+            shared_dir="$release_root/shared"
+            state_dir="$shared_dir/state"
+            env_file="$shared_dir/.env"
+            pm2_owner="${{ vars.STAGING_PM2_OWNER || secrets.STAGING_SSH_USER }}"
+            [ -n "$pm2_owner" ] || pm2_owner="$(id -un)"
+
+            find_pm2_for_user() {
+              user="$1"
+              home_dir="$(getent passwd "$user" | cut -d: -f6)"
+              for candidate in \
+                /usr/local/bin/pm2 \
+                /usr/bin/pm2 \
+                "$home_dir"/.local/bin/pm2 \
+                "$home_dir"/.nvm/versions/node/*/bin/pm2
+              do
+                if [ -x "$candidate" ]; then
+                  printf '%s\n' "$candidate"
+                  return 0
+                fi
+              done
+              sudo -H -u "$user" bash -lc 'command -v pm2' 2>/dev/null || true
+            }
+
+            pm2_bin="$(find_pm2_for_user "$pm2_owner" | head -n 1)"
+            if [ -z "$pm2_bin" ] && id ec2-user >/dev/null 2>&1; then
+              pm2_owner=ec2-user
+              pm2_bin="$(find_pm2_for_user "$pm2_owner" | head -n 1)"
+            fi
+            if [ -z "$pm2_bin" ]; then
+              echo "pm2 not found. user=$(id -un), requested owner=$pm2_owner"
+              echo "Known users:" && cut -d: -f1,6 /etc/passwd | grep -E 'ec2-user|ubuntu|deploy|www-data|apache|root' || true
+              exit 1
+            fi
+
+            run_pm2() {
+              if [ "$pm2_owner" = "$(id -un)" ]; then
+                "$pm2_bin" "$@"
+              else
+                owner_home="$(getent passwd "$pm2_owner" | cut -d: -f6)"
+                sudo -H -u "$pm2_owner" env PM2_HOME="$owner_home/.pm2" "$pm2_bin" "$@"
+              fi
+            }
+
+            sudo mkdir -p "$release_root/releases" "$shared_dir" "$state_dir"
+            sudo chown -R "$(id -un)":"$(id -gn)" "$release_root"
+            test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
+
+            legacy_cwd="$(run_pm2 jlist | python3 -c 'import json,sys; data=json.load(sys.stdin); names=("solslot-api-staging","solslot-api"); print(next((p.get("pm2_env",{}).get("pm_cwd") or p.get("pm2_env",{}).get("PWD") or "") for name in names for p in data if p.get("name")==name), ""))' 2>/dev/null || true)"
+            if [ ! -f "$env_file" ] && [ -n "$legacy_cwd" ] && [ -f "$legacy_cwd/.env" ]; then
+              cp "$legacy_cwd/.env" "$env_file"
+              chmod 600 "$env_file"
+              echo "Bootstrapped shared .env from existing API cwd: $legacy_cwd"
+            fi
+            test -f "$env_file" || (echo "Missing $env_file. Copy the existing API .env there before deploying." && exit 1)
+
+            if [ -n "$legacy_cwd" ]; then
+              for state_file in \
+                admin_records.json \
+                bootstrap_manifest.json \
+                bootstrap_recovery_anchor.json \
+                deployment_manifest.json \
+                portal_runtime_config.json \
+                vault_registrations.json \
+                zkpassport_enrollments.json
+              do
+                if [ -f "$legacy_cwd/$state_file" ] && [ ! -f "$state_dir/$state_file" ]; then
+                  cp "$legacy_cwd/$state_file" "$state_dir/$state_file"
+                  echo "Copied existing state file into shared state: $state_file"
+                fi
+              done
+            fi
+
+            rm -rf "$release_dir"
+            mkdir -p "$release_dir"
+            tar -xzf "$archive" -C "$release_dir"
+            ln -sfn "$env_file" "$release_dir/.env"
+            mkdir -p "$release_dir/state"
+            rmdir "$release_dir/state"
+            ln -sfn "$state_dir" "$release_dir/state"
+
+            cd "$release_dir"
+            package_name="$(python3 -c 'import json; print(json.load(open("release.json"))["package_name"])')"
+            app_module="$(python3 -c 'import json; print(json.load(open("release.json"))["app_module"])')"
+            python3 -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip wheel
+            .venv/bin/python -m pip install ./protocol .
+            .venv/bin/python -m compileall -q "$package_name"
+            .venv/bin/python - <<PY
+            import importlib
+            module_name = "${app_module}".split(":")[0]
+            app = importlib.import_module(module_name).app
+            paths = app.openapi().get("paths", {})
+            assert "Solslot" in app.title, app.title
+            assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
+            PY
+
+            cat > "$release_root/ecosystem.config.cjs" <<EOF
+            module.exports = {
+              apps: [{
+                name: "${{ env.PM2_PROCESS_NAME }}",
+                cwd: "$release_root/current",
+                script: "$release_root/current/.venv/bin/uvicorn",
+                args: "$app_module --host 127.0.0.1 --port 5001",
+                interpreter: "none",
+                env: {
+                  PYTHONUNBUFFERED: "1",
+                  SOLSLOT_STATE_DIR: "$state_dir",
+                  POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH: "$state_dir/zkpassport_enrollments.json"
+                }
+              }]
+            };
+            EOF
+
+            ln -sfn "$release_dir" "$release_root/current"
+            if run_pm2 describe "${{ env.LEGACY_PM2_PROCESS_NAME }}" >/dev/null 2>&1 && ! run_pm2 describe "${{ env.PM2_PROCESS_NAME }}" >/dev/null 2>&1; then
+              run_pm2 delete "${{ env.LEGACY_PM2_PROCESS_NAME }}" || true
+            fi
+            run_pm2 startOrReload "$release_root/ecosystem.config.cjs" --update-env
+            run_pm2 save
+
+            sleep 5
+            curl -fsS http://127.0.0.1:5001/health
+            curl -fsS http://127.0.0.1:5001/openapi.json \
+              | "$release_dir/.venv/bin/python" -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
+
+            find "$release_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+              | sort -rn \
+              | awk 'NR>5 {print $2}' \
+              | xargs -r rm -rf
+
+      - name: Verify public staging API
+        run: |
+          set -euo pipefail
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/openapi.json" \
+            | python -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
+
+      - name: Print PM2 diagnostics on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set +e
+            echo "user=$(id -un) home=$HOME"
+            ps aux | grep -E 'uvicorn|pm2|solslot-api|populis_api' | grep -v grep
+            for user in "$(id -un)" ec2-user ubuntu; do
+              if id "$user" >/dev/null 2>&1; then
+                home_dir="$(getent passwd "$user" | cut -d: -f6)"
+                for pm2 in /usr/local/bin/pm2 /usr/bin/pm2 "$home_dir"/.nvm/versions/node/*/bin/pm2; do
+                  if [ -x "$pm2" ]; then
+                    echo "== pm2 for $user: $pm2 =="
+                    sudo -H -u "$user" env PM2_HOME="$home_dir/.pm2" "$pm2" list
+                    sudo -H -u "$user" env PM2_HOME="$home_dir/.pm2" "$pm2" logs "${{ env.PM2_PROCESS_NAME }}" --lines 80 --nostream
+                    sudo -H -u "$user" env PM2_HOME="$home_dir/.pm2" "$pm2" logs "${{ env.LEGACY_PM2_PROCESS_NAME }}" --lines 80 --nostream
+                  fi
+                done
+              fi
+            done
+
+  rollback:
+    if: ${{ github.event.inputs.rollback_sha != '' && github.event.inputs.rollback_sha != null }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Roll back staging API
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            release_root="${{ env.RELEASE_ROOT }}"
+            rollback_sha="${{ github.event.inputs.rollback_sha }}"
+            release_dir="$release_root/releases/$rollback_sha"
+            test -d "$release_dir" || (echo "No release directory exists for $rollback_sha" && exit 1)
+
+            pm2_owner="${{ vars.STAGING_PM2_OWNER || secrets.STAGING_SSH_USER }}"
+            [ -n "$pm2_owner" ] || pm2_owner="$(id -un)"
+            if id ec2-user >/dev/null 2>&1; then
+              pm2_owner=ec2-user
+            fi
+            owner_home="$(getent passwd "$pm2_owner" | cut -d: -f6)"
+            pm2_bin="$(for c in /usr/local/bin/pm2 /usr/bin/pm2 "$owner_home"/.nvm/versions/node/*/bin/pm2; do [ -x "$c" ] && echo "$c" && break; done)"
+            test -n "$pm2_bin" || (echo "pm2 not found for rollback owner $pm2_owner" && exit 1)
+
+            ln -sfn "$release_dir" "$release_root/current"
+            sudo -H -u "$pm2_owner" env PM2_HOME="$owner_home/.pm2" "$pm2_bin" startOrReload "$release_root/ecosystem.config.cjs" --update-env
+            sudo -H -u "$pm2_owner" env PM2_HOME="$owner_home/.pm2" "$pm2_bin" save
+            sleep 5
+            curl -fsS http://127.0.0.1:5001/health
+
+      - name: Verify public rollback
+        run: |
+          set -euo pipefail
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/openapi.json" >/dev/null

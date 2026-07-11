@@ -24,8 +24,6 @@ from pydantic import BaseModel, Field, field_validator
 
 from .config import Settings
 from .state import get_registry
-from populis_puzzles.vault_driver import one_leaf_merkle_root, puzzle_for_vault_full
-
 router = APIRouter(prefix="/zkpassport/enrollments", tags=["zkpassport"])
 
 _HEX32_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
@@ -228,6 +226,11 @@ def _expected_stamped_vault_puzzle_hash(
             detail="Vault is not registered on this server; cannot verify stamped vault puzzle.",
         )
     try:
+        from populis_puzzles.vault_driver import (
+            one_leaf_merkle_root,
+            puzzle_for_vault_full,
+        )
+
         expected = puzzle_for_vault_full(
             bytes32.fromhex(vault_launcher_id.removeprefix("0x")),
             bytes(record.owner_pubkey),

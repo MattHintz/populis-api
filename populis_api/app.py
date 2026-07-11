@@ -1,4 +1,4 @@
-"""Populis API — FastAPI application.
+"""Solslot API — FastAPI application.
 
 Endpoints:
   GET  /health
@@ -240,9 +240,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Populis API",
+    title="Solslot API",
     version="0.1.0",
-    description="Populis Protocol members-portal API (testnet)",
+    description="Solslot Protocol members-portal API (testnet)",
     lifespan=lifespan,
 )
 
