@@ -267,6 +267,8 @@ jobs:
             Environment=PYTHONUNBUFFERED=1
             Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
             Environment=SOLSLOT_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
+            Environment=POPULIS_VAULT_REGISTRY_PATH=$state_dir/vault_registry.db
+            Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry.db
             Environment=POPULIS_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED=true
             Environment=SOLSLOT_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED=true
             $zkpassport_bridge_parent_env_lines

@@ -126,14 +126,18 @@ _registry: Optional[VaultRegistry] = None
 def get_registry() -> VaultRegistry:
     """Return the process-wide ``VaultRegistry`` singleton.
 
-    Path resolution: ``POPULIS_VAULT_REGISTRY_PATH`` env var, defaulting
-    to ``./vault_registry.db``.  Settings is intentionally NOT consulted
+    Path resolution: ``SOLSLOT_VAULT_REGISTRY_PATH`` (or the legacy
+    ``POPULIS_VAULT_REGISTRY_PATH`` alias), defaulting to
+    ``./vault_registry.db``.  Settings is intentionally NOT consulted
     so this function remains importable from tests without forcing a
     pydantic-settings load.
     """
     global _registry
     if _registry is None:
-        path = os.environ.get("POPULIS_VAULT_REGISTRY_PATH", "./vault_registry.db")
+        path = os.environ.get(
+            "SOLSLOT_VAULT_REGISTRY_PATH",
+            os.environ.get("POPULIS_VAULT_REGISTRY_PATH", "./vault_registry.db"),
+        )
         _registry = VaultRegistry.open(path)
     return _registry
 

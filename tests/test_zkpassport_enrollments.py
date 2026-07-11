@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
-from chia_rs import Coin
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+from eth_keys import keys as eth_keys
+from chia_rs import Coin, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi.testclient import TestClient
@@ -10,6 +15,7 @@ from populis_api import admin
 from populis_api.app import app
 from populis_api import zkpassport_enrollments
 from populis_api.config import Settings
+from populis_api.state import reset_registry_for_tests
 
 
 VAULT_A = "0x" + "11" * 32
@@ -25,6 +31,7 @@ VALIDATOR_MESSAGE = "0x" + "88" * 32
 VALIDATOR_SEED_HEX = "bd15624be42c1cd1c51dd4a440bff40a4a3466f716f9e13149d3422767876ad7"
 VAULT_COIN_PARENT = "0x" + "99" * 32
 VAULT_COIN_PUZZLE = "0x" + "d1" * 32
+EVM_SENDER = "0x1111111111111111111111111111111111111111"
 
 
 def _coin_id(parent: str, policy_hash: str, amount: int = 1) -> str:
@@ -47,6 +54,35 @@ def _bridge_record(parent: str = PARENT_A, *, amount: int = 1, puzzle_hash: str 
     }
 
 
+def _indexed_event(
+    *,
+    vault_launcher_id: str = VAULT_A,
+    bridge_parent_id: str = PARENT_A,
+    bridge_policy_hash: str = POLICY_HASH,
+    bridge_amount: int = 1,
+) -> zkpassport_enrollments.IndexedEvmAttestation:
+    return zkpassport_enrollments.IndexedEvmAttestation(
+        sender=EVM_SENDER,
+        vault_launcher_id=vault_launcher_id,
+        scoped_nullifier="0x" + "12" * 32,
+        nullifier_type=1,
+        service_scope_hash="0x" + "13" * 32,
+        service_subscope_hash="0x" + "14" * 32,
+        proof_timestamp=1_700_000_000,
+        attestation_leaf_hash=LEAF,
+        identity_attest_root=ROOT,
+        bridge_parent_id=bridge_parent_id,
+        bridge_amount=bridge_amount,
+        bridge_coin_id=_coin_id(bridge_parent_id, bridge_policy_hash, bridge_amount),
+        bridge_message="0x" + "99" * 32,
+        bridge_policy_hash=bridge_policy_hash,
+        policy_version=1,
+        validator_message=VALIDATOR_MESSAGE,
+        transaction_hash=TX,
+        block_number=456,
+    )
+
+
 def _client(
     monkeypatch,
     tmp_path,
@@ -65,6 +101,14 @@ def _client(
         "_fetch_bridge_coin_records",
         lambda _settings, _bridge_policy_hash: list(bridge_records or []),
     )
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_fetch_verified_evm_attestation",
+        lambda _settings, **kwargs: _indexed_event(
+            vault_launcher_id=kwargs["expected_vault_launcher_id"]
+        ),
+    )
+    reset_registry_for_tests(tmp_path / "vault_registry.db")
     return TestClient(app)
 
 
@@ -335,3 +379,216 @@ def test_record_proof_rejects_wrong_reserved_bridge_coin(monkeypatch, tmp_path):
         )
 
     assert resp.status_code == 409
+
+
+def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_path):
+    from populis_puzzles.vault_driver import (
+        AUTH_TYPE_SECP256K1,
+        DEFAULT_IDENTITY_ATTEST_ROOT,
+        one_leaf_merkle_root,
+        puzzle_for_vault_full,
+    )
+    from populis_puzzles.zkpassport_attestation import (
+        ZkPassportAttestation,
+        compute_attestation_bridge_message,
+        compute_attestation_root,
+        compute_validator_bridge_message,
+    )
+    from populis_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
+
+    private_key = bytes.fromhex("01" * 32)
+    account = Account.from_key(private_key)
+    owner_pubkey = eth_keys.PrivateKey(private_key).public_key.to_compressed_bytes()
+    validator_sk = zkpassport_enrollments.AugSchemeMPL.key_gen(
+        bytes.fromhex(VALIDATOR_SEED_HEX)
+    )
+    policy_hash = make_bridge_policy_hash([bytes(validator_sk.get_g1())], 1)
+    policy_hex = "0x" + policy_hash.hex()
+    launcher = bytes32.fromhex(VAULT_A.removeprefix("0x"))
+    pool_launcher = bytes32(b"\x70" * 32)
+    current_puzzle = puzzle_for_vault_full(
+        launcher,
+        owner_pubkey,
+        AUTH_TYPE_SECP256K1,
+        one_leaf_merkle_root(owner_pubkey),
+        pool_launcher,
+        identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+        zkpassport_bridge_policy_hash=policy_hash,
+    )
+    current_coin = Coin(launcher, bytes32(current_puzzle.get_tree_hash()), uint64(1))
+    bridge_parent = bytes32.fromhex(PARENT_A.removeprefix("0x"))
+    bridge_coin = Coin(bridge_parent, policy_hash, uint64(1))
+    attestation = ZkPassportAttestation(
+        vault_launcher_id=launcher,
+        scoped_nullifier=bytes32(b"\x12" * 32),
+        nullifier_type=1,
+        service_scope_hash=bytes32(b"\x13" * 32),
+        service_subscope_hash=bytes32(b"\x14" * 32),
+        proof_timestamp=1_700_000_000,
+        policy_version=1,
+    )
+    root = compute_attestation_root([attestation.leaf_hash])
+    bridge_message = compute_attestation_bridge_message(
+        vault_launcher_id=launcher,
+        attestation_root=root,
+        bridge_policy_hash=policy_hash,
+        policy_version=1,
+    )
+    validator_message = compute_validator_bridge_message(
+        vault_launcher_id=launcher,
+        attestation_root=root,
+        bridge_policy_hash=policy_hash,
+        bridge_coin_id=bridge_coin.name(),
+        bridge_message=bridge_message,
+        attestation_leaf_hash=attestation.leaf_hash,
+        scoped_nullifier=attestation.scoped_nullifier,
+        nullifier_type=attestation.nullifier_type,
+        service_scope_hash=attestation.service_scope_hash,
+        service_subscope_hash=attestation.service_subscope_hash,
+        proof_timestamp=attestation.proof_timestamp,
+        policy_version=1,
+    )
+    event = zkpassport_enrollments.IndexedEvmAttestation(
+        sender=account.address,
+        vault_launcher_id=VAULT_A,
+        scoped_nullifier="0x" + attestation.scoped_nullifier.hex(),
+        nullifier_type=attestation.nullifier_type,
+        service_scope_hash="0x" + attestation.service_scope_hash.hex(),
+        service_subscope_hash="0x" + attestation.service_subscope_hash.hex(),
+        proof_timestamp=attestation.proof_timestamp,
+        attestation_leaf_hash="0x" + attestation.leaf_hash.hex(),
+        identity_attest_root="0x" + root.hex(),
+        bridge_parent_id=PARENT_A,
+        bridge_amount=1,
+        bridge_coin_id="0x" + bridge_coin.name().hex(),
+        bridge_message="0x" + bridge_message.hex(),
+        bridge_policy_hash=policy_hex,
+        policy_version=1,
+        validator_message="0x" + validator_message.hex(),
+        transaction_hash=TX,
+        block_number=456,
+    )
+
+    monkeypatch.setenv(
+        "POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH",
+        str(tmp_path / "enrollments.json"),
+    )
+    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS", PARENT_A)
+    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", policy_hex)
+    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AMOUNT", "1")
+    monkeypatch.setenv("POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX", VALIDATOR_SEED_HEX)
+    monkeypatch.setenv("POPULIS_POOL_LAUNCHER_ID", "0x" + pool_launcher.hex())
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_fetch_bridge_coin_records",
+        lambda _settings, _policy: [_bridge_record(puzzle_hash=policy_hex)],
+    )
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_fetch_verified_evm_attestation",
+        lambda _settings, **_kwargs: event,
+    )
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_find_initial_vault_coin",
+        lambda _settings, _launcher: current_coin,
+    )
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_verify_reserved_bridge_coin",
+        lambda _settings, _record: bridge_coin,
+    )
+    pushed: list[dict] = []
+
+    class FakeCoinsetClient:
+        def __init__(self, _base_url):
+            pass
+
+        async def push_tx(self, spend_bundle_json):
+            pushed.append(spend_bundle_json)
+            return {"success": True, "status": "SUCCESS"}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(zkpassport_enrollments, "CoinsetClient", FakeCoinsetClient)
+    reset_registry_for_tests(tmp_path / "vault_registry.db")
+
+    enrollment = asyncio.run(
+        zkpassport_enrollments.create_enrollment(
+            zkpassport_enrollments.CreateEnrollmentRequest(vaultLauncherId=VAULT_A)
+        )
+    )
+    proof = zkpassport_enrollments.record_evm_proof(
+        VAULT_A,
+        zkpassport_enrollments.RecordProofRequest(
+            vaultLauncherId=VAULT_A,
+            policyVersion=1,
+            identityAttestRoot=event.identity_attest_root,
+            attestationLeafHash=event.attestation_leaf_hash,
+            attestationProof={"bitpath": 0, "siblings": []},
+            bridgePolicyHash=enrollment.bridgePolicyHash,
+            bridgeParentId=enrollment.bridgeParentId,
+            bridgeAmount=enrollment.bridgeAmount,
+            bridgeCoinId=enrollment.bridgeCoinId,
+            bridgeMessage=event.bridge_message,
+            validatorMessage=event.validator_message,
+            evmTxHash=TX,
+        ),
+    )
+    prepared = zkpassport_enrollments.prepare_chia_stamp(VAULT_A)
+    signature = Account.sign_message(
+        encode_typed_data(full_message=prepared.typedData),
+        private_key,
+    ).signature.hex()
+    submitted = asyncio.run(
+        zkpassport_enrollments.submit_evm_chia_stamp(
+            VAULT_A,
+            zkpassport_enrollments.SubmitEvmChiaStampRequest(
+                signature="0x" + signature
+            ),
+        )
+    )
+
+    assert proof.status == "evm_confirmed"
+    assert prepared.authType == "evm"
+    assert submitted.enrollment.status == "stamp_pending"
+    assert len(pushed) == 1
+    assert len(pushed[0]["coin_spends"]) == 2
+    submitted_bundle = SpendBundle.from_json_dict(pushed[0])
+    assert zkpassport_enrollments.AugSchemeMPL.verify(
+        validator_sk.get_g1(),
+        bytes(validator_message)
+        + bytes(bridge_coin.name())
+        + zkpassport_enrollments.AGG_SIG_ME_DATA["testnet11"],
+        submitted_bundle.aggregated_signature,
+    )
+
+    expected_coin_id = submitted.expectedVaultCoinId
+    expected_puzzle_hash = zkpassport_enrollments._expected_stamped_vault_puzzle_hash(
+        Settings(),
+        vault_launcher_id=VAULT_A,
+        identity_attest_root=event.identity_attest_root,
+    )
+    expected_parent = "0x" + current_coin.name().hex()
+    monkeypatch.setattr(
+        zkpassport_enrollments,
+        "_fetch_coin_record_by_name",
+        lambda _settings, coin_id: {
+            "coin": {
+                "parent_coin_info": expected_parent,
+                "puzzle_hash": expected_puzzle_hash,
+                "amount": 1,
+            },
+            "confirmed_block_index": 789,
+            "spent_block_index": 0,
+        }
+        if coin_id == expected_coin_id
+        else None,
+    )
+    synced = zkpassport_enrollments.sync_chia_stamp(VAULT_A)
+
+    assert synced.confirmed is True
+    assert synced.enrollment.status == "chia_confirmed"
+    assert synced.enrollment.receipt is not None
+    assert synced.enrollment.receipt.confirmedBlockIndex == 789
