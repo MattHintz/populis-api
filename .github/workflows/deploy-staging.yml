@@ -434,3 +434,23 @@ jobs:
             curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" \
               | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("info",{}).get("title")); [print(path) for path in sorted(d.get("paths",{})) if "zkpassport" in path]' \
               || true
+            echo "--- vault registry candidates ---"
+            sudo find /opt/solslot /opt/populis-api-staging -type f -name 'vault_registry.db' -print0 2>/dev/null \
+              | while IFS= read -r -d '' db; do
+                  sudo DB_PATH="$db" python3 - <<'PY'
+            import os
+            import sqlite3
+
+            path = os.environ["DB_PATH"]
+            try:
+                connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                count = connection.execute("SELECT count(*) FROM vaults").fetchone()[0]
+                connection.close()
+                print(f"{path} vaults={count}")
+            except Exception as exc:
+                print(f"{path} unreadable={exc}")
+            PY
+                done
+            echo "--- shared state ---"
+            sudo find "${{ env.SHARED_ROOT }}/state" -maxdepth 1 -type f -printf '%f bytes=%s modified=%TY-%Tm-%TdT%TH:%TM:%TS\n' 2>/dev/null \
+              | sort
