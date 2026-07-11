@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import pytest
 from chia_rs import Coin
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi.testclient import TestClient
 
+from populis_api import admin
 from populis_api.app import app
 from populis_api import zkpassport_enrollments
+from populis_api.config import Settings
 
 
 VAULT_A = "0x" + "11" * 32
@@ -103,6 +106,43 @@ def test_create_enrollment_auto_topups_when_pool_is_empty(monkeypatch, tmp_path)
     assert body["bridgeParentId"] == PARENT_B
     assert body["bridgeAmount"] == 3
     assert body["bridgeCoinId"] == _coin_id(PARENT_B, POLICY_HASH, 3)
+
+
+@pytest.mark.asyncio
+async def test_auto_top_up_converts_admin_bridge_pool_response(monkeypatch):
+    bridge_coin_id = _coin_id(PARENT_B, POLICY_HASH, 3)
+
+    async def fake_top_up(_request, _settings):
+        return admin.BridgePoolTopUpResponse(
+            pushed=True,
+            spend_bundle_id="0x" + "77" * 32,
+            source_coin_id="0x" + "99" * 32,
+            bridgePolicyHash=POLICY_HASH,
+            coins=[
+                admin.BridgePoolCoin(
+                    parentId=PARENT_B,
+                    bridgeAmount=3,
+                    bridgeCoinId=bridge_coin_id,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(admin, "top_up_zkpassport_bridge_pool", fake_top_up)
+    settings = Settings(
+        network="testnet11",
+        zkpassport_bridge_auto_topup_enabled=True,
+        zkpassport_bridge_policy_hash=POLICY_HASH,
+    )
+
+    candidates = await zkpassport_enrollments._auto_top_up_bridge_pool(settings)
+
+    assert candidates == [
+        zkpassport_enrollments.BridgeCoinCandidate(
+            parent_id=PARENT_B,
+            amount=3,
+            coin_id=bridge_coin_id,
+        )
+    ]
 
 
 def test_create_enrollment_reserves_bridge_coin_and_gets_same_record(monkeypatch, tmp_path):

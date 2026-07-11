@@ -408,7 +408,7 @@ async def _auto_top_up_bridge_pool(settings: Settings) -> list[BridgeCoinCandida
 
     return [
         BridgeCoinCandidate(
-            parent_id=coin.bridgeParentId,
+            parent_id=coin.parentId,
             amount=coin.bridgeAmount,
             coin_id=coin.bridgeCoinId,
         )

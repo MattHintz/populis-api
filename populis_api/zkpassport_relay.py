@@ -181,6 +181,36 @@ def _describe_revert(exc: BaseException) -> str:
     return f"{'; '.join(decoded)} Raw error: {text}"
 
 
+def _simulate_forwarded_inner_call(
+    w3: Web3,
+    *,
+    forwarder_address: str,
+    emitter_address: str,
+    signer_address: str,
+    data: bytes,
+) -> str:
+    """Simulate the ERC-2771 target call to expose its real revert data.
+
+    OpenZeppelin's forwarder wraps a target revert in ``FailedCall()``.  A
+    direct ``eth_call`` from the trusted forwarder with the original signer
+    appended reproduces the exact calldata seen by ``ERC2771Context`` and
+    preserves the emitter/verifier custom error for operator diagnostics.
+    """
+    forwarded_data = data + Web3.to_bytes(hexstr=signer_address)
+    try:
+        w3.eth.call(
+            {
+                "from": forwarder_address,
+                "to": emitter_address,
+                "value": 0,
+                "data": forwarded_data,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - the RPC provider controls the exception type
+        return _describe_revert(exc)
+    return "The emitter simulation succeeded; the failure is in the forwarder execution path."
+
+
 @router.post(
     "/relay",
     response_model=RelayResponse,
@@ -245,7 +275,20 @@ def relay(req: RelayRequest) -> RelayResponse:
     try:
         forwarder.functions.execute(request_tuple).call({"from": account.address, "value": 0})
     except ContractLogicError as exc:
-        raise HTTPException(status_code=400, detail=f"Simulation reverted: {_describe_revert(exc)}") from exc
+        inner_detail = _simulate_forwarded_inner_call(
+            w3,
+            forwarder_address=forwarder_addr,
+            emitter_address=to,
+            signer_address=signer,
+            data=data_bytes,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Simulation reverted: {_describe_revert(exc)} "
+                f"Inner emitter simulation: {inner_detail}"
+            ),
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"RPC simulation failed: {exc}") from exc
 
