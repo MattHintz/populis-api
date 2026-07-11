@@ -16,10 +16,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_ROOT: /opt/solslot/api-staging
-  SHARED_ROOT: /var/lib/populis-ceremony
-  SYSTEMD_SERVICE: populis-api-ceremony.service
-  APP_PORT: "8790"
+  RELEASE_ROOT: ${{ vars.SOLSLOT_API_RELEASE_ROOT || '/opt/solslot/api-staging' }}
+  SHARED_ROOT: ${{ vars.SOLSLOT_API_SHARED_ROOT || '/opt/solslot/api-staging/shared' }}
+  ENV_FILE_PATH: ${{ vars.SOLSLOT_API_ENV_FILE_PATH || '/opt/populis-api-staging/.env' }}
+  SYSTEMD_SERVICE: ${{ vars.SOLSLOT_API_SYSTEMD_SERVICE || 'populis-api-staging.service' }}
+  APP_PORT: ${{ vars.SOLSLOT_API_PORT || '8790' }}
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'main' }}
@@ -185,13 +186,14 @@ jobs:
             release_sha="${{ github.sha }}"
             release_dir="$release_root/releases/$release_sha"
             archive="/tmp/solslot-api-release-$release_sha.tgz"
-            shared_dir="${{ env.SHARED_ROOT }}"
-            env_file="$shared_dir/api.env"
+            shared_root="${{ env.SHARED_ROOT }}"
+            state_dir="$shared_root/state"
+            env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             app_port="${{ env.APP_PORT }}"
 
-            sudo mkdir -p "$release_root/releases" "$shared_dir"
-            sudo chown -R "$(id -un)":"$(id -gn)" "$release_root"
+            sudo mkdir -p "$release_root/releases" "$state_dir"
+            sudo chown -R "$(id -un)":"$(id -gn)" "$release_root" "$shared_root"
             test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
             sudo test -f "$env_file" || (echo "Missing $env_file on staging host." && exit 1)
 
@@ -232,10 +234,10 @@ jobs:
             WorkingDirectory=$release_root/current
             EnvironmentFile=$env_file
             Environment=PYTHONUNBUFFERED=1
-            Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$shared_dir/zkpassport_enrollments.json
+            Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
             ExecStart=
             ExecStart=$release_root/current/.venv/bin/uvicorn $app_module --host 127.0.0.1 --port $app_port
-            ReadWritePaths=$shared_dir $release_root
+            ReadWritePaths=$shared_root $release_root
             EOF
             sudo systemctl daemon-reload
             sudo systemctl restart "$systemd_service"
