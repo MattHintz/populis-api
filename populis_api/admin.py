@@ -28,6 +28,7 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
+from .admin_auth import require_admin_jwt
 from .config import Settings, get_settings
 
 
@@ -77,6 +78,40 @@ def require_admin_token(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid admin token.",
         )
+
+
+def require_admin_operator(
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> None:
+    """Accept the modern admin JWT authority or the legacy static token.
+
+    The genesis/admin-desk path issues short-lived JWTs checked by
+    ``require_admin_jwt``.  The static bearer token remains only as a
+    break-glass compatibility path for older one-shot operator endpoints.
+    """
+    jwt_error: HTTPException | None = None
+    if settings.effective_admin_allowlist_set():
+        try:
+            require_admin_jwt(settings, authorization)
+            return
+        except HTTPException as exc:
+            jwt_error = exc
+
+    if settings.admin_token:
+        try:
+            require_admin_token(settings, authorization)
+            return
+        except HTTPException as exc:
+            if jwt_error is None:
+                jwt_error = exc
+
+    if jwt_error is not None:
+        raise jwt_error
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Admin operator endpoints are disabled; configure admin desk authority.",
+    )
 
 
 # ── Helpers for app-state plumbing ───────────────────────────────────────────
@@ -410,7 +445,7 @@ async def deploy_protocol(
 @router.post(
     "/zkpassport/bridge-pool/top-up",
     response_model=BridgePoolTopUpResponse,
-    dependencies=[Depends(require_admin_token)],
+    dependencies=[Depends(require_admin_operator)],
 )
 async def top_up_zkpassport_bridge_pool(
     body: BridgePoolTopUpRequest,

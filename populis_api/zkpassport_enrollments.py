@@ -332,6 +332,7 @@ def _bridge_coin_candidates(
     *,
     bridge_policy_hash: str,
     default_amount: int,
+    extra_candidates: Optional[list[BridgeCoinCandidate]] = None,
 ) -> list[BridgeCoinCandidate]:
     candidates_by_id: dict[str, BridgeCoinCandidate] = {}
 
@@ -366,10 +367,53 @@ def _bridge_coin_candidates(
             coin_id=coin_id,
         )
 
+    for candidate in extra_candidates or []:
+        if candidate.amount > 0:
+            candidates_by_id[candidate.coin_id] = candidate
+
     return sorted(
         candidates_by_id.values(),
         key=lambda item: (item.amount, item.parent_id),
     )
+
+
+async def _auto_top_up_bridge_pool(settings: Settings) -> list[BridgeCoinCandidate]:
+    if not settings.zkpassport_bridge_auto_topup_enabled:
+        return []
+    if settings.network != "testnet11":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Automatic zkPassport bridge top-up is available only on testnet11.",
+        )
+
+    from .admin import BridgePoolTopUpRequest, top_up_zkpassport_bridge_pool
+
+    try:
+        response = await top_up_zkpassport_bridge_pool(
+            BridgePoolTopUpRequest(
+                count=int(settings.zkpassport_bridge_auto_topup_count),
+                start_amount=int(settings.zkpassport_bridge_auto_topup_start_amount),
+                fee=int(settings.zkpassport_bridge_auto_topup_fee),
+                dry_run=False,
+            ),
+            settings,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Automatic zkPassport bridge top-up failed: {exc}",
+        ) from exc
+
+    return [
+        BridgeCoinCandidate(
+            parent_id=coin.bridgeParentId,
+            amount=coin.bridgeAmount,
+            coin_id=coin.bridgeCoinId,
+        )
+        for coin in response.coins
+    ]
 
 
 def _public_record(record: dict[str, Any]) -> EnrollmentRecord:
@@ -389,7 +433,7 @@ def indexed_validator_message(vault_launcher_id: str) -> Optional[str]:
 
 
 @router.post("", response_model=EnrollmentRecord)
-def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
+async def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
     settings = _settings()
     vault_launcher_id = _normalize_hex32(req.vaultLauncherId, "vaultLauncherId")
     bridge_policy_hash = _normalize_hex32(
@@ -402,55 +446,75 @@ def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="zkPassport bridge amount is not configured.",
         )
-    bridge_candidates = _bridge_coin_candidates(
-        settings,
-        bridge_policy_hash=bridge_policy_hash,
-        default_amount=bridge_amount,
-    )
-    if not bridge_candidates:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No unspent zkPassport bridge coins are available; top up the bridge pool.",
-        )
+    extra_candidates: list[BridgeCoinCandidate] = []
+    top_up_attempted = False
+    last_empty_pool = False
 
-    with _STORE_LOCK:
-        data = _load_store(settings)
-        records: dict[str, Any] = data.setdefault("records", {})
-        existing = records.get(vault_launcher_id)
-        if existing:
-            return _public_record(existing)
-
-        used_coin_ids = {
-            str(record.get("bridgeCoinId", "")).lower()
-            for record in records.values()
-            if isinstance(record, dict)
-        }
-        bridge_candidate = next(
-            (candidate for candidate in bridge_candidates if candidate.coin_id not in used_coin_ids),
-            None,
+    while True:
+        bridge_candidates = _bridge_coin_candidates(
+            settings,
+            bridge_policy_hash=bridge_policy_hash,
+            default_amount=bridge_amount,
+            extra_candidates=extra_candidates,
         )
-        if bridge_candidate is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="No unreserved zkPassport bridge coins remain; top up the bridge pool.",
+        last_empty_pool = not bridge_candidates
+
+        with _STORE_LOCK:
+            data = _load_store(settings)
+            records: dict[str, Any] = data.setdefault("records", {})
+            existing = records.get(vault_launcher_id)
+            if existing:
+                return _public_record(existing)
+
+            used_coin_ids = {
+                str(record.get("bridgeCoinId", "")).lower()
+                for record in records.values()
+                if isinstance(record, dict)
+            }
+            bridge_candidate = next(
+                (
+                    candidate
+                    for candidate in bridge_candidates
+                    if candidate.coin_id not in used_coin_ids
+                ),
+                None,
             )
+            if bridge_candidate is not None:
+                now = int(time.time())
+                record = EnrollmentRecord(
+                    vaultLauncherId=vault_launcher_id,
+                    network=settings.network,
+                    policyVersion=1,
+                    status="reserved",
+                    bridgePolicyHash=bridge_policy_hash,
+                    bridgeParentId=bridge_candidate.parent_id,
+                    bridgeAmount=bridge_candidate.amount,
+                    bridgeCoinId=bridge_candidate.coin_id,
+                    createdAt=now,
+                    updatedAt=now,
+                )
+                records[vault_launcher_id] = record.model_dump()
+                _save_store(settings, data)
+                return record
 
-        now = int(time.time())
-        record = EnrollmentRecord(
-            vaultLauncherId=vault_launcher_id,
-            network=settings.network,
-            policyVersion=1,
-            status="reserved",
-            bridgePolicyHash=bridge_policy_hash,
-            bridgeParentId=bridge_candidate.parent_id,
-            bridgeAmount=bridge_candidate.amount,
-            bridgeCoinId=bridge_candidate.coin_id,
-            createdAt=now,
-            updatedAt=now,
+        if settings.zkpassport_bridge_auto_topup_enabled and not top_up_attempted:
+            top_up_attempted = True
+            extra_candidates = await _auto_top_up_bridge_pool(settings)
+            continue
+
+        detail = (
+            "No unspent zkPassport bridge coins are available; top up the bridge pool."
+            if last_empty_pool
+            else "No unreserved zkPassport bridge coins remain; top up the bridge pool."
         )
-        records[vault_launcher_id] = record.model_dump()
-        _save_store(settings, data)
-        return record
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if last_empty_pool
+                else status.HTTP_409_CONFLICT
+            ),
+            detail=detail,
+        )
 
 
 @router.get("/{vault_launcher_id}", response_model=EnrollmentRecord)

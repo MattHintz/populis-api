@@ -29,6 +29,7 @@ from populis_api.admin import (
     ManifestResponse,
     _coin_id_from_fields,
     _select_coin_by_id,
+    require_admin_operator,
     require_admin_token,
 )
 from populis_api.config import Settings
@@ -76,6 +77,30 @@ class TestRequireAdminToken:
             with pytest.raises(HTTPException) as exc:
                 require_admin_token(settings, authorization=f"Bearer {wrong}")
             assert exc.value.status_code == 403
+
+
+class TestRequireAdminOperator:
+    def test_accepts_admin_jwt_authority(self) -> None:
+        settings = Settings(
+            network="testnet11",
+            admin_token=None,
+            admin_pubkey_allowlist="0xabc",
+        )
+        with patch("populis_api.admin.require_admin_jwt", return_value=object()) as jwt:
+            result = require_admin_operator(settings, authorization="Bearer jwt")
+        assert result is None
+        jwt.assert_called_once()
+
+    def test_keeps_static_token_fallback(self) -> None:
+        settings = Settings(network="testnet11", admin_token="secret")
+        result = require_admin_operator(settings, authorization="Bearer secret")
+        assert result is None
+
+    def test_disabled_without_any_admin_authority(self) -> None:
+        settings = Settings(network="testnet11", admin_token=None, admin_pubkey_allowlist="")
+        with pytest.raises(HTTPException) as exc:
+            require_admin_operator(settings, authorization="Bearer anything")
+        assert exc.value.status_code == 503
 
 
 # ── _select_coin_by_id ──────────────────────────────────────────────────────

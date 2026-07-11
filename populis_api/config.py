@@ -290,6 +290,14 @@ class Settings(BaseSettings):
     # unused parent id per vault. Empty = fail closed.
     zkpassport_bridge_parent_ids: Optional[str] = None
     zkpassport_bridge_amount: int = 1
+    # Staging/testnet helper: when enrollment has no unreserved bridge coin,
+    # create a fresh batch from the configured faucet and reserve one. Keep
+    # disabled by default so production/mainnet never mints operational bridge
+    # coins from a public enrollment request.
+    zkpassport_bridge_auto_topup_enabled: bool = False
+    zkpassport_bridge_auto_topup_count: int = 6
+    zkpassport_bridge_auto_topup_start_amount: int = 1
+    zkpassport_bridge_auto_topup_fee: int = 0
     # Local public receipt/index used for recovery. Chia vault state remains
     # final authority; this index only lets the API/frontend recover receipt
     # material after refresh or wallet reconnect.

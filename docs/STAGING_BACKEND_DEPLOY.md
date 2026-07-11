@@ -45,6 +45,11 @@ Coinset and reserves by full bridge coin id. The old
 `SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS` environment variable remains only as an
 emergency static override.
 
+Staging deploys set `POPULIS_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED=true`, so a
+testnet11 enrollment request can create a fresh bridge batch from the staging
+faucet when every discovered bridge coin is already reserved. This is disabled
+by default in code and must remain off for mainnet.
+
 1. Confirm bridge coins exist at the configured bridge policy hash:
 
 ```bash
@@ -54,9 +59,9 @@ curl -fsS -X POST https://testnet11.api.coinset.org/get_coin_records_by_puzzle_h
   | python3 -m json.tool
 ```
 
-2. If the pool is empty or fully reserved, create more bridge coins from the
-   staging faucet. Prefer the GitHub deploy workflow's top-up inputs so the
-   admin token never leaves the staging host:
+2. If the pool is empty or fully reserved and auto-top-up is unavailable, create
+   more bridge coins from the staging faucet. Prefer the GitHub deploy
+   workflow's top-up inputs so the admin token never leaves the staging host:
 
 ```bash
 gh workflow run deploy-staging.yml \

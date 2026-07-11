@@ -49,11 +49,14 @@ def _client(
     tmp_path,
     parents: str = "",
     bridge_records: list[dict] | None = None,
+    auto_topup: bool = False,
 ) -> TestClient:
     monkeypatch.setenv("POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH", str(tmp_path / "enrollments.json"))
     monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS", parents)
     monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", POLICY_HASH)
     monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AMOUNT", "1")
+    if auto_topup:
+        monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED", "true")
     monkeypatch.setattr(
         zkpassport_enrollments,
         "_fetch_bridge_coin_records",
@@ -79,6 +82,27 @@ def test_create_enrollment_discovers_unspent_bridge_coins(monkeypatch, tmp_path)
     assert body["bridgeParentId"] == PARENT_A
     assert body["bridgeAmount"] == 2
     assert body["bridgeCoinId"] == _coin_id(PARENT_A, POLICY_HASH, 2)
+
+
+def test_create_enrollment_auto_topups_when_pool_is_empty(monkeypatch, tmp_path):
+    async def fake_topup(_settings):
+        return [
+            zkpassport_enrollments.BridgeCoinCandidate(
+                parent_id=PARENT_B,
+                amount=3,
+                coin_id=_coin_id(PARENT_B, POLICY_HASH, 3),
+            )
+        ]
+
+    monkeypatch.setattr(zkpassport_enrollments, "_auto_top_up_bridge_pool", fake_topup)
+    with _client(monkeypatch, tmp_path, parents="", bridge_records=[], auto_topup=True) as client:
+        created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["bridgeParentId"] == PARENT_B
+    assert body["bridgeAmount"] == 3
+    assert body["bridgeCoinId"] == _coin_id(PARENT_B, POLICY_HASH, 3)
 
 
 def test_create_enrollment_reserves_bridge_coin_and_gets_same_record(monkeypatch, tmp_path):
