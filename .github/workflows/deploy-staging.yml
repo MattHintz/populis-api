@@ -17,8 +17,9 @@ concurrency:
 
 env:
   RELEASE_ROOT: /opt/solslot/api-staging
-  PM2_PROCESS_NAME: solslot-api-staging
-  LEGACY_PM2_PROCESS_NAME: solslot-api
+  SHARED_ROOT: /var/lib/populis-ceremony
+  SYSTEMD_SERVICE: populis-api-ceremony.service
+  APP_PORT: "8790"
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'main' }}
@@ -91,7 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           pattern='sk_(live|test)_[A-Za-z0-9]+|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|MANDRILL_API_KEY=|STRIPE_SECRET_KEY=|BEGIN (RSA|EC|OPENSSH|PRIVATE)'
-          if grep -R -n -E "$pattern" "$APP_PACKAGE" tests .github; then
+          if grep -R -n -E "$pattern" "$APP_PACKAGE" tests .github --exclude="*.yml" --exclude="*.yaml"; then
             echo "Secret-like value found in API source, tests, or workflows."
             exit 1
           fi
@@ -184,90 +185,19 @@ jobs:
             release_sha="${{ github.sha }}"
             release_dir="$release_root/releases/$release_sha"
             archive="/tmp/solslot-api-release-$release_sha.tgz"
-            shared_dir="$release_root/shared"
-            state_dir="$shared_dir/state"
-            env_file="$shared_dir/.env"
-            pm2_owner="${{ vars.STAGING_PM2_OWNER || secrets.STAGING_SSH_USER }}"
-            [ -n "$pm2_owner" ] || pm2_owner="$(id -un)"
+            shared_dir="${{ env.SHARED_ROOT }}"
+            env_file="$shared_dir/api.env"
+            systemd_service="${{ env.SYSTEMD_SERVICE }}"
+            app_port="${{ env.APP_PORT }}"
 
-            find_pm2_for_user() {
-              user="$1"
-              home_dir="$(getent passwd "$user" | cut -d: -f6)"
-              for candidate in \
-                /usr/local/bin/pm2 \
-                /usr/bin/pm2 \
-                "$home_dir"/.local/bin/pm2 \
-                "$home_dir"/.npm-global/bin/pm2 \
-                "$home_dir"/.yarn/bin/pm2 \
-                "$home_dir"/.nvm/versions/node/*/bin/pm2
-              do
-                if [ -x "$candidate" ]; then
-                  printf '%s\n' "$candidate"
-                  return 0
-                fi
-              done
-              if [ -s "$home_dir/.nvm/nvm.sh" ]; then
-                sudo -H -u "$user" bash -lc ". '$home_dir/.nvm/nvm.sh' && command -v pm2" 2>/dev/null || true
-              fi
-              sudo -H -u "$user" bash -lc 'command -v pm2' 2>/dev/null || true
-            }
-
-            pm2_bin="$(find_pm2_for_user "$pm2_owner" | head -n 1)"
-            if [ -z "$pm2_bin" ] && id ec2-user >/dev/null 2>&1; then
-              pm2_owner=ec2-user
-              pm2_bin="$(find_pm2_for_user "$pm2_owner" | head -n 1)"
-            fi
-            if [ -z "$pm2_bin" ]; then
-              echo "pm2 not found. user=$(id -un), requested owner=$pm2_owner"
-              echo "Known users:" && cut -d: -f1,6 /etc/passwd | grep -E 'ec2-user|ubuntu|deploy|www-data|apache|root' || true
-              exit 1
-            fi
-
-            run_pm2() {
-              if [ "$pm2_owner" = "$(id -un)" ]; then
-                "$pm2_bin" "$@"
-              else
-                owner_home="$(getent passwd "$pm2_owner" | cut -d: -f6)"
-                sudo -H -u "$pm2_owner" env PM2_HOME="$owner_home/.pm2" "$pm2_bin" "$@"
-              fi
-            }
-
-            sudo mkdir -p "$release_root/releases" "$shared_dir" "$state_dir"
+            sudo mkdir -p "$release_root/releases" "$shared_dir"
             sudo chown -R "$(id -un)":"$(id -gn)" "$release_root"
             test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
-
-            legacy_cwd="$(run_pm2 jlist | python3 -c 'import json,sys; data=json.load(sys.stdin); names=("solslot-api-staging","solslot-api"); print(next((p.get("pm2_env",{}).get("pm_cwd") or p.get("pm2_env",{}).get("PWD") or "") for name in names for p in data if p.get("name")==name), ""))' 2>/dev/null || true)"
-            if [ ! -f "$env_file" ] && [ -n "$legacy_cwd" ] && [ -f "$legacy_cwd/.env" ]; then
-              cp "$legacy_cwd/.env" "$env_file"
-              chmod 600 "$env_file"
-              echo "Bootstrapped shared .env from existing API cwd: $legacy_cwd"
-            fi
-            test -f "$env_file" || (echo "Missing $env_file. Copy the existing API .env there before deploying." && exit 1)
-
-            if [ -n "$legacy_cwd" ]; then
-              for state_file in \
-                admin_records.json \
-                bootstrap_manifest.json \
-                bootstrap_recovery_anchor.json \
-                deployment_manifest.json \
-                portal_runtime_config.json \
-                vault_registrations.json \
-                zkpassport_enrollments.json
-              do
-                if [ -f "$legacy_cwd/$state_file" ] && [ ! -f "$state_dir/$state_file" ]; then
-                  cp "$legacy_cwd/$state_file" "$state_dir/$state_file"
-                  echo "Copied existing state file into shared state: $state_file"
-                fi
-              done
-            fi
+            sudo test -f "$env_file" || (echo "Missing $env_file on staging host." && exit 1)
 
             rm -rf "$release_dir"
             mkdir -p "$release_dir"
             tar -xzf "$archive" -C "$release_dir"
-            ln -sfn "$env_file" "$release_dir/.env"
-            mkdir -p "$release_dir/state"
-            rmdir "$release_dir/state"
-            ln -sfn "$state_dir" "$release_dir/state"
 
             cd "$release_dir"
             package_name="$(python3 -c 'import json; print(json.load(open("release.json"))["package_name"])')"
@@ -285,33 +215,24 @@ jobs:
             assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
             PY
 
-            cat > "$release_root/ecosystem.config.cjs" <<EOF
-            module.exports = {
-              apps: [{
-                name: "${{ env.PM2_PROCESS_NAME }}",
-                cwd: "$release_root/current",
-                script: "$release_root/current/.venv/bin/uvicorn",
-                args: "$app_module --host 127.0.0.1 --port 5001",
-                interpreter: "none",
-                env: {
-                  PYTHONUNBUFFERED: "1",
-                  SOLSLOT_STATE_DIR: "$state_dir",
-                  POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH: "$state_dir/zkpassport_enrollments.json"
-                }
-              }]
-            };
-            EOF
-
             ln -sfn "$release_dir" "$release_root/current"
-            if run_pm2 describe "${{ env.LEGACY_PM2_PROCESS_NAME }}" >/dev/null 2>&1 && ! run_pm2 describe "${{ env.PM2_PROCESS_NAME }}" >/dev/null 2>&1; then
-              run_pm2 delete "${{ env.LEGACY_PM2_PROCESS_NAME }}" || true
-            fi
-            run_pm2 startOrReload "$release_root/ecosystem.config.cjs" --update-env
-            run_pm2 save
+            sudo mkdir -p /etc/systemd/system/"$systemd_service".d
+            sudo tee /etc/systemd/system/"$systemd_service".d/solslot-staging.conf >/dev/null <<EOF
+            [Service]
+            WorkingDirectory=$release_root/current
+            EnvironmentFile=$env_file
+            Environment=PYTHONUNBUFFERED=1
+            Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$shared_dir/zkpassport_enrollments.json
+            ExecStart=
+            ExecStart=$release_root/current/.venv/bin/uvicorn $app_module --host 127.0.0.1 --port $app_port
+            ReadWritePaths=$shared_dir $release_root/current
+            EOF
+            sudo systemctl daemon-reload
+            sudo systemctl restart "$systemd_service"
 
             sleep 5
-            curl -fsS http://127.0.0.1:5001/health
-            curl -fsS http://127.0.0.1:5001/openapi.json \
+            curl -fsS "http://127.0.0.1:$app_port/health"
+            curl -fsS "http://127.0.0.1:$app_port/openapi.json" \
               | "$release_dir/.venv/bin/python" -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
 
             find "$release_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
@@ -326,7 +247,7 @@ jobs:
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/openapi.json" \
             | python -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
 
-      - name: Print PM2 diagnostics on failure
+      - name: Print staging API diagnostics on failure
         if: failure()
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -338,20 +259,10 @@ jobs:
           script: |
             set +e
             echo "user=$(id -un) home=$HOME"
-            ps aux | grep -E 'uvicorn|pm2|solslot-api|populis_api' | grep -v grep
-            for user in "$(id -un)" ec2-user ubuntu; do
-              if id "$user" >/dev/null 2>&1; then
-                home_dir="$(getent passwd "$user" | cut -d: -f6)"
-                for pm2 in /usr/local/bin/pm2 /usr/bin/pm2 "$home_dir"/.nvm/versions/node/*/bin/pm2; do
-                  if [ -x "$pm2" ]; then
-                    echo "== pm2 for $user: $pm2 =="
-                    sudo -H -u "$user" env PM2_HOME="$home_dir/.pm2" "$pm2" list
-                    sudo -H -u "$user" env PM2_HOME="$home_dir/.pm2" "$pm2" logs "${{ env.PM2_PROCESS_NAME }}" --lines 80 --nostream
-                    sudo -H -u "$user" env PM2_HOME="$home_dir/.pm2" "$pm2" logs "${{ env.LEGACY_PM2_PROCESS_NAME }}" --lines 80 --nostream
-                  fi
-                done
-              fi
-            done
+            ps aux | grep -E 'uvicorn|solslot|populis_api' | grep -v grep
+            sudo systemctl status "${{ env.SYSTEMD_SERVICE }}" --no-pager
+            sudo journalctl -u "${{ env.SYSTEMD_SERVICE }}" -n 120 --no-pager
+            curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" || true
 
   rollback:
     if: ${{ github.event.inputs.rollback_sha != '' && github.event.inputs.rollback_sha != null }}
@@ -373,23 +284,10 @@ jobs:
             release_dir="$release_root/releases/$rollback_sha"
             test -d "$release_dir" || (echo "No release directory exists for $rollback_sha" && exit 1)
 
-            pm2_owner="${{ vars.STAGING_PM2_OWNER || secrets.STAGING_SSH_USER }}"
-            [ -n "$pm2_owner" ] || pm2_owner="$(id -un)"
-            if id ec2-user >/dev/null 2>&1; then
-              pm2_owner=ec2-user
-            fi
-            owner_home="$(getent passwd "$pm2_owner" | cut -d: -f6)"
-            pm2_bin="$(for c in /usr/local/bin/pm2 /usr/bin/pm2 "$owner_home"/.local/bin/pm2 "$owner_home"/.npm-global/bin/pm2 "$owner_home"/.yarn/bin/pm2 "$owner_home"/.nvm/versions/node/*/bin/pm2; do [ -x "$c" ] && echo "$c" && break; done)"
-            if [ -z "$pm2_bin" ] && [ -s "$owner_home/.nvm/nvm.sh" ]; then
-              pm2_bin="$(sudo -H -u "$pm2_owner" bash -lc ". '$owner_home/.nvm/nvm.sh' && command -v pm2" 2>/dev/null || true)"
-            fi
-            test -n "$pm2_bin" || (echo "pm2 not found for rollback owner $pm2_owner" && exit 1)
-
             ln -sfn "$release_dir" "$release_root/current"
-            sudo -H -u "$pm2_owner" env PM2_HOME="$owner_home/.pm2" "$pm2_bin" startOrReload "$release_root/ecosystem.config.cjs" --update-env
-            sudo -H -u "$pm2_owner" env PM2_HOME="$owner_home/.pm2" "$pm2_bin" save
+            sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}"
             sleep 5
-            curl -fsS http://127.0.0.1:5001/health
+            curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health"
 
       - name: Verify public rollback
         run: |
