@@ -200,11 +200,21 @@ jobs:
             tar -xzf "$archive" -C "$release_dir"
 
             cd "$release_dir"
-            package_name="$(python3 -c 'import json; print(json.load(open("release.json"))["package_name"])')"
-            app_module="$(python3 -c 'import json; print(json.load(open("release.json"))["app_module"])')"
-            python3 -m venv .venv
+            python_bin="$(command -v python3.12 || command -v python3.11 || true)"
+            if [ -z "$python_bin" ]; then
+              echo "Python 3.11+ is required on the staging host."
+              exit 1
+            fi
+            "$python_bin" - <<'PY'
+            import sys
+            if sys.version_info < (3, 11):
+                raise SystemExit(f"Python 3.11+ is required, found {sys.version}")
+            PY
+            package_name="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["package_name"])')"
+            app_module="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["app_module"])')"
+            "$python_bin" -m venv .venv
             .venv/bin/python -m pip install --upgrade pip wheel
-            .venv/bin/python -m pip install ./protocol .
+            .venv/bin/python -m pip install -e ./protocol .
             .venv/bin/python -m compileall -q "$package_name"
             .venv/bin/python - <<PY
             import importlib
@@ -225,7 +235,7 @@ jobs:
             Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$shared_dir/zkpassport_enrollments.json
             ExecStart=
             ExecStart=$release_root/current/.venv/bin/uvicorn $app_module --host 127.0.0.1 --port $app_port
-            ReadWritePaths=$shared_dir $release_root/current
+            ReadWritePaths=$shared_dir $release_root
             EOF
             sudo systemctl daemon-reload
             sudo systemctl restart "$systemd_service"

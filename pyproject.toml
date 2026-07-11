@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "populis_api"
 version = "0.1.0"
-description = "Populis faucet API for vault launcher funding, registration challenges, and legacy operator endpoints"
+description = "Solslot protocol API for vault launcher funding, registration challenges, and legacy operator endpoints"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = { text = "Proprietary - All Rights Reserved" }
 authors = [{ name = "Matthew S. Hintz" }]
 dependencies = [
