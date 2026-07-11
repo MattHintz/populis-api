@@ -112,14 +112,14 @@ version: "1"
 chainId: 1
 ```
 
-Typehash (for actual vault spends, not registration):
+Legacy protocol spend typehash, kept for existing wallet/protocol compatibility:
 ```
 PopulisVaultSpend(bytes32 spend_case,bytes32 deed_launcher_id,bytes32 vault_coin_id)
 ```
 
 The portal uses a separate, simpler typehash for onboarding:
 ```
-PopulisVaultRegister(address owner,bytes32 nonce)
+SolslotVaultRegister(address owner,bytes32 nonce,bytes32 poolLauncherId,string authType,string chiaNetwork)
 ```
 
 ## Tests

@@ -4,7 +4,7 @@ Two responsibilities:
 
 1. **Typed data builders** — emit the exact EIP-712 payload the frontend should
    pass to `signTypedData_v4`.  One for *vault registration* (onboarding, when
-   no vault coin id exists yet) and one that mirrors the in-puzzle
+   no vault coin id exists yet) and one that mirrors the legacy in-puzzle
    `PopulisVaultSpend` typehash for actual vault operations.
 
 2. **Signature verification + pubkey recovery** — given an EIP-712 typed data
@@ -32,7 +32,7 @@ from eth_utils import keccak, to_checksum_address
 
 from .config import get_settings
 
-REGISTER_PRIMARY_TYPE = "PopulisVaultRegister"
+REGISTER_PRIMARY_TYPE = "SolslotVaultRegister"
 # v2 envelope (post POP-CANON-002 fix).  ``eip712_version`` in Settings is
 # pinned to "2" so v1 signatures cannot replay against this expanded type.
 REGISTER_TYPES = {
@@ -57,8 +57,9 @@ REGISTER_TYPES = {
     ],
 }
 
-# Mirrors `POPULIS_VAULT_TYPEHASH_STRING` in populis_puzzles/vault_driver.py.
-# Kept as a module constant so tests can assert both sides agree.
+# Mirrors the legacy in-puzzle vault spend typehash in
+# populis_puzzles/vault_driver.py. Kept as a module constant so tests can
+# assert both sides agree while registration uses the Solslot envelope above.
 VAULT_SPEND_TYPEHASH_STRING = (
     "PopulisVaultSpend(bytes32 spend_case,bytes32 deed_launcher_id,bytes32 vault_coin_id)"
 )

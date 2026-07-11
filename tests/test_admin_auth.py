@@ -103,7 +103,7 @@ class TestTypedData:
         assert td["message"]["scope"] == "admin"
 
     def test_envelope_distinct_from_registration_typehash(self, settings_with_admin):
-        # Sanity: PopulisVaultRegister envelope and PopulisAdminLogin
+        # Sanity: SolslotVaultRegister envelope and PopulisAdminLogin
         # envelope must not collide.  The primary type alone separates
         # them under EIP-712's structHash, so even fields that overlap
         # by name (e.g. ``authType``) hash distinctly.

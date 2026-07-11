@@ -78,6 +78,9 @@ class TestEnvelopeExpansion:
             auth_type="secp256k1",
             chia_network="testnet11",
         )
+        assert td["primaryType"] == "SolslotVaultRegister"
+        assert "SolslotVaultRegister" in td["types"]
+        assert "PopulisVaultRegister" not in td["types"]
         msg = td["message"]
         assert msg["owner"] == "0x1234567890123456789012345678901234567890"
         assert msg["nonce"] == "0x" + "ab" * 32
