@@ -308,10 +308,22 @@ jobs:
             esac
 
             test -f "$env_file" || (echo "Missing $env_file" >&2; exit 1)
-            set -a
-            . "$env_file"
-            set +a
-            admin_token="${SOLSLOT_ADMIN_TOKEN:-${POPULIS_ADMIN_TOKEN:-}}"
+            admin_token="$(ENV_FILE="$env_file" python3 - <<'PY'
+            import os
+            from pathlib import Path
+
+            token = ""
+            for raw in Path(os.environ["ENV_FILE"]).read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.removeprefix("export ").strip()
+                if key in {"SOLSLOT_ADMIN_TOKEN", "POPULIS_ADMIN_TOKEN"}:
+                    token = value.strip().strip("'\"")
+            print(token)
+            PY
+            )"
             test -n "$admin_token" || (echo "No admin token configured in $env_file" >&2; exit 1)
 
             body="$(python3 - <<PY
