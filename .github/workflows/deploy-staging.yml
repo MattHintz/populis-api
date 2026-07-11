@@ -3,6 +3,11 @@ name: Staging Backend Deploy
 on:
   workflow_dispatch:
     inputs:
+      diagnostics_only:
+        description: "Inspect the live staging API without deploying a release."
+        required: false
+        type: boolean
+        default: false
       rollback_sha:
         description: "Existing release SHA to roll back to. Leave blank for a normal deploy."
         required: false
@@ -36,13 +41,14 @@ env:
   SYSTEMD_SERVICE: ${{ vars.SOLSLOT_API_SYSTEMD_SERVICE || 'populis-api-staging.service' }}
   APP_PORT: ${{ vars.SOLSLOT_API_PORT || '8790' }}
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
+  EXPECTED_HOSTNAME: ${{ vars.SOLSLOT_API_HOSTNAME || 'SolomonsLot' }}
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'main' }}
   ZKPASSPORT_BRIDGE_PARENT_IDS: ${{ vars.SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS || vars.POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS || '' }}
 
 jobs:
   build-release:
-    if: ${{ github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null }}
+    if: ${{ (github.event.inputs.diagnostics_only != 'true') && (github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null) }}
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -208,6 +214,11 @@ jobs:
             app_port="${{ env.APP_PORT }}"
             zkpassport_bridge_parent_ids="${{ env.ZKPASSPORT_BRIDGE_PARENT_IDS }}"
             zkpassport_bridge_parent_env_lines=""
+            actual_hostname="$(hostname)"
+            if [ "$actual_hostname" != "${{ env.EXPECTED_HOSTNAME }}" ]; then
+              echo "Refusing staging deploy: expected host ${{ env.EXPECTED_HOSTNAME }}, got $actual_hostname" >&2
+              exit 1
+            fi
             if [ -n "$zkpassport_bridge_parent_ids" ]; then
               zkpassport_bridge_parent_env_lines="$(printf 'Environment=POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS=%s\nEnvironment=SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS=%s' "$zkpassport_bridge_parent_ids" "$zkpassport_bridge_parent_ids")"
             fi
@@ -363,7 +374,7 @@ jobs:
             curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" || true
 
   rollback:
-    if: ${{ github.event.inputs.rollback_sha != '' && github.event.inputs.rollback_sha != null }}
+    if: ${{ (github.event.inputs.diagnostics_only != 'true') && (github.event.inputs.rollback_sha != '' && github.event.inputs.rollback_sha != null) }}
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -392,3 +403,34 @@ jobs:
           set -euo pipefail
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/openapi.json" >/dev/null
+
+  runtime-diagnostics:
+    if: ${{ github.event.inputs.diagnostics_only == 'true' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Inspect live staging API
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 5m
+          script: |
+            set +e
+            echo "hostname=$(hostname) expected=${{ env.EXPECTED_HOSTNAME }}"
+            echo "user=$(id -un) home=$HOME"
+            echo "current=$(readlink -f '${{ env.RELEASE_ROOT }}/current')"
+            sudo systemctl status "${{ env.SYSTEMD_SERVICE }}" --no-pager
+            ps -eo pid,user,lstart,cmd | grep -E 'uvicorn .*populis_api|uvicorn .*solslot_api' | grep -v grep
+            echo "--- recent API journal ---"
+            sudo journalctl -u "${{ env.SYSTEMD_SERVICE }}" -n 300 --no-pager
+            echo "--- local health ---"
+            curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" || true
+            echo
+            echo "--- local OpenAPI routes ---"
+            curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("info",{}).get("title")); [print(path) for path in sorted(d.get("paths",{})) if "zkpassport" in path]' \
+              || true
