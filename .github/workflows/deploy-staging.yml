@@ -24,6 +24,7 @@ env:
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'main' }}
+  ZKPASSPORT_BRIDGE_PARENT_IDS: ${{ vars.SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS || vars.POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS || '' }}
 
 jobs:
   build-release:
@@ -191,6 +192,11 @@ jobs:
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             app_port="${{ env.APP_PORT }}"
+            zkpassport_bridge_parent_ids="${{ env.ZKPASSPORT_BRIDGE_PARENT_IDS }}"
+            zkpassport_bridge_parent_env_lines=""
+            if [ -n "$zkpassport_bridge_parent_ids" ]; then
+              zkpassport_bridge_parent_env_lines="$(printf 'Environment=POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS=%s\nEnvironment=SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS=%s' "$zkpassport_bridge_parent_ids" "$zkpassport_bridge_parent_ids")"
+            fi
 
             sudo mkdir -p "$release_root/releases" "$state_dir"
             sudo chown -R "$(id -un)":"$(id -gn)" "$release_root" "$shared_root"
@@ -235,6 +241,8 @@ jobs:
             EnvironmentFile=$env_file
             Environment=PYTHONUNBUFFERED=1
             Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
+            Environment=SOLSLOT_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
+            $zkpassport_bridge_parent_env_lines
             ExecStart=
             ExecStart=$release_root/current/.venv/bin/uvicorn $app_module --host 127.0.0.1 --port $app_port
             ReadWritePaths=$shared_root $release_root
