@@ -20,6 +20,18 @@ The workflow packages a release, uploads it to the AWS staging host, switches
 `/opt/solslot/api-staging/current`, restarts the staging systemd service, and
 checks both local and public `/health` plus OpenAPI.
 
+For changes to identity enrollment, the minimum local gate is:
+
+```bash
+python -m pytest \
+  tests/test_zkpassport_enrollments.py \
+  tests/test_zkpassport_relay.py \
+  tests/test_zkpassport_validator.py -q
+```
+
+The end-to-end state and failure rules are defined in
+[`ZKPASSPORT_CHIA_VAULT_ATTESTATION.md`](ZKPASSPORT_CHIA_VAULT_ATTESTATION.md).
+
 ## Verification
 
 ```bash

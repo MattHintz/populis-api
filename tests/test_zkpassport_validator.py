@@ -8,7 +8,9 @@ import pytest
 from chia_rs import AugSchemeMPL, G2Element
 from fastapi.testclient import TestClient
 
+from populis_api import zkpassport_validator
 from populis_api.app import app
+from populis_api.faucet import AGG_SIG_ME_DATA
 from populis_api.zkpassport_validator import _validator_sk
 
 # ---------------------------------------------------------------------------
@@ -21,11 +23,18 @@ EXPECTED_PUBKEY_HEX = (
     "f5b6e1a399fc8a749daf45dd74efac4c"
 )
 VALIDATOR_MESSAGE_HEX = "0x" + "ab" * 32
+VAULT_LAUNCHER_ID = "0x" + "11" * 32
+BRIDGE_COIN_ID = "0x" + "22" * 32
 
 
 @pytest.fixture()
 def client_with_seed(monkeypatch):
     monkeypatch.setenv("POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX", SEED_HEX)
+    monkeypatch.setattr(
+        zkpassport_validator,
+        "indexed_validator_signing_context",
+        lambda _vault: (VALIDATOR_MESSAGE_HEX, BRIDGE_COIN_ID, "testnet11"),
+    )
     _validator_sk.cache_clear()
     with TestClient(app) as c:
         yield c
@@ -68,10 +77,20 @@ class TestGetValidator:
 # ---------------------------------------------------------------------------
 
 class TestSign:
-    def test_signs_valid_message(self, client_with_seed):
+    def test_requires_vault_launcher_context(self, client_with_seed):
         resp = client_with_seed.post(
             "/zkpassport/sign",
             json={"validator_message_hex": VALIDATOR_MESSAGE_HEX},
+        )
+        assert resp.status_code == 422
+
+    def test_signs_valid_message(self, client_with_seed):
+        resp = client_with_seed.post(
+            "/zkpassport/sign",
+            json={
+                "validator_message_hex": VALIDATOR_MESSAGE_HEX,
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -83,7 +102,10 @@ class TestSign:
     def test_signature_verifies(self, client_with_seed):
         resp = client_with_seed.post(
             "/zkpassport/sign",
-            json={"validator_message_hex": VALIDATOR_MESSAGE_HEX},
+            json={
+                "validator_message_hex": VALIDATOR_MESSAGE_HEX,
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
         )
         data = resp.json()
         pk_bytes = bytes.fromhex(data["pubkey_hex"])
@@ -92,45 +114,95 @@ class TestSign:
         from chia_rs import G1Element, G2Element
         pk = G1Element.from_bytes(pk_bytes)
         sig = G2Element.from_bytes(sig_bytes)
-        assert AugSchemeMPL.verify(pk, msg, sig)
+        assert AugSchemeMPL.verify(
+            pk,
+            msg
+            + bytes.fromhex(BRIDGE_COIN_ID.removeprefix("0x"))
+            + AGG_SIG_ME_DATA["testnet11"],
+            sig,
+        )
 
     def test_different_messages_give_different_signatures(self, client_with_seed):
         msg_a = "0x" + "aa" * 32
         msg_b = "0x" + "bb" * 32
-        sig_a = client_with_seed.post("/zkpassport/sign", json={"validator_message_hex": msg_a}).json()["signature_hex"]
-        sig_b = client_with_seed.post("/zkpassport/sign", json={"validator_message_hex": msg_b}).json()["signature_hex"]
+        monkeypatch_context = zkpassport_validator.indexed_validator_signing_context
+        zkpassport_validator.indexed_validator_signing_context = lambda _vault: (
+            msg_a,
+            BRIDGE_COIN_ID,
+            "testnet11",
+        )
+        try:
+            sig_a = client_with_seed.post(
+                "/zkpassport/sign",
+                json={
+                    "validator_message_hex": msg_a,
+                    "vault_launcher_id": VAULT_LAUNCHER_ID,
+                },
+            ).json()["signature_hex"]
+            zkpassport_validator.indexed_validator_signing_context = lambda _vault: (
+                msg_b,
+                BRIDGE_COIN_ID,
+                "testnet11",
+            )
+            sig_b = client_with_seed.post(
+                "/zkpassport/sign",
+                json={
+                    "validator_message_hex": msg_b,
+                    "vault_launcher_id": VAULT_LAUNCHER_ID,
+                },
+            ).json()["signature_hex"]
+        finally:
+            zkpassport_validator.indexed_validator_signing_context = monkeypatch_context
         assert sig_a != sig_b
 
     def test_accepts_hex_without_0x_prefix(self, client_with_seed):
         raw = "ab" * 32
-        resp = client_with_seed.post("/zkpassport/sign", json={"validator_message_hex": raw})
+        resp = client_with_seed.post(
+            "/zkpassport/sign",
+            json={
+                "validator_message_hex": raw,
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
+        )
         assert resp.status_code == 200
 
     def test_rejects_short_message(self, client_with_seed):
         resp = client_with_seed.post(
             "/zkpassport/sign",
-            json={"validator_message_hex": "0x" + "ab" * 16},
+            json={
+                "validator_message_hex": "0x" + "ab" * 16,
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
         )
         assert resp.status_code == 422
 
     def test_rejects_long_message(self, client_with_seed):
         resp = client_with_seed.post(
             "/zkpassport/sign",
-            json={"validator_message_hex": "0x" + "ab" * 64},
+            json={
+                "validator_message_hex": "0x" + "ab" * 64,
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
         )
         assert resp.status_code == 422
 
     def test_rejects_non_hex(self, client_with_seed):
         resp = client_with_seed.post(
             "/zkpassport/sign",
-            json={"validator_message_hex": "not-hex"},
+            json={
+                "validator_message_hex": "not-hex",
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
         )
         assert resp.status_code == 422
 
     def test_returns_503_when_unconfigured(self, client_no_seed):
         resp = client_no_seed.post(
             "/zkpassport/sign",
-            json={"validator_message_hex": VALIDATOR_MESSAGE_HEX},
+            json={
+                "validator_message_hex": VALIDATOR_MESSAGE_HEX,
+                "vault_launcher_id": VAULT_LAUNCHER_ID,
+            },
         )
         assert resp.status_code == 503
 

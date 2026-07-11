@@ -103,8 +103,17 @@ jobs:
           assert "Solslot" in app.title, app.title
           assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
           PY
-          if [ -f tests/test_zkpassport_enrollments.py ]; then
-            pytest tests/test_zkpassport_enrollments.py -q
+          zkpassport_tests=()
+          for test_file in \
+            tests/test_zkpassport_enrollments.py \
+            tests/test_zkpassport_relay.py \
+            tests/test_zkpassport_validator.py; do
+            if [ -f "$test_file" ]; then
+              zkpassport_tests+=("$test_file")
+            fi
+          done
+          if [ "${#zkpassport_tests[@]}" -gt 0 ]; then
+            pytest "${zkpassport_tests[@]}" -q
           fi
 
       - name: Secret scan

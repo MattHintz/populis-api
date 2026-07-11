@@ -18,8 +18,9 @@ from typing import Any, Literal, Optional
 
 import httpx
 from eth_abi import decode as abi_decode
+from chia.types.blockchain_format.program import Program
 from chia.wallet.lineage_proof import LineageProof
-from chia_rs import AugSchemeMPL, Coin, SpendBundle
+from chia_rs import AugSchemeMPL, Coin, G1Element, G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi import APIRouter, HTTPException, status
@@ -159,10 +160,13 @@ class PrepareChiaStampResponse(BaseModel):
     currentVaultCoinId: str
     identityAttestRoot: str
     typedData: Optional[dict[str, Any]] = None
+    currentTimestamp: Optional[int] = None
+    vaultCoinSpend: Optional[dict[str, Any]] = None
 
 
-class SubmitEvmChiaStampRequest(BaseModel):
+class SubmitChiaStampRequest(BaseModel):
     signature: str
+    currentTimestamp: Optional[int] = Field(None, ge=0)
 
 
 class SubmitChiaStampResponse(BaseModel):
@@ -902,6 +906,26 @@ def indexed_validator_message(vault_launcher_id: str) -> Optional[str]:
     return parsed.receipt.validatorMessage if parsed.receipt else None
 
 
+def indexed_validator_signing_context(
+    vault_launcher_id: str,
+) -> Optional[tuple[str, str, str]]:
+    """Return the AGG_SIG_ME inputs for one indexed vault proof."""
+    settings = _settings()
+    key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
+    with _STORE_LOCK:
+        record = _load_store(settings).get("records", {}).get(key)
+    if not record:
+        return None
+    parsed = EnrollmentRecord.model_validate(record)
+    if parsed.receipt is None or not parsed.receipt.validatorMessage:
+        return None
+    return (
+        parsed.receipt.validatorMessage,
+        parsed.bridgeCoinId,
+        parsed.network,
+    )
+
+
 @router.post("", response_model=EnrollmentRecord)
 async def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
     settings = _settings()
@@ -1167,6 +1191,226 @@ def record_evm_proof(vault_launcher_id: str, req: RecordProofRequest) -> Enrollm
         return updated
 
 
+def _wallet_coin_spend(coin_spend: Any) -> dict[str, Any]:
+    """Return the CHIP-0002 shape consumed by Goby and Sage."""
+    return {
+        "coin": {
+            "parentCoinInfo": _hex32(coin_spend.coin.parent_coin_info),
+            "puzzleHash": _hex32(coin_spend.coin.puzzle_hash),
+            "amount": int(coin_spend.coin.amount),
+        },
+        "puzzleReveal": "0x" + bytes(coin_spend.puzzle_reveal).hex(),
+        "solution": "0x" + bytes(coin_spend.solution).hex(),
+    }
+
+
+def _build_bls_chia_stamp(
+    settings: Settings,
+    *,
+    key: str,
+    record: EnrollmentRecord,
+    event: IndexedEvmAttestation,
+    vault_coin: Coin,
+    current_timestamp: int,
+) -> tuple[Any, Coin, bytes, G2Element]:
+    """Build the exact BLS vault spend and both AGG_SIG_ME messages.
+
+    The browser receives only the vault coin spend. The API rebuilds it from
+    canonical state during submission and verifies the returned owner
+    signature before aggregating the independently produced validator
+    signature.
+    """
+    if record.receipt is None:
+        raise HTTPException(status_code=409, detail="No EVM proof receipt to stamp.")
+    if not settings.pool_launcher_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Pool launcher id is not configured; the vault stamp cannot be built.",
+        )
+
+    from populis_puzzles.vault_driver import (
+        AUTH_TYPE_BLS,
+        DEFAULT_IDENTITY_ATTEST_ROOT,
+        one_leaf_merkle_root,
+        puzzle_for_vault_full,
+    )
+    from populis_puzzles.zkpassport_bridge_driver import (
+        build_bridge_and_vault_update_identity_bundle,
+        make_bridge_policy_hash,
+    )
+
+    launcher = bytes32.fromhex(key.removeprefix("0x"))
+    vault_record = get_registry().get(launcher)
+    if vault_record is None or vault_record.auth_type != AUTH_TYPE_BLS:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The registered vault is not a Chia BLS vault.",
+        )
+    owner_pubkey = bytes(vault_record.owner_pubkey)
+    try:
+        G1Element.from_bytes(owner_pubkey)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The registered BLS vault owner key is invalid.",
+        ) from exc
+
+    pool_launcher_id = bytes32.fromhex(settings.pool_launcher_id.removeprefix("0x"))
+    bridge_policy_hash = bytes32.fromhex(record.bridgePolicyHash.removeprefix("0x"))
+    members_root = one_leaf_merkle_root(owner_pubkey)
+    current_puzzle = puzzle_for_vault_full(
+        launcher,
+        owner_pubkey,
+        AUTH_TYPE_BLS,
+        members_root,
+        pool_launcher_id,
+        identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+        zkpassport_bridge_policy_hash=bridge_policy_hash,
+    )
+    if bytes32(current_puzzle.get_tree_hash()) != vault_coin.puzzle_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The current Chia coin does not match the registered BLS vault.",
+        )
+
+    validator_sk = _validator_key(settings)
+    validator_pubkey = bytes(validator_sk.get_g1())
+    if make_bridge_policy_hash([validator_pubkey], 1) != bridge_policy_hash:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The configured validator key does not match the vault bridge policy.",
+        )
+
+    try:
+        built = build_bridge_and_vault_update_identity_bundle(
+            bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
+            bridge_amount=record.bridgeAmount,
+            validator_pubkeys=[validator_pubkey],
+            threshold=1,
+            signer_indices=[0],
+            vault_coin=vault_coin,
+            vault_launcher_id=launcher,
+            owner_pubkey_bytes=owner_pubkey,
+            auth_type=AUTH_TYPE_BLS,
+            members_merkle_root=members_root,
+            pool_launcher_id=pool_launcher_id,
+            new_identity_attest_root=bytes32.fromhex(
+                record.receipt.identityAttestRoot.removeprefix("0x")
+            ),
+            attestation_leaf_hash=bytes32.fromhex(
+                record.receipt.attestationLeafHash.removeprefix("0x")
+            ),
+            scoped_nullifier=bytes32.fromhex(event.scoped_nullifier.removeprefix("0x")),
+            nullifier_type=event.nullifier_type,
+            service_scope_hash=bytes32.fromhex(event.service_scope_hash.removeprefix("0x")),
+            service_subscope_hash=bytes32.fromhex(
+                event.service_subscope_hash.removeprefix("0x")
+            ),
+            proof_timestamp=event.proof_timestamp,
+            current_timestamp=current_timestamp,
+            lineage_proof=LineageProof(parent_name=launcher, amount=uint64(1)),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"The Chia BLS identity stamp could not be built: {exc}",
+        ) from exc
+    if _hex32(built.bridge.validator_message) != event.validator_message:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Chia bridge validator message does not match the EVM event.",
+        )
+
+    identity_root = bytes32.fromhex(record.receipt.identityAttestRoot.removeprefix("0x"))
+    expected_puzzle = puzzle_for_vault_full(
+        launcher,
+        owner_pubkey,
+        AUTH_TYPE_BLS,
+        members_root,
+        pool_launcher_id,
+        identity_attest_root=identity_root,
+        zkpassport_bridge_policy_hash=bridge_policy_hash,
+    )
+    expected_vault_coin = Coin(
+        vault_coin.name(),
+        bytes32(expected_puzzle.get_tree_hash()),
+        uint64(1),
+    )
+    owner_inner_message = bytes(
+        Program.to([b"z", identity_root, vault_coin.name()]).get_tree_hash()
+    )
+    owner_message = (
+        owner_inner_message
+        + bytes(vault_coin.name())
+        + AGG_SIG_ME_DATA[settings.network]
+    )
+    validator_signature = AugSchemeMPL.sign(
+        validator_sk,
+        bytes(built.bridge.validator_message)
+        + bytes(built.bridge.bridge_coin_id)
+        + AGG_SIG_ME_DATA[settings.network],
+    )
+    return built, expected_vault_coin, owner_message, validator_signature
+
+
+async def _push_chia_stamp_and_mark_pending(
+    settings: Settings,
+    *,
+    key: str,
+    spend_bundle: SpendBundle,
+    expected_vault_coin: Coin,
+) -> SubmitChiaStampResponse:
+    spend_bundle_id = _hex32(spend_bundle.name())
+    expected_vault_coin_id = _hex32(expected_vault_coin.name())
+    coinset = CoinsetClient(settings.coinset_base_url)
+    try:
+        push_result = await coinset.push_tx(spend_bundle.to_json_dict())
+    except Exception as exc:  # noqa: BLE001 - normalize provider failures for the portal
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Coinset could not submit the Chia vault stamp: {exc}",
+        ) from exc
+    finally:
+        await coinset.close()
+    push_status = str(push_result.get("status") or "").upper()
+    if not push_result.get("success") and push_status not in {"SUCCESS", "PENDING"}:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Coinset rejected the Chia vault stamp: {push_result.get('error') or push_result}",
+        )
+
+    with _STORE_LOCK:
+        data = _load_store(settings)
+        records: dict[str, Any] = data.setdefault("records", {})
+        latest_raw = records.get(key)
+        if not latest_raw:
+            raise HTTPException(status_code=404, detail="Enrollment not found.")
+        latest = EnrollmentRecord.model_validate(latest_raw)
+        if latest.receipt is None:
+            raise HTTPException(status_code=409, detail="No EVM proof receipt to stamp.")
+        receipt = latest.receipt.model_copy(
+            update={
+                "chiaVaultCoinId": expected_vault_coin_id,
+                "chiaSpendBundleId": spend_bundle_id,
+                "confirmedBlockIndex": None,
+            }
+        )
+        pending = latest.model_copy(
+            update={
+                "status": "stamp_pending",
+                "receipt": receipt,
+                "updatedAt": int(time.time()),
+            }
+        )
+        records[key] = pending.model_dump()
+        _save_store(settings, data)
+    return SubmitChiaStampResponse(
+        enrollment=pending,
+        spendBundleId=spend_bundle_id,
+        expectedVaultCoinId=expected_vault_coin_id,
+    )
+
+
 @router.post("/{vault_launcher_id}/stamp/prepare", response_model=PrepareChiaStampResponse)
 def prepare_chia_stamp(vault_launcher_id: str) -> PrepareChiaStampResponse:
     settings = _settings()
@@ -1190,6 +1434,8 @@ def prepare_chia_stamp(vault_launcher_id: str) -> PrepareChiaStampResponse:
     vault_record = get_registry().get(bytes32.fromhex(key.removeprefix("0x")))
     auth_type = "chia_bls" if vault_record and vault_record.auth_type == 1 else "evm"
     typed_data: Optional[dict[str, Any]] = None
+    current_timestamp: Optional[int] = None
+    vault_coin_spend: Optional[dict[str, Any]] = None
     if auth_type == "evm":
         from populis_puzzles.vault_driver import eip712_typed_data_for_vault_spend
 
@@ -1198,19 +1444,38 @@ def prepare_chia_stamp(vault_launcher_id: str) -> PrepareChiaStampResponse:
             bytes32.fromhex(record.receipt.identityAttestRoot.removeprefix("0x")),
             vault_coin.name(),
         )
+    else:
+        event = _fetch_verified_evm_attestation(
+            settings,
+            transaction_hash=record.receipt.evmTxHash,
+            expected_vault_launcher_id=key,
+        )
+        _verify_reserved_bridge_coin(settings, record)
+        current_timestamp = int(time.time())
+        built, _, _, _ = _build_bls_chia_stamp(
+            settings,
+            key=key,
+            record=record,
+            event=event,
+            vault_coin=vault_coin,
+            current_timestamp=current_timestamp,
+        )
+        vault_coin_spend = _wallet_coin_spend(built.vault_spend)
     return PrepareChiaStampResponse(
         vaultLauncherId=key,
         authType=auth_type,
         currentVaultCoinId=_hex32(vault_coin.name()),
         identityAttestRoot=record.receipt.identityAttestRoot,
         typedData=typed_data,
+        currentTimestamp=current_timestamp,
+        vaultCoinSpend=vault_coin_spend,
     )
 
 
 @router.post("/{vault_launcher_id}/stamp/submit", response_model=SubmitChiaStampResponse)
 async def submit_evm_chia_stamp(
     vault_launcher_id: str,
-    req: SubmitEvmChiaStampRequest,
+    req: SubmitChiaStampRequest,
 ) -> SubmitChiaStampResponse:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
@@ -1255,6 +1520,53 @@ async def submit_evm_chia_stamp(
     vault_coin = _find_initial_vault_coin(settings, key)
     _verify_reserved_bridge_coin(settings, record)
 
+    launcher = bytes32.fromhex(key.removeprefix("0x"))
+    vault_record = get_registry().get(launcher)
+    if vault_record is not None and vault_record.auth_type == 1:
+        if req.currentTimestamp is None:
+            raise HTTPException(
+                status_code=422,
+                detail="currentTimestamp is required for a Chia BLS vault stamp.",
+            )
+        if abs(int(time.time()) - req.currentTimestamp) > 90:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The BLS vault stamp authorization expired. Prepare and sign it again.",
+            )
+        built, expected_vault_coin, owner_message, validator_signature = (
+            _build_bls_chia_stamp(
+                settings,
+                key=key,
+                record=record,
+                event=event,
+                vault_coin=vault_coin,
+                current_timestamp=req.currentTimestamp,
+            )
+        )
+        try:
+            owner_signature_bytes = bytes.fromhex(req.signature.removeprefix("0x"))
+            if len(owner_signature_bytes) != 96:
+                raise ValueError("BLS vault stamp signature must be 96 bytes.")
+            owner_signature = G2Element.from_bytes(owner_signature_bytes)
+            owner_public_key = G1Element.from_bytes(bytes(vault_record.owner_pubkey))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not AugSchemeMPL.verify(owner_public_key, owner_message, owner_signature):
+            raise HTTPException(
+                status_code=400,
+                detail="The BLS owner signature does not authorize this exact vault stamp.",
+            )
+        spend_bundle = SpendBundle(
+            list(built.spend_bundle.coin_spends),
+            AugSchemeMPL.aggregate([owner_signature, validator_signature]),
+        )
+        return await _push_chia_stamp_and_mark_pending(
+            settings,
+            key=key,
+            spend_bundle=spend_bundle,
+            expected_vault_coin=expected_vault_coin,
+        )
+
     from populis_puzzles.vault_driver import (
         AUTH_TYPE_SECP256K1,
         DEFAULT_IDENTITY_ATTEST_ROOT,
@@ -1286,7 +1598,6 @@ async def submit_evm_chia_stamp(
             detail="The vault stamp signature is not from the zkPassport event signer.",
         )
 
-    launcher = bytes32.fromhex(key.removeprefix("0x"))
     pool_launcher_id = bytes32.fromhex(settings.pool_launcher_id.removeprefix("0x"))
     bridge_policy_hash = bytes32.fromhex(record.bridgePolicyHash.removeprefix("0x"))
     members_root = one_leaf_merkle_root(recovery.compressed_pubkey)
@@ -1405,55 +1716,11 @@ async def submit_evm_chia_stamp(
         bytes32(expected_puzzle.get_tree_hash()),
         uint64(1),
     )
-    spend_bundle_id = _hex32(spend_bundle.name())
-    expected_vault_coin_id = _hex32(expected_vault_coin.name())
-
-    coinset = CoinsetClient(settings.coinset_base_url)
-    try:
-        push_result = await coinset.push_tx(spend_bundle.to_json_dict())
-    except Exception as exc:  # noqa: BLE001 - normalize provider failures for the portal
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Coinset could not submit the Chia vault stamp: {exc}",
-        ) from exc
-    finally:
-        await coinset.close()
-    push_status = str(push_result.get("status") or "").upper()
-    if not push_result.get("success") and push_status not in {"SUCCESS", "PENDING"}:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Coinset rejected the Chia vault stamp: {push_result.get('error') or push_result}",
-        )
-
-    with _STORE_LOCK:
-        data = _load_store(settings)
-        records: dict[str, Any] = data.setdefault("records", {})
-        latest_raw = records.get(key)
-        if not latest_raw:
-            raise HTTPException(status_code=404, detail="Enrollment not found.")
-        latest = EnrollmentRecord.model_validate(latest_raw)
-        if latest.receipt is None:
-            raise HTTPException(status_code=409, detail="No EVM proof receipt to stamp.")
-        receipt = latest.receipt.model_copy(
-            update={
-                "chiaVaultCoinId": expected_vault_coin_id,
-                "chiaSpendBundleId": spend_bundle_id,
-                "confirmedBlockIndex": None,
-            }
-        )
-        pending = latest.model_copy(
-            update={
-                "status": "stamp_pending",
-                "receipt": receipt,
-                "updatedAt": int(time.time()),
-            }
-        )
-        records[key] = pending.model_dump()
-        _save_store(settings, data)
-    return SubmitChiaStampResponse(
-        enrollment=pending,
-        spendBundleId=spend_bundle_id,
-        expectedVaultCoinId=expected_vault_coin_id,
+    return await _push_chia_stamp_and_mark_pending(
+        settings,
+        key=key,
+        spend_bundle=spend_bundle,
+        expected_vault_coin=expected_vault_coin,
     )
 
 

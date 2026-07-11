@@ -2,7 +2,7 @@
 
 Endpoints:
   GET  /zkpassport/validator        — returns BLS pubkey + config (503 when unset)
-  POST /zkpassport/sign             — sign a validatorMessage with the BLS key
+  POST /zkpassport/sign             — sign an indexed bridge AGG_SIG_ME message
 
 The validator node holds a BLS keypair whose pubkey is curried into the
 ``zkpassport_bridge_message.clsp`` puzzle on the Chia side (the bridge policy
@@ -10,11 +10,10 @@ hash).  When a user completes a zkPassport proof on EVM the portal polls this
 endpoint to collect the threshold signatures needed to spend the bridge coin.
 
 Security model:
-  - The signing endpoint is unauthenticated intentionally: the validator
-    message is a commitment derived from the on-chain EVM event fields; signing
-    a forged message that was never emitted by the contract cannot create a
-    valid bridge spend (the vault puzzle asserts the coin announcement from a
-    real coin whose puzzle hash equals the bridge policy hash).
+  - The signing endpoint is unauthenticated intentionally, but fail-closed: the
+    validator message and bridge coin must come from the indexed canonical EVM
+    event for the supplied vault launcher. The signature includes the bridge
+    coin id and network additional data required by Chia AGG_SIG_ME.
   - Rate-limiting / IP filtering is left to a reverse-proxy layer.
 """
 
@@ -28,7 +27,11 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from .config import Settings
-from .zkpassport_enrollments import indexed_validator_message, _normalize_hex32
+from .faucet import AGG_SIG_ME_DATA
+from .zkpassport_enrollments import (
+    _normalize_hex32,
+    indexed_validator_signing_context,
+)
 
 router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
 
@@ -71,7 +74,7 @@ class ValidatorInfoResponse(BaseModel):
 
 class SignRequest(BaseModel):
     validator_message_hex: str
-    vault_launcher_id: str | None = None
+    vault_launcher_id: str
 
 
 class SignResponse(BaseModel):
@@ -110,15 +113,15 @@ def get_validator_info() -> ValidatorInfoResponse:
     summary="Sign a validatorMessage with the BLS validator key",
 )
 def sign_validator_message(req: SignRequest) -> SignResponse:
-    """Sign a 32-byte validator message (hex) with this node's BLS key.
+    """Sign an indexed validator message for its exact Chia bridge coin.
 
     The ``validator_message_hex`` must be the 64-char hex of the 32-byte
     ``validatorMessage`` field returned by the portal's EVM attestation poller
     (computed as ``sha256-tree-hash`` of the 12 attestation fields as defined
     in ``zkpassport_bridge_message.clsp``).
 
-    Returns the 96-byte BLS signature (192 hex chars) over the message using
-    ``AugSchemeMPL.sign`` with this node's private key.
+    Returns the 96-byte BLS signature over
+    ``validatorMessage || bridgeCoinId || networkAdditionalData``.
     """
     sk = _get_sk()
     try:
@@ -134,23 +137,30 @@ def sign_validator_message(req: SignRequest) -> SignResponse:
             detail=f"validator_message_hex must decode to exactly 32 bytes, got {len(raw)}.",
         )
     msg = bytes32(raw)
-    if req.vault_launcher_id:
-        try:
-            vault_launcher_id = _normalize_hex32(req.vault_launcher_id, "vault_launcher_id")
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        indexed = indexed_validator_message(vault_launcher_id)
-        if indexed is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No indexed zkPassport proof exists for this vault.",
-            )
-        if indexed.lower() != ("0x" + msg.hex()):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="validator_message_hex does not match the indexed vault proof.",
-            )
-    sig = AugSchemeMPL.sign(sk, bytes(msg))
+    try:
+        vault_launcher_id = _normalize_hex32(req.vault_launcher_id, "vault_launcher_id")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    indexed = indexed_validator_signing_context(vault_launcher_id)
+    if indexed is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No indexed zkPassport proof exists for this vault.",
+        )
+    indexed_message, bridge_coin_id, network = indexed
+    if indexed_message.lower() != ("0x" + msg.hex()):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="validator_message_hex does not match the indexed vault proof.",
+        )
+    additional_data = AGG_SIG_ME_DATA.get(network)
+    if additional_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The indexed enrollment uses an unsupported Chia network.",
+        )
+    bridge_coin = bytes.fromhex(bridge_coin_id.removeprefix("0x"))
+    sig = AugSchemeMPL.sign(sk, bytes(msg) + bridge_coin + additional_data)
     pk: G1Element = sk.get_g1()
     return SignResponse(
         pubkey_hex=bytes(pk).hex(),
