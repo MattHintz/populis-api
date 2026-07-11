@@ -7,6 +7,20 @@ on:
         description: "Existing release SHA to roll back to. Leave blank for a normal deploy."
         required: false
         type: string
+      bridge_pool_topup_count:
+        description: "Optional: create this many zkPassport bridge coins after deploy."
+        required: false
+        type: string
+      bridge_pool_topup_start_amount:
+        description: "First bridge coin amount in mojos when bridge_pool_topup_count is set."
+        required: false
+        default: "1"
+        type: string
+      bridge_pool_topup_dry_run:
+        description: "Preview bridge pool top-up without pushing to Coinset."
+        required: false
+        type: boolean
+        default: true
   push:
     branches:
       - staging
@@ -266,6 +280,56 @@ jobs:
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/openapi.json" \
             | python -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
+
+      - name: Optional bridge pool top-up
+        if: ${{ github.event.inputs.bridge_pool_topup_count != '' && github.event.inputs.bridge_pool_topup_count != null }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+
+            env_file="${{ env.ENV_FILE_PATH }}"
+            app_port="${{ env.APP_PORT }}"
+            count="${{ github.event.inputs.bridge_pool_topup_count }}"
+            start_amount="${{ github.event.inputs.bridge_pool_topup_start_amount }}"
+            dry_run="${{ github.event.inputs.bridge_pool_topup_dry_run }}"
+
+            case "$count" in
+              ''|*[!0-9]*) echo "bridge_pool_topup_count must be numeric" >&2; exit 1 ;;
+            esac
+            case "$start_amount" in
+              ''|*[!0-9]*) echo "bridge_pool_topup_start_amount must be numeric" >&2; exit 1 ;;
+            esac
+
+            test -f "$env_file" || (echo "Missing $env_file" >&2; exit 1)
+            set -a
+            . "$env_file"
+            set +a
+            admin_token="${SOLSLOT_ADMIN_TOKEN:-${POPULIS_ADMIN_TOKEN:-}}"
+            test -n "$admin_token" || (echo "No admin token configured in $env_file" >&2; exit 1)
+
+            body="$(python3 - <<PY
+            import json
+            print(json.dumps({
+                "count": int("$count"),
+                "start_amount": int("$start_amount"),
+                "dry_run": "$dry_run".lower() == "true",
+            }))
+            PY
+            )"
+
+            curl -fsS \
+              -X POST "http://127.0.0.1:${app_port}/admin/zkpassport/bridge-pool/top-up" \
+              -H "authorization: Bearer ${admin_token}" \
+              -H "content-type: application/json" \
+              --data "$body" \
+              | python3 -m json.tool
 
       - name: Print staging API diagnostics on failure
         if: failure()
