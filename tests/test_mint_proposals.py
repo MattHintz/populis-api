@@ -1,4 +1,4 @@
-"""Unit tests for ``populis_api.mint_proposals``.
+"""Unit tests for ``solslot_api.mint_proposals``.
 
 In-memory SQLite (``:memory:``) is sufficient for the schema, state
 machine, and uniqueness invariants — no chia_rs imports required.
@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from populis_api.mint_proposals import (
+from solslot_api.mint_proposals import (
     ALL_STATES,
     ALLOWED_TRANSITIONS,
     DuplicateProperty,
@@ -62,7 +62,7 @@ def _publish_args(*, suffix: int = 0) -> dict:
         deed_full_puzhash=_b32(0xD0 + (suffix & 0x0F)),
         proposal_hash=_b32(0xE0 + (suffix & 0x0F)),
         proposal_tracker_coin_id=_b32(0x11),
-        pgt_lock_coin_id=_b32(0x22),
+        sgt_lock_coin_id=_b32(0x22),
         published_bundle_id="bundle",
         deadline=2_000_000_000,
     )
@@ -285,7 +285,7 @@ class TestStateMachine:
         assert rec.deed_full_puzhash == _b32(0xD0 + (30 & 0x0F))
         assert rec.proposal_hash == _b32(0xE0 + (30 & 0x0F))
         assert rec.proposal_tracker_coin_id == _b32(0x11)
-        assert rec.pgt_lock_coin_id == _b32(0x22)
+        assert rec.sgt_lock_coin_id == _b32(0x22)
         assert rec.published_bundle_id == "bundle"
         assert rec.deadline == 2_000_000_000
         assert rec.published_at is not None
@@ -514,7 +514,7 @@ class TestPublicDict:
         # On-chain sub-dict starts entirely null in DRAFT
         assert d["on_chain"] == {
             "proposal_tracker_coin_id": None,
-            "pgt_lock_coin_id": None,
+            "sgt_lock_coin_id": None,
             "deed_launcher_id": None,
             "published_bundle_id": None,
             "executed_bundle_id": None,
@@ -543,7 +543,7 @@ class TestPublicDict:
             assert d["computed"][k].startswith("0x")
             assert len(d["computed"][k]) == 2 + 64
         assert d["on_chain"]["proposal_tracker_coin_id"].endswith("11" * 32)
-        assert d["on_chain"]["pgt_lock_coin_id"].endswith("22" * 32)
+        assert d["on_chain"]["sgt_lock_coin_id"].endswith("22" * 32)
         assert d["on_chain"]["published_bundle_id"] == "bundle"
         assert d["timestamps"]["published_at"] is not None
 

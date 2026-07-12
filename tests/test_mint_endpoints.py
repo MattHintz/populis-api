@@ -1,8 +1,8 @@
-"""Endpoint tests for ``populis_api.mint_endpoints``.
+"""Endpoint tests for ``solslot_api.mint_endpoints``.
 
 Mounts only the admin_auth + mint_endpoints routers on a self-contained
 FastAPI app to avoid the chia_rs LazyNode threading edges that affect
-the full ``populis_api.app`` import.
+the full ``solslot_api.app`` import.
 
 The login flow is exercised end-to-end via eth_account so the JWT used
 in subsequent /admin/mint/* calls is genuinely signed by a real wallet
@@ -20,9 +20,9 @@ from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from populis_api import admin_auth, mint_endpoints
-from populis_api.admin_records import load_admin_records_from_path
-from populis_api.config import get_settings
+from solslot_api import admin_auth, mint_endpoints
+from solslot_api.admin_records import load_admin_records_from_path
+from solslot_api.config import get_settings
 
 
 # ── Test fixtures: deterministic key + address ──────────────────────────────
@@ -57,17 +57,17 @@ def _reset_module_state():
 
 @pytest.fixture
 def settings_for_admin(monkeypatch, tmp_path):
-    # Allow both test operators in the allowlist so we can exercise
-    # multi-operator scenarios.
-    monkeypatch.setenv(
-        "POPULIS_ADMIN_PUBKEY_ALLOWLIST",
-        f"{_TEST_ADDRESS_LOWER},{_OTHER_ADDRESS_LOWER}",
+    path = tmp_path / "admin_records_v2.json"
+    config = _write_admin_records(
+        path,
+        [_TEST_ADDRESS_LOWER, _OTHER_ADDRESS_LOWER],
     )
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "k" * 64)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "900")
-    monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
+    _pin_admin_records_env(monkeypatch, path, config)
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "k" * 64)
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_TTL_SECONDS", "900")
+    monkeypatch.setenv("SOLSLOT_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
     monkeypatch.setenv(
-        "POPULIS_ADMIN_DB_PATH",
+        "SOLSLOT_ADMIN_DB_PATH",
         str(tmp_path / "admin_proposals.db"),
     )
     get_settings.cache_clear()
@@ -127,6 +127,10 @@ def _propose_body(*, suffix: int = 0) -> dict[str, Any]:
 
 
 def _write_admin_records(path, records_evm_addresses: list[str]):
+    pubkeys_by_address = {
+        _TEST_ADDRESS_LOWER: _TEST_ACCT._key_obj.public_key.to_compressed_bytes(),
+        _OTHER_ADDRESS_LOWER: _OTHER_ACCT._key_obj.public_key.to_compressed_bytes(),
+    }
     records = [
         {
             "admin_idx": i,
@@ -135,7 +139,7 @@ def _write_admin_records(path, records_evm_addresses: list[str]):
                 {
                     "kind": "eip712_member",
                     "evm_address": evm,
-                    "secp256k1_pubkey": "0x02" + bytes([i + 1]).hex() + "11" * 31,
+                    "secp256k1_pubkey": "0x" + pubkeys_by_address[evm.lower()].hex(),
                     "type_hash": "0x" + "ee" * 32,
                     "prefix_and_domain_separator": "0x1901" + "ff" * 32,
                 },
@@ -144,7 +148,7 @@ def _write_admin_records(path, records_evm_addresses: list[str]):
         for i, evm in enumerate(records_evm_addresses)
     ]
     path.write_text(json.dumps({
-        "version": 1,
+        "schemaVersion": 2,
         "launcher_id": "0x" + "10" * 32,
         "admin_records": records,
     }))
@@ -152,13 +156,13 @@ def _write_admin_records(path, records_evm_addresses: list[str]):
 
 
 def _pin_admin_records_env(monkeypatch: pytest.MonkeyPatch, path, config) -> None:
-    monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+    monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
     monkeypatch.setenv(
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
         "0x" + config.compute_admins_hash().hex(),
     )
     monkeypatch.setenv(
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
         "0x" + config.launcher_id.hex(),
     )
     get_settings.cache_clear()
@@ -171,13 +175,13 @@ def _admin_records_client(
     records_evm_addresses: list[str],
     legacy_allowlist: str = "",
 ) -> TestClient:
-    path = tmp_path / "admin_records.json"
+    path = tmp_path / "admin_records_v2.json"
     config = _write_admin_records(path, records_evm_addresses)
-    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", legacy_allowlist)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "k" * 64)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "900")
-    monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
-    monkeypatch.setenv("POPULIS_ADMIN_DB_PATH", str(tmp_path / "admin_records_proposals.db"))
+    monkeypatch.setenv("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", legacy_allowlist)
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "k" * 64)
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_TTL_SECONDS", "900")
+    monkeypatch.setenv("SOLSLOT_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
+    monkeypatch.setenv("SOLSLOT_ADMIN_DB_PATH", str(tmp_path / "admin_records_proposals.db"))
     _pin_admin_records_env(monkeypatch, path, config)
     a = FastAPI()
     a.include_router(admin_auth.router)
@@ -565,8 +569,8 @@ class TestCommitteeVote:
     """POP-CANON-013: ``/admin/committee/vote`` is a publish-only forwarder.
 
     The endpoint:
-      * is NOT gated by admin JWT (the PGT signature in the bundle is the
-        authority — any PGT holder must be able to participate),
+      * is NOT gated by admin JWT (the SGT signature in the bundle is the
+        authority — any SGT holder must be able to participate),
       * validates only **structure** (well-formed ``chia_rs.SpendBundle`` JSON
         with at least one coin spend), then
       * forwards to ``coinset.org``'s mempool and faithfully surfaces the
@@ -575,7 +579,7 @@ class TestCommitteeVote:
 
     A minimal but structurally valid SpendBundle JSON is used as the fixture;
     the actual governance / registry semantics are tested end-to-end in
-    populis_protocol's ``test_governance_vault_version_execute_sim.py``.
+    solslot_protocol's ``test_governance_vault_version_execute_sim.py``.
     """
 
     @staticmethod
@@ -605,7 +609,7 @@ class TestCommitteeVote:
     def _override_coinset(app, *, success: bool, status_str: str = "SUCCESS",
                           error: str | None = None, raises: Exception | None = None):
         """Install an AsyncMock CoinsetClient on the test app's dependency."""
-        from populis_api.mint_endpoints import _get_coinset_dep
+        from solslot_api.mint_endpoints import _get_coinset_dep
 
         coinset = MagicMock()
         if raises is not None:

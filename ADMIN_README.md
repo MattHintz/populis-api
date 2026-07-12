@@ -1,330 +1,83 @@
-# Populis Admin Desk — Operations Runbook
+# Solslot V2 Administrator Authority
 
-> Day-to-day operator guide for the JWT-gated `/admin/*` endpoints.
-> For first-time protocol bootstrap (PGT genesis, pool/governance/A.x
-> singleton launches), read **`GENESIS_README.md`** first.
+The API has two deliberately separate authority surfaces.
 
-The admin desk is the operator-facing UI bolted onto the same
-FastAPI process that serves users.  It drives:
+## Ceremony Authority
 
-1. **Mint-proposal lifecycle** — DRAFT → APPROVED → EXECUTED, with
-   on-chain mirroring via the A.1 `mint_proposal_inner.clsp` singleton.
-2. **Key rotation + JWT issuance** — wallet-signature login, short-lived
-   JWTs, refresh-without-re-sign workflow.
-3. **Cross-coin coordination with the on-chain trust roots** — A.2
-   admin-authority, A.3 protocol-config, A.4 property-registry.
+`SOLSLOT_ADMIN_TOKEN` unlocks only the run-once ceremony endpoints while no
+bootstrap lock exists:
 
----
+- `POST /admin/bootstrap/challenge`
+- `POST /admin/deploy/protocol`
+- `POST /admin/protocol-config/finalize`
+- `GET /admin/deployment`
 
-## Auth model at a glance
+The challenge exchanges the bearer credential for an HTTP-only, secure,
+same-site bootstrap cookie. The cookie is scoped to `/admin/bootstrap`, has a
+short TTL, and cannot authorize normal admin routes. Finalization writes the
+bootstrap lock last. The bearer credential must be rotated or removed after
+the ceremony evidence is archived.
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│ POPULIS_ADMIN_TOKEN          (one-shot bearer; genesis only)   │
-│   └─▶ /admin/deploy/protocol  /admin/deployment                │
-├───────────────────────────────────────────────────────────────┤
-│ Phase 2.5+ chain-verified records (PREFERRED) ─────────────────│
-│   POPULIS_ADMIN_RECORDS_PATH → JSON whose admins_hash MUST     │
-│   match the on-chain admin_authority_v2 singleton state.       │
-│   API at boot:                                                  │
-│     1. Loads JSON.                                              │
-│     2. Recomputes admins_hash from the records.                 │
-│     3. Asserts match against env-supplied                       │
-│        POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH (or,     │
-│        in Phase 2.5b-2, directly fetches it from coinset.org).  │
-│     4. Builds the EVM-address allowlist from leaf metadata.     │
-│   Drift in step 3 → API refuses to boot.                        │
-├───────────────────────────────────────────────────────────────┤
-│ Phase 2 env-var allowlist (LEGACY / FALLBACK)                  │
-│   POPULIS_ADMIN_PUBKEY_ALLOWLIST + POPULIS_ADMIN_JWT_SECRET    │
-│   Used only when POPULIS_ADMIN_RECORDS_PATH is unset.          │
-│   └─▶ /admin/auth/* /admin/mint/* /admin/property/* etc.       │
-├───────────────────────────────────────────────────────────────┤
-│ A.5 admin-authority-v2 singleton (on-chain trust root)         │
-│   └─▶ GET /admin/auth/authority_v2                              │
-│       gating_source: 'POPULIS_ADMIN_RECORDS_PATH'               │
-│       (when chain-verified records mode is active)              │
-└───────────────────────────────────────────────────────────────┘
-```
+## Chain-Bound Admin Authority
 
-**Phase 2.5+ trust model.**  When `POPULIS_ADMIN_RECORDS_PATH` is
-configured, the on-chain singleton is the trust root: the records JSON
-is convenience storage that MUST hash to the on-chain `admins_hash` or
-the API refuses to start.  The two paths are NEVER unioned — exclusive
-precedence prevents an env-var admin smuggling past the chain hash
-check.
+Post-genesis admin operations use wallet-signed EIP-712 login and short-lived
+JWTs. The only membership source is a V2 `admin_records_v2.json` file at
+`SOLSLOT_ADMIN_RECORDS_PATH`.
 
-**Backward compat.**  Operators who haven't yet launched a v2
-singleton can continue running pre-Phase-2.5 deployments unchanged:
-leave `POPULIS_ADMIN_RECORDS_PATH` unset and `POPULIS_ADMIN_PUBKEY_ALLOWLIST`
-+ `POPULIS_ADMIN_JWT_SECRET` retain their original behaviour.
+At startup the API:
 
-See `SECURITY.md` §A.5 for the migration plan and threat model.
+1. Requires `schemaVersion: 2` and rejects the retired `version` field.
+2. Recomputes the records `admins_hash` with the protocol implementation.
+3. Matches that hash and launcher to the current admin-authority ceremony
+   coordinates.
+4. Refuses startup on malformed records, drift, missing trust roots, or a
+   non-empty retired environment-only allowlist.
+5. Requires a stable `SOLSLOT_ADMIN_JWT_SECRET` whenever the desk is enabled.
 
----
+The login flow is:
 
-## Required environment
+1. `POST /admin/auth/challenge`
+2. Wallet signs `SolslotAdminLogin` under `Solslot Protocol`, version `2`.
+3. `POST /admin/auth/login`
+4. API recovers the signer, checks the current records set, and issues a
+   short-lived JWT.
+5. Every protected request checks membership again, providing immediate
+   revocation without waiting for JWT expiry.
 
-### Phase 2.5+ (preferred): chain-verified admin records
+## Route Boundaries
 
-After launching the v2 admin-authority singleton via the portal's
-`/admin/launch-authority-v2` wizard, you'll have downloaded an
-`admin_records.json` file.  Configure:
+- Mint proposal mutations require the chain-bound admin JWT.
+- zkPassport bridge-pool top-up requires the chain-bound admin JWT.
+- Committee voting uses its own signed committee authority.
+- Bootstrap cookies and ceremony tokens are rejected by post-genesis routes.
+- Public authority and receipt reads expose only on-chain/public material.
 
-```bash
-# Path to the wizard-generated records JSON.  When set, this is the
-# admin desk's gating source — the env-var allowlist is ignored.
-POPULIS_ADMIN_RECORDS_PATH=/etc/populis/admin_records.json
+## Records Format
 
-# HS256 secret for signing admin JWTs.  Required whenever the admin
-# desk is enabled (records-path or env-var mode).
-# Generate once, persist to .env (POP-CANON-016 forbids per-process
-# random secrets in production).
-POPULIS_ADMIN_JWT_SECRET=$(openssl rand -hex 32)
-
-# Pin which singleton these records bind to.  The wizard puts the
-# launcher_id in admin_records.json's top level too; the env value is
-# cross-checked against it at boot to catch deployment mix-ups
-# (e.g. accidentally deploying mainnet records to testnet).
-POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID=0x...
-
-# On-chain admins_hash, sourced from the singleton's state.  The
-# wizard surfaces this on the success card; coinset.org explorers
-# also display it.  Drift between this and the records JSON's
-# recomputed hash → API refuses to boot.
-POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH=0x...
+```json
+{
+  "$schema": "https://solslot.io/schemas/admin_records_v2.json",
+  "schemaVersion": 2,
+  "launcher_id": "0x...",
+  "admin_records": [
+    {
+      "admin_idx": 0,
+      "m_within": 1,
+      "leaves": [
+        {
+          "kind": "eip712_member",
+          "leaf_hash": "0x...",
+          "evm_address": "0x...",
+          "secp256k1_pubkey": "0x...",
+          "type_hash": "0x...",
+          "prefix_and_domain_separator": "0x..."
+        }
+      ]
+    }
+  ]
+}
 ```
 
-Phase 2.5b-2 will replace `_V2_ADMINS_HASH` with a direct
-coinset.org fetch at API boot, so the chain becomes the single
-source of truth.
-
-### Phase 2 (legacy / fallback): env-var allowlist
-
-```bash
-# Wallet allowlist — comma-separated 0x EVM addresses or BLS G1 hex.
-# Empty = admin desk disabled (returns 503).
-# Only consulted when POPULIS_ADMIN_RECORDS_PATH is unset.
-POPULIS_ADMIN_PUBKEY_ALLOWLIST=0xabc...,0x123...
-
-POPULIS_ADMIN_JWT_SECRET=$(openssl rand -hex 32)
-POPULIS_ADMIN_LOGIN_TOKEN_TTL_SECONDS=900   # JWT lifetime in seconds
-```
-
-### Optional A.2 v1 mirror (informational only)
-
-```bash
-POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID=0x...
-POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS=0xpubkey1,0xpubkey2,...   # BLS G1 hex
-POPULIS_PROTOCOL_ADMIN_AUTHORITY_QUORUM_M=2
-POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION=1
-```
-
-When all four are set, `GET /admin/auth/authority` publishes a
-deterministic `state_hash` matching what the on-chain v1 singleton
-emits.  Auditors can recompute the hash from the singleton's curried
-state and refuse to trust the API if they diverge.
-
----
-
-## Login flow
-
-```
-┌──── operator wallet ────┐                ┌──── populis-api ─────┐
-│                         │                │                       │
-│   1. POST /admin/auth/challenge  ───────▶│  issue nonce + EIP-712│
-│      {address, auth_type}                │  typed-data envelope   │
-│                                          │                       │
-│   ◀───────────────────────────  challenge.typed_data              │
-│                                          │                       │
-│   2. wallet.signTypedData_v4(typed_data) │                       │
-│                                          │                       │
-│   3. POST /admin/auth/login   ──────────▶│ verify sig + allowlist │
-│      {address, nonce, signature,         │ check + bind authType  │
-│       authType, scope: "admin"}          │ (POP-CANON-015)        │
-│                                          │                       │
-│   ◀──────────────────  {jwt, expires_at, owner}                   │
-│                                          │                       │
-│   4. Authorization: Bearer <jwt>   ─────▶│ require_admin_jwt:     │
-│       (every subsequent request)         │ verify + LIVE re-check │
-│                                          │ allowlist (POP-CANON-  │
-│                                          │ 012)                   │
-│                                          │                       │
-│   5. POST /admin/auth/refresh  ─────────▶│ extend session w/o     │
-│       (Authorization header)             │ re-signing             │
-└──────────────────────────────────────────┴───────────────────────┘
-```
-
-Critical security properties:
-
-- **Live allowlist re-check.**  `require_admin_jwt` re-reads the env-var
-  allowlist on every request — a removed pubkey loses access immediately,
-  even if its JWT hasn't expired (POP-CANON-012).
-- **`authType` + `scope` claim binding.**  The login envelope's
-  `authType` and `scope` are bound into the JWT and re-checked on every
-  request, so a token issued for `scope: "user"` cannot be presented at
-  an `/admin/*` endpoint (POP-CANON-015).
-- **Failure-mode opacity.**  Login errors are uniform: invalid sig, bad
-  nonce, missing allowlist all return identical 401s.
-
----
-
-## Mint-proposal lifecycle
-
-The off-chain `MintProposalStore` (SQLite) is the live gating source.
-Each proposal is *also* mirrored on-chain via the A.1
-`mint_proposal_inner.clsp` singleton — a per-proposal launcher coin
-whose state machine runs in lock-step with the API.
-
-```
-   ┌──── operator (admin) ────┐                    ┌──── chain ────┐
-   │                          │                    │                │
-   │  POST /admin/mint/propose                      │                │
-   │   ▶ DRAFT row created                          │                │
-   │   ▶ launcher coin built                        │                │
-   │     └──▶ /admin/mint/{id}/publish ─────────────▶ A.1 launcher   │
-   │                                                  emitted        │
-   │  POST /admin/mint/{id}/cancel                   │ owner-sig      │
-   │   ▶ CANCELLED row + tx                          │ DRAFT→CANCELLED│
-   │                                                  on-chain        │
-   │                                                  + announcement  │
-   │                                                  (PROTOCOL_PREFIX │
-   │                                                   || msg)        │
-   │  POST /admin/mint/{id}/execute                  │ PGT-VOTE bundle│
-   │   ▶ EXECUTED row + tx                           │ APPROVED→      │
-   │                                                  EXECUTED        │
-   └──────────────────────────────────────────────────────────────────┘
-```
-
-States (matching `populis_puzzles/mint_proposal_inner.clsp` exactly):
-
-| State | Value | Reachable from | Required signer |
-|-------|-------|----------------|-----------------|
-| DRAFT | 1 | (initial) | — |
-| APPROVED | 2 | DRAFT | `GOV_PUBKEY` |
-| CANCELLED | 3 | DRAFT | `OWNER_PUBKEY` |
-| EXECUTED | (V2) | APPROVED | (PGT-VOTE bundle, V2) |
-
-Each transition emits a `CREATE_PUZZLE_ANNOUNCEMENT` carrying
-`PROTOCOL_PREFIX (0x50) || sha256tree([transition_case, new_state, new_version])`.
-Off-chain consumers can index these to rebuild the full
-proposal-history without trusting the API.
-
-### Practical workflow
-
-```bash
-# 1. Authenticate.
-JWT=$(curl -s -X POST http://localhost:8787/admin/auth/login \
-  -H 'Content-Type: application/json' \
-  -d "{\"address\": \"$ADDR\", \"nonce\": \"$NONCE\", \"signature\": \"$SIG\", \"authType\": \"evm\", \"scope\": \"admin\"}" \
-  | jq -r .jwt)
-
-# 2. Create a proposal.
-curl -s -X POST http://localhost:8787/admin/mint/propose \
-  -H "Authorization: Bearer $JWT" \
-  -H 'Content-Type: application/json' \
-  -d '{"property_id": "PROP-001", "par_value_mojos": 1000000, "royalty_bps": 500, "quorum_threshold": 10}' \
-  | jq .
-
-# 3. List drafts.
-curl -s http://localhost:8787/admin/mint?state=DRAFT \
-  -H "Authorization: Bearer $JWT" | jq .
-
-# 4. Approve / publish to chain.
-curl -s -X POST http://localhost:8787/admin/mint/{id}/publish \
-  -H "Authorization: Bearer $JWT" | jq .
-
-# 5. Or cancel.
-curl -s -X POST http://localhost:8787/admin/mint/{id}/cancel \
-  -H "Authorization: Bearer $JWT" | jq .
-```
-
-The launcher `id` returned by `propose` IS the on-chain proposal id —
-walk it on coinset.org to verify the state machine's history matches
-what the API reports.
-
----
-
-## Property-registry administration
-
-Each new property identifier should be registered on-chain via the
-A.4 `property_registry_inner.clsp` singleton **before** any mint
-proposal that references it gets approved.  This is what makes the
-registry an audit-trail of legitimate property identifiers rather
-than just an off-chain database.
-
-The registration spend itself is operator-side (it requires the
-`GOV_PUBKEY` curried into the registry singleton), so the API does
-not currently expose a one-shot `/admin/property/register` endpoint.
-For Phase 3, operators drive registrations directly using the
-`property_registry_driver.build_registration_spend` helper from a
-trusted shell.
-
-`GET /protocol` surfaces:
-
-- `property_registry_launcher_id` — the singleton's launcher coin id.
-- `property_registry_mod_hash` — the canonical mod-hash third parties
-  use to identify the singleton's puzzle on-chain.
-
-Phase 3.5 will add a coinset.org-driven indexer + an admin endpoint
-that gates new mint-proposal `property_id_canon`s on whether they
-match a registered announcement.
-
----
-
-## Key rotation (A.2 admin-authority singleton)
-
-> Phase 2 status: **on-chain primitive landed; informational only.**
-> The env-var allowlist remains the live gate.
-
-When you're ready to rotate keys (compromise, team change, scheduled
-hygiene), the recommended workflow is:
-
-1. **Update the env-var allowlist** — this takes effect immediately
-   on every API request (POP-CANON-012).  Restart is *not* required.
-2. **Bump the on-chain singleton** — spend the
-   `admin_authority_inner.clsp` singleton with:
-   - `new_allowlist` = updated set of pubkeys
-   - `new_quorum_m` (if changing)
-   - `new_authority_version = current.AUTHORITY_VERSION + 1` (replay)
-   - `signer_indices` = sorted strictly ascending list of indices into
-     the *current* allowlist
-   - `signatures` = corresponding `AGG_SIG_ME`s
-3. **Update env vars** — bump
-   `POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION` and
-   `POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS` to match.  The
-   `state_hash` on `GET /admin/auth/authority` will refresh.
-
-The driver helper `populis_puzzles.admin_authority_driver.build_rotation_spend`
-constructs the solution + signing message; pair it with your wallet
-signing tool of choice.
-
----
-
-## Disabling the admin desk
-
-If you need to take the admin surface down temporarily (incident
-response, planned maintenance):
-
-1. Set `POPULIS_ADMIN_PUBKEY_ALLOWLIST=` (empty).  Every `/admin/*`
-   route that uses `require_admin_jwt` returns 503.
-2. **Do not** rotate `POPULIS_ADMIN_JWT_SECRET` casually — every
-   active session loses its JWT and admins must re-sign to log back
-   in.  Acceptable for incident response, painful otherwise.
-3. The public `/admin/auth/authority` endpoint stays up — it's
-   informational and reads the on-chain singleton.
-
----
-
-## Cross-references
-
-- **`SECURITY.md`** — `POP-CANON-012`, `POP-CANON-013`, `POP-CANON-015`,
-  `POP-CANON-016`, A.1, A.2 sections.
-- **`docs/ADMIN_DESK_DESIGN.md`** — the original architecture doc that
-  motivated the JWT model (December 2025).
-- **`GENESIS_README.md`** — initial trust-root bootstrap, before any
-  of this is meaningful.
-- **`../populis_protocol/populis_puzzles/admin_authority_inner.clsp`**
-  — canonical source of A.2 enforcement logic.
-- **`../populis_protocol/populis_puzzles/mint_proposal_inner.clsp`**
-  — canonical source of A.1 state-machine logic.
+Admin records contain public keys, addresses, and commitments, not private
+keys. They still belong in the checksummed ceremony bundle because modifying
+them changes the authority interpretation and must fail startup.

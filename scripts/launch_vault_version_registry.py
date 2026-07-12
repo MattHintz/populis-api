@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """Operator script: deploy the vault-version registry singleton on testnet11.
 
-Uses the API faucet wallet (POPULIS_FAUCET_MASTER_SK_HEX) to fund the launcher
+Uses the API faucet wallet (SOLSLOT_FAUCET_MASTER_SK_HEX) to fund the launcher
 coin. Reads protocol coordinates from .env (admin_authority_v2, bridge policy)
-and deployment_manifest.json (pool/tracker launchers). Builds, signs, and pushes
+and deployment_manifest_v2.json (pool/tracker launchers). Builds, signs, and pushes
 the registry genesis spend bundle.
 
-Usage (from populis_api/):
+Usage (from solslot_api/):
   # Inspect the unsigned bundle without broadcasting
-  PYTHONPATH=../populis_protocol .venv/bin/python scripts/launch_vault_version_registry.py --dry-run
+  PYTHONPATH=../solslot_protocol .venv/bin/python scripts/launch_vault_version_registry.py --dry-run
 
   # Build + sign + push to testnet11
-  PYTHONPATH=../populis_protocol .venv/bin/python scripts/launch_vault_version_registry.py
+  PYTHONPATH=../solslot_protocol .venv/bin/python scripts/launch_vault_version_registry.py
 
 The script prints the registry launcher id, content_hash, and the parent coin it
 spent. On success, paste the launcher id into:
-  - populis_api/.env POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID
-  - populis_portal/src/environments/environment.ts vaultVersionRegistryLauncherId
+  - solslot_api/.env SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID
+  - solslot_portal/src/environments/environment.ts vaultVersionRegistryLauncherId
 """
 from __future__ import annotations
 
@@ -43,10 +43,10 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_MOD_HASH,
 )
 
-from populis_api.coinset_client import CoinsetClient
-from populis_api.config import get_settings
-from populis_puzzles.vault_driver import VAULT_INNER_MOD
-from populis_puzzles.vault_version_registry_driver import (
+from solslot_api.coinset_client import CoinsetClient
+from solslot_api.config import get_settings
+from solslot_puzzles.vault_driver import VAULT_INNER_MOD
+from solslot_puzzles.vault_version_registry_driver import (
     build_launch_registry_bundle,
     compute_canonical_params_hash,
 )
@@ -94,11 +94,11 @@ async def main() -> int:
     parser.add_argument(
         "--env-file",
         default=".env",
-        help="Path to the .env file with POPULIS_FAUCET_MASTER_SK_HEX.",
+        help="Path to the .env file with SOLSLOT_FAUCET_MASTER_SK_HEX.",
     )
     parser.add_argument(
         "--manifest",
-        default="deployment_manifest.json",
+        default="deployment_manifest_v2.json",
         help="Path to the deployment manifest JSON.",
     )
     parser.add_argument(
@@ -111,12 +111,12 @@ async def main() -> int:
 
     # Load settings and manifest.
     env = _load_env(Path(args.env_file))
-    if not env.get("POPULIS_FAUCET_MASTER_SK_HEX"):
-        print(f"ERROR: POPULIS_FAUCET_MASTER_SK_HEX not found in {args.env_file}")
+    if not env.get("SOLSLOT_FAUCET_MASTER_SK_HEX"):
+        print(f"ERROR: SOLSLOT_FAUCET_MASTER_SK_HEX not found in {args.env_file}")
         return 1
 
     settings = get_settings()
-    master_sk_hex = settings.faucet_master_sk_hex or env.get("POPULIS_FAUCET_MASTER_SK_HEX")
+    master_sk_hex = settings.faucet_master_sk_hex or env.get("SOLSLOT_FAUCET_MASTER_SK_HEX")
     if not master_sk_hex:
         print("ERROR: no faucet master key available")
         return 1
@@ -125,7 +125,7 @@ async def main() -> int:
     pool_launcher_id = bytes32.fromhex(_strip0x(manifest["pool_launcher_id"]))
     tracker_launcher_id = bytes32.fromhex(_strip0x(manifest["tracker_launcher_id"]))
     admin_authority_launcher_id = bytes32.fromhex(
-        _strip0x(settings.protocol_admin_authority_v2_launcher_id or env["POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID"])
+        _strip0x(settings.protocol_admin_authority_v2_launcher_id or env["SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID"])
     )
     bridge_policy_hash = bytes32.fromhex(_strip0x(settings.zkpassport_bridge_policy_hash))
 
@@ -250,7 +250,7 @@ async def main() -> int:
         print()
         print("=" * 60)
         print("SUCCESS — paste this launcher id into your configs:")
-        print(f"  POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID=0x{artifacts.registry_launcher_id.hex()}")
+        print(f"  SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID=0x{artifacts.registry_launcher_id.hex()}")
         print()
         print("Portal environment.ts:")
         print(f"  vaultVersionRegistryLauncherId: '0x{artifacts.registry_launcher_id.hex()}',")

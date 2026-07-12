@@ -18,21 +18,18 @@ What this file covers:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
-
 import pytest
 from fastapi import HTTPException
 
-from populis_api.admin import (
+from solslot_api.admin import (
     BridgePoolTopUpRequest,
     DeployRequest,
     ManifestResponse,
     _coin_id_from_fields,
     _select_coin_by_id,
-    require_admin_operator,
     require_admin_token,
 )
-from populis_api.config import Settings
+from solslot_api.config import Settings
 
 
 # ── require_admin_token ──────────────────────────────────────────────────────
@@ -79,30 +76,6 @@ class TestRequireAdminToken:
             assert exc.value.status_code == 403
 
 
-class TestRequireAdminOperator:
-    def test_accepts_admin_jwt_authority(self) -> None:
-        settings = Settings(
-            network="testnet11",
-            admin_token=None,
-            admin_pubkey_allowlist="0xabc",
-        )
-        with patch("populis_api.admin.require_admin_jwt", return_value=object()) as jwt:
-            result = require_admin_operator(settings, authorization="Bearer jwt")
-        assert result is None
-        jwt.assert_called_once()
-
-    def test_keeps_static_token_fallback(self) -> None:
-        settings = Settings(network="testnet11", admin_token="secret")
-        result = require_admin_operator(settings, authorization="Bearer secret")
-        assert result is None
-
-    def test_disabled_without_any_admin_authority(self) -> None:
-        settings = Settings(network="testnet11", admin_token=None, admin_pubkey_allowlist="")
-        with pytest.raises(HTTPException) as exc:
-            require_admin_operator(settings, authorization="Bearer anything")
-        assert exc.value.status_code == 503
-
-
 # ── _select_coin_by_id ──────────────────────────────────────────────────────
 class _FakeCoin:
     """Lightweight Coin stand-in (avoids chia imports for speed)."""
@@ -129,14 +102,14 @@ class TestSelectCoin:
     def test_select_by_id_amount_too_small(self) -> None:
         coins = [_FakeCoin("a" * 64, 100)]
         with pytest.raises(HTTPException) as exc:
-            _select_coin_by_id(coins, "0x" + "a" * 64, min_amount=200, label="pgt_coin")
+            _select_coin_by_id(coins, "0x" + "a" * 64, min_amount=200, label="sgt_coin")
         assert exc.value.status_code == 400
         assert "amount 100" in exc.value.detail
 
     def test_select_by_id_not_found(self) -> None:
         coins = [_FakeCoin("a" * 64, 100)]
         with pytest.raises(HTTPException) as exc:
-            _select_coin_by_id(coins, "0x" + "f" * 64, min_amount=50, label="pgt_coin")
+            _select_coin_by_id(coins, "0x" + "f" * 64, min_amount=50, label="sgt_coin")
         assert exc.value.status_code == 404
 
     def test_select_smallest_fitting(self) -> None:
@@ -152,7 +125,7 @@ class TestSelectCoin:
     def test_select_no_coins_fit(self) -> None:
         coins = [_FakeCoin("a" * 64, 50), _FakeCoin("b" * 64, 60)]
         with pytest.raises(HTTPException) as exc:
-            _select_coin_by_id(coins, None, min_amount=1000, label="pgt_coin")
+            _select_coin_by_id(coins, None, min_amount=1000, label="sgt_coin")
         assert exc.value.status_code == 503
         assert "no unspent" in exc.value.detail.lower()
 
@@ -172,7 +145,7 @@ class TestDeployRequestSchema:
         body = DeployRequest()
         assert body.quorum_bps == 5000
         assert body.voting_window_seconds == 300
-        assert body.pgt_total_supply == 1_000_000
+        assert body.sgt_total_supply == 1_000_000
         assert body.min_proposal_stake == 10_000
         assert body.fp_scale == 1000
         assert body.initial_pool_status == 1
@@ -253,7 +226,7 @@ class TestAdminSettings:
 
     def test_deployment_manifest_path_default(self) -> None:
         s = Settings(network="testnet11")
-        assert s.deployment_manifest_path == "./deployment_manifest.json"
+        assert s.deployment_manifest_path == "./state/deployment_manifest_v2.json"
 
     def test_admin_token_round_trips(self) -> None:
         s = Settings(network="testnet11", admin_token="my-token-123")

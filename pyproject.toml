@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "populis_api"
+name = "solslot-api"
 version = "0.1.0"
-description = "Solslot protocol API for vault launcher funding, registration challenges, and legacy operator endpoints"
+description = "Solslot protocol API for vaults, credentials, and ceremony operations"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary - All Rights Reserved" }
@@ -23,12 +23,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyjwt>=2.9",
     "web3>=7,<8",
-    # Populis protocol (local path install)
-    # Use: pip install -e ../populis_protocol
+    # Solslot protocol (local path install)
+    # Use: pip install -e ../solslot-protocol
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx[cli]>=0.27"]
 
 [tool.setuptools.packages.find]
-include = ["populis_api*"]
+include = ["solslot_api*"]

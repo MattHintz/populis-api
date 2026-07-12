@@ -1,4 +1,4 @@
-"""Regression tests for CANON_POPULIS_API_AUDIT_2026_04_26 fixes.
+"""Regression tests for CANON_SOLSLOT_API_AUDIT_2026_04_26 fixes.
 
 Each finding has its own test class so a future audit revisiting these can
 trace test → finding 1:1.  Tests run as direct function-level units (no
@@ -12,7 +12,7 @@ Findings covered:
   - POP-CANON-005 / SIGN-1             — covered by 002 (same envelope expansion)
   - POP-CANON-006 / LD-1               — ChallengeStore.pop is write-once-read-once
 
-Pass 2 audit (CANON_POPULIS_API_AUDIT_2026_04_26 Pass 2) findings covered:
+Pass 2 audit (CANON_SOLSLOT_API_AUDIT_2026_04_26 Pass 2) findings covered:
   - POP-CANON-007 / SP-2 + CL-1         — VaultRegistry persisted via SQLite (WAL, indexed reverse lookup)
   - POP-CANON-008 / CL-1 + Producer Deadline — Faucet consolidation worker (opt-in, joins fragmented UTXOs)
   - POP-CANON-009 / Documentation drift — faucet_max_spend_mojos enforced via select_coin max_amount
@@ -28,13 +28,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from eth_account import Account
 
-from populis_api.challenges import (
+from solslot_api.challenges import (
     Challenge,
     ChallengeStore,
     ChallengeStoreFullError,
     RateLimitedError,
 )
-from populis_api.evm_auth import (
+from solslot_api.evm_auth import (
     REGISTER_PRIMARY_TYPE,
     REGISTER_TYPES,
     recover_evm_signer,
@@ -80,7 +80,7 @@ class TestEnvelopeExpansion:
         )
         assert td["primaryType"] == "SolslotVaultRegister"
         assert "SolslotVaultRegister" in td["types"]
-        assert "PopulisVaultRegister" not in td["types"]
+        assert set(td["types"]) == {"EIP712Domain", "SolslotVaultRegister"}
         msg = td["message"]
         assert msg["owner"] == "0x1234567890123456789012345678901234567890"
         assert msg["nonce"] == "0x" + "ab" * 32
@@ -330,11 +330,17 @@ class TestPopIsWriteOnceReadOnce:
 
 
 class TestChallengeRequestValidationBeforeAllocation:
-    def test_public_evm_challenge_invalid_address_does_not_allocate(self) -> None:
+    def test_public_evm_challenge_invalid_address_does_not_allocate(
+        self, monkeypatch
+    ) -> None:
         from fastapi.testclient import TestClient
-        from populis_api.app import app, get_challenge_store
+        from solslot_api.app import app, get_challenge_store
 
         store = ChallengeStore(ttl_seconds=300, max_pending=1, per_ip_per_minute=100)
+        monkeypatch.setattr(
+            "solslot_api.app._require_vault_protocol_ready",
+            lambda _settings: "0x" + "00" * 32,
+        )
         app.dependency_overrides[get_challenge_store] = lambda: store
         try:
             with TestClient(app) as client:
@@ -365,7 +371,7 @@ class TestPushOrFail:
 
     @pytest.mark.asyncio
     async def test_success_returns_true_none(self) -> None:
-        from populis_api.app import _push_or_fail
+        from solslot_api.app import _push_or_fail
 
         coinset = MagicMock()
         coinset.push_tx = AsyncMock(return_value={"success": True})
@@ -381,7 +387,7 @@ class TestPushOrFail:
         """The PRE-fix code only logged a warning and returned success.  Now
         the (False, status) tuple lets the endpoint surface failure to the
         client."""
-        from populis_api.app import _push_or_fail
+        from solslot_api.app import _push_or_fail
 
         coinset = MagicMock()
         coinset.push_tx = AsyncMock(return_value={
@@ -400,7 +406,7 @@ class TestPushOrFail:
         """Network/HTTP errors during push_tx must surface as 502, not
         be swallowed."""
         from fastapi import HTTPException
-        from populis_api.app import _push_or_fail
+        from solslot_api.app import _push_or_fail
 
         coinset = MagicMock()
         coinset.push_tx = AsyncMock(side_effect=ConnectionError("coinset down"))
@@ -414,14 +420,18 @@ class TestPushOrFail:
 
 class TestVaultRegistrationSafetyFalsifiers:
     def _faucet(self):
-        from populis_api.faucet import Faucet
+        from solslot_api.faucet import Faucet
 
         return Faucet.from_seed_hex("00" * 32, "testnet11")
 
     def _settings(self):
         from types import SimpleNamespace
 
-        return SimpleNamespace(faucet_max_spend_mojos=10_000_000)
+        return SimpleNamespace(
+            alpha_writes_enabled=True,
+            faucet_max_spend_mojos=10_000_000,
+            zkpassport_bridge_policy_hash="0x" + "c1" * 32,
+        )
 
     def _coin_records(self, faucet):
         return [
@@ -436,7 +446,7 @@ class TestVaultRegistrationSafetyFalsifiers:
         ]
 
     def _signed_request(self):
-        from populis_api.app import RegisterEvmVaultRequest
+        from solslot_api.app import RegisterEvmVaultRequest
 
         acct = Account.from_key(b"\x42" * 32)
         store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=10)
@@ -468,11 +478,15 @@ class TestVaultRegistrationSafetyFalsifiers:
         return acct, store, body
 
     @pytest.mark.asyncio
-    async def test_rejected_push_does_not_persist_registry_record(self):
+    async def test_rejected_push_does_not_persist_registry_record(self, monkeypatch):
         from fastapi import HTTPException
-        from populis_api.app import register_evm_vault
+        from solslot_api.app import register_evm_vault
 
         _acct, store, body = self._signed_request()
+        monkeypatch.setattr(
+            "solslot_api.app._require_vault_protocol_ready",
+            lambda _settings: "0x" + "00" * 32,
+        )
         faucet = self._faucet()
         coinset = MagicMock()
         coinset.get_coin_records_by_puzzle_hash = AsyncMock(
@@ -500,11 +514,15 @@ class TestVaultRegistrationSafetyFalsifiers:
         registry.record.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_duplicate_evm_registration_rejected_before_push(self):
+    async def test_duplicate_evm_registration_rejected_before_push(self, monkeypatch):
         from fastapi import HTTPException
-        from populis_api.app import register_evm_vault
+        from solslot_api.app import register_evm_vault
 
         _acct, store, body = self._signed_request()
+        monkeypatch.setattr(
+            "solslot_api.app._require_vault_protocol_ready",
+            lambda _settings: "0x" + "00" * 32,
+        )
         faucet = self._faucet()
         coinset = MagicMock()
         coinset.get_coin_records_by_puzzle_hash = AsyncMock(
@@ -534,7 +552,8 @@ class TestChallengeDoSFalsifiers:
         from types import SimpleNamespace
 
         return SimpleNamespace(
-            deployment_manifest_path="/tmp/no-populis-test-manifest.json",
+            alpha_writes_enabled=True,
+            deployment_manifest_path="/tmp/no-solslot-test-manifest.json",
             pool_launcher_id=None,
             network="testnet11",
         )
@@ -548,11 +567,15 @@ class TestChallengeDoSFalsifiers:
         )
 
     @pytest.mark.asyncio
-    async def test_xff_spoofing_does_not_bypass_per_peer_rate_limit(self):
+    async def test_xff_spoofing_does_not_bypass_per_peer_rate_limit(self, monkeypatch):
         from fastapi import HTTPException
-        from populis_api.app import ChallengeRequest, request_challenge
+        from solslot_api.app import ChallengeRequest, request_challenge
 
         store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=1)
+        monkeypatch.setattr(
+            "solslot_api.app._require_vault_protocol_ready",
+            lambda _settings: "0x" + "00" * 32,
+        )
         settings = self._settings()
         await request_challenge(
             ChallengeRequest(
@@ -579,21 +602,13 @@ class TestChallengeDoSFalsifiers:
         assert len(store) == 1
 
     def test_unbounded_passkey_challenge_rejected_before_allocation(self):
-        from fastapi.testclient import TestClient
-        from populis_api.app import app, get_challenge_store
+        from pydantic import ValidationError
+        from solslot_api.app import ChallengeRequest
 
         store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=10)
-        app.dependency_overrides[get_challenge_store] = lambda: store
-        try:
-            with TestClient(app) as client:
-                resp = client.post(
-                    "/auth/challenge",
-                    json={"address": "p" * 100_000, "auth_type": "passkey"},
-                )
-            assert resp.status_code in (400, 422)
-            assert len(store) == 0
-        finally:
-            app.dependency_overrides.clear()
+        with pytest.raises(ValidationError):
+            ChallengeRequest(address="p" * 100_000, auth_type="passkey")
+        assert len(store) == 0
 
 
 # ============================================================================
@@ -611,7 +626,7 @@ class TestFaucetMaxAmount:
     (``chia/wallet/util/tx_config.py:16-42``)."""
 
     def _faucet(self):
-        from populis_api.faucet import Faucet
+        from solslot_api.faucet import Faucet
 
         seed = "00" * 32
         return Faucet.from_seed_hex(seed, "testnet11")
@@ -687,7 +702,7 @@ class TestCoinsetPaginationCursor:
         it in the JSON body."""
         from unittest.mock import AsyncMock, patch
 
-        from populis_api.coinset_client import CoinsetClient
+        from solslot_api.coinset_client import CoinsetClient
 
         client = CoinsetClient("https://testnet11.api.coinset.org")
         try:
@@ -712,7 +727,7 @@ class TestCoinsetPaginationCursor:
         doesn't support it.  Verifies our docstring contract."""
         from unittest.mock import AsyncMock, patch
 
-        from populis_api.coinset_client import CoinsetClient
+        from solslot_api.coinset_client import CoinsetClient
 
         client = CoinsetClient("https://testnet11.api.coinset.org")
         try:
@@ -735,7 +750,7 @@ class TestCoinsetPaginationCursor:
         import logging
         from unittest.mock import AsyncMock, patch
 
-        from populis_api.coinset_client import CoinsetClient
+        from solslot_api.coinset_client import CoinsetClient
 
         big_payload = {
             "coin_records": [
@@ -756,7 +771,7 @@ class TestCoinsetPaginationCursor:
             with patch.object(
                 client, "_post", new=AsyncMock(return_value=big_payload)
             ):
-                with caplog.at_level(logging.WARNING, logger="populis_api.coinset_client"):
+                with caplog.at_level(logging.WARNING, logger="solslot_api.coinset_client"):
                     records = await client.get_coin_records_by_puzzle_hash("0x" + "ab" * 32)
                     assert len(records) == 1500, "client must not silently truncate"
                     assert any(
@@ -796,14 +811,14 @@ class TestPoolLauncherManifestPreference:
         must return that value, NOT the env-based fallback."""
         import json
 
-        from populis_api.app import _pool_launcher_id_or_zero
+        from solslot_api.app import _pool_launcher_id_or_zero
 
         manifest = tmp_path / "manifest.json"
         manifest.write_text(json.dumps({
             "pool_launcher_id": "0x" + "ab" * 32,
             "tracker_launcher_id": "0x" + "cd" * 32,
             "did_launcher_id": "0x" + "ef" * 32,
-            "pgt_genesis_coin_id": "0x" + "01" * 32,
+            "sgt_genesis_coin_id": "0x" + "01" * 32,
         }))
 
         settings = self._make_settings(
@@ -818,7 +833,7 @@ class TestPoolLauncherManifestPreference:
     def test_env_used_when_manifest_missing(self, tmp_path):
         """When no manifest exists, the resolver falls back to the env value
         — the bootstrap default before any deploy."""
-        from populis_api.app import _pool_launcher_id_or_zero
+        from solslot_api.app import _pool_launcher_id_or_zero
 
         settings = self._make_settings(
             str(tmp_path / "no_such_file.json"),
@@ -829,7 +844,7 @@ class TestPoolLauncherManifestPreference:
 
     def test_zero_when_neither_present(self, tmp_path):
         """No manifest + no env = zero placeholder (Phase-0 smoke testing)."""
-        from populis_api.app import _pool_launcher_id_or_zero
+        from solslot_api.app import _pool_launcher_id_or_zero
 
         settings = self._make_settings(
             str(tmp_path / "no_such_file.json"),
@@ -844,7 +859,7 @@ class TestPoolLauncherManifestPreference:
         clear or process restart.  This is the core POP-CANON-011 property."""
         import json
 
-        from populis_api.app import _pool_launcher_id_or_zero
+        from solslot_api.app import _pool_launcher_id_or_zero
 
         manifest = tmp_path / "manifest.json"
         settings = self._make_settings(str(manifest), env_pool_id=None)
@@ -865,7 +880,7 @@ class TestPoolLauncherManifestPreference:
     def test_malformed_manifest_falls_back_to_env(self, tmp_path):
         """A corrupt manifest file must NOT raise; the resolver falls back
         to the env value.  Defensive behaviour for partial admin writes."""
-        from populis_api.app import _pool_launcher_id_or_zero
+        from solslot_api.app import _pool_launcher_id_or_zero
 
         manifest = tmp_path / "manifest.json"
         manifest.write_text("{ this is not valid json")
@@ -884,7 +899,7 @@ class TestPoolLauncherManifestPreference:
         back to env."""
         import json
 
-        from populis_api.app import _pool_launcher_id_or_zero
+        from solslot_api.app import _pool_launcher_id_or_zero
 
         manifest = tmp_path / "manifest.json"
         manifest.write_text(json.dumps({"some_other_key": "value"}))
@@ -906,7 +921,7 @@ class TestVaultRegistryPersistence:
     no eviction), and ALL state was lost on process restart.
 
     Post-fix: ``VaultRegistry`` is backed by SQLite running in WAL mode
-    (``populis_api.vault_db.VaultStore``).  Records survive restart, the
+    (``solslot_api.vault_db.VaultStore``).  Records survive restart, the
     EVM reverse-lookup is a B-tree index (O(log N)), writes are
     transactional (``BEGIN IMMEDIATE`` + ``COMMIT``), and concurrent
     readers don't block the writer.  Schema versioning via
@@ -916,7 +931,7 @@ class TestVaultRegistryPersistence:
         """Build a VaultRecord with deterministic test bytes."""
         from chia_rs.sized_bytes import bytes32
 
-        from populis_api.state import VaultRecord
+        from solslot_api.state import VaultRecord
 
         return VaultRecord(
             launcher_id=bytes32(bytes([launcher_byte] * 32)),
@@ -932,7 +947,7 @@ class TestVaultRegistryPersistence:
     def test_record_round_trip_via_disk(self, tmp_path):
         """Record a vault, close the registry, reopen at the same path,
         verify the record survives — proves on-disk durability."""
-        from populis_api.state import VaultRegistry
+        from solslot_api.state import VaultRegistry
 
         path = tmp_path / "vault_registry.db"
         rec = self._make_record()
@@ -959,7 +974,7 @@ class TestVaultRegistryPersistence:
     def test_evm_index_reverse_lookup_case_insensitive(self, tmp_path):
         """``get_by_evm`` is case-insensitive thanks to ``COLLATE NOCASE``
         on the unique index — callers don't need to normalize."""
-        from populis_api.state import VaultRegistry
+        from solslot_api.state import VaultRegistry
 
         rec = self._make_record(launcher_byte=0x22, evm=True)
         reg = VaultRegistry.open(":memory:")
@@ -983,7 +998,7 @@ class TestVaultRegistryPersistence:
         """``remove`` must drop the row, so neither lookup returns it
         afterwards.  SQLite's row deletion automatically maintains the
         EVM index; we verify both views agree."""
-        from populis_api.state import VaultRegistry
+        from solslot_api.state import VaultRegistry
 
         rec = self._make_record()
         reg = VaultRegistry.open(":memory:")
@@ -1006,7 +1021,7 @@ class TestVaultRegistryPersistence:
         """Re-recording the same launcher_id replaces the row in place.
         Verified via SQL: the upsert relies on
         ``ON CONFLICT(launcher_id) DO UPDATE``."""
-        from populis_api.state import VaultRecord, VaultRegistry
+        from solslot_api.state import VaultRecord, VaultRegistry
 
         rec_v1 = self._make_record()
         rec_v2 = VaultRecord(
@@ -1038,7 +1053,7 @@ class TestVaultRegistryPersistence:
         silently corrupt the registry."""
         import sqlite3
 
-        from populis_api.vault_db import StoredVault, VaultStore
+        from solslot_api.vault_db import StoredVault, VaultStore
 
         store = VaultStore(":memory:")
         try:
@@ -1081,7 +1096,7 @@ class TestVaultRegistryPersistence:
 
         from chia_rs.sized_bytes import bytes32
 
-        from populis_api.state import VaultRecord, VaultRegistry
+        from solslot_api.state import VaultRecord, VaultRegistry
 
         reg = VaultRegistry.open(":memory:")
         try:
@@ -1105,7 +1120,7 @@ class TestVaultRegistryPersistence:
     def test_schema_version_tracked(self, tmp_path):
         """``PRAGMA user_version`` is set after migration so future
         migrations can detect the current schema."""
-        from populis_api.vault_db import SCHEMA_VERSION, VaultStore
+        from solslot_api.vault_db import SCHEMA_VERSION, VaultStore
 
         store = VaultStore(":memory:")
         try:
@@ -1117,7 +1132,7 @@ class TestVaultRegistryPersistence:
         """File-backed stores must come up in WAL mode — that's the
         whole point of choosing SQLite over a JSON file.  Verified via
         ``PRAGMA journal_mode`` after open."""
-        from populis_api.vault_db import VaultStore
+        from solslot_api.vault_db import VaultStore
 
         path = tmp_path / "wal_check.db"
         store = VaultStore(path)
@@ -1146,7 +1161,7 @@ class TestFaucetConsolidationWorker:
     aggregated signature ensures atomicity."""
 
     def _faucet(self):
-        from populis_api.faucet import Faucet
+        from solslot_api.faucet import Faucet
 
         return Faucet.from_seed_hex("00" * 32, "testnet11")
 
@@ -1166,7 +1181,7 @@ class TestFaucetConsolidationWorker:
         must return None and not push any bundle."""
         from unittest.mock import AsyncMock, MagicMock
 
-        from populis_api.faucet_worker import (
+        from solslot_api.faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
         )
@@ -1195,7 +1210,7 @@ class TestFaucetConsolidationWorker:
         the faucet's puzhash."""
         from unittest.mock import AsyncMock, MagicMock
 
-        from populis_api.faucet_worker import (
+        from solslot_api.faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
         )
@@ -1232,7 +1247,7 @@ class TestFaucetConsolidationWorker:
         """The single output amount must equal the total of inputs minus fee."""
         from unittest.mock import AsyncMock, MagicMock
 
-        from populis_api.faucet_worker import (
+        from solslot_api.faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
         )
@@ -1287,7 +1302,7 @@ class TestFaucetConsolidationWorker:
         """``start()`` is a no-op when ``config.enabled`` is False."""
         from unittest.mock import MagicMock
 
-        from populis_api.faucet_worker import (
+        from solslot_api.faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
         )
@@ -1307,7 +1322,7 @@ class TestFaucetConsolidationWorker:
         """``stop()`` must signal the loop and await its completion."""
         from unittest.mock import AsyncMock, MagicMock
 
-        from populis_api.faucet_worker import (
+        from solslot_api.faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
         )
@@ -1335,7 +1350,7 @@ class TestFaucetConsolidationWorker:
         """Single-coin or empty input lists return None — nothing to merge."""
         from unittest.mock import MagicMock
 
-        from populis_api.faucet_worker import FaucetConsolidationWorker
+        from solslot_api.faucet_worker import FaucetConsolidationWorker
 
         f = self._faucet()
         worker = FaucetConsolidationWorker(faucet=f, coinset=MagicMock())
@@ -1348,7 +1363,7 @@ class TestFaucetConsolidationWorker:
         coins are included.  Subsequent worker runs handle the remainder."""
         from unittest.mock import MagicMock
 
-        from populis_api.faucet_worker import (
+        from solslot_api.faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
         )

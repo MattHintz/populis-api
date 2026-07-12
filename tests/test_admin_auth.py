@@ -1,4 +1,4 @@
-"""Unit + endpoint tests for ``populis_api.admin_auth``.
+"""Unit + endpoint tests for ``solslot_api.admin_auth``.
 
 Three concentric layers:
 
@@ -6,7 +6,7 @@ Three concentric layers:
     without spinning up FastAPI,
   * a self-contained mini-app that mounts only the admin_auth router
     so endpoint behaviour can be tested without dragging in the full
-    ``populis_api.app`` (which carries chia_rs LazyNode threading
+    ``solslot_api.app`` (which carries chia_rs LazyNode threading
     edge cases unrelated to this module),
   * full-flow happy path that signs a real EIP-712 envelope with
     ``eth_account`` so the recovery + allowlist check are exercised
@@ -15,6 +15,7 @@ Three concentric layers:
 from __future__ import annotations
 
 import time
+import json
 from typing import Any
 
 import pytest
@@ -23,8 +24,8 @@ from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from populis_api import admin_auth
-from populis_api.admin_auth import (
+from solslot_api import admin_auth
+from solslot_api.admin_auth import (
     ADMIN_LOGIN_PRIMARY_TYPE,
     AdminClaims,
     JWTVerifyError,
@@ -33,7 +34,11 @@ from populis_api.admin_auth import (
     reset_admin_state_for_tests,
     verify_jwt,
 )
-from populis_api.config import Settings, get_settings
+from solslot_api.config import Settings, get_settings
+from solslot_api.admin_records import (
+    clear_admin_records_cache,
+    load_admin_records_from_path,
+)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -48,14 +53,14 @@ def _reset_admin_state():
 
 
 @pytest.fixture
-def settings_with_admin(monkeypatch) -> Settings:
+def settings_with_admin(monkeypatch, tmp_path) -> Settings:
     """Settings with the admin desk fully configured + a fresh JWT secret."""
     # Use a deterministic test pubkey so allowlist checks succeed when
     # we sign with ``Account.from_key(_TEST_PRIVKEY_HEX)``.
-    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "900")
-    monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
+    _configure_admin_records(monkeypatch, tmp_path, [_TEST_ACCT])
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_TTL_SECONDS", "900")
+    monkeypatch.setenv("SOLSLOT_ADMIN_LOGIN_PER_IP_PER_MINUTE", "100")
     get_settings.cache_clear()
     s = get_settings()
     return s
@@ -82,6 +87,50 @@ _TEST_PRIVKEY_HEX = (
 _TEST_ACCT = Account.from_key(_TEST_PRIVKEY_HEX)
 _TEST_ADDRESS = _TEST_ACCT.address                  # checksummed
 _TEST_ADDRESS_LOWER = _TEST_ADDRESS.lower()         # matches allowlist normalization
+_OTHER_ACCT = Account.from_key(
+    "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba"
+)
+
+
+def _configure_admin_records(monkeypatch, tmp_path, accounts) -> None:
+    launcher_id = "0x" + "10" * 32
+    records = {
+        "schemaVersion": 2,
+        "launcher_id": launcher_id,
+        "admin_records": [
+            {
+                "admin_idx": index,
+                "m_within": 1,
+                "leaves": [
+                    {
+                        "kind": "eip712_member",
+                        "evm_address": account.address.lower(),
+                        "secp256k1_pubkey": (
+                            "0x"
+                            + account._key_obj.public_key.to_compressed_bytes().hex()
+                        ),
+                        "type_hash": "0x" + "ee" * 32,
+                        "prefix_and_domain_separator": "0x1901" + "ff" * 32,
+                    }
+                ],
+            }
+            for index, account in enumerate(accounts)
+        ],
+    }
+    path = tmp_path / "admin_records_v2.json"
+    path.write_text(json.dumps(records), encoding="utf-8")
+    config = load_admin_records_from_path(path)
+    monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
+    monkeypatch.setenv(
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        launcher_id,
+    )
+    monkeypatch.setenv(
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "0x" + config.compute_admins_hash().hex(),
+    )
+    clear_admin_records_cache()
+    get_settings.cache_clear()
 
 
 # ── Pure helpers (no FastAPI) ───────────────────────────────────────────────
@@ -94,7 +143,7 @@ class TestTypedData:
             settings=settings_with_admin,
         )
         assert td["primaryType"] == ADMIN_LOGIN_PRIMARY_TYPE
-        assert td["domain"]["name"] == "Populis Protocol"
+        assert td["domain"]["name"] == "Solslot Protocol"
         assert td["message"]["owner"] == _TEST_ADDRESS
         assert td["message"]["nonce"].startswith("0x")
         assert td["message"]["issuedAt"] == 1_000_000_000
@@ -103,7 +152,7 @@ class TestTypedData:
         assert td["message"]["scope"] == "admin"
 
     def test_envelope_distinct_from_registration_typehash(self, settings_with_admin):
-        # Sanity: SolslotVaultRegister envelope and PopulisAdminLogin
+        # Sanity: SolslotVaultRegister envelope and SolslotAdminLogin
         # envelope must not collide.  The primary type alone separates
         # them under EIP-712's structHash, so even fields that overlap
         # by name (e.g. ``authType``) hash distinctly.
@@ -113,7 +162,7 @@ class TestTypedData:
             issued_at=1_000_000_000,
             settings=settings_with_admin,
         )
-        assert td["primaryType"] == "PopulisAdminLogin"
+        assert td["primaryType"] == "SolslotAdminLogin"
         # Registration-only fields that should NOT appear in the admin
         # login envelope (poolLauncherId, chiaNetwork are pool-binding
         # fields specific to vault registration).
@@ -151,7 +200,7 @@ class TestJWTRoundtrip:
 
     def test_verify_rejects_expired_token(self, monkeypatch, settings_with_admin):
         # Issue a token with TTL=1s, then wait it out.
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_TTL_SECONDS", "1")
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_TTL_SECONDS", "1")
         get_settings.cache_clear()
         s = get_settings()
         token, _ = issue_jwt(sub=_TEST_ADDRESS_LOWER, auth_type="evm", settings=s)
@@ -175,8 +224,7 @@ class TestJWTRoundtrip:
     def test_verify_rejects_wrong_secret(self, monkeypatch):
         """A token signed under one secret must not verify under another."""
         # Issue a token with secret A.
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "a" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "a" * 64)
         get_settings.cache_clear()
         reset_admin_state_for_tests()
         s_a = get_settings()
@@ -185,9 +233,9 @@ class TestJWTRoundtrip:
         )
 
         # Switch the configured secret to B (simulating an operator
-        # rotating POPULIS_ADMIN_JWT_SECRET) and verify the old token
+        # rotating SOLSLOT_ADMIN_JWT_SECRET) and verify the old token
         # is rejected.
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "b" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "b" * 64)
         get_settings.cache_clear()
         reset_admin_state_for_tests()
         s_b = get_settings()
@@ -200,8 +248,8 @@ class TestJWTSecretCaching:
         # POP-CANON-016: random fallback is allowed only when the
         # allowlist is empty (admin desk disabled).  This test exercises
         # the dev/test-only path.
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", "")
         get_settings.cache_clear()
         s = get_settings()
         secret1 = admin_auth.get_jwt_secret(s)
@@ -213,29 +261,27 @@ class TestJWTSecretCaching:
 
     def test_explicit_secret_used_when_set(self, monkeypatch):
         explicit = "abc123" * 11           # arbitrary, deterministic
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", explicit)
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", explicit)
         get_settings.cache_clear()
         s = get_settings()
         assert admin_auth.get_jwt_secret(s) == explicit
 
-    def test_unset_secret_with_enabled_allowlist_raises(self, monkeypatch):
+    def test_unset_secret_with_enabled_records_raises(self, monkeypatch, tmp_path):
         # POP-CANON-016: when the admin desk is enabled (allowlist set)
-        # but POPULIS_ADMIN_JWT_SECRET is missing, get_jwt_secret must
+        # but SOLSLOT_ADMIN_JWT_SECRET is missing, get_jwt_secret must
         # refuse rather than silently generate a per-process random
         # secret.  The silent path produces intermittent 403s under
         # multi-worker deployments because each worker's secret diverges.
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
-        monkeypatch.setenv(
-            "POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER,
-        )
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "")
+        _configure_admin_records(monkeypatch, tmp_path, [_TEST_ACCT])
         get_settings.cache_clear()
         s = get_settings()
-        with pytest.raises(RuntimeError, match="POPULIS_ADMIN_JWT_SECRET"):
+        with pytest.raises(RuntimeError, match="SOLSLOT_ADMIN_JWT_SECRET"):
             admin_auth.get_jwt_secret(s)
 
 
 class TestStartupValidator:
-    """POP-CANON-016: startup-time complement to the runtime guard.
+    """Startup-time complement to the runtime JWT guard.
 
     The runtime path (``get_jwt_secret``) only fires on the first JWT
     issuance, which can be hours after deployment.  The startup
@@ -244,68 +290,45 @@ class TestStartupValidator:
     """
 
     def test_passes_when_admin_desk_disabled(self, monkeypatch):
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "")
         get_settings.cache_clear()
         # No exception, no return value — just logs an "admin desk disabled" line.
         admin_auth.validate_admin_config_at_startup(get_settings())
 
-    def test_passes_when_both_set(self, monkeypatch):
-        # POP-CANON-021: also set the BLS authority pubkeys list so the
-        # cardinality drift check passes.  Each EVM admin must have a
-        # matching BLS pubkey in the on-chain authority singleton — the
-        # validator now refuses to boot if these are out of sync.
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS", "11" * 48)
+    def test_retired_environment_only_admin_configuration_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="is retired"):
+            admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_raises_when_records_set_but_secret_missing(self, monkeypatch, tmp_path):
+        _configure_admin_records(monkeypatch, tmp_path, [_TEST_ACCT])
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "")
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="SOLSLOT_ADMIN_JWT_SECRET"):
+            admin_auth.validate_admin_config_at_startup(get_settings())
+
+    def test_passes_with_chain_verified_records(self, monkeypatch, tmp_path):
+        _configure_admin_records(monkeypatch, tmp_path, [_TEST_ACCT])
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         get_settings.cache_clear()
         admin_auth.validate_admin_config_at_startup(get_settings())
 
-    def test_raises_when_allowlist_set_but_secret_missing(self, monkeypatch):
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "")
+    def test_retired_authority_key_is_rejected_even_with_unrelated_keys(self, monkeypatch):
+        monkeypatch.setenv("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_UNUSED_AUTHORITY_HINT", "11" * 48)
         get_settings.cache_clear()
-        with pytest.raises(RuntimeError, match="POPULIS_ADMIN_JWT_SECRET"):
-            admin_auth.validate_admin_config_at_startup(get_settings())
-
-    def test_raises_when_evm_set_but_bls_authority_empty(self, monkeypatch):
-        """POP-CANON-021 drift A: EVM allowlist set, BLS pubkeys empty.
-
-        The transparency endpoint would publish ``enabled: false`` while
-        the admin desk fully accepts EVM logins — silent drift between
-        published state and gating source.  Validator must refuse to boot.
-        """
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
-        # setenv("", "") rather than delenv so the conftest's .env
-        # mask survives — see conftest.py for why.
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS", "")
-        get_settings.cache_clear()
-        with pytest.raises(RuntimeError, match=r"(?i)drift|authority"):
-            admin_auth.validate_admin_config_at_startup(get_settings())
-
-    def test_raises_when_evm_and_bls_cardinality_differ(self, monkeypatch):
-        """POP-CANON-021 drift B: 1 EVM admin, 3 BLS pubkeys.
-
-        Cardinality alone reveals the misconfig — the operator forgot to
-        add the corresponding EVM admins (or removed one without
-        rotating the on-chain singleton).
-        """
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER)
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
-        monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS",
-            ",".join(["11" * 48, "22" * 48, "33" * 48]),
-        )
-        get_settings.cache_clear()
-        with pytest.raises(RuntimeError, match=r"(?i)cardinality|mismatch"):
+        with pytest.raises(RuntimeError, match="is retired"):
             admin_auth.validate_admin_config_at_startup(get_settings())
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 class TestChallenge:
-    def test_503_when_allowlist_empty(self, monkeypatch):
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
+    def test_503_when_records_missing(self, monkeypatch):
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", "")
         get_settings.cache_clear()
         app = FastAPI()
         app.include_router(admin_auth.router)
@@ -350,7 +373,7 @@ class TestChallenge:
 
     def test_rate_limit_kicks_in(self, monkeypatch, client):
         # Override the cap to 2/min so the third call is rejected.
-        monkeypatch.setenv("POPULIS_ADMIN_LOGIN_PER_IP_PER_MINUTE", "2")
+        monkeypatch.setenv("SOLSLOT_ADMIN_LOGIN_PER_IP_PER_MINUTE", "2")
         get_settings.cache_clear()
         reset_admin_state_for_tests()
         app = FastAPI()
@@ -455,14 +478,9 @@ class TestLogin:
         # recovered address is _TEST_ADDRESS, which does not match.
         assert resp.status_code == 401
 
-    def test_not_in_allowlist_403(self, monkeypatch):
-        # Reconfigure with a different allowlist that doesn't include
-        # the test signer.
-        monkeypatch.setenv(
-            "POPULIS_ADMIN_PUBKEY_ALLOWLIST",
-            "0x000000000000000000000000000000000000DEAD",
-        )
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "y" * 64)
+    def test_not_in_records_403(self, monkeypatch, tmp_path):
+        _configure_admin_records(monkeypatch, tmp_path, [_OTHER_ACCT])
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "y" * 64)
         get_settings.cache_clear()
         reset_admin_state_for_tests()
         app = FastAPI()
@@ -529,13 +547,9 @@ class TestRefresh:
         )
         assert resp.status_code == 403
 
-    def test_503_when_allowlist_empty(self, monkeypatch):
-        # Logged-in token, but allowlist subsequently cleared → 503.
-        # (The refresh dependency reads the allowlist on every call.)
-        monkeypatch.setenv(
-            "POPULIS_ADMIN_PUBKEY_ALLOWLIST", _TEST_ADDRESS_LOWER,
-        )
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "z" * 64)
+    def test_rotated_records_revoke_refresh(self, monkeypatch, tmp_path):
+        _configure_admin_records(monkeypatch, tmp_path, [_TEST_ACCT])
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "z" * 64)
         get_settings.cache_clear()
         reset_admin_state_for_tests()
         app = FastAPI()
@@ -543,12 +557,12 @@ class TestRefresh:
         c = TestClient(app)
         token, _ = self._login(c)
 
-        # Now clear the allowlist and recreate the dependency cache.
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
+        # Rotate the records away from the token subject.
+        _configure_admin_records(monkeypatch, tmp_path, [_OTHER_ACCT])
         get_settings.cache_clear()
 
         resp = c.post(
             "/admin/auth/refresh",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp.status_code == 503
+        assert resp.status_code == 403

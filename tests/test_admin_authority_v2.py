@@ -1,11 +1,11 @@
-"""Tests for ``populis_api.admin_authority_v2`` and ``/admin/auth/authority_v2``.
+"""Tests for ``solslot_api.admin_authority_v2`` and ``/admin/auth/authority_v2``.
 
 Phase 9-Hermes-C extends the on-chain admin-authority surface with v2
 (MIPS-based, supports per-admin OneOfN of mixed auth methods). This file
 regression-tests both the helper module and the wired-in endpoint.
 
 The matching Chialisp + driver tests live in
-``populis_protocol/tests/test_admin_authority_v2.py``; the cross-repo
+``solslot_protocol/tests/test_admin_authority_v2.py``; the cross-repo
 contract is that the off-chain ``compute_state_hash`` exactly equals
 the on-chain ``state-hash`` defun. Here we only need to assert that the
 API's wiring threads the right values into the helper.
@@ -15,13 +15,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from populis_api.admin_authority_v2 import (
+from solslot_api.admin_authority_v2 import (
     AdminAuthorityV2Snapshot,
     build_admin_authority_v2_snapshot,
 )
-from populis_api.app import app
-from populis_api.config import get_settings
-from populis_puzzles.admin_authority_v2_driver import (
+from solslot_api.app import app
+from solslot_api.config import get_settings
+from solslot_puzzles.admin_authority_v2_driver import (
     EMPTY_LIST_HASH,
     compute_state_hash,
 )
@@ -40,17 +40,17 @@ def fresh_settings(monkeypatch):
     # String-typed: setenv("") so conftest's .env mask survives.
     # Integer-typed: delenv so Pydantic falls back to model default.
     for key in (
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_PUBKEYS",
     ):
         monkeypatch.setenv(key, "")
     for key in (
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION",
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_VERSION",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_VERSION",
     ):
         monkeypatch.delenv(key, raising=False)
     get_settings.cache_clear()
@@ -77,7 +77,7 @@ class TestBuildV2Snapshot:
         assert snap.pending_ops_hash_hex is None
         assert snap.authority_version == 1  # default
         assert snap.state_hash_hex is None
-        assert snap.phase == "1-not-deployed"
+        assert snap.phase == "not-deployed"
         assert snap.deployment_status == "not-configured"
         assert snap.chain_verifiable is False
 
@@ -89,7 +89,7 @@ class TestBuildV2Snapshot:
         not yet computable' (no full state).
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
         )
         get_settings.cache_clear()
         snap = build_admin_authority_v2_snapshot(get_settings())
@@ -106,20 +106,20 @@ class TestBuildV2Snapshot:
         applied to the same inputs.
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
             PENDING_OPS_HASH_HEX,
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION", "5"
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION", "5"
         )
         get_settings.cache_clear()
         snap = build_admin_authority_v2_snapshot(get_settings())
@@ -154,13 +154,13 @@ class TestBuildV2Snapshot:
         env-var state, but state_hash uses EMPTY_LIST_HASH internally.
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
         )
         get_settings.cache_clear()
         snap = build_admin_authority_v2_snapshot(get_settings())
@@ -183,7 +183,7 @@ class TestBuildV2Snapshot:
         see it immediately).
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
             "0xnot-actually-hex",
         )
         get_settings.cache_clear()
@@ -193,7 +193,7 @@ class TestBuildV2Snapshot:
     def test_rejects_wrong_length_hash(self, fresh_settings, monkeypatch):
         """16-byte hash (half size) should be rejected with a clear error."""
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH",
             "0x" + ("ab" * 16),  # only 16 bytes, not 32
         )
         get_settings.cache_clear()
@@ -206,10 +206,10 @@ class TestBuildV2Snapshot:
         """
         bare_hex = "ab" * 32
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", bare_hex
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", bare_hex
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "0x" + ("cd" * 32)
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "0x" + ("cd" * 32)
         )
         get_settings.cache_clear()
         snap = build_admin_authority_v2_snapshot(get_settings())
@@ -223,17 +223,17 @@ class TestBuildV2Snapshot:
         launcher id auditors cannot locate a singleton to verify.
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
         )
         get_settings.cache_clear()
         snap = build_admin_authority_v2_snapshot(get_settings())
         assert snap.enabled is False
         assert snap.deployment_status == "hash-config-only"
         assert snap.chain_verifiable is False
-        assert snap.phase == "1-not-deployed"
+        assert snap.phase == "not-deployed"
         assert snap.state_hash_hex is not None
 
 
@@ -263,12 +263,12 @@ class TestAuthorityV2Endpoint:
         assert body["admins_hash"] is None
         assert body["pending_ops_hash"] is None
         assert body["state_hash"] is None
-        assert body["phase"] == "1-not-deployed"
+        assert body["phase"] == "not-deployed"
         assert body["deployment_status"] == "not-configured"
         assert body["chain_verifiable"] is False
         # Transparency disclaimer fields surface even when disabled.
         assert body["informational_only"] is True
-        assert body["gating_source"] == "POPULIS_ADMIN_PUBKEY_ALLOWLIST"
+        assert body["gating_source"] == "disabled"
 
     def test_endpoint_returns_full_state_when_configured(
         self, fresh_settings, monkeypatch
@@ -277,20 +277,20 @@ class TestAuthorityV2Endpoint:
         snapshot helper produced, including the computed state_hash.
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", LAUNCHER_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_PENDING_OPS_HASH",
             PENDING_OPS_HASH_HEX,
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION", "7"
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_VERSION", "7"
         )
         get_settings.cache_clear()
 
@@ -306,7 +306,7 @@ class TestAuthorityV2Endpoint:
         assert body["pending_ops_hash"] == PENDING_OPS_HASH_HEX
         assert body["authority_version"] == 7
         assert body["state_hash"] is not None and body["state_hash"].startswith("0x")
-        assert body["phase"] == "2-informational-only"
+        assert body["phase"] == "chain-published-not-gating"
         assert body["deployment_status"] == "deployed-configured"
         assert body["chain_verifiable"] is True
         assert body["informational_only"] is True
@@ -315,10 +315,10 @@ class TestAuthorityV2Endpoint:
         self, fresh_settings, monkeypatch
     ):
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", MIPS_ROOT_HEX
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", ADMINS_HASH_HEX
         )
         get_settings.cache_clear()
         client = self._client()
@@ -353,7 +353,7 @@ class TestAuthorityV2Endpoint:
         what production traffic would see.
         """
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "garbage"
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "garbage"
         )
         get_settings.cache_clear()
 

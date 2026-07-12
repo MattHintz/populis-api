@@ -12,20 +12,6 @@ on:
         description: "Existing release SHA to roll back to. Leave blank for a normal deploy."
         required: false
         type: string
-      bridge_pool_topup_count:
-        description: "Optional: create this many zkPassport bridge coins after deploy."
-        required: false
-        type: string
-      bridge_pool_topup_start_amount:
-        description: "First bridge coin amount in mojos when bridge_pool_topup_count is set."
-        required: false
-        default: "1"
-        type: string
-      bridge_pool_topup_dry_run:
-        description: "Preview bridge pool top-up without pushing to Coinset."
-        required: false
-        type: boolean
-        default: true
   push:
     branches:
       - staging
@@ -37,14 +23,13 @@ concurrency:
 env:
   RELEASE_ROOT: ${{ vars.SOLSLOT_API_RELEASE_ROOT || '/opt/solslot/api-staging' }}
   SHARED_ROOT: ${{ vars.SOLSLOT_API_SHARED_ROOT || '/opt/solslot/api-staging/shared' }}
-  ENV_FILE_PATH: ${{ vars.SOLSLOT_API_ENV_FILE_PATH || '/opt/populis-api-staging/.env' }}
-  SYSTEMD_SERVICE: ${{ vars.SOLSLOT_API_SYSTEMD_SERVICE || 'populis-api-staging.service' }}
+  ENV_FILE_PATH: ${{ vars.SOLSLOT_API_ENV_FILE_PATH || '/opt/solslot-api-staging/.env' }}
+  SYSTEMD_SERVICE: ${{ vars.SOLSLOT_API_SYSTEMD_SERVICE || 'solslot-api-staging.service' }}
   APP_PORT: ${{ vars.SOLSLOT_API_PORT || '8790' }}
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   EXPECTED_HOSTNAME: ${{ vars.SOLSLOT_API_HOSTNAME || 'SolomonsLot' }}
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF || 'main' }}
-  ZKPASSPORT_BRIDGE_PARENT_IDS: ${{ vars.SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS || vars.POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS || '' }}
+  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF }}
 
 jobs:
   build-release:
@@ -54,6 +39,15 @@ jobs:
     steps:
       - name: Checkout API
         uses: actions/checkout@v4
+
+      - name: Require frozen protocol commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$PROTOCOL_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "SOLSLOT_PROTOCOL_REF must be an exact 40-character commit SHA." >&2
+            exit 1
+          fi
 
       - name: Checkout protocol package
         uses: actions/checkout@v4
@@ -75,10 +69,8 @@ jobs:
           set -euo pipefail
           if [ -d solslot_api ]; then
             package_name=solslot_api
-          elif [ -d populis_api ]; then
-            package_name=populis_api
           else
-            echo "No solslot_api or populis_api package directory found." >&2
+            echo "No solslot_api package directory found." >&2
             exit 1
           fi
           echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
@@ -103,18 +95,8 @@ jobs:
           assert "Solslot" in app.title, app.title
           assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
           PY
-          zkpassport_tests=()
-          for test_file in \
-            tests/test_zkpassport_enrollments.py \
-            tests/test_zkpassport_relay.py \
-            tests/test_zkpassport_validator.py; do
-            if [ -f "$test_file" ]; then
-              zkpassport_tests+=("$test_file")
-            fi
-          done
-          if [ "${#zkpassport_tests[@]}" -gt 0 ]; then
-            pytest "${zkpassport_tests[@]}" -q
-          fi
+          pytest -q
+          python scripts/check_namespace.py
 
       - name: Secret scan
         shell: bash
@@ -140,6 +122,8 @@ jobs:
           python - <<PY
           import json
           data = {
+              "schemaVersion": 2,
+              "protocolVersion": "solslot-v2",
               "api_commit": "${GITHUB_SHA}",
               "api_repository": "${GITHUB_REPOSITORY}",
               "protocol_repository": "${PROTOCOL_REPOSITORY}",
@@ -173,6 +157,10 @@ jobs:
             pyproject.toml \
             README.md \
             release.json
+
+      - name: Verify packaged namespace
+        shell: bash
+        run: python scripts/check_namespace.py --paths "solslot-api-release-${GITHUB_SHA}.tgz"
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
@@ -221,17 +209,11 @@ jobs:
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             app_port="${{ env.APP_PORT }}"
-            zkpassport_bridge_parent_ids="${{ env.ZKPASSPORT_BRIDGE_PARENT_IDS }}"
-            zkpassport_bridge_parent_env_lines=""
             actual_hostname="$(hostname)"
             if [ "$actual_hostname" != "${{ env.EXPECTED_HOSTNAME }}" ]; then
               echo "Refusing staging deploy: expected host ${{ env.EXPECTED_HOSTNAME }}, got $actual_hostname" >&2
               exit 1
             fi
-            if [ -n "$zkpassport_bridge_parent_ids" ]; then
-              zkpassport_bridge_parent_env_lines="$(printf 'Environment=POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS=%s\nEnvironment=SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS=%s' "$zkpassport_bridge_parent_ids" "$zkpassport_bridge_parent_ids")"
-            fi
-
             sudo mkdir -p "$release_root/releases" "$state_dir"
             sudo chown -R "$(id -un)":"$(id -gn)" "$release_root" "$shared_root"
             test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
@@ -274,13 +256,11 @@ jobs:
             WorkingDirectory=$release_root/current
             EnvironmentFile=$env_file
             Environment=PYTHONUNBUFFERED=1
-            Environment=POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
-            Environment=SOLSLOT_ZKPASSPORT_ENROLLMENT_STORE_PATH=$state_dir/zkpassport_enrollments.json
-            Environment=POPULIS_VAULT_REGISTRY_PATH=$state_dir/vault_registry.db
-            Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry.db
-            Environment=POPULIS_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED=true
-            Environment=SOLSLOT_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED=true
-            $zkpassport_bridge_parent_env_lines
+            Environment=SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH=$state_dir/zkpassport_v2.db
+            Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry_v2.db
+            Environment=SOLSLOT_ADMIN_DB_PATH=$state_dir/admin_desk_v2.db
+            Environment=SOLSLOT_DEPLOYMENT_MANIFEST_PATH=$state_dir/deployment_manifest_v2.json
+            Environment=SOLSLOT_BOOTSTRAP_MANIFEST_PATH=$state_dir/bootstrap_manifest_v2.json
             ExecStart=
             ExecStart=$release_root/current/.venv/bin/uvicorn $app_module --host 127.0.0.1 --port $app_port
             ReadWritePaths=$shared_root $release_root
@@ -290,6 +270,8 @@ jobs:
 
             sleep 5
             curl -fsS "http://127.0.0.1:$app_port/health"
+            curl -fsS "http://127.0.0.1:$app_port/release" \
+              | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
             curl -fsS "http://127.0.0.1:$app_port/openapi.json" \
               | "$release_dir/.venv/bin/python" -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
 
@@ -302,70 +284,10 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
+            | python -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/openapi.json" \
             | python -c 'import json, sys; data = json.load(sys.stdin); assert "Solslot" in data.get("info", {}).get("title", ""), data.get("info"); assert any("zkpassport/enrollments" in path for path in data.get("paths", {}))'
-
-      - name: Optional bridge pool top-up
-        if: ${{ github.event.inputs.bridge_pool_topup_count != '' && github.event.inputs.bridge_pool_topup_count != null }}
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.STAGING_SERVER_IP }}
-          username: ${{ secrets.STAGING_SSH_USER }}
-          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
-          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
-          port: 22
-          command_timeout: 5m
-          script: |
-            set -euo pipefail
-
-            env_file="${{ env.ENV_FILE_PATH }}"
-            app_port="${{ env.APP_PORT }}"
-            count="${{ github.event.inputs.bridge_pool_topup_count }}"
-            start_amount="${{ github.event.inputs.bridge_pool_topup_start_amount }}"
-            dry_run="${{ github.event.inputs.bridge_pool_topup_dry_run }}"
-
-            case "$count" in
-              ''|*[!0-9]*) echo "bridge_pool_topup_count must be numeric" >&2; exit 1 ;;
-            esac
-            case "$start_amount" in
-              ''|*[!0-9]*) echo "bridge_pool_topup_start_amount must be numeric" >&2; exit 1 ;;
-            esac
-
-            test -f "$env_file" || (echo "Missing $env_file" >&2; exit 1)
-            admin_token="$(ENV_FILE="$env_file" python3 - <<'PY'
-            import os
-            from pathlib import Path
-
-            token = ""
-            for raw in Path(os.environ["ENV_FILE"]).read_text(encoding="utf-8").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.removeprefix("export ").strip()
-                if key in {"SOLSLOT_ADMIN_TOKEN", "POPULIS_ADMIN_TOKEN"}:
-                    token = value.strip().strip("'\"")
-            print(token)
-            PY
-            )"
-            test -n "$admin_token" || (echo "No admin token configured in $env_file" >&2; exit 1)
-
-            body="$(python3 - <<PY
-            import json
-            print(json.dumps({
-                "count": int("$count"),
-                "start_amount": int("$start_amount"),
-                "dry_run": "$dry_run".lower() == "true",
-            }))
-            PY
-            )"
-
-            curl -fsS \
-              -X POST "http://127.0.0.1:${app_port}/admin/zkpassport/bridge-pool/top-up" \
-              -H "authorization: Bearer ${admin_token}" \
-              -H "content-type: application/json" \
-              --data "$body" \
-              | python3 -m json.tool
 
       - name: Print staging API diagnostics on failure
         if: failure()
@@ -379,7 +301,7 @@ jobs:
           script: |
             set +e
             echo "user=$(id -un) home=$HOME"
-            ps aux | grep -E 'uvicorn|solslot|populis_api' | grep -v grep
+            ps aux | grep -E 'uvicorn|solslot|solslot_api' | grep -v grep
             sudo systemctl status "${{ env.SYSTEMD_SERVICE }}" --no-pager
             sudo journalctl -u "${{ env.SYSTEMD_SERVICE }}" -n 120 --no-pager
             curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" || true
@@ -435,7 +357,7 @@ jobs:
             echo "user=$(id -un) home=$HOME"
             echo "current=$(readlink -f '${{ env.RELEASE_ROOT }}/current')"
             sudo systemctl status "${{ env.SYSTEMD_SERVICE }}" --no-pager
-            ps -eo pid,user,lstart,cmd | grep -E 'uvicorn .*populis_api|uvicorn .*solslot_api' | grep -v grep
+            ps -eo pid,user,lstart,cmd | grep -E 'uvicorn .*solslot_api' | grep -v grep
             echo "--- recent API journal ---"
             sudo journalctl -u "${{ env.SYSTEMD_SERVICE }}" -n 300 --no-pager
             echo "--- local health ---"
@@ -446,7 +368,7 @@ jobs:
               | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("info",{}).get("title")); [print(path) for path in sorted(d.get("paths",{})) if "zkpassport" in path]' \
               || true
             echo "--- vault registry candidates ---"
-            sudo find /opt/solslot /opt/populis-api-staging -type f -name 'vault_registry.db' -print0 2>/dev/null \
+            sudo find /opt/solslot /opt/solslot-api-staging -type f -name 'vault_registry.db' -print0 2>/dev/null \
               | while IFS= read -r -d '' db; do
                   sudo DB_PATH="$db" python3 - <<'PY'
             import os

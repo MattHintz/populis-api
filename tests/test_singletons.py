@@ -1,4 +1,4 @@
-"""Tests for ``populis_api.singletons`` and the A.1 + A.4 fields on /protocol.
+"""Tests for ``solslot_api.singletons`` and the A.1 + A.4 fields on /protocol.
 
 Phase 3 of the on-chain migration introduces the mint-proposal and
 property-registry singletons.  This file regression-tests:
@@ -6,22 +6,22 @@ property-registry singletons.  This file regression-tests:
   * The off-chain helper module (``build_singletons_snapshot``).
   * The wiring on the ``/protocol`` endpoint.
   * The cross-repo contract: the API's published mod-hashes match what
-    ``populis_puzzles`` produces for the canonical .clsp files.
+    ``solslot_puzzles`` produces for the canonical .clsp files.
 
 The matching Chialisp + driver tests live in
-``populis_protocol/tests/test_property_registry.py`` and
-``populis_protocol/tests/test_mint_proposal.py``.
+``solslot_protocol/tests/test_property_registry.py`` and
+``solslot_protocol/tests/test_mint_proposal.py``.
 """
 from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
 
-from populis_api.app import app
-from populis_api.config import get_settings
-from populis_api.singletons import build_singletons_snapshot
-from populis_puzzles.mint_proposal_driver import mint_proposal_inner_mod_hash
-from populis_puzzles.property_registry_driver import (
+from solslot_api.app import app
+from solslot_api.config import get_settings
+from solslot_api.singletons import build_singletons_snapshot
+from solslot_puzzles.mint_proposal_v2_driver import mint_proposal_inner_v2_mod_hash
+from solslot_puzzles.property_registry_driver import (
     property_registry_inner_mod_hash,
 )
 
@@ -33,7 +33,7 @@ PROPERTY_REGISTRY_LAUNCHER = "0x" + ("ab" * 32)
 def fresh_settings(monkeypatch):
     """Reset env + cached settings for every test."""
     for key in (
-        "POPULIS_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID",
     ):
         monkeypatch.delenv(key, raising=False)
     get_settings.cache_clear()
@@ -58,7 +58,7 @@ class TestBuildSnapshot:
         self, fresh_settings, monkeypatch
     ):
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID",
+            "SOLSLOT_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID",
             PROPERTY_REGISTRY_LAUNCHER,
         )
         get_settings.cache_clear()
@@ -66,15 +66,15 @@ class TestBuildSnapshot:
         assert snap.property_registry_launcher_id_hex == PROPERTY_REGISTRY_LAUNCHER
 
     def test_property_registry_mod_hash_matches_driver(self, fresh_settings):
-        """Cross-repo contract: API helper matches populis_puzzles driver."""
+        """Cross-repo contract: API helper matches solslot_puzzles driver."""
         snap = build_singletons_snapshot(fresh_settings)
         expected = "0x" + property_registry_inner_mod_hash().hex()
         assert snap.property_registry_mod_hash_hex == expected
 
     def test_mint_proposal_mod_hash_matches_driver(self, fresh_settings):
-        """Cross-repo contract: API helper matches populis_puzzles driver."""
+        """Cross-repo contract: API helper matches solslot_puzzles driver."""
         snap = build_singletons_snapshot(fresh_settings)
-        expected = "0x" + mint_proposal_inner_mod_hash().hex()
+        expected = "0x" + mint_proposal_inner_v2_mod_hash().hex()
         assert snap.mint_proposal_mod_hash_hex == expected
 
 
@@ -99,7 +99,7 @@ class TestProtocolEndpoint:
         self, fresh_settings, monkeypatch
     ):
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID",
+            "SOLSLOT_PROTOCOL_PROPERTY_REGISTRY_LAUNCHER_ID",
             PROPERTY_REGISTRY_LAUNCHER,
         )
         get_settings.cache_clear()
@@ -109,7 +109,7 @@ class TestProtocolEndpoint:
             assert body["property_registry_launcher_id"] == PROPERTY_REGISTRY_LAUNCHER
 
     def test_mod_hashes_match_drivers(self, fresh_settings):
-        """The /protocol response's mod-hashes match populis_puzzles drivers."""
+        """The /protocol response's mod-hashes match solslot_puzzles drivers."""
         with TestClient(app) as client:
             resp = client.get("/protocol")
             body = resp.json()
@@ -117,7 +117,7 @@ class TestProtocolEndpoint:
                 "0x" + property_registry_inner_mod_hash().hex()
             )
             assert body["mint_proposal_mod_hash"] == (
-                "0x" + mint_proposal_inner_mod_hash().hex()
+                "0x" + mint_proposal_inner_v2_mod_hash().hex()
             )
 
     def test_mod_hashes_stable_across_calls(self, fresh_settings):

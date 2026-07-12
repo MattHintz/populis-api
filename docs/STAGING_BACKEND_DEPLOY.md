@@ -1,134 +1,84 @@
-# Staging Backend Deploy Runbook
+# Solslot API Staging Deployment
 
-Staging backend deploys are owned by `MattHintz/solslot-api` on the `staging`
-branch. Do not patch the API from the frontend repo except for an explicitly
-temporary emergency.
+The canonical backend deploy is `.github/workflows/deploy-staging.yml` in the
+API repository. Do not copy individual Python files to the host and do not
+deploy from either frontend repository.
 
-## Normal Deploy
+## Release Contract
 
-1. Work in a clean clone of `MattHintz/solslot-api` on `staging`.
-2. Run focused tests locally before pushing.
-3. Commit and push to `staging`.
-4. Watch the workflow:
+Every normal deploy:
 
-```bash
-gh run list -R MattHintz/solslot-api --workflow "Staging Backend Deploy" --limit 5
-gh run watch <run-id> -R MattHintz/solslot-api --exit-status
+1. Checks out the API commit and an exact 40-character protocol commit.
+2. Installs both in an isolated Python 3.12 environment.
+3. Runs compile/import smoke, full pytest, namespace scan, and secret scan.
+4. Writes `release.json` with API commit, protocol commit, repositories,
+   package, app module, and UTC build time.
+5. Packages the complete release and scans the archive again.
+6. Uploads to `/tmp/solslot-api-release-<sha>.tgz`.
+7. Extracts to `/opt/solslot/api-staging/releases/<sha>/` and builds a fresh
+   release virtual environment.
+8. Validates OpenAPI before switching the `current` symlink.
+9. Restarts `solslot-api-staging.service`.
+10. Verifies local and public health and OpenAPI through `/protocol-api`.
+11. Keeps the five newest releases for rollback.
+
+The systemd unit must run:
+
+```text
+/opt/solslot/api-staging/current/.venv/bin/uvicorn solslot_api.app:app --host 127.0.0.1 --port 8790
 ```
 
-The workflow packages a release, uploads it to the AWS staging host, switches
-`/opt/solslot/api-staging/current`, restarts the staging systemd service, and
-checks both local and public `/health` plus OpenAPI.
+## Persistent Layout
 
-For changes to identity enrollment, the minimum local gate is:
-
-```bash
-python -m pytest \
-  tests/test_zkpassport_enrollments.py \
-  tests/test_zkpassport_relay.py \
-  tests/test_zkpassport_validator.py -q
+```text
+/opt/solslot/api-staging/
+  current -> releases/<sha>
+  releases/<sha>/
+  shared/
+    state/
+      deployment_manifest_v2.json
+      bootstrap_manifest_v2.json
+      admin_records_v2.json
+      portal_runtime_config_v2.json
+      bootstrap_recovery_anchor_v2.json
+      vault_registry_v2.db
+      admin_desk_v2.db
+      zkpassport_v2.db
 ```
 
-The end-to-end state and failure rules are defined in
-[`ZKPASSPORT_CHIA_VAULT_ATTESTATION.md`](ZKPASSPORT_CHIA_VAULT_ATTESTATION.md).
+The environment file is outside release directories and must be mode `0600`.
+State files are never packaged, copied from an earlier ceremony, or deleted by
+release cleanup.
 
-## Verification
+## Required GitHub Configuration
 
-```bash
-curl -fsS https://staging.solslot.com/protocol-api/health
-curl -fsS https://staging.solslot.com/protocol-api/openapi.json \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["info"]["title"]); print("/zkpassport/enrollments" in d["paths"])'
+The `staging` environment holds SSH secrets. Repository variables pin the
+expected host, service, release root, port, and exact protocol commit. The
+workflow refuses a host-name mismatch or branch-like protocol reference.
 
-curl -fsS -X POST https://staging.solslot.com/protocol-api/auth/challenge \
-  -H 'content-type: application/json' \
-  --data '{"address":"0x1234567890123456789012345678901234567890","auth_type":"evm"}' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["typed_data"]["primaryType"])'
-```
+No passphrase, private key, bearer token, seed, or RPC secret belongs in a
+workflow variable, source file, release archive, or issue log.
 
-Expected registration primary type is `SolslotVaultRegister`. The legacy
-`PopulisVaultSpend` typehash may still appear in `/protocol` until a versioned
-protocol migration replaces that in-puzzle spend type.
+## Bridge Pool
 
-## zkPassport Bridge Pool
-
-The enrollment endpoint fails closed until unspent bridge coins exist at the
-configured bridge policy hash. The API now auto-discovers those coins from
-Coinset and reserves by full bridge coin id. The old
-`SOLSLOT_ZKPASSPORT_BRIDGE_PARENT_IDS` environment variable remains only as an
-emergency static override.
-
-Staging deploys set `POPULIS_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED=true`, so a
-testnet11 enrollment request can create a fresh bridge batch from the staging
-faucet when every discovered bridge coin is already reserved. This is disabled
-by default in code and must remain off for mainnet.
-
-1. Confirm bridge coins exist at the configured bridge policy hash:
-
-```bash
-curl -fsS -X POST https://testnet11.api.coinset.org/get_coin_records_by_puzzle_hash \
-  -H 'content-type: application/json' \
-  --data '{"puzzle_hash":"0xc87f45cd23d052c88256de8823a4a01f40da4e2066156f48f3b3dfc0a50350d7","include_spent_coins":false}' \
-  | python3 -m json.tool
-```
-
-2. If the pool is empty or fully reserved and auto-top-up is unavailable, create
-   more bridge coins from the staging faucet. Prefer the GitHub deploy
-   workflow's top-up inputs so the admin token never leaves the staging host:
-
-```bash
-gh workflow run deploy-staging.yml \
-  -R MattHintz/solslot-api \
-  --ref staging \
-  -f bridge_pool_topup_count=6 \
-  -f bridge_pool_topup_start_amount=1 \
-  -f bridge_pool_topup_dry_run=true
-```
-
-Then run the same workflow with `bridge_pool_topup_dry_run=false`.
-
-If SSH is unavailable but you already have the admin token locally, the
-equivalent direct API call is:
-
-```bash
-curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/bridge-pool/top-up \
-  -H "authorization: Bearer $SOLSLOT_ADMIN_TOKEN" \
-  -H 'content-type: application/json' \
-  --data '{"count":6,"start_amount":1,"dry_run":true}' \
-  | python3 -m json.tool
-```
-
-Then push directly:
-
-```bash
-curl -fsS -X POST https://staging.solslot.com/protocol-api/admin/zkpassport/bridge-pool/top-up \
-  -H "authorization: Bearer $SOLSLOT_ADMIN_TOKEN" \
-  -H 'content-type: application/json' \
-  --data '{"count":6,"start_amount":1,"dry_run":false}' \
-  | python3 -m json.tool
-```
-
-3. Verify reservation succeeds:
-
-```bash
-curl -fsS -X POST https://staging.solslot.com/protocol-api/zkpassport/enrollments \
-  -H 'content-type: application/json' \
-  --data '{"vaultLauncherId":"0x5807c4716d82028ed3c2e47d46f87d815a975120443bdab827ae29f64454df7d"}' \
-  | python3 -m json.tool
-```
-
-Each top-up creates several bridge coins from one faucet parent with distinct
-amounts. The amount is part of the coin id and EVM attestation, so those bridge
-coins can be reserved independently without hand-editing server config.
+Enrollment discovers confirmed unspent coins at the active bridge policy
+hash. Static parent-ID configuration is not used. Public enrollment cannot
+create coins or spend the faucet. Replenishment is a deliberate post-genesis
+admin action through `/admin/zkpassport/bridge-pool/top-up` using a current
+chain-bound admin JWT.
 
 ## Rollback
 
-Use the workflow rollback input rather than SSH:
+Dispatch the workflow with `rollback_sha` set to an existing release. Rollback
+changes only the `current` symlink, restarts the service, and reruns local and
+public checks. It does not roll back shared state or ceremony coordinates.
 
-```bash
-gh workflow run deploy-staging.yml \
-  -R MattHintz/solslot-api \
-  --ref staging \
-  -f rollback_sha=<existing-release-sha>
-```
+If a release changed persistent schema incompatibly, stop and restore from the
+matching checksummed state backup rather than pointing old code at newer data.
 
-Then rerun the verification checks above.
+## Diagnostics
+
+Dispatch with `diagnostics_only=true` to print host identity, current release,
+systemd status, recent journal lines, local health, zkPassport OpenAPI routes,
+and shared-state inventory. A failed deploy prints the same evidence
+automatically while the prior release remains available.

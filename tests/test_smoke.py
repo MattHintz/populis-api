@@ -2,20 +2,72 @@
 from __future__ import annotations
 
 import secrets
+import json
 
 import pytest
 from fastapi.testclient import TestClient
 from eth_account import Account
 
-from populis_api.app import app
-from populis_api.evm_auth import recover_evm_signer, registration_typed_data
+from solslot_api.app import app
+from solslot_api.evm_auth import recover_evm_signer, registration_typed_data
+from solslot_api.config import get_settings
+
+
+def _v2_manifest() -> dict:
+    hex_value = lambda byte: "0x" + byte * 32
+    fields = {
+        name: hex_value(f"{index:02x}")
+        for index, name in enumerate(
+            (
+                "faucet_inner_puzhash",
+                "sgt_genesis_coin_id",
+                "pool_genesis_coin_id",
+                "did_genesis_coin_id",
+                "gov_genesis_coin_id",
+                "pool_launcher_id",
+                "did_launcher_id",
+                "tracker_launcher_id",
+                "sgt_tail_hash",
+                "sgt_full_puzhash",
+                "pool_token_tail_hash",
+                "pool_inner_puzhash",
+                "pool_full_puzhash",
+                "pool_inner_mod_hash",
+                "p2_pool_mod_hash",
+                "smart_deed_inner_mod_hash",
+                "governance_singleton_struct_hash",
+                "did_inner_puzhash",
+                "did_full_puzhash",
+                "tracker_inner_puzhash",
+                "tracker_full_puzhash",
+            ),
+            start=1,
+        )
+    }
+    return {
+        "network": "testnet11",
+        "params": {},
+        "protocol_version": "solslot-v2",
+        "pool_puzzle_version": 3,
+        "smart_deed_puzzle_version": 2,
+        **fields,
+    }
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "deployment_manifest_v2.json"
+    manifest = _v2_manifest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(manifest_path))
+    monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", manifest["pool_launcher_id"])
+    monkeypatch.setenv("SOLSLOT_GOVERNANCE_LAUNCHER_ID", manifest["tracker_launcher_id"])
+    monkeypatch.setenv("SOLSLOT_PROTOCOL_CONFIG_LAUNCHER_ID", "0x" + "ee" * 32)
+    get_settings.cache_clear()
     # `with` triggers Starlette's lifespan (populates app.state).
     with TestClient(app) as c:
         yield c
+    get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -41,7 +93,7 @@ def test_protocol(client: TestClient) -> None:
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["eip712_domain"]["chainId"] == 1
-    assert "PopulisVaultSpend" in body["eip712_typehash_string"]
+    assert "SolslotVaultSpend" in body["eip712_typehash_string"]
     assert body["vault_inner_mod_hash"].startswith("0x")
     assert len(body["vault_inner_mod_hash"]) == 66  # 0x + 32 bytes hex
 

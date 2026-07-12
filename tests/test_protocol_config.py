@@ -1,4 +1,4 @@
-"""Tests for ``populis_api.protocol_config`` and the ``/protocol`` integration.
+"""Tests for ``solslot_api.protocol_config`` and the ``/protocol`` integration.
 
 Phase 1 of the on-chain protocol-config migration (A.3) introduces a
 deterministic ``content_hash`` that the API surfaces alongside its
@@ -6,7 +6,7 @@ existing manifest data.  This file regression-tests both the helper
 module and the wired-in ``/protocol`` endpoint.
 
 The matching Chialisp + driver tests live in
-``populis_protocol/tests/test_protocol_config.py``; the cross-repo
+``solslot_protocol/tests/test_protocol_config.py``; the cross-repo
 contract is that the off-chain ``compute_content_hash`` exactly equals
 the on-chain ``content-hash`` defun.  Here we only need to assert that
 the API's wiring threads the right values into the helper.
@@ -16,21 +16,21 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from populis_api.app import app
-from populis_api.config import get_settings
-from populis_api.protocol_config import (
+from solslot_api.app import app
+from solslot_api.config import get_settings
+from solslot_api.protocol_config import (
     ProtocolConfigSnapshot,
     build_snapshot,
 )
-from populis_api.vault_version_registry import (
+from solslot_api.vault_version_registry import (
     VaultVersionRegistrySnapshot,
     build_vault_version_registry_snapshot,
 )
-from populis_puzzles.protocol_config_driver import (
+from solslot_puzzles.protocol_config_driver import (
     NETWORK_ID_TESTNET11,
     compute_content_hash,
 )
-from populis_puzzles.vault_version_registry_driver import (
+from solslot_puzzles.vault_version_registry_driver import (
     compute_canonical_params_hash as compute_vault_canonical_params_hash,
     compute_content_hash as compute_vault_registry_content_hash,
 )
@@ -53,21 +53,24 @@ BRIDGE_POLICY_HEX = "0x" + ("ee" * 32)
 def fresh_settings(monkeypatch):
     """Reset env + cached settings for every test."""
     for key in (
-        "POPULIS_POOL_LAUNCHER_ID",
-        "POPULIS_GOVERNANCE_LAUNCHER_ID",
-        "POPULIS_PROTOCOL_CONFIG_LAUNCHER_ID",
-        "POPULIS_PROTOCOL_CONFIG_VERSION",
-        "POPULIS_NETWORK",
-        "POPULIS_VAULT_VERSION_REGISTRY_VERSION",
-        "POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH",
+        "SOLSLOT_POOL_LAUNCHER_ID",
+        "SOLSLOT_GOVERNANCE_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_CONFIG_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_CONFIG_VERSION",
+        "SOLSLOT_NETWORK",
+        "SOLSLOT_VAULT_VERSION_REGISTRY_VERSION",
     ):
         monkeypatch.delenv(key, raising=False)
     # The operator's local ``.env`` pins the deployed registry launcher id;
     # ``delenv`` would let pydantic fall back to it.  Force the empty-string
     # mask (coerced to ``None`` by the Settings validator) for the
     # registry-less default path.  Tests that need it set use setenv.
-    monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
-    monkeypatch.setenv("POPULIS_NETWORK", "testnet11")
+    monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
+    monkeypatch.setenv("SOLSLOT_NETWORK", "testnet11")
+    monkeypatch.setenv(
+        "SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH",
+        BRIDGE_POLICY_HEX,
+    )
     get_settings.cache_clear()
     yield get_settings()
     get_settings.cache_clear()
@@ -107,7 +110,7 @@ class TestBuildSnapshot:
         assert len(snap.content_hash_hex) == 2 + 64  # 0x + 32 bytes hex
 
     def test_hash_matches_driver_directly(self, fresh_settings):
-        """The API helper must produce the SAME hash as the populis_puzzles
+        """The API helper must produce the SAME hash as the solslot_puzzles
         driver — that's the cross-repo contract.  If this fails, the
         EIP-712 binding has silently drifted from the on-chain puzzle.
         """
@@ -130,7 +133,7 @@ class TestBuildSnapshot:
             pool_launcher_id_hex=POOL_HEX,
             governance_launcher_id_hex=GOV_HEX,
         )
-        monkeypatch.setenv("POPULIS_PROTOCOL_CONFIG_VERSION", "2")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_CONFIG_VERSION", "2")
         get_settings.cache_clear()
         snap_v2 = build_snapshot(
             get_settings(),
@@ -140,7 +143,7 @@ class TestBuildSnapshot:
         assert snap_v1.content_hash_hex != snap_v2.content_hash_hex
 
     def test_surfaces_singleton_launcher_id(self, fresh_settings, monkeypatch):
-        monkeypatch.setenv("POPULIS_PROTOCOL_CONFIG_LAUNCHER_ID", PCS_HEX)
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_CONFIG_LAUNCHER_ID", PCS_HEX)
         get_settings.cache_clear()
         snap = build_snapshot(
             get_settings(),
@@ -152,7 +155,7 @@ class TestBuildSnapshot:
     def test_unknown_network_raises(self, fresh_settings, monkeypatch):
         # Pydantic accepts only the literal values, but build_snapshot's
         # _network_id helper has its own guard for defence-in-depth.
-        from populis_api.protocol_config import _network_id
+        from solslot_api.protocol_config import _network_id
 
         with pytest.raises(ValueError, match="unknown network"):
             _network_id("regtest")
@@ -180,8 +183,8 @@ class TestProtocolEndpoint:
     def test_returns_hash_when_launchers_configured(
         self, fresh_settings, monkeypatch
     ):
-        monkeypatch.setenv("POPULIS_POOL_LAUNCHER_ID", POOL_HEX)
-        monkeypatch.setenv("POPULIS_GOVERNANCE_LAUNCHER_ID", GOV_HEX)
+        monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", POOL_HEX)
+        monkeypatch.setenv("SOLSLOT_GOVERNANCE_LAUNCHER_ID", GOV_HEX)
         get_settings.cache_clear()
         with TestClient(app) as client:
             resp = client.get("/protocol")
@@ -204,7 +207,7 @@ class TestProtocolEndpoint:
             assert resp.json()["protocol_config_version"] == 1
 
     def test_version_override_via_env(self, fresh_settings, monkeypatch):
-        monkeypatch.setenv("POPULIS_PROTOCOL_CONFIG_VERSION", "7")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_CONFIG_VERSION", "7")
         get_settings.cache_clear()
         with TestClient(app) as client:
             resp = client.get("/protocol")
@@ -239,13 +242,13 @@ class TestVaultVersionRegistryEndpoint:
             assert body["vault_version_registry_content_hash"] is None
 
     def test_registry_content_hash_matches_driver(self, fresh_settings, monkeypatch):
-        """The API helper must produce the SAME content hash as the populis_puzzles
+        """The API helper must produce the SAME content hash as the solslot_puzzles
         driver — that's the cross-repo contract for the on-chain registry.
         """
-        monkeypatch.setenv("POPULIS_POOL_LAUNCHER_ID", POOL_HEX)
-        monkeypatch.setenv("POPULIS_GOVERNANCE_LAUNCHER_ID", GOV_HEX)
-        monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_POLICY_HEX)
-        monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID", VAULT_VERSION_REGISTRY_HEX)
+        monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", POOL_HEX)
+        monkeypatch.setenv("SOLSLOT_GOVERNANCE_LAUNCHER_ID", GOV_HEX)
+        monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_POLICY_HEX)
+        monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID", VAULT_VERSION_REGISTRY_HEX)
         get_settings.cache_clear()
 
         with TestClient(app) as client:
@@ -275,9 +278,9 @@ class TestVaultVersionRegistryEndpoint:
             assert body["vault_version_registry_content_hash"] == "0x" + expected_content_hash.hex()
 
     def test_registry_version_override_via_env(self, fresh_settings, monkeypatch):
-        monkeypatch.setenv("POPULIS_POOL_LAUNCHER_ID", POOL_HEX)
-        monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_POLICY_HEX)
-        monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_VERSION", "3")
+        monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", POOL_HEX)
+        monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_POLICY_HEX)
+        monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_VERSION", "3")
         get_settings.cache_clear()
 
         with TestClient(app) as client:

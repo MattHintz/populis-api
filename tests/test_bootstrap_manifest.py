@@ -4,10 +4,11 @@ import json
 from pathlib import Path
 
 import pytest
+from eth_keys import keys as eth_keys
 
-from populis_api import bootstrap_manifest as bm
-from populis_api.admin_records import load_admin_records_from_mapping
-from populis_api.bootstrap_manifest import (
+from solslot_api import bootstrap_manifest as bm
+from solslot_api.admin_records import load_admin_records_from_mapping
+from solslot_api.bootstrap_manifest import (
     BootstrapArtifactPaths,
     BootstrapManifestError,
     build_bootstrap_artifacts,
@@ -29,10 +30,13 @@ def deployment_manifest() -> dict:
     return {
         "network": "testnet11",
         "params": {"quorum_bps": 5000},
+        "protocol_version": "solslot-v2",
+        "pool_puzzle_version": 3,
+        "smart_deed_puzzle_version": 2,
         "pool_launcher_id": H("11"),
         "did_launcher_id": H("22"),
         "tracker_launcher_id": H("33"),
-        "pgt_tail_hash": H("44"),
+        "sgt_tail_hash": H("44"),
         "pool_token_tail_hash": H("55"),
         "pool_full_puzhash": H("66"),
         "tracker_full_puzhash": H("77"),
@@ -40,8 +44,9 @@ def deployment_manifest() -> dict:
 
 
 def admin_records() -> dict:
+    public_key = eth_keys.PrivateKey(bytes.fromhex("11" * 32)).public_key
     return {
-        "version": 1,
+        "schemaVersion": 2,
         "launcher_id": H("88"),
         "admin_records": [
             {
@@ -51,8 +56,8 @@ def admin_records() -> dict:
                     {
                         "kind": "eip712_member",
                         "leaf_hash": H("99"),
-                        "evm_address": "0x" + "aa" * 20,
-                        "secp256k1_pubkey": "0x02" + "bb" * 32,
+                        "evm_address": public_key.to_checksum_address().lower(),
+                        "secp256k1_pubkey": "0x" + public_key.to_compressed_bytes().hex(),
                         "type_hash": H("cc"),
                         "prefix_and_domain_separator": "0x1901" + "dd" * 32,
                     }
@@ -64,10 +69,10 @@ def admin_records() -> dict:
 
 def artifact_paths(root: Path) -> BootstrapArtifactPaths:
     return BootstrapArtifactPaths(
-        admin_records_json=root / "admin_records.json",
-        portal_runtime_config_json=root / "portal_runtime_config.json",
-        bootstrap_recovery_anchor_json=root / "bootstrap_recovery_anchor.json",
-        bootstrap_manifest_json=root / "bootstrap_manifest.json",
+        admin_records_json=root / "admin_records_v2.json",
+        portal_runtime_config_json=root / "portal_runtime_config_v2.json",
+        bootstrap_recovery_anchor_json=root / "bootstrap_recovery_anchor_v2.json",
+        bootstrap_manifest_json=root / "bootstrap_manifest_v2.json",
     )
 
 
@@ -120,13 +125,14 @@ def test_builds_public_bootstrap_manifest_and_runtime_config() -> None:
         admin_authority_launcher_id=records["launcher_id"],
         admins_hash=H("ab"),
         mips_root=H("cd"),
-        read_only_api_url="https://api.populis.example",
+        read_only_api_url="https://api.solslot.example",
         read_only_coinset_url="https://coinset.example",
     )
 
     bootstrap = artifacts.bootstrap_manifest
     runtime = artifacts.portal_runtime_config
-    assert bootstrap["version"] == 1
+    assert bootstrap["schemaVersion"] == 2
+    assert bootstrap["protocolVersion"] == "solslot-v2"
     assert bootstrap["network"] == "testnet11"
     assert bootstrap["protocol"]["pool_launcher_id"] == H("11")
     assert bootstrap["admin_authority_v2"] == {
@@ -140,7 +146,7 @@ def test_builds_public_bootstrap_manifest_and_runtime_config() -> None:
     assert bootstrap["artifact_hashes"]["portal_runtime_config_json"] == content_hash(runtime)
     assert runtime["admin_authority_v2"]["authority_version"] == 1
     assert runtime["admin_authority_v2"]["admin_records_hash"] == content_hash(records)
-    assert runtime["read_only_api_url"] == "https://api.populis.example"
+    assert runtime["read_only_api_url"] == "https://api.solslot.example"
     assert runtime["read_only_coinset_url"] == "https://coinset.example"
     assert artifacts.bootstrap_recovery_anchor["tag"] == bm.BOOTSTRAP_RECOVERY_ANCHOR_TAG
     assert artifacts.bootstrap_recovery_anchor["bootstrap_manifest_hash"] == content_hash(bootstrap)
@@ -157,7 +163,7 @@ def test_builds_bootstrap_recovery_anchor_from_finalized_artifacts() -> None:
     )
 
     expected_payload = {
-        "version": 1,
+        "version": 2,
         "tag": bm.BOOTSTRAP_RECOVERY_ANCHOR_TAG,
         "network": "testnet11",
         "admin_authority_v2_launcher_id": H("88"),
@@ -199,7 +205,7 @@ def test_bootstrap_recovery_anchor_rejects_invalid_payload_version(version) -> N
 def test_bootstrap_recovery_anchor_rejects_runtime_config_hash_drift() -> None:
     artifacts, _ = artifacts_and_records()
     runtime = clone_json(artifacts.portal_runtime_config)
-    runtime["read_only_api_url"] = "https://mirror.populis.example"
+    runtime["read_only_api_url"] = "https://mirror.solslot.example"
 
     with pytest.raises(BootstrapManifestError, match="portal_runtime_config_json hash"):
         build_bootstrap_recovery_anchor(
@@ -235,7 +241,7 @@ def test_bootstrap_recovery_anchor_rejects_authority_coordinate_mismatch() -> No
 def test_bootstrap_recovery_anchor_rejects_secret_bearing_artifacts() -> None:
     artifacts, _ = artifacts_and_records()
     manifest = clone_json(artifacts.bootstrap_manifest)
-    manifest["forbidden"] = "POPULIS_ADMIN_TOKEN"
+    manifest["forbidden"] = "SOLSLOT_ADMIN_TOKEN"
 
     with pytest.raises(BootstrapManifestError, match="forbidden credential marker"):
         build_bootstrap_recovery_anchor(
@@ -251,7 +257,7 @@ def test_builds_bootstrap_recovery_anchor_marker_memos() -> None:
         bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
     )
 
-    assert carrier.tag_memo == b"POPULIS_BOOTSTRAP_V1"
+    assert carrier.tag_memo == b"SOLSLOT_BOOTSTRAP_V2"
     assert carrier.payload_memo == canonical_json_bytes(artifacts.bootstrap_recovery_anchor)
     assert carrier.memos == (carrier.tag_memo, carrier.payload_memo)
     assert carrier.payload_hash == content_hash(artifacts.bootstrap_recovery_anchor)
@@ -532,7 +538,7 @@ def test_recovery_verifier_rejects_admin_records_metadata_tamper() -> None:
     tampered_records = clone_json(records)
     tampered_records["admin_records"][0]["leaves"][0]["evm_address"] = "0x" + "ee" * 20
 
-    with pytest.raises(BootstrapManifestError, match="admin_records.json content hash"):
+    with pytest.raises(BootstrapManifestError, match="admin_records_v2.json content hash"):
         verify_bootstrap_recovery_artifacts(
             bootstrap_recovery_anchor=artifacts.bootstrap_recovery_anchor,
             bootstrap_manifest=artifacts.bootstrap_manifest,
@@ -562,7 +568,7 @@ def test_recovery_verifier_rejects_admin_records_protocol_hash_forgery() -> None
 
     with pytest.raises(
         BootstrapManifestError,
-        match="admin_records.json does not match verified admin authority",
+        match="admin_records_v2.json does not match verified admin authority",
     ):
         verify_bootstrap_recovery_artifacts(
             bootstrap_recovery_anchor=forged_anchor.payload,
@@ -620,8 +626,8 @@ def test_rejects_invalid_authority_version(authority_version) -> None:
 @pytest.mark.parametrize(
     "forbidden",
     [
-        "POPULIS_ADMIN_TOKEN",
-        "populis_bootstrap_session",
+        "SOLSLOT_ADMIN_TOKEN",
+        "solslot_bootstrap_session",
         "Bearer abc",
         "raw_wallet_signature",
         "auth_nonce",
@@ -672,8 +678,8 @@ def test_outputs_do_not_contain_secret_or_signature_material() -> None:
         sort_keys=True,
     ).lower()
     for forbidden in (
-        "populis_admin_token",
-        "populis_bootstrap_session",
+        "solslot_admin_token",
+        "solslot_bootstrap_session",
         "bootstrap_session",
         "bearer",
         "jwt",
@@ -704,10 +710,10 @@ def test_persists_public_artifacts_with_bootstrap_manifest_last(tmp_path, monkey
     )
 
     assert writes == [
-        "admin_records.json",
-        "portal_runtime_config.json",
-        "bootstrap_recovery_anchor.json",
-        "bootstrap_manifest.json",
+        "admin_records_v2.json",
+        "portal_runtime_config_v2.json",
+        "bootstrap_recovery_anchor_v2.json",
+        "bootstrap_manifest_v2.json",
     ]
     assert json.loads(paths.admin_records_json.read_text()) == records
     assert json.loads(paths.portal_runtime_config_json.read_text()) == artifacts.portal_runtime_config
@@ -740,7 +746,7 @@ def test_partial_failure_does_not_write_lock_manifest(tmp_path, monkeypatch) -> 
     original = bm._atomic_write_json
 
     def fail_runtime(path, value):
-        if Path(path).name == "portal_runtime_config.json":
+        if Path(path).name == "portal_runtime_config_v2.json":
             raise OSError("disk full")
         original(path, value)
 
@@ -766,7 +772,7 @@ def test_persistence_rechecks_lock_before_final_manifest_write(tmp_path, monkeyp
 
     def race_lock(path, value):
         original(path, value)
-        if Path(path).name == "bootstrap_recovery_anchor.json":
+        if Path(path).name == "bootstrap_recovery_anchor_v2.json":
             paths.bootstrap_manifest_json.write_text('{"locked": true}', encoding="utf-8")
 
     monkeypatch.setattr(bm, "_atomic_write_json", race_lock)

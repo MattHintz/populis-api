@@ -1,0 +1,79 @@
+name: Solslot API CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: solslot-api-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
+  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout API
+        uses: actions/checkout@v4
+
+      - name: Require frozen protocol commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$PROTOCOL_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "SOLSLOT_PROTOCOL_REF must be an exact protocol commit." >&2
+            exit 1
+          fi
+
+      - name: Checkout frozen protocol
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PROTOCOL_REPOSITORY }}
+          ref: ${{ env.PROTOCOL_REF }}
+          path: solslot-protocol
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install -e solslot-protocol -e '.[dev]'
+
+      - name: Compile and import
+        run: |
+          python -m compileall -q solslot_api
+          python - <<'PY'
+          from solslot_api.app import app
+
+          schema = app.openapi()
+          assert schema["info"]["title"] == "Solslot API"
+          assert "/zkpassport/sign" not in schema["paths"]
+          assert "/zkpassport/enrollments" in schema["paths"]
+          PY
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Namespace gate
+        run: python scripts/check_namespace.py --paths .
+
+      - name: Secret scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='sk_(live|test)_[A-Za-z0-9]+|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|MANDRILL_API_KEY=|STRIPE_SECRET_KEY=|BEGIN (RSA|EC|OPENSSH|PRIVATE)'
+          if grep -R -n -E "$pattern" solslot_api tests scripts .github; then
+            echo "Secret-like value found in tracked release material." >&2
+            exit 1
+          fi

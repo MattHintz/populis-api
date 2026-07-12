@@ -11,11 +11,12 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi.testclient import TestClient
 
-from populis_api import admin
-from populis_api.app import app
-from populis_api import zkpassport_enrollments
-from populis_api.config import Settings
-from populis_api.state import reset_registry_for_tests
+from solslot_api.app import app
+from solslot_api import zkpassport_enrollments
+from solslot_api.config import Settings
+from solslot_api.credential_auth import VerifiedOwner
+from solslot_api.state import VaultRecord, get_registry, reset_registry_for_tests
+from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1
 
 
 VAULT_A = "0x" + "11" * 32
@@ -31,7 +32,42 @@ VALIDATOR_MESSAGE = "0x" + "88" * 32
 VALIDATOR_SEED_HEX = "bd15624be42c1cd1c51dd4a440bff40a4a3466f716f9e13149d3422767876ad7"
 VAULT_COIN_PARENT = "0x" + "99" * 32
 VAULT_COIN_PUZZLE = "0x" + "d1" * 32
-EVM_SENDER = "0x1111111111111111111111111111111111111111"
+_DEFAULT_PRIVATE_KEY = bytes.fromhex("01" * 32)
+_DEFAULT_ACCOUNT = Account.from_key(_DEFAULT_PRIVATE_KEY)
+_DEFAULT_OWNER_PUBKEY = eth_keys.PrivateKey(
+    _DEFAULT_PRIVATE_KEY
+).public_key.to_compressed_bytes()
+EVM_SENDER = _DEFAULT_ACCOUNT.address
+OWNER_AUTH = {"challengeId": "a" * 48, "signature": "0x00"}
+
+
+class _OwnerTestClient(TestClient):
+    """Inject a placeholder owner envelope into focused router tests.
+
+    The route's verifier is replaced below. Dedicated credential-auth tests
+    exercise real EVM and BLS signatures, so these cases remain focused on
+    bridge, event, and Chia spend behavior.
+    """
+
+    def post(self, url, *args, **kwargs):
+        if str(url).startswith("/zkpassport/enrollments") and "owner-challenge" not in str(url):
+            body = dict(kwargs.get("json") or {})
+            body.setdefault("ownerAuth", OWNER_AUTH)
+            kwargs["json"] = body
+        return super().post(url, *args, **kwargs)
+
+
+def _install_owner_bypass(monkeypatch) -> None:
+    def fake_verify_owner(_settings, *, vault_launcher_id, **_kwargs):
+        record = get_registry().get(bytes32.fromhex(vault_launcher_id[2:]))
+        assert record is not None
+        return VerifiedOwner(
+            owner_key=(record.owner_evm_address or ("0x" + record.owner_pubkey.hex())).lower(),
+            auth_type="evm" if record.owner_evm_address else "chia_bls",
+            vault_record=record,
+        )
+
+    monkeypatch.setattr(zkpassport_enrollments, "verify_owner_auth", fake_verify_owner)
 
 
 def _coin_id(parent: str, policy_hash: str, amount: int = 1) -> str:
@@ -76,7 +112,7 @@ def _indexed_event(
         bridge_coin_id=_coin_id(bridge_parent_id, bridge_policy_hash, bridge_amount),
         bridge_message="0x" + "99" * 32,
         bridge_policy_hash=bridge_policy_hash,
-        policy_version=1,
+        policy_version=2,
         validator_message=VALIDATOR_MESSAGE,
         transaction_hash=TX,
         block_number=456,
@@ -86,16 +122,17 @@ def _indexed_event(
 def _client(
     monkeypatch,
     tmp_path,
-    parents: str = "",
     bridge_records: list[dict] | None = None,
-    auto_topup: bool = False,
 ) -> TestClient:
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH", str(tmp_path / "enrollments.json"))
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS", parents)
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", POLICY_HASH)
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AMOUNT", "1")
-    if auto_topup:
-        monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AUTO_TOPUP_ENABLED", "true")
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH", str(tmp_path / "credential.db"))
+    monkeypatch.setenv("SOLSLOT_ALPHA_WRITES_ENABLED", "true")
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", POLICY_HASH)
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_AMOUNT", "1")
+    if bridge_records is None:
+        bridge_records = [
+            _bridge_record(PARENT_A),
+            _bridge_record(PARENT_B),
+        ]
     monkeypatch.setattr(
         zkpassport_enrollments,
         "_fetch_bridge_coin_records",
@@ -108,12 +145,30 @@ def _client(
             vault_launcher_id=kwargs["expected_vault_launcher_id"]
         ),
     )
-    reset_registry_for_tests(tmp_path / "vault_registry.db")
-    return TestClient(app)
+    registry = reset_registry_for_tests(tmp_path / "vault_registry.db")
+    for index, vault in enumerate((VAULT_A, VAULT_B, VAULT_C), start=1):
+        private_key = bytes([index]) * 32
+        account = Account.from_key(private_key)
+        owner_pubkey = eth_keys.PrivateKey(private_key).public_key.to_compressed_bytes()
+        registry.record(
+            VaultRecord(
+                launcher_id=bytes32.fromhex(vault[2:]),
+                full_puzhash=bytes32(b"\x01" * 32),
+                p2_vault_puzhash=bytes32(b"\x02" * 32),
+                auth_type=AUTH_TYPE_SECP256K1,
+                owner_pubkey=owner_pubkey,
+                owner_evm_address=account.address,
+                spend_bundle_id="test-fixture",
+                pushed_at=0,
+            )
+        )
+
+    _install_owner_bypass(monkeypatch)
+    return _OwnerTestClient(app)
 
 
 def test_create_enrollment_fails_closed_without_bridge_pool(monkeypatch, tmp_path):
-    with _client(monkeypatch, tmp_path, parents="") as client:
+    with _client(monkeypatch, tmp_path, bridge_records=[]) as client:
         resp = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
 
     assert resp.status_code == 503
@@ -121,7 +176,7 @@ def test_create_enrollment_fails_closed_without_bridge_pool(monkeypatch, tmp_pat
 
 
 def test_create_enrollment_discovers_unspent_bridge_coins(monkeypatch, tmp_path):
-    with _client(monkeypatch, tmp_path, parents="", bridge_records=[_bridge_record(amount=2)]) as client:
+    with _client(monkeypatch, tmp_path, bridge_records=[_bridge_record(amount=2)]) as client:
         created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
 
     assert created.status_code == 200
@@ -131,66 +186,8 @@ def test_create_enrollment_discovers_unspent_bridge_coins(monkeypatch, tmp_path)
     assert body["bridgeCoinId"] == _coin_id(PARENT_A, POLICY_HASH, 2)
 
 
-def test_create_enrollment_auto_topups_when_pool_is_empty(monkeypatch, tmp_path):
-    async def fake_topup(_settings):
-        return [
-            zkpassport_enrollments.BridgeCoinCandidate(
-                parent_id=PARENT_B,
-                amount=3,
-                coin_id=_coin_id(PARENT_B, POLICY_HASH, 3),
-            )
-        ]
-
-    monkeypatch.setattr(zkpassport_enrollments, "_auto_top_up_bridge_pool", fake_topup)
-    with _client(monkeypatch, tmp_path, parents="", bridge_records=[], auto_topup=True) as client:
-        created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
-
-    assert created.status_code == 200
-    body = created.json()
-    assert body["bridgeParentId"] == PARENT_B
-    assert body["bridgeAmount"] == 3
-    assert body["bridgeCoinId"] == _coin_id(PARENT_B, POLICY_HASH, 3)
-
-
-@pytest.mark.asyncio
-async def test_auto_top_up_converts_admin_bridge_pool_response(monkeypatch):
-    bridge_coin_id = _coin_id(PARENT_B, POLICY_HASH, 3)
-
-    async def fake_top_up(_request, _settings):
-        return admin.BridgePoolTopUpResponse(
-            pushed=True,
-            spend_bundle_id="0x" + "77" * 32,
-            source_coin_id="0x" + "99" * 32,
-            bridgePolicyHash=POLICY_HASH,
-            coins=[
-                admin.BridgePoolCoin(
-                    parentId=PARENT_B,
-                    bridgeAmount=3,
-                    bridgeCoinId=bridge_coin_id,
-                )
-            ],
-        )
-
-    monkeypatch.setattr(admin, "top_up_zkpassport_bridge_pool", fake_top_up)
-    settings = Settings(
-        network="testnet11",
-        zkpassport_bridge_auto_topup_enabled=True,
-        zkpassport_bridge_policy_hash=POLICY_HASH,
-    )
-
-    candidates = await zkpassport_enrollments._auto_top_up_bridge_pool(settings)
-
-    assert candidates == [
-        zkpassport_enrollments.BridgeCoinCandidate(
-            parent_id=PARENT_B,
-            amount=3,
-            coin_id=bridge_coin_id,
-        )
-    ]
-
-
 def test_create_enrollment_reserves_bridge_coin_and_gets_same_record(monkeypatch, tmp_path):
-    with _client(monkeypatch, tmp_path, parents=f"{PARENT_A},{PARENT_B}") as client:
+    with _client(monkeypatch, tmp_path) as client:
         created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
         again = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
         fetched = client.get(f"/zkpassport/enrollments/{VAULT_A}")
@@ -206,7 +203,7 @@ def test_create_enrollment_reserves_bridge_coin_and_gets_same_record(monkeypatch
 
 
 def test_bridge_coin_pool_is_single_use(monkeypatch, tmp_path):
-    with _client(monkeypatch, tmp_path, parents=f"{PARENT_A},{PARENT_B}") as client:
+    with _client(monkeypatch, tmp_path) as client:
         first = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
         second = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_B})
         third = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_C})
@@ -217,7 +214,7 @@ def test_bridge_coin_pool_is_single_use(monkeypatch, tmp_path):
     assert third.status_code == 409
 
 
-def test_record_proof_and_chia_confirmation(monkeypatch, tmp_path):
+def test_chia_confirmation_cannot_skip_stamp_submission(monkeypatch, tmp_path):
     vault_coin_id = _coin_id(VAULT_COIN_PARENT, VAULT_COIN_PUZZLE)
     monkeypatch.setattr(
         zkpassport_enrollments,
@@ -239,13 +236,13 @@ def test_record_proof_and_chia_confirmation(monkeypatch, tmp_path):
         if coin_id == vault_coin_id
         else None,
     )
-    with _client(monkeypatch, tmp_path, parents=PARENT_A) as client:
+    with _client(monkeypatch, tmp_path, bridge_records=[_bridge_record()]) as client:
         enrollment = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A}).json()
         proof = client.post(
             f"/zkpassport/enrollments/{VAULT_A}/proof",
             json={
                 "vaultLauncherId": VAULT_A,
-                "policyVersion": 1,
+                "policyVersion": 2,
                 "identityAttestRoot": ROOT,
                 "attestationLeafHash": LEAF,
                 "attestationProof": {"bitpath": 0, "siblings": []},
@@ -270,9 +267,7 @@ def test_record_proof_and_chia_confirmation(monkeypatch, tmp_path):
     assert proof.json()["status"] == "evm_confirmed"
     assert proof.json()["receipt"]["identityAttestRoot"] == ROOT
     assert proof.json()["receipt"]["validatorMessage"] == VALIDATOR_MESSAGE
-    assert confirmed.status_code == 200
-    assert confirmed.json()["status"] == "chia_confirmed"
-    assert confirmed.json()["receipt"]["confirmedBlockIndex"] == 123
+    assert confirmed.status_code == 409
 
 
 def test_chia_confirmation_rejects_client_only_coin_claim(monkeypatch, tmp_path):
@@ -286,13 +281,13 @@ def test_chia_confirmation_rejects_client_only_coin_claim(monkeypatch, tmp_path)
         "_fetch_coin_record_by_name",
         lambda _settings, _coin_id: None,
     )
-    with _client(monkeypatch, tmp_path, parents=PARENT_A) as client:
+    with _client(monkeypatch, tmp_path, bridge_records=[_bridge_record()]) as client:
         enrollment = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A}).json()
         client.post(
             f"/zkpassport/enrollments/{VAULT_A}/proof",
             json={
                 "vaultLauncherId": VAULT_A,
-                "policyVersion": 1,
+                "policyVersion": 2,
                 "identityAttestRoot": ROOT,
                 "attestationLeafHash": LEAF,
                 "attestationProof": {"bitpath": 0, "siblings": []},
@@ -314,57 +309,17 @@ def test_chia_confirmation_rejects_client_only_coin_claim(monkeypatch, tmp_path)
         )
 
     assert confirmed.status_code == 409
-    assert "Coinset" in confirmed.json()["detail"]
-
-
-def test_validator_signing_can_be_bound_to_indexed_vault_proof(monkeypatch, tmp_path):
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX", VALIDATOR_SEED_HEX)
-    with _client(monkeypatch, tmp_path, parents=PARENT_A) as client:
-        enrollment = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A}).json()
-        client.post(
-            f"/zkpassport/enrollments/{VAULT_A}/proof",
-            json={
-                "vaultLauncherId": VAULT_A,
-                "policyVersion": 1,
-                "identityAttestRoot": ROOT,
-                "attestationLeafHash": LEAF,
-                "attestationProof": {"bitpath": 0, "siblings": []},
-                "bridgePolicyHash": enrollment["bridgePolicyHash"],
-                "bridgeParentId": enrollment["bridgeParentId"],
-                "bridgeAmount": enrollment["bridgeAmount"],
-                "bridgeCoinId": enrollment["bridgeCoinId"],
-                "bridgeMessage": "0x" + "99" * 32,
-                "validatorMessage": VALIDATOR_MESSAGE,
-                "evmTxHash": TX,
-            },
-        )
-        ok = client.post(
-            "/zkpassport/sign",
-            json={
-                "validator_message_hex": VALIDATOR_MESSAGE,
-                "vault_launcher_id": VAULT_A,
-            },
-        )
-        bad = client.post(
-            "/zkpassport/sign",
-            json={
-                "validator_message_hex": "0x" + "89" * 32,
-                "vault_launcher_id": VAULT_A,
-            },
-        )
-
-    assert ok.status_code == 200
-    assert bad.status_code == 409
+    assert "vault coin" in confirmed.json()["detail"].lower()
 
 
 def test_record_proof_rejects_wrong_reserved_bridge_coin(monkeypatch, tmp_path):
-    with _client(monkeypatch, tmp_path, parents=PARENT_A) as client:
+    with _client(monkeypatch, tmp_path, bridge_records=[_bridge_record()]) as client:
         enrollment = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A}).json()
         resp = client.post(
             f"/zkpassport/enrollments/{VAULT_A}/proof",
             json={
                 "vaultLauncherId": VAULT_A,
-                "policyVersion": 1,
+                "policyVersion": 2,
                 "identityAttestRoot": ROOT,
                 "attestationLeafHash": LEAF,
                 "attestationProof": {"bitpath": 0, "siblings": []},
@@ -382,19 +337,22 @@ def test_record_proof_rejects_wrong_reserved_bridge_coin(monkeypatch, tmp_path):
 
 
 def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_path):
-    from populis_puzzles.vault_driver import (
+    _install_owner_bypass(monkeypatch)
+    monkeypatch.setenv("SOLSLOT_ALPHA_WRITES_ENABLED", "true")
+    from solslot_puzzles.vault_driver import (
         AUTH_TYPE_SECP256K1,
         DEFAULT_IDENTITY_ATTEST_ROOT,
         one_leaf_merkle_root,
+        puzzle_for_p2_vault,
         puzzle_for_vault_full,
     )
-    from populis_puzzles.zkpassport_attestation import (
+    from solslot_puzzles.zkpassport_attestation import (
         ZkPassportAttestation,
         compute_attestation_bridge_message,
         compute_attestation_root,
         compute_validator_bridge_message,
     )
-    from populis_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
+    from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
 
     private_key = bytes.fromhex("01" * 32)
     account = Account.from_key(private_key)
@@ -425,14 +383,14 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
         service_scope_hash=bytes32(b"\x13" * 32),
         service_subscope_hash=bytes32(b"\x14" * 32),
         proof_timestamp=1_700_000_000,
-        policy_version=1,
+        policy_version=2,
     )
     root = compute_attestation_root([attestation.leaf_hash])
     bridge_message = compute_attestation_bridge_message(
         vault_launcher_id=launcher,
         attestation_root=root,
         bridge_policy_hash=policy_hash,
-        policy_version=1,
+        policy_version=2,
     )
     validator_message = compute_validator_bridge_message(
         vault_launcher_id=launcher,
@@ -446,7 +404,7 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
         service_scope_hash=attestation.service_scope_hash,
         service_subscope_hash=attestation.service_subscope_hash,
         proof_timestamp=attestation.proof_timestamp,
-        policy_version=1,
+        policy_version=2,
     )
     event = zkpassport_enrollments.IndexedEvmAttestation(
         sender=account.address,
@@ -463,21 +421,20 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
         bridge_coin_id="0x" + bridge_coin.name().hex(),
         bridge_message="0x" + bridge_message.hex(),
         bridge_policy_hash=policy_hex,
-        policy_version=1,
+        policy_version=2,
         validator_message="0x" + validator_message.hex(),
         transaction_hash=TX,
         block_number=456,
     )
 
     monkeypatch.setenv(
-        "POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH",
-        str(tmp_path / "enrollments.json"),
+        "SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH",
+        str(tmp_path / "credential.db"),
     )
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS", PARENT_A)
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", policy_hex)
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AMOUNT", "1")
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX", VALIDATOR_SEED_HEX)
-    monkeypatch.setenv("POPULIS_POOL_LAUNCHER_ID", "0x" + pool_launcher.hex())
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", policy_hex)
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_AMOUNT", "1")
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX", VALIDATOR_SEED_HEX)
+    monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", "0x" + pool_launcher.hex())
     monkeypatch.setattr(
         zkpassport_enrollments,
         "_fetch_bridge_coin_records",
@@ -513,17 +470,32 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
 
     monkeypatch.setattr(zkpassport_enrollments, "CoinsetClient", FakeCoinsetClient)
     reset_registry_for_tests(tmp_path / "vault_registry.db")
+    get_registry().record(
+        VaultRecord(
+            launcher_id=launcher,
+            full_puzhash=bytes32(current_puzzle.get_tree_hash()),
+            p2_vault_puzhash=bytes32(puzzle_for_p2_vault(launcher).get_tree_hash()),
+            auth_type=AUTH_TYPE_SECP256K1,
+            owner_pubkey=owner_pubkey,
+            owner_evm_address=account.address,
+            spend_bundle_id="test-launch",
+            pushed_at=1.0,
+        )
+    )
 
     enrollment = asyncio.run(
         zkpassport_enrollments.create_enrollment(
-            zkpassport_enrollments.CreateEnrollmentRequest(vaultLauncherId=VAULT_A)
+            zkpassport_enrollments.CreateEnrollmentRequest(
+                vaultLauncherId=VAULT_A,
+                ownerAuth=OWNER_AUTH,
+            )
         )
     )
     proof = zkpassport_enrollments.record_evm_proof(
         VAULT_A,
         zkpassport_enrollments.RecordProofRequest(
             vaultLauncherId=VAULT_A,
-            policyVersion=1,
+            policyVersion=2,
             identityAttestRoot=event.identity_attest_root,
             attestationLeafHash=event.attestation_leaf_hash,
             attestationProof={"bitpath": 0, "siblings": []},
@@ -534,9 +506,13 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
             bridgeMessage=event.bridge_message,
             validatorMessage=event.validator_message,
             evmTxHash=TX,
+            ownerAuth=OWNER_AUTH,
         ),
     )
-    prepared = zkpassport_enrollments.prepare_chia_stamp(VAULT_A)
+    prepared = zkpassport_enrollments.prepare_chia_stamp(
+        VAULT_A,
+        zkpassport_enrollments.OwnerAuthorizedMutation(ownerAuth=OWNER_AUTH),
+    )
     signature = Account.sign_message(
         encode_typed_data(full_message=prepared.typedData),
         private_key,
@@ -545,7 +521,8 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
         zkpassport_enrollments.submit_evm_chia_stamp(
             VAULT_A,
             zkpassport_enrollments.SubmitChiaStampRequest(
-                signature="0x" + signature
+                signature="0x" + signature,
+                ownerAuth=OWNER_AUTH,
             ),
         )
     )
@@ -586,7 +563,10 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
         if coin_id == expected_coin_id
         else None,
     )
-    synced = zkpassport_enrollments.sync_chia_stamp(VAULT_A)
+    synced = zkpassport_enrollments.sync_chia_stamp(
+        VAULT_A,
+        zkpassport_enrollments.OwnerAuthorizedMutation(ownerAuth=OWNER_AUTH),
+    )
 
     assert synced.confirmed is True
     assert synced.enrollment.status == "chia_confirmed"
@@ -597,22 +577,24 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
 def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
     monkeypatch, tmp_path
 ):
+    _install_owner_bypass(monkeypatch)
+    monkeypatch.setenv("SOLSLOT_ALPHA_WRITES_ENABLED", "true")
     from chia.types.blockchain_format.program import Program
-    from populis_api.state import VaultRecord, get_registry
-    from populis_puzzles.vault_driver import (
+    from solslot_api.state import VaultRecord, get_registry
+    from solslot_puzzles.vault_driver import (
         AUTH_TYPE_BLS,
         DEFAULT_IDENTITY_ATTEST_ROOT,
         one_leaf_merkle_root,
         puzzle_for_p2_vault,
         puzzle_for_vault_full,
     )
-    from populis_puzzles.zkpassport_attestation import (
+    from solslot_puzzles.zkpassport_attestation import (
         ZkPassportAttestation,
         compute_attestation_bridge_message,
         compute_attestation_root,
         compute_validator_bridge_message,
     )
-    from populis_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
+    from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
 
     owner_sk = zkpassport_enrollments.AugSchemeMPL.key_gen(bytes.fromhex("02" * 32))
     owner_pubkey = bytes(owner_sk.get_g1())
@@ -642,14 +624,14 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
         service_scope_hash=bytes32(b"\x13" * 32),
         service_subscope_hash=bytes32(b"\x14" * 32),
         proof_timestamp=1_700_000_000,
-        policy_version=1,
+        policy_version=2,
     )
     root = compute_attestation_root([attestation.leaf_hash])
     bridge_message = compute_attestation_bridge_message(
         vault_launcher_id=launcher,
         attestation_root=root,
         bridge_policy_hash=policy_hash,
-        policy_version=1,
+        policy_version=2,
     )
     validator_message = compute_validator_bridge_message(
         vault_launcher_id=launcher,
@@ -663,7 +645,7 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
         service_scope_hash=attestation.service_scope_hash,
         service_subscope_hash=attestation.service_subscope_hash,
         proof_timestamp=attestation.proof_timestamp,
-        policy_version=1,
+        policy_version=2,
     )
     event = zkpassport_enrollments.IndexedEvmAttestation(
         sender=EVM_SENDER,
@@ -680,21 +662,20 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
         bridge_coin_id="0x" + bridge_coin.name().hex(),
         bridge_message="0x" + bridge_message.hex(),
         bridge_policy_hash=policy_hex,
-        policy_version=1,
+        policy_version=2,
         validator_message="0x" + validator_message.hex(),
         transaction_hash=TX,
         block_number=456,
     )
 
     monkeypatch.setenv(
-        "POPULIS_ZKPASSPORT_ENROLLMENT_STORE_PATH",
-        str(tmp_path / "enrollments.json"),
+        "SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH",
+        str(tmp_path / "credential.db"),
     )
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_PARENT_IDS", PARENT_A)
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", policy_hex)
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_AMOUNT", "1")
-    monkeypatch.setenv("POPULIS_ZKPASSPORT_VALIDATOR_SEED_HEX", VALIDATOR_SEED_HEX)
-    monkeypatch.setenv("POPULIS_POOL_LAUNCHER_ID", "0x" + pool_launcher.hex())
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", policy_hex)
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_AMOUNT", "1")
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX", VALIDATOR_SEED_HEX)
+    monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", "0x" + pool_launcher.hex())
     monkeypatch.setattr(
         zkpassport_enrollments,
         "_fetch_bridge_coin_records",
@@ -745,14 +726,17 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
 
     enrollment = asyncio.run(
         zkpassport_enrollments.create_enrollment(
-            zkpassport_enrollments.CreateEnrollmentRequest(vaultLauncherId=VAULT_A)
+            zkpassport_enrollments.CreateEnrollmentRequest(
+                vaultLauncherId=VAULT_A,
+                ownerAuth=OWNER_AUTH,
+            )
         )
     )
     proof = zkpassport_enrollments.record_evm_proof(
         VAULT_A,
         zkpassport_enrollments.RecordProofRequest(
             vaultLauncherId=VAULT_A,
-            policyVersion=1,
+            policyVersion=2,
             identityAttestRoot=event.identity_attest_root,
             attestationLeafHash=event.attestation_leaf_hash,
             attestationProof={"bitpath": 0, "siblings": []},
@@ -763,9 +747,13 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
             bridgeMessage=event.bridge_message,
             validatorMessage=event.validator_message,
             evmTxHash=TX,
+            ownerAuth=OWNER_AUTH,
         ),
     )
-    prepared = zkpassport_enrollments.prepare_chia_stamp(VAULT_A)
+    prepared = zkpassport_enrollments.prepare_chia_stamp(
+        VAULT_A,
+        zkpassport_enrollments.OwnerAuthorizedMutation(ownerAuth=OWNER_AUTH),
+    )
     assert prepared.authType == "chia_bls"
     assert prepared.typedData is None
     assert prepared.currentTimestamp is not None
@@ -796,6 +784,7 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
                 zkpassport_enrollments.SubmitChiaStampRequest(
                     signature="0x" + bytes(wrong_owner_signature).hex(),
                     currentTimestamp=prepared.currentTimestamp,
+                    ownerAuth=OWNER_AUTH,
                 ),
             )
         )
@@ -809,6 +798,7 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
                 zkpassport_enrollments.SubmitChiaStampRequest(
                     signature="0x" + bytes(owner_signature).hex(),
                     currentTimestamp=prepared.currentTimestamp - 1000,
+                    ownerAuth=OWNER_AUTH,
                 ),
             )
         )
@@ -821,6 +811,7 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
             zkpassport_enrollments.SubmitChiaStampRequest(
                 signature="0x" + bytes(owner_signature).hex(),
                 currentTimestamp=prepared.currentTimestamp,
+                ownerAuth=OWNER_AUTH,
             ),
         )
     )

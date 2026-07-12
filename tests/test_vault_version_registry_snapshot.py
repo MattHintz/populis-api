@@ -1,16 +1,16 @@
-"""Tests for ``populis_api.vault_version_registry`` (vault upgrade Brick 4d).
+"""Tests for ``solslot_api.vault_version_registry`` (vault upgrade Brick 4d).
 
 This pure snapshot module is the API's off-chain reader for the on-chain
-``vault_version_registry_inner.clsp`` singleton (populis_protocol Brick 2).
-It mirrors :mod:`populis_api.protocol_config`: it re-derives the static
-registry + vault mod-hashes from the compiled populis_puzzles bundle and
+``vault_version_registry_inner.clsp`` singleton (solslot_protocol Brick 2).
+It mirrors :mod:`solslot_api.protocol_config`: it re-derives the static
+registry + vault mod-hashes from the compiled solslot_puzzles bundle and
 computes the deterministic ``canonical_params_hash`` / ``content_hash`` from
 ``Settings``.
 
 The cross-repo contract — that the off-chain ``compute_content_hash`` /
 ``compute_canonical_params_hash`` here exactly equal the on-chain CLVM
 behaviour — is enforced by
-``populis_protocol/tests/test_vault_version_registry.py``.  Here we only
+``solslot_protocol/tests/test_vault_version_registry.py``.  Here we only
 assert the API wiring threads the right values into those helpers.
 
 NOTE: this brick is the pure snapshot module + Settings fields only; the
@@ -26,13 +26,13 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
 )
 from chia_rs.sized_bytes import bytes32
 
-from populis_api.config import get_settings
-from populis_api.vault_version_registry import (
+from solslot_api.config import get_settings
+from solslot_api.vault_version_registry import (
     VaultVersionRegistrySnapshot,
     build_vault_version_registry_snapshot,
 )
-from populis_puzzles.vault_driver import VAULT_INNER_MOD
-from populis_puzzles.vault_version_registry_driver import (
+from solslot_puzzles.vault_driver import VAULT_INNER_MOD
+from solslot_puzzles.vault_version_registry_driver import (
     compute_canonical_params_hash,
     compute_content_hash,
     vault_version_registry_inner_mod_hash,
@@ -42,9 +42,7 @@ from populis_puzzles.vault_version_registry_driver import (
 # Distinct sentinel values so a swapped-arg bug shows up immediately.
 POOL_HEX = "0x" + ("aa" * 32)
 REGISTRY_HEX = "0x" + ("cc" * 32)
-# Matches the Settings default; pinned here so the expected-hash helpers below
-# don't depend on importing the private default.
-BRIDGE_HEX = "0xc87f45cd23d052c88256de8823a4a01f40da4e2066156f48f3b3dfc0a50350d7"
+BRIDGE_HEX = "0x" + ("c1" * 32)
 
 
 def _strip0x(s: str) -> str:
@@ -72,18 +70,18 @@ def _expected_content_hash(pool_hex: str, bridge_hex: str, version: int) -> byte
 def fresh_settings(monkeypatch):
     """Reset env + cached settings for every test."""
     for key in (
-        "POPULIS_POOL_LAUNCHER_ID",
-        "POPULIS_VAULT_VERSION_REGISTRY_VERSION",
-        "POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH",
-        "POPULIS_NETWORK",
+        "SOLSLOT_POOL_LAUNCHER_ID",
+        "SOLSLOT_VAULT_VERSION_REGISTRY_VERSION",
+        "SOLSLOT_NETWORK",
     ):
         monkeypatch.delenv(key, raising=False)
     # The operator's local ``.env`` pins the deployed registry launcher id.
     # ``delenv`` would let pydantic fall back to that ``.env`` value, so
     # force the empty-string mask (coerced to ``None`` by the Settings
     # validator) to override it for the registry-less default path.
-    monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
-    monkeypatch.setenv("POPULIS_NETWORK", "testnet11")
+    monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
+    monkeypatch.setenv("SOLSLOT_NETWORK", "testnet11")
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_HEX)
     get_settings.cache_clear()
     yield get_settings()
     get_settings.cache_clear()
@@ -152,7 +150,7 @@ class TestBuildSnapshot:
 
     def test_content_hash_matches_driver_directly(self, fresh_settings):
         """The API helper must produce the SAME content hash as the
-        populis_puzzles driver — the cross-repo binding contract.  If this
+        solslot_puzzles driver — the cross-repo binding contract.  If this
         fails, the portal's "vault current" check has silently drifted from
         the on-chain registry puzzle.
         """
@@ -166,7 +164,7 @@ class TestBuildSnapshot:
         snap_v1 = build_vault_version_registry_snapshot(
             fresh_settings, pool_launcher_id_hex=POOL_HEX
         )
-        monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_VERSION", "2")
+        monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_VERSION", "2")
         get_settings.cache_clear()
         snap_v2 = build_vault_version_registry_snapshot(
             get_settings(), pool_launcher_id_hex=POOL_HEX
@@ -183,7 +181,7 @@ class TestBuildSnapshot:
             fresh_settings, pool_launcher_id_hex=POOL_HEX
         )
         other_bridge = "0x" + ("dd" * 32)
-        monkeypatch.setenv("POPULIS_ZKPASSPORT_BRIDGE_POLICY_HASH", other_bridge)
+        monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", other_bridge)
         get_settings.cache_clear()
         snap_b = build_vault_version_registry_snapshot(
             get_settings(), pool_launcher_id_hex=POOL_HEX
@@ -195,7 +193,7 @@ class TestBuildSnapshot:
 
     def test_surfaces_registry_launcher_id(self, fresh_settings, monkeypatch):
         monkeypatch.setenv(
-            "POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID", REGISTRY_HEX
+            "SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID", REGISTRY_HEX
         )
         get_settings.cache_clear()
         snap = build_vault_version_registry_snapshot(
@@ -210,7 +208,7 @@ class TestBuildSnapshot:
         assert snap.vault_version_registry_launcher_id_hex is None
 
     def test_empty_launcher_id_normalized_to_none(self, fresh_settings, monkeypatch):
-        monkeypatch.setenv("POPULIS_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
+        monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_LAUNCHER_ID", "")
         get_settings.cache_clear()
         snap = build_vault_version_registry_snapshot(
             get_settings(), pool_launcher_id_hex=POOL_HEX

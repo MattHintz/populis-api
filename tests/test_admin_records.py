@@ -1,4 +1,4 @@
-"""Tests for ``populis_api.admin_records`` (Phase 2.5).
+"""Tests for ``solslot_api.admin_records`` (Phase 2.5).
 
 Validates the JSON loader, the cross-repo binding to the protocol's
 ``compute_admins_hash``, and the drift-detection helpers that gate the
@@ -20,7 +20,7 @@ import pytest
 from chia_rs.sized_bytes import bytes32
 from eth_keys import keys as eth_keys
 
-from populis_api.admin_records import (
+from solslot_api.admin_records import (
     AdminRecordSpec,
     AdminRecordsConfig,
     AdminRecordsDriftError,
@@ -31,7 +31,7 @@ from populis_api.admin_records import (
     verify_against_admins_hash,
     verify_against_launcher_id,
 )
-from populis_puzzles.admin_authority_v2_driver import (
+from solslot_puzzles.admin_authority_v2_driver import (
     AdminRecord as ProtocolAdminRecord,
     compute_admins_hash as protocol_compute_admins_hash,
 )
@@ -127,13 +127,13 @@ def _make_admin_records_dict(
             }
         ]
     return {
-        "version": 1,
+        "schemaVersion": 2,
         "launcher_id": launcher_id,
         "admin_records": admin_records,
     }
 
 
-def _write_json(tmp_path: Path, data: dict, filename: str = "admin_records.json") -> Path:
+def _write_json(tmp_path: Path, data: dict, filename: str = "admin_records_v2.json") -> Path:
     """Materialise a JSON dict at a temporary path; return the path.
 
     Pass distinct ``filename`` values when a single test needs to load
@@ -149,11 +149,11 @@ def _write_json(tmp_path: Path, data: dict, filename: str = "admin_records.json"
 def _pin_records_trust_root(monkeypatch, path: Path) -> AdminRecordsConfig:
     config = load_admin_records_from_path(path)
     monkeypatch.setenv(
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
         "0x" + config.compute_admins_hash().hex(),
     )
     monkeypatch.setenv(
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
         "0x" + config.launcher_id.hex(),
     )
     return config
@@ -170,7 +170,7 @@ class TestLoadAdminRecords:
         path = _write_json(tmp_path, _make_admin_records_dict())
         config = load_admin_records_from_path(path)
 
-        assert config.version == 1
+        assert config.schema_version == 2
         assert config.launcher_id == _hash(0x10)
         assert len(config.admin_records) == 1
         admin = config.admin_records[0]
@@ -192,7 +192,7 @@ class TestLoadAdminRecords:
     def test_loads_from_in_memory_mapping(self):
         config = load_admin_records_from_mapping(_make_admin_records_dict())
 
-        assert config.version == 1
+        assert config.schema_version == 2
         assert config.launcher_id == _hash(0x10)
         assert len(config.admin_records) == 1
 
@@ -284,7 +284,7 @@ class TestLoadAdminRecords:
 class TestAdminsHashMatchesProtocol:
     """The single most important contract: the API's recomputed
     ``admins_hash`` MUST equal what
-    ``populis_protocol.admin_authority_v2_driver.compute_admins_hash``
+    ``solslot_protocol.admin_authority_v2_driver.compute_admins_hash``
     produces for the same logical records.  Drift between the two
     means the API and the chain disagree on what the singleton's
     state means → silent admin-authority drift.
@@ -459,9 +459,16 @@ class TestLoadErrors:
 
     def test_unsupported_version(self, tmp_path):
         data = _make_admin_records_dict()
+        data["schemaVersion"] = 1
+        path = _write_json(tmp_path, data)
+        with pytest.raises(AdminRecordsLoadError, match="unsupported schema version 1"):
+            load_admin_records_from_path(path)
+
+    def test_rejects_retired_version_field_even_with_v2_header(self, tmp_path):
+        data = _make_admin_records_dict()
         data["version"] = 2
         path = _write_json(tmp_path, data)
-        with pytest.raises(AdminRecordsLoadError, match="unsupported schema version 2"):
+        with pytest.raises(AdminRecordsLoadError, match="retired version field"):
             load_admin_records_from_path(path)
 
     def test_missing_launcher_id(self, tmp_path):
@@ -649,10 +656,9 @@ class TestSettingsIntegration:
     """
 
     def test_records_path_provides_allowlist(self, tmp_path, monkeypatch):
-        """When ``POPULIS_ADMIN_RECORDS_PATH`` is set and the legacy
-        env var is empty, the JSON's EVM addresses ARE the allowlist.
+        """The JSON's EVM addresses are the only effective allowlist.
         """
-        from populis_api.config import get_settings
+        from solslot_api.config import get_settings
 
         evm_a = _evm_address(0x01)
         evm_b = _evm_address(0x02)
@@ -673,22 +679,17 @@ class TestSettingsIntegration:
             },
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
         _pin_records_trust_root(monkeypatch, path)
-        # Legacy env var explicitly empty so we know the JSON path is winning.
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", "")
         get_settings.cache_clear()
         s = get_settings()
 
         assert s.effective_admin_allowlist_set() == {evm_a.lower(), evm_b.lower()}
 
-    def test_records_path_takes_precedence_over_env_var(self, tmp_path, monkeypatch):
-        """When BOTH gating sources are set, the JSON wins.
-
-        Exclusivity is intentional — unioning would let an env-var
-        admin smuggle through past the on-chain hash check.
-        """
-        from populis_api.config import get_settings
+    def test_retired_environment_value_never_unions_with_records(self, tmp_path, monkeypatch):
+        """A retired value cannot add authority to verified records."""
+        from solslot_api.config import get_settings
 
         records_evm = _evm_address(0x01)
         env_evm = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
@@ -702,9 +703,9 @@ class TestSettingsIntegration:
             },
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
         _pin_records_trust_root(monkeypatch, path)
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", env_evm)
+        monkeypatch.setenv("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", env_evm)
         get_settings.cache_clear()
         s = get_settings()
 
@@ -715,11 +716,11 @@ class TestSettingsIntegration:
         assert env_evm not in result
 
     def test_records_path_requires_expected_admins_hash(self, tmp_path, monkeypatch):
-        from populis_api.config import get_settings
+        from solslot_api.config import get_settings
 
         path = _write_json(tmp_path, _make_admin_records_dict())
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
         get_settings.cache_clear()
         s = get_settings()
 
@@ -729,7 +730,7 @@ class TestSettingsIntegration:
     def test_records_path_revalidates_hot_reload_before_allowlist(
         self, tmp_path, monkeypatch
     ):
-        from populis_api.config import get_settings
+        from solslot_api.config import get_settings
 
         records_a = [
             {
@@ -751,7 +752,7 @@ class TestSettingsIntegration:
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records_a))
         _pin_records_trust_root(monkeypatch, path)
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
         get_settings.cache_clear()
         s = get_settings()
         assert s.effective_admin_allowlist_set() == {_evm_address(0x01)}
@@ -763,28 +764,25 @@ class TestSettingsIntegration:
         with pytest.raises(AdminRecordsDriftError, match="drift"):
             s.effective_admin_allowlist_set()
 
-    def test_falls_back_to_env_var_when_records_path_unset(self, monkeypatch):
-        """Phase 2 backward-compat: when the JSON path is unset, the
-        env var is the gating source.  Nothing changes for operators
-        running pre-Phase-2.5 deployments.
-        """
-        from populis_api.config import get_settings
+    def test_retired_environment_value_does_not_enable_admins(self, monkeypatch):
+        """Environment-only authority is not an active V2 path."""
+        from solslot_api.config import get_settings
 
         evm = "0x" + "33" * 20
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", "")
-        monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", evm)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", evm)
         get_settings.cache_clear()
         s = get_settings()
 
-        assert s.effective_admin_allowlist_set() == {evm.lower()}
+        assert s.effective_admin_allowlist_set() == set()
 
     def test_boot_validator_loads_records(self, tmp_path, monkeypatch):
         """``validate_admin_config_at_startup`` must load the JSON
         records and verify their hash when ``admin_records_path`` is
         set.  Happy path: matching ``admins_hash`` → success, no raise.
         """
-        from populis_api import admin_auth
-        from populis_api.config import get_settings
+        from solslot_api import admin_auth
+        from solslot_api.config import get_settings
 
         records = [
             {
@@ -797,13 +795,13 @@ class TestSettingsIntegration:
         config = load_admin_records_from_path(path)
         expected_hash = "0x" + config.compute_admins_hash().hex()
 
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", expected_hash
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", expected_hash
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
             "0x" + "10" * 32,  # matches _make_admin_records_dict default
         )
         get_settings.cache_clear()
@@ -817,21 +815,21 @@ class TestSettingsIntegration:
         become the default admin source without copying their values back
         into env vars.
         """
-        from populis_api import admin_auth
-        from populis_api.config import get_settings
+        from solslot_api import admin_auth
+        from solslot_api.config import get_settings
 
         launcher_id = "0x" + "10" * 32
         records_path = _write_json(
             tmp_path,
             _make_admin_records_dict(launcher_id=launcher_id),
-            "admin_records.json",
+            "admin_records_v2.json",
         )
         config = load_admin_records_from_path(records_path)
         mips_root = "0x" + "77" * 32
         _write_json(
             tmp_path,
             {
-                "version": 1,
+                "schemaVersion": 2,
                 "network": "testnet11",
                 "protocol": {},
                 "admin_authority_v2": {
@@ -842,17 +840,17 @@ class TestSettingsIntegration:
                     "admin_records_hash": "sha256:" + "12" * 32,
                 },
             },
-            "portal_runtime_config.json",
+            "portal_runtime_config_v2.json",
         )
         monkeypatch.setenv(
-            "POPULIS_BOOTSTRAP_MANIFEST_PATH",
-            str(tmp_path / "bootstrap_manifest.json"),
+            "SOLSLOT_BOOTSTRAP_MANIFEST_PATH",
+            str(tmp_path / "bootstrap_manifest_v2.json"),
         )
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", "")
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", "")
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "")
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", "")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", "")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         get_settings.cache_clear()
 
         settings = get_settings()
@@ -870,8 +868,8 @@ class TestSettingsIntegration:
         """Operator updates the JSON without rotating the singleton →
         admins_hash mismatch → boot fails loud.
         """
-        from populis_api import admin_auth
-        from populis_api.config import get_settings
+        from solslot_api import admin_auth
+        from solslot_api.config import get_settings
 
         records = [
             {
@@ -883,10 +881,10 @@ class TestSettingsIntegration:
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
 
         # WRONG admins_hash on env (simulates stale or tampered config).
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
             "0x" + "ff" * 32,  # garbage — does not match JSON's hash
         )
         get_settings.cache_clear()
@@ -897,8 +895,8 @@ class TestSettingsIntegration:
         """Operator deploys records JSON from a different singleton →
         launcher_id mismatch → boot fails loud.
         """
-        from populis_api import admin_auth
-        from populis_api.config import get_settings
+        from solslot_api import admin_auth
+        from solslot_api.config import get_settings
 
         records = [
             {
@@ -911,14 +909,14 @@ class TestSettingsIntegration:
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
         config = load_admin_records_from_path(path)
 
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
             "0x" + config.compute_admins_hash().hex(),
         )
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
             "0x" + "fe" * 32,
         )
         get_settings.cache_clear()
@@ -933,8 +931,8 @@ class TestSettingsIntegration:
         records-path name and ``informational_only`` flips to False.
         """
         from fastapi.testclient import TestClient
-        from populis_api.app import app
-        from populis_api.config import get_settings
+        from solslot_api.app import app
+        from solslot_api.config import get_settings
 
         records = [
             {
@@ -944,18 +942,18 @@ class TestSettingsIntegration:
             }
         ]
         path = _write_json(tmp_path, _make_admin_records_dict(admin_records=records))
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(path))
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(path))
         _pin_records_trust_root(monkeypatch, path)
         # Boot validator requires JWT secret when admin desk is
         # enabled (which records_path enables); set a dummy.
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         get_settings.cache_clear()
 
         with TestClient(app) as client:
             r = client.get("/admin/auth/authority_v2")
         assert r.status_code == 200
         body = r.json()
-        assert body["gating_source"] == "POPULIS_ADMIN_RECORDS_PATH"
+        assert body["gating_source"] == "SOLSLOT_ADMIN_RECORDS_PATH"
         assert body["informational_only"] is False
 
     def test_authority_v2_endpoint_uses_finalized_bootstrap_artifacts(
@@ -966,14 +964,14 @@ class TestSettingsIntegration:
         re-entered by hand.
         """
         from fastapi.testclient import TestClient
-        from populis_api.app import app
-        from populis_api.config import get_settings
+        from solslot_api.app import app
+        from solslot_api.config import get_settings
 
         launcher_id = "0x" + "10" * 32
         records_path = _write_json(
             tmp_path,
             _make_admin_records_dict(launcher_id=launcher_id),
-            "admin_records.json",
+            "admin_records_v2.json",
         )
         config = load_admin_records_from_path(records_path)
         admins_hash = "0x" + config.compute_admins_hash().hex()
@@ -981,7 +979,7 @@ class TestSettingsIntegration:
         _write_json(
             tmp_path,
             {
-                "version": 1,
+                "schemaVersion": 2,
                 "network": "testnet11",
                 "protocol": {},
                 "admin_authority_v2": {
@@ -992,17 +990,17 @@ class TestSettingsIntegration:
                     "admin_records_hash": "sha256:" + "34" * 32,
                 },
             },
-            "portal_runtime_config.json",
+            "portal_runtime_config_v2.json",
         )
         monkeypatch.setenv(
-            "POPULIS_BOOTSTRAP_MANIFEST_PATH",
-            str(tmp_path / "bootstrap_manifest.json"),
+            "SOLSLOT_BOOTSTRAP_MANIFEST_PATH",
+            str(tmp_path / "bootstrap_manifest_v2.json"),
         )
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", "")
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", "")
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
-        monkeypatch.setenv("POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "")
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", "")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID", "")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH", "")
+        monkeypatch.setenv("SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_MIPS_ROOT_HASH", "")
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         get_settings.cache_clear()
 
         with TestClient(app) as client:
@@ -1016,7 +1014,7 @@ class TestSettingsIntegration:
         assert body["authority_version"] == 4
         assert body["deployment_status"] == "deployed-configured"
         assert body["chain_verifiable"] is True
-        assert body["gating_source"] == "POPULIS_ADMIN_RECORDS_PATH"
+        assert body["gating_source"] == "SOLSLOT_ADMIN_RECORDS_PATH"
         assert body["informational_only"] is False
 
 
@@ -1033,7 +1031,7 @@ class TestEip712ComputeLeafHashEndpoint:
 
     def _client(self):
         from fastapi.testclient import TestClient
-        from populis_api.app import app
+        from solslot_api.app import app
         return TestClient(app)
 
     def test_happy_path_testnet11(self):
@@ -1061,7 +1059,7 @@ class TestEip712ComputeLeafHashEndpoint:
 
     def test_default_network_uses_settings(self, monkeypatch):
         """Omitting ``network`` in the request defaults to the API's
-        configured POPULIS_NETWORK setting (testnet11 by default).
+        configured SOLSLOT_NETWORK setting (testnet11 by default).
         """
         with self._client() as client:
             r = client.post(
@@ -1141,16 +1139,16 @@ class TestEip712ComputeLeafHashEndpoint:
         """Malformed JSON at the configured path → boot fails with a
         clear ``Failed to load admin records`` message.
         """
-        from populis_api import admin_auth
-        from populis_api.config import get_settings
+        from solslot_api import admin_auth
+        from solslot_api.config import get_settings
 
         bad = tmp_path / "bad.json"
         bad.write_text("{not valid json")
 
-        monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(bad))
-        monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "x" * 64)
+        monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(bad))
+        monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         monkeypatch.setenv(
-            "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+            "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
             "0x" + "10" * 32,
         )
         get_settings.cache_clear()

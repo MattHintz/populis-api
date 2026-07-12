@@ -4,8 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
-from populis_api.config import Settings
-from populis_api.cors import cors_middleware_options
+from solslot_api.config import Settings
+from solslot_api.cors import cors_middleware_options
 
 
 def _client() -> TestClient:

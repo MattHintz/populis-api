@@ -10,19 +10,19 @@ from eth_keys import keys as eth_keys
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from populis_api import admin_auth, admin_bootstrap
-from populis_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_PATH
-from populis_api.admin_records import (
+from solslot_api import admin_auth, admin_bootstrap
+from solslot_api.admin_bootstrap import BOOTSTRAP_COOKIE_NAME, BOOTSTRAP_COOKIE_PATH
+from solslot_api.admin_records import (
     clear_admin_records_cache,
     load_admin_records_from_mapping,
 )
-from populis_api.bootstrap_manifest import (
+from solslot_api.bootstrap_manifest import (
     BOOTSTRAP_RECOVERY_ANCHOR_TAG,
     build_bootstrap_artifacts,
     canonical_json_bytes,
     content_hash,
 )
-from populis_api.config import get_settings
+from solslot_api.config import get_settings
 
 
 @pytest.fixture(autouse=True)
@@ -38,19 +38,15 @@ def _reset_state():
 
 @pytest.fixture
 def bootstrap_env(monkeypatch, tmp_path):
-    manifest_path = tmp_path / "bootstrap_manifest.json"
-    deployment_manifest_path = tmp_path / "deployment_manifest.json"
-    monkeypatch.setenv("POPULIS_ADMIN_TOKEN", "bootstrap-secret")
-    monkeypatch.setenv("POPULIS_BOOTSTRAP_MANIFEST_PATH", str(manifest_path))
-    monkeypatch.setenv("POPULIS_DEPLOYMENT_MANIFEST_PATH", str(deployment_manifest_path))
-    monkeypatch.setenv("POPULIS_BOOTSTRAP_SESSION_SECRET", "b" * 64)
-    monkeypatch.setenv("POPULIS_BOOTSTRAP_SESSION_TTL_SECONDS", "60")
-    monkeypatch.setenv("POPULIS_BOOTSTRAP_COOKIE_SECURE", "false")
-    monkeypatch.setenv(
-        "POPULIS_ADMIN_PUBKEY_ALLOWLIST",
-        "0x1111111111111111111111111111111111111111",
-    )
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "j" * 64)
+    manifest_path = tmp_path / "bootstrap_manifest_v2.json"
+    deployment_manifest_path = tmp_path / "deployment_manifest_v2.json"
+    monkeypatch.setenv("SOLSLOT_ADMIN_TOKEN", "bootstrap-secret")
+    monkeypatch.setenv("SOLSLOT_BOOTSTRAP_MANIFEST_PATH", str(manifest_path))
+    monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(deployment_manifest_path))
+    monkeypatch.setenv("SOLSLOT_BOOTSTRAP_SESSION_SECRET", "b" * 64)
+    monkeypatch.setenv("SOLSLOT_BOOTSTRAP_SESSION_TTL_SECONDS", "60")
+    monkeypatch.setenv("SOLSLOT_BOOTSTRAP_COOKIE_SECURE", "false")
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "j" * 64)
     get_settings.cache_clear()
     return manifest_path
 
@@ -81,16 +77,19 @@ def deployment_manifest() -> dict:
     return {
         "network": "testnet11",
         "params": {"quorum_bps": 5000},
+        "protocol_version": "solslot-v2",
+        "pool_puzzle_version": 3,
+        "smart_deed_puzzle_version": 2,
         "faucet_inner_puzhash": H("01"),
-        "pgt_genesis_coin_id": H("02"),
+        "sgt_genesis_coin_id": H("02"),
         "pool_genesis_coin_id": H("03"),
         "did_genesis_coin_id": H("04"),
         "gov_genesis_coin_id": H("05"),
         "pool_launcher_id": H("11"),
         "did_launcher_id": H("22"),
         "tracker_launcher_id": H("33"),
-        "pgt_tail_hash": H("44"),
-        "pgt_full_puzhash": H("45"),
+        "sgt_tail_hash": H("44"),
+        "sgt_full_puzhash": H("45"),
         "pool_token_tail_hash": H("55"),
         "pool_inner_puzhash": H("56"),
         "pool_full_puzhash": H("66"),
@@ -103,7 +102,7 @@ def deployment_manifest() -> dict:
 
 def admin_records() -> dict:
     return {
-        "version": 1,
+        "schemaVersion": 2,
         "launcher_id": H("88"),
         "admin_records": [
             {
@@ -135,7 +134,7 @@ def finalize_payload() -> dict:
         "admin_authority_launcher_id": H("88"),
         "admins_hash": admins_hash_for_records(records),
         "mips_root": H("cd"),
-        "read_only_api_url": "https://api.populis.example",
+        "read_only_api_url": "https://api.solslot.example",
         "read_only_coinset_url": "https://coinset.example",
     }
 
@@ -161,7 +160,7 @@ def recovery_verify_payload() -> dict:
 
 
 def write_deployment_manifest(bootstrap_manifest_path) -> None:
-    bootstrap_manifest_path.with_name("deployment_manifest.json").write_text(
+    bootstrap_manifest_path.with_name("deployment_manifest_v2.json").write_text(
         json.dumps(deployment_manifest()),
         encoding="utf-8",
     )
@@ -285,13 +284,13 @@ def test_bootstrap_cookie_does_not_authorize_normal_admin_auth(client: TestClien
     assert bootstrap_token
 
     cookie_only = client.post("/admin/auth/refresh")
-    assert cookie_only.status_code == 401
+    assert cookie_only.status_code == 503
 
     bearer_replay = client.post(
         "/admin/auth/refresh",
         headers={"Authorization": f"Bearer {bootstrap_token}"},
     )
-    assert bearer_replay.status_code == 403
+    assert bearer_replay.status_code == 503
 
 
 def test_bootstrap_finalize_requires_bootstrap_session(
@@ -359,8 +358,8 @@ def test_bootstrap_finalize_rejects_admin_records_that_do_not_match_admins_hash(
     assert "admin records validation failed" in detail
     assert "drift" in detail
     assert not bootstrap_env.exists()
-    assert not bootstrap_env.with_name("admin_records.json").exists()
-    assert not bootstrap_env.with_name("portal_runtime_config.json").exists()
+    assert not bootstrap_env.with_name("admin_records_v2.json").exists()
+    assert not bootstrap_env.with_name("portal_runtime_config_v2.json").exists()
 
 
 def test_bootstrap_finalize_persists_public_artifacts_and_locks(
@@ -387,7 +386,7 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
     }
     assert body["portal_runtime_config"]["admin_authority_v2"]["authority_version"] == 1
     assert body["bootstrap_recovery_anchor"] == {
-        "version": 1,
+        "version": 2,
         "tag": BOOTSTRAP_RECOVERY_ANCHOR_TAG,
         "network": "testnet11",
         "admin_authority_v2_launcher_id": H("88"),
@@ -396,19 +395,19 @@ def test_bootstrap_finalize_persists_public_artifacts_and_locks(
         "portal_runtime_config_hash": content_hash(body["portal_runtime_config"]),
         "admin_records_hash": content_hash(admin_records()),
     }
-    admin_records_path = bootstrap_env.with_name("admin_records.json")
-    runtime_path = bootstrap_env.with_name("portal_runtime_config.json")
-    recovery_anchor_path = bootstrap_env.with_name("bootstrap_recovery_anchor.json")
+    admin_records_path = bootstrap_env.with_name("admin_records_v2.json")
+    runtime_path = bootstrap_env.with_name("portal_runtime_config_v2.json")
+    recovery_anchor_path = bootstrap_env.with_name("bootstrap_recovery_anchor_v2.json")
     assert json.loads(admin_records_path.read_text()) == admin_records()
     assert json.loads(runtime_path.read_text()) == body["portal_runtime_config"]
     assert json.loads(recovery_anchor_path.read_text()) == body["bootstrap_recovery_anchor"]
     assert json.loads(bootstrap_env.read_text()) == body["bootstrap_manifest"]
-    assert body["portal_runtime_config"]["read_only_api_url"] == "https://api.populis.example"
+    assert body["portal_runtime_config"]["read_only_api_url"] == "https://api.solslot.example"
     emitted = json.dumps(body).lower()
     for forbidden in (
-        "populis_admin_token",
+        "solslot_admin_token",
         "bootstrap-secret",
-        "populis_bootstrap_session",
+        "solslot_bootstrap_session",
         "bearer",
         "jwt_secret",
         "signature",
@@ -441,26 +440,25 @@ def test_bootstrap_finalize_artifacts_become_records_backed_slot0_admin_source(
         "admin_authority_launcher_id": H("88"),
         "admins_hash": admins_hash_for_records(records),
         "mips_root": H("cd"),
-        "read_only_api_url": "https://api.populis.example",
+        "read_only_api_url": "https://api.solslot.example",
         "read_only_coinset_url": "https://coinset.example",
     }
     resp = client.post("/admin/bootstrap/finalize", json=payload)
     assert resp.status_code == 200
 
-    admin_records_path = bootstrap_env.with_name("admin_records.json")
+    admin_records_path = bootstrap_env.with_name("admin_records_v2.json")
     slot0_evm = _TEST_ADDRESS_LOWER
-    legacy_env_evm = "0x1111111111111111111111111111111111111111"
-    monkeypatch.setenv("POPULIS_ADMIN_RECORDS_PATH", str(admin_records_path))
+    non_member_evm = "0x1111111111111111111111111111111111111111"
+    monkeypatch.setenv("SOLSLOT_ADMIN_RECORDS_PATH", str(admin_records_path))
     monkeypatch.setenv(
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_LAUNCHER_ID",
         payload["admin_authority_launcher_id"],
     )
     monkeypatch.setenv(
-        "POPULIS_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
+        "SOLSLOT_PROTOCOL_ADMIN_AUTHORITY_V2_ADMINS_HASH",
         payload["admins_hash"],
     )
-    monkeypatch.setenv("POPULIS_ADMIN_PUBKEY_ALLOWLIST", legacy_env_evm)
-    monkeypatch.setenv("POPULIS_ADMIN_JWT_SECRET", "j" * 64)
+    monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "j" * 64)
     get_settings.cache_clear()
     clear_admin_records_cache()
     admin_auth.reset_admin_state_for_tests()
@@ -484,14 +482,14 @@ def test_bootstrap_finalize_artifacts_become_records_backed_slot0_admin_source(
     refreshed = admin_auth.verify_jwt(refresh.json()["jwt"], settings)
     assert refreshed.sub == slot0_evm
 
-    legacy_env_jwt, _ = admin_auth.issue_jwt(
-        sub=legacy_env_evm,
+    non_member_jwt, _ = admin_auth.issue_jwt(
+        sub=non_member_evm,
         auth_type="evm",
         settings=settings,
     )
     rejected = client.post(
         "/admin/auth/refresh",
-        headers={"Authorization": f"Bearer {legacy_env_jwt}"},
+        headers={"Authorization": f"Bearer {non_member_jwt}"},
     )
     assert rejected.status_code == 403
     assert "no longer in the admin allowlist" in rejected.json()["detail"]
@@ -535,14 +533,16 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
         "bootstrap_recovery_anchor",
     }
     assert {
-        "version",
+        "schemaVersion",
+        "protocolVersion",
         "network",
         "protocol",
         "admin_authority_v2",
         "artifact_hashes",
     }.issubset(set(bootstrap_schema["required"]))
     assert {
-        "version",
+        "schemaVersion",
+        "protocolVersion",
         "network",
         "protocol",
         "admin_authority_v2",
@@ -603,28 +603,36 @@ def test_recovery_anchor_publish_intent_accepts_bootstrap_cookie_after_lock(
 def test_recovery_anchor_publish_intent_requires_locked_artifacts(
     client: TestClient,
 ) -> None:
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
     resp = client.get(
         "/admin/bootstrap/recovery-anchor/publish-intent",
-        headers=admin_authorization_header(),
     )
 
     assert resp.status_code == 409
-    assert "only after bootstrap_manifest.json exists" in resp.json()["detail"]
+    assert "only after bootstrap_manifest_v2.json exists" in resp.json()["detail"]
 
 
 def test_recovery_anchor_publish_intent_rejects_missing_anchor_after_lock(
     client: TestClient,
     bootstrap_env,
 ) -> None:
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200
     bootstrap_env.write_text('{"locked": true}', encoding="utf-8")
 
     resp = client.get(
         "/admin/bootstrap/recovery-anchor/publish-intent",
-        headers=admin_authorization_header(),
     )
 
     assert resp.status_code == 409
-    assert "bootstrap_recovery_anchor.json is required" in resp.json()["detail"]
+    assert "bootstrap_recovery_anchor_v2.json is required" in resp.json()["detail"]
 
 
 def test_recovery_anchor_publish_intent_returns_json_safe_marker_inputs(
@@ -668,7 +676,7 @@ def test_recovery_anchor_publish_intent_returns_json_safe_marker_inputs(
     emitted = json.dumps(body).lower()
     for forbidden in (
         "bootstrap-secret",
-        "populis_bootstrap_session",
+        "solslot_bootstrap_session",
         "jwt_secret",
         "private_key",
         "spend_bundle",
@@ -782,7 +790,7 @@ def test_recovery_anchor_create_coin_preview_returns_json_safe_condition(
     emitted = json.dumps(body).lower()
     for forbidden in (
         "bootstrap-secret",
-        "populis_bootstrap_session",
+        "solslot_bootstrap_session",
         "jwt_secret",
         "private_key",
         "spend_bundle",
@@ -892,7 +900,7 @@ def test_recovery_anchor_verify_returns_false_for_tampered_admin_records(
     assert body["verified"] is False
     assert body["deployment_manifest_verified"] is False
     assert body["live_authority_verified"] is False
-    assert "admin_records.json content hash" in body["error"]
+    assert "admin_records_v2.json content hash" in body["error"]
     assert body["admin_records_hash"] is None
 
 
@@ -910,8 +918,8 @@ def test_recovery_anchor_verify_does_not_require_server_lock_or_files(
     assert resp.status_code == 200
     assert resp.json()["verified"] is True
     assert not bootstrap_env.exists()
-    assert not bootstrap_env.with_name("admin_records.json").exists()
-    assert not bootstrap_env.with_name("portal_runtime_config.json").exists()
+    assert not bootstrap_env.with_name("admin_records_v2.json").exists()
+    assert not bootstrap_env.with_name("portal_runtime_config_v2.json").exists()
 
 
 def test_recovery_anchor_verify_openapi_schema_pins_verifier_boundary(

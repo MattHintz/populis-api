@@ -6,10 +6,10 @@ from collections.abc import Callable
 from fastapi import APIRouter
 from fastapi.routing import APIRoute
 
-from populis_api import admin, admin_auth, admin_bootstrap, mint_endpoints
-from populis_api.admin import require_admin_token
-from populis_api.admin_auth import require_admin_jwt
-from populis_api.admin_bootstrap import (
+from solslot_api import admin, admin_auth, admin_bootstrap, mint_endpoints
+from solslot_api.admin import require_admin_token
+from solslot_api.admin_auth import require_admin_jwt
+from solslot_api.admin_bootstrap import (
     require_bootstrap_session,
     require_recovery_anchor_handoff_auth,
 )
@@ -94,7 +94,6 @@ def test_admin_auth_refresh_is_the_only_jwt_gated_auth_route() -> None:
     assert _route_keys(admin_auth.router) == {
         ("POST", "/admin/auth/challenge"),
         ("POST", "/admin/auth/login"),
-        ("GET", "/admin/auth/authority"),
         ("GET", "/admin/auth/authority_v2"),
         ("POST", "/admin/auth/eip712/compute_leaf_hash"),
         ("POST", "/admin/auth/refresh"),
@@ -109,17 +108,25 @@ def test_admin_auth_refresh_is_the_only_jwt_gated_auth_route() -> None:
     assert jwt_routes == {("POST", "/admin/auth/refresh")}
 
 
-def test_legacy_protocol_deployment_routes_are_static_token_gated() -> None:
-    expected = {
+def test_protocol_operator_routes_have_explicit_authority_boundaries() -> None:
+    static_token_routes = {
         ("GET", "/admin/deployment"),
         ("POST", "/admin/deploy/protocol"),
+        ("POST", "/admin/protocol-config/finalize"),
     }
+    chain_admin_routes = {
+        ("POST", "/admin/zkpassport/bridge-pool/top-up"),
+    }
+    expected = static_token_routes | chain_admin_routes
 
     assert _route_keys(admin.router) == expected
-    for method, path in expected:
+    for method, path in static_token_routes:
         calls = _dependency_calls(_route(admin.router, method, path))
         assert require_admin_token in calls
-        assert require_admin_jwt not in calls
+    for method, path in chain_admin_routes:
+        calls = _dependency_calls(_route(admin.router, method, path))
+        assert require_admin_jwt in calls
+        assert require_admin_token not in calls
 
 
 def test_bootstrap_routes_keep_scoped_auth_boundary() -> None:

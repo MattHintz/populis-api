@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from populis_api.zkpassport_relay import _simulate_forwarded_inner_call
+from solslot_api.zkpassport_relay import _simulate_forwarded_inner_call
 
 
 FORWARDER = "0x" + "11" * 20
