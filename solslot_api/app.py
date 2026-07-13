@@ -516,22 +516,7 @@ async def release(
 @app.get("/protocol", response_model=ProtocolInfo)
 async def protocol(
     settings: Annotated[Settings, Depends(get_settings)],
-    coinset: Annotated[CoinsetClient, Depends(get_coinset)],
 ) -> ProtocolInfo:
-    faucet: Optional[Faucet] = app.state.faucet  # type: ignore[attr-defined]
-    faucet_balance = None
-    if faucet is not None:
-        try:
-            coins = await coinset.get_coin_records_by_puzzle_hash(
-                "0x" + faucet.address_puzzle_hash.hex(), include_spent=False
-            )
-            faucet_balance = sum(
-                int((c.get("coin") or c)["amount"])
-                for c in coins
-                if c.get("spent_block_index") in (0, None)
-            )
-        except Exception as e:
-            logger.warning("faucet balance lookup failed: %s", e)
     # Auto-discover the deployment manifest if present (dict-only, no CLVM
     # Program instantiation on the request thread).
     deployed = False
@@ -584,10 +569,15 @@ async def protocol(
         vault_inner_mod_hash=VAULT_INNER_MOD_HASH_HEX,
         eip712_domain=eip712_domain(),
         eip712_typehash_string=VAULT_SPEND_TYPEHASH_STRING,
-        faucet_address=faucet.bech32_address() if faucet else None,
-        faucet_balance_mojos=faucet_balance,
+        # Retained as nullable compatibility fields. Operational funding data
+        # belongs on authenticated admin surfaces, not the public snapshot.
+        faucet_address=None,
+        faucet_balance_mojos=None,
         deployed=deployed,
-        deployment_manifest=deployment_manifest,
+        # Canonical public coordinates are exposed as typed fields below. The
+        # raw ceremony manifest can contain operational metadata and is never
+        # returned from this unauthenticated route.
+        deployment_manifest=None,
         protocol_config_hash=protocol_snapshot.content_hash_hex,
         protocol_config_launcher_id=protocol_snapshot.protocol_config_launcher_id_hex,
         protocol_config_version=protocol_snapshot.config_version,

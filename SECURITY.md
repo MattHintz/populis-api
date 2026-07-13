@@ -26,6 +26,19 @@ created until every gate in this document is green.
 - Request parameters cannot replace canonical pool, governance, treasury,
   registry, or bridge coordinates.
 
+### Public cryptographic metadata
+
+- `/protocol` exposes only typed coordinates and commitments that are already
+  independently observable on-chain and are required for client verification.
+- The public snapshot never returns the raw deployment manifest, faucet
+  address, faucet balance, private ceremony evidence, or administrator records.
+- `/admin/auth/authority_v2` may expose launcher and commitment hashes needed
+  before login. Those hashes are public singleton state, are informational
+  only, and never grant authority; administrator addresses and Merkle paths are
+  loaded from hash-verified records and are not returned by that route.
+- Public metadata is not an authorization source. Every mutation revalidates
+  current chain state, owner proof, canonical coordinates, and replay guards.
+
 ### Administrator authority
 
 - Interactive admin authority comes only from `SOLSLOT_ADMIN_RECORDS_PATH`.
@@ -45,6 +58,8 @@ created until every gate in this document is green.
   machine; there is no public signer endpoint.
 - Nullifiers, bridge coins, EVM events, relay nonces, and enrollment actions are
   single-use in a persistent SQLite-WAL ledger.
+- Mainnet production refuses to start with a validator threshold below two.
+  Alpha's explicit single-validator policy cannot be promoted to mainnet.
 - The UI may report verified only when Coinset confirms the current unspent
   vault successor whose puzzle hash contains the receipt's identity root.
 - Browser storage is never an authorization source.

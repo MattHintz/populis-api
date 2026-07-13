@@ -96,6 +96,9 @@ def test_protocol(client: TestClient) -> None:
     assert "SolslotVaultSpend" in body["eip712_typehash_string"]
     assert body["vault_inner_mod_hash"].startswith("0x")
     assert len(body["vault_inner_mod_hash"]) == 66  # 0x + 32 bytes hex
+    assert body["faucet_address"] is None
+    assert body["faucet_balance_mojos"] is None
+    assert body["deployment_manifest"] is None
 
 
 def test_evm_challenge_roundtrip(client: TestClient, local_acct) -> None:
