@@ -253,6 +253,32 @@ class TestRateLimit:
         for _ in range(10):
             store.issue("0xabc", "evm", source_ip=None)
 
+    def test_persistent_quota_is_shared_across_workers(self, tmp_path) -> None:
+        path = tmp_path / "challenges.db"
+        first = ChallengeStore(
+            ttl_seconds=300,
+            per_ip_per_minute=2,
+            db_path=path,
+        )
+        second = ChallengeStore(
+            ttl_seconds=300,
+            per_ip_per_minute=2,
+            db_path=path,
+        )
+        first.issue("0xabc", "evm", source_ip="192.0.2.10")
+        second.issue("0xabc", "evm", source_ip="192.0.2.10")
+        with pytest.raises(RateLimitedError, match="exceeded"):
+            first.issue("0xabc", "evm", source_ip="192.0.2.10")
+
+    def test_persistent_nonce_is_single_use_across_workers(self, tmp_path) -> None:
+        path = tmp_path / "challenges.db"
+        first = ChallengeStore(ttl_seconds=300, db_path=path)
+        second = ChallengeStore(ttl_seconds=300, db_path=path)
+        challenge = first.issue("0xabc", "evm", source_ip="192.0.2.20")
+
+        assert second.pop(challenge.nonce, "0xabc", "evm") is not None
+        assert first.pop(challenge.nonce, "0xabc", "evm") is None
+
 
 class TestCapacityCap:
     def test_max_pending_enforced(self) -> None:

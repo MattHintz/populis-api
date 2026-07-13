@@ -74,6 +74,42 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
         )
 
 
+def validate_server_hardening_at_startup(settings: "Settings") -> None:
+    """Reject unsafe staging/production HTTP posture before serving traffic."""
+
+    if settings.runtime_environment not in {"staging", "production"}:
+        return
+    if not settings.bootstrap_cookie_secure:
+        raise RuntimeError(
+            "SOLSLOT_BOOTSTRAP_COOKIE_SECURE must be true in staging/production."
+        )
+    if settings.api_docs_enabled:
+        raise RuntimeError(
+            "SOLSLOT_API_DOCS_ENABLED must be false in staging/production."
+        )
+    if not settings.security_headers_enabled or not settings.hsts_enabled:
+        raise RuntimeError(
+            "Security headers and HSTS must be enabled in staging/production."
+        )
+
+    insecure_origins: list[str] = []
+    for origin in settings.allowed_origins():
+        lowered = origin.lower()
+        if (
+            origin == "*"
+            or lowered.startswith("http://")
+            or "localhost" in lowered
+            or "127.0.0.1" in lowered
+            or "0.0.0.0" in lowered
+        ):
+            insecure_origins.append(origin)
+    if insecure_origins:
+        raise RuntimeError(
+            "Staging/production CORS origins must be exact HTTPS origins; rejected: "
+            + ", ".join(sorted(insecure_origins))
+        )
+
+
 def _secret_keys_present_in_env_file(path: Path) -> set[str]:
     keys: set[str] = set()
     try:
@@ -135,6 +171,19 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip() == "":
             return None
         return v
+
+    # ── Server posture ───────────────────────────────────────────────────
+    # Secure-by-default: local development must opt in explicitly.  This
+    # prevents a missing environment variable on a newly provisioned host
+    # from silently enabling development CORS or API documentation.
+    runtime_environment: Literal[
+        "development", "test", "staging", "production"
+    ] = "production"
+    api_docs_enabled: bool = False
+    security_headers_enabled: bool = True
+    hsts_enabled: bool = True
+    max_request_body_bytes: int = Field(4 * 1024 * 1024, ge=1, le=16 * 1024 * 1024)
+    request_timeout_seconds: float = Field(30.0, gt=0, le=120.0)
 
     # ── Network ───────────────────────────────────────────────────────────
     network: Literal["testnet11", "mainnet"] = "testnet11"
@@ -422,7 +471,10 @@ class Settings(BaseSettings):
     admin_db_path: str = "./state/admin_desk_v2.db"
 
     # ── CORS ──────────────────────────────────────────────────────────────
-    cors_origins: str = "http://localhost:4200,http://localhost:5173"
+    # Same-origin deployments need no CORS entries. Local development opts
+    # in with SOLSLOT_RUNTIME_ENVIRONMENT=development; only then is the
+    # localhost regex accepted by cors_middleware_options().
+    cors_origins: str = ""
 
     # ── EIP-712 domain ────────────────────────────────────────────────────
     eip712_name: str = "Solslot Protocol"
@@ -437,6 +489,9 @@ class Settings(BaseSettings):
     challenge_store_max_pending: int = 50_000
     # Maximum challenges issued per source IP per minute.
     challenge_per_ip_per_minute: int = 60
+    # Shared SQLite-WAL store makes challenge quotas and nonce consumption
+    # process-safe. Tests opt into the in-memory implementation explicitly.
+    challenge_store_path: str = "./state/challenges_v2.db"
 
     # ── Faucet UTXO consolidation worker (POP-CANON-008) ──────────────────
     # Background task that periodically merges fragmented faucet change UTXOs

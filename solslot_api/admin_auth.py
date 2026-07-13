@@ -140,6 +140,10 @@ def get_admin_challenges() -> ChallengeStore:
             ttl_seconds=s.challenge_ttl_seconds,
             max_pending=2_000,                          # admin desk: tiny vs public vault flow
             per_ip_per_minute=s.admin_login_per_ip_per_minute,
+            db_path=(
+                None if s.runtime_environment == "test" else s.challenge_store_path
+            ),
+            namespace="admin_login",
         )
     return _admin_challenges
 

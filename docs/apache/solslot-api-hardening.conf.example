@@ -1,0 +1,27 @@
+# Reference controls for the public /protocol-api/ route inside the TLS vhost.
+# Apache must be the only public listener; uvicorn binds to 127.0.0.1:8790.
+# mod_remoteip must normalize trusted Cloudflare peers before this block runs.
+
+ProxyPreserveHost On
+ProxyTimeout 30
+RequestReadTimeout header=10-20,MinRate=500 body=15,MinRate=500
+
+ProxyPass /protocol-api/ http://127.0.0.1:8790/ connectiontimeout=5 timeout=30 retry=0
+ProxyPassReverse /protocol-api/ http://127.0.0.1:8790/
+
+<Location /protocol-api/>
+    LimitRequestBody 4194304
+
+    # Ignore any forwarding chain supplied by the public client. Uvicorn trusts
+    # only this loopback proxy, which receives Apache's normalized client IP.
+    RequestHeader unset X-Forwarded-For
+    RequestHeader set X-Forwarded-For "expr=%{REMOTE_ADDR}"
+    RequestHeader set X-Forwarded-Host "expr=%{HTTP_HOST}"
+    RequestHeader set X-Forwarded-Proto "https"
+
+    Header always set Cache-Control "no-store"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "no-referrer"
+    Header always set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+</Location>

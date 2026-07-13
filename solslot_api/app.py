@@ -66,6 +66,7 @@ from .config import (
     get_settings,
     validate_runtime_environment_namespace,
     validate_secret_env_file_permissions,
+    validate_server_hardening_at_startup,
 )
 from .credential_auth import require_alpha_writes
 from .deployment_manifest import load_deployment_manifest
@@ -77,11 +78,14 @@ from .evm_auth import (
     eip712_domain,
     normalize_evm_address,
     recover_evm_signer,
+    registration_bls_message,
+    registration_bls_signing_digest,
     registration_typed_data,
     VAULT_SPEND_TYPEHASH_STRING,
 )
 from .faucet import Faucet
 from .state import VaultRecord, VaultRegistry, get_registry
+from .server_hardening import ServerHardeningMiddleware, documentation_urls
 from .vault_launcher import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1, build_and_sign_launch
 from .vault_version_registry import (
     VaultVersionRegistrySnapshot,
@@ -182,6 +186,7 @@ async def lifespan(app: FastAPI):
     validate_runtime_environment_namespace()
     validate_secret_env_file_permissions()
     settings = get_settings()
+    validate_server_hardening_at_startup(settings)
 
     # POP-CANON-016: fail fast at boot if the admin desk is enabled but
     # SOLSLOT_ADMIN_JWT_SECRET is unset.  This complements the runtime
@@ -249,27 +254,26 @@ async def lifespan(app: FastAPI):
         await app.state.coinset.close()
 
 
+_server_settings = get_settings()
+
 app = FastAPI(
     title="Solslot API",
     version="0.1.0",
     description="Solslot Protocol members-portal API (testnet)",
     lifespan=lifespan,
+    **documentation_urls(_server_settings),
 )
 
 
-@app.middleware("http")
-async def add_cors(request, call_next):
-    # Handled by CORSMiddleware below — this no-op middleware is a hook point
-    # for future request-scoped logging.
-    return await call_next(request)
-
-
-# Allow any localhost / 127.0.0.1 / 0.0.0.0 origin on any port for local dev
-# (including Cascade's browser-preview proxy which uses an ephemeral port).
-# Production should pin exact origins via SOLSLOT_CORS_ORIGINS.
+# Localhost matching is available only in development/test. Staging and
+# production accept exact HTTPS origins from SOLSLOT_CORS_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    **cors_middleware_options(get_settings()),
+    **cors_middleware_options(_server_settings),
+)
+app.add_middleware(
+    ServerHardeningMiddleware,
+    settings=_server_settings,
 )
 
 # Run-once ceremony routes use the bootstrap operator token.
@@ -429,6 +433,7 @@ class ChallengeResponse(BaseModel):
     nonce: str
     expires_at: float
     typed_data: Optional[dict[str, Any]] = None
+    message_hex: Optional[str] = None
 
 
 class RegisterEvmVaultRequest(BaseModel):
@@ -631,6 +636,7 @@ async def request_challenge(
         raise HTTPException(status_code=429, detail=str(e)) from e
 
     typed_data: Optional[dict[str, Any]] = None
+    message_hex: Optional[str] = None
     if body.auth_type == "evm":
         typed_data = registration_typed_data(
             body.address,
@@ -639,10 +645,18 @@ async def request_challenge(
             auth_type="secp256k1",
             chia_network=network,
         )
+    elif body.auth_type == "chia_bls":
+        message_hex = "0x" + registration_bls_message(
+            ch.nonce,
+            ch.pool_launcher_id_hex,
+            ch.auth_type,
+            ch.chia_network,
+        ).hex()
     return ChallengeResponse(
         nonce=ch.nonce,
         expires_at=ch.expires_at,
         typed_data=typed_data,
+        message_hex=message_hex,
     )
 
 
@@ -821,9 +835,13 @@ async def register_chia_vault(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"BLS key/sig invalid: {e}") from e
 
-    # Chia wallets sign the raw bytes of the nonce (hex form → bytes).
-    nonce_bytes = bytes.fromhex(ch.nonce[2:] if ch.nonce.startswith("0x") else ch.nonce)
-    if not AugSchemeMPL.verify(pk, nonce_bytes, sig):
+    signing_digest = registration_bls_signing_digest(
+        ch.nonce,
+        ch.pool_launcher_id_hex,
+        ch.auth_type,
+        ch.chia_network,
+    )
+    if not AugSchemeMPL.verify(pk, signing_digest, sig):
         raise HTTPException(status_code=400, detail="BLS signature does not verify")
 
     coins = await coinset.get_coin_records_by_puzzle_hash(
@@ -840,11 +858,8 @@ async def register_chia_vault(
         raise HTTPException(status_code=503, detail="Faucet has no spendable coins")
 
     # POP-CANON-002 parity: use the snapshotted pool_launcher_id_hex from
-    # the challenge, not live settings. BLS users sign only the raw nonce
-    # bytes (no EIP-712 envelope), so the user's signature does not
-    # cryptographically commit to the pool — but the snapshot still
-    # records operator intent at challenge time, and using it removes the
-    # asymmetry with /vault/register/evm. Without this parity, an operator
+    # the challenge, not live settings. The CHIP-0002 signature commits to
+    # this pool, auth path, and network. Without this parity, an operator
     # who changes pool_launcher_id between /auth/challenge and
     # /vault/register/chia would silently launch a BLS vault bound to a
     # different pool than the one snapshotted at challenge issuance.

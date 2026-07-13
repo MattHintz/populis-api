@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from chia.types.blockchain_format.program import Program
 from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 from fastapi import HTTPException, status
@@ -140,6 +141,16 @@ def credential_bls_message(settings: Settings, challenge: OwnerChallenge) -> byt
     return hashlib.sha256(material).digest()
 
 
+def credential_bls_signing_digest(settings: Settings, challenge: OwnerChallenge) -> bytes:
+    """Return the CHIP-0002 digest signed by Chia wallet message RPCs."""
+
+    return bytes(
+        Program.to(
+            ("Chia Signed Message", credential_bls_message(settings, challenge))
+        ).get_tree_hash()
+    )
+
+
 def require_alpha_writes(settings: Settings) -> None:
     if not settings.alpha_writes_enabled:
         raise HTTPException(
@@ -268,7 +279,11 @@ def verify_owner_auth(
             pubkey = G1Element.from_bytes(bytes(record.owner_pubkey))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=401, detail=f"Invalid BLS owner signature: {exc}") from exc
-        if not AugSchemeMPL.verify(pubkey, credential_bls_message(settings, challenge), signature):
+        if not AugSchemeMPL.verify(
+            pubkey,
+            credential_bls_signing_digest(settings, challenge),
+            signature,
+        ):
             raise HTTPException(status_code=403, detail="BLS signature does not belong to this vault owner.")
         owner_key = "0x" + bytes(pubkey).hex()
         auth_type = "chia_bls"
@@ -296,6 +311,8 @@ __all__ = [
     "OwnerChallengeResponse",
     "VerifiedOwner",
     "credential_payload_hash",
+    "credential_bls_message",
+    "credential_bls_signing_digest",
     "credential_typed_data",
     "issue_owner_challenge",
     "require_alpha_writes",

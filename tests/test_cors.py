@@ -13,7 +13,10 @@ def _client() -> TestClient:
     app.add_middleware(
         CORSMiddleware,
         **cors_middleware_options(
-            Settings(cors_origins="http://localhost:4200,http://localhost:5173"),
+            Settings(
+                runtime_environment="development",
+                cors_origins="http://localhost:4200,http://localhost:5173",
+            ),
         ),
     )
 
@@ -82,9 +85,22 @@ def test_cors_credentials_are_not_wildcarded() -> None:
 
 
 def test_cors_options_keep_existing_method_and_header_policy() -> None:
-    opts = cors_middleware_options(Settings())
+    opts = cors_middleware_options(Settings(runtime_environment="development"))
 
     assert opts["allow_credentials"] is True
     assert opts["allow_methods"] == ["GET", "POST", "OPTIONS"]
-    assert opts["allow_headers"] == ["*"]
+    assert "Authorization" in opts["allow_headers"]
+    assert "Content-Type" in opts["allow_headers"]
     assert "http://localhost:4200" in opts["allow_origins"]
+
+
+def test_staging_does_not_enable_localhost_regex() -> None:
+    opts = cors_middleware_options(
+        Settings(
+            runtime_environment="staging",
+            cors_origins="https://staging.solslot.com",
+        )
+    )
+
+    assert opts["allow_origin_regex"] is None
+    assert opts["allow_origins"] == ["https://staging.solslot.com"]

@@ -44,7 +44,7 @@ def contains_forbidden(data: bytes) -> bool:
 
 def tracked_files(repo_root: Path) -> list[Path]:
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=repo_root,
         check=True,
         capture_output=True,
@@ -105,6 +105,14 @@ def scan_file(path: Path) -> list[str]:
         return [f"{path} (unreadable: {error})"]
     if contains_forbidden(data):
         violations.append(f"{path} (content)")
+    try:
+        printable = subprocess.run(
+            ["strings", "-a", str(path)], check=False, capture_output=True
+        ).stdout
+        if contains_forbidden(printable) and f"{path} (content)" not in violations:
+            violations.append(f"{path} (strings)")
+    except OSError:
+        pass
     if path.name.lower().endswith(ARCHIVE_SUFFIXES):
         try:
             violations.extend(archive_violations(path))

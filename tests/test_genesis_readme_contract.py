@@ -70,6 +70,21 @@ def test_staging_contract_has_no_public_bridge_autotopup() -> None:
     assert "Static parent-ID configuration is not used" in text
 
 
+def test_staging_contract_pins_server_hardening_boundary() -> None:
+    text = _read("docs/STAGING_BACKEND_DEPLOY.md")
+    for required in (
+        "--host 127.0.0.1",
+        "--forwarded-allow-ips 127.0.0.1",
+        "--no-server-header",
+        "SOLSLOT_API_DOCS_ENABLED=false",
+        "SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304",
+        "SOLSLOT_REQUEST_TIMEOUT_SECONDS=30",
+        "HSTS/security headers",
+    ):
+        assert required in text
+    assert "Do not add `--reload`" in text
+
+
 def test_zkpassport_contract_uses_chia_as_final_authority() -> None:
     text = _read("docs/ZKPASSPORT_CHIA_VAULT_ATTESTATION.md")
     assert "reserved -> evm_confirmed -> stamp_pending -> chia_confirmed" in text

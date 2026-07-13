@@ -59,6 +59,19 @@ created until every gate in this document is green.
 - Public enrollment requests cannot spend the faucet or create bridge coins.
 - Bridge-pool replenishment requires current chain-bound admin authority.
 
+### Server and proxy boundary
+
+- Uvicorn binds only `127.0.0.1`; the reverse proxy is the only public
+  listener and the firewall denies direct access to the application port.
+- Staging and production reject insecure bootstrap cookies, development CORS,
+  public API documentation, disabled HSTS, or disabled security headers during
+  startup.
+- The app enforces a bounded body size and request duration. Uvicorn also caps
+  concurrency, backlog, and keep-alive duration; the proxy independently caps
+  bodies, reads, connections, and request rates.
+- Forwarded headers are trusted only from the loopback proxy. The process never
+  runs with file watching or a public-interface bind.
+
 ### Offers and minting
 
 - Mint writes require both `SOLSLOT_ALPHA_WRITES_ENABLED=true` and

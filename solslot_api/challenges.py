@@ -6,9 +6,9 @@ back (address, nonce, signature).  We re-derive the digest, ecrecover the
 pubkey, and if (a) the address matches and (b) the nonce is still alive,
 we accept it.
 
-Nonces are single-use: we pop them on successful verification.  TTL is
-enforced in-memory per process (good enough for a single-server MVP — swap
-for Redis later).
+Nonces are single-use: every verification attempt consumes them. Production
+uses a shared SQLite-WAL store so quotas and nonce consumption remain atomic
+across workers and restarts; focused unit tests may use the in-memory backend.
 
 Audit history:
 
@@ -30,9 +30,11 @@ Audit history:
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from .config import get_settings
@@ -73,13 +75,20 @@ class ChallengeStore:
         ttl_seconds: int,
         max_pending: int = 50_000,
         per_ip_per_minute: int = 60,
+        *,
+        db_path: str | Path | None = None,
+        namespace: str = "vault_registration",
     ) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_pending = max_pending
         self.per_ip_per_minute = per_ip_per_minute
+        self.namespace = namespace
+        self._db_path = Path(db_path) if db_path is not None else None
         self._challenges: dict[str, Challenge] = {}
         # Per-IP issuance log: deque of timestamps within the last 60s.
         self._ip_issuance: dict[str, deque[float]] = defaultdict(deque)
+        if self._db_path is not None:
+            self._init_db()
 
     def issue(
         self,
@@ -95,6 +104,15 @@ class ChallengeStore:
             RateLimitedError: source_ip has exceeded per-minute quota.
             ChallengeStoreFullError: the store has hit max_pending.
         """
+        if self._db_path is not None:
+            return self._issue_persistent(
+                address=address,
+                auth_type=auth_type,
+                pool_launcher_id_hex=pool_launcher_id_hex,
+                chia_network=chia_network,
+                source_ip=source_ip,
+            )
+
         now = time.time()
         self._gc(now)
 
@@ -129,7 +147,10 @@ class ChallengeStore:
         from filling the store with entries that are never garbage-collected
         because they're never matched by a legitimate caller.
         """
-        ch = self._challenges.pop(nonce, None)
+        if self._db_path is not None:
+            ch = self._pop_persistent(nonce)
+        else:
+            ch = self._challenges.pop(nonce, None)
         if ch is None:
             return None
         now = time.time()
@@ -166,7 +187,184 @@ class ChallengeStore:
             )
 
     def __len__(self) -> int:
+        if self._db_path is not None:
+            now = time.time()
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM challenges WHERE namespace = ? AND expires_at < ?",
+                    (self.namespace, now),
+                )
+                count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM challenges WHERE namespace = ?",
+                        (self.namespace,),
+                    ).fetchone()[0]
+                )
+                conn.commit()
+                return count
         return len(self._challenges)
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._db_path is None:
+            raise RuntimeError("Persistent challenge storage is not configured")
+        conn = sqlite3.connect(self._db_path, timeout=5.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn
+
+    def _init_db(self) -> None:
+        if self._db_path is None:
+            return
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS challenges (
+                    namespace TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    auth_type TEXT NOT NULL,
+                    issued_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    pool_launcher_id_hex TEXT NOT NULL,
+                    chia_network TEXT NOT NULL,
+                    PRIMARY KEY(namespace, nonce)
+                );
+                CREATE INDEX IF NOT EXISTS challenges_expiry_idx
+                    ON challenges(namespace, expires_at);
+                CREATE TABLE IF NOT EXISTS challenge_issuance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace TEXT NOT NULL,
+                    source_ip TEXT NOT NULL,
+                    issued_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS challenge_issuance_window_idx
+                    ON challenge_issuance(namespace, source_ip, issued_at);
+                """
+            )
+
+    def _issue_persistent(
+        self,
+        *,
+        address: str,
+        auth_type: str,
+        pool_launcher_id_hex: str,
+        chia_network: str,
+        source_ip: Optional[str],
+    ) -> Challenge:
+        now = time.time()
+        challenge = Challenge(
+            nonce="0x" + secrets.token_hex(32),
+            address=address.lower() if auth_type == "evm" else address,
+            auth_type=auth_type,
+            issued_at=now,
+            expires_at=now + self.ttl_seconds,
+            pool_launcher_id_hex=pool_launcher_id_hex,
+            chia_network=chia_network,
+        )
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM challenges WHERE namespace = ? AND expires_at < ?",
+                    (self.namespace, now),
+                )
+                conn.execute(
+                    "DELETE FROM challenge_issuance WHERE namespace = ? AND issued_at < ?",
+                    (self.namespace, now - 60.0),
+                )
+                if source_ip is not None:
+                    issued = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*) FROM challenge_issuance
+                            WHERE namespace = ? AND source_ip = ? AND issued_at >= ?
+                            """,
+                            (self.namespace, source_ip, now - 60.0),
+                        ).fetchone()[0]
+                    )
+                    if issued >= self.per_ip_per_minute:
+                        raise RateLimitedError(
+                            f"IP {source_ip} exceeded "
+                            f"{self.per_ip_per_minute} challenges/minute"
+                        )
+                pending = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM challenges WHERE namespace = ?",
+                        (self.namespace,),
+                    ).fetchone()[0]
+                )
+                if pending >= self.max_pending:
+                    raise ChallengeStoreFullError(
+                        f"Challenge store is at capacity ({self.max_pending}); "
+                        "try again later"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO challenges(
+                        namespace, nonce, address, auth_type, issued_at,
+                        expires_at, pool_launcher_id_hex, chia_network
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.namespace,
+                        challenge.nonce,
+                        challenge.address,
+                        challenge.auth_type,
+                        challenge.issued_at,
+                        challenge.expires_at,
+                        challenge.pool_launcher_id_hex,
+                        challenge.chia_network,
+                    ),
+                )
+                if source_ip is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO challenge_issuance(namespace, source_ip, issued_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (self.namespace, source_ip, now),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return challenge
+
+    def _pop_persistent(self, nonce: str) -> Optional[Challenge]:
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT nonce, address, auth_type, issued_at, expires_at,
+                           pool_launcher_id_hex, chia_network
+                    FROM challenges WHERE namespace = ? AND nonce = ?
+                    """,
+                    (self.namespace, nonce),
+                ).fetchone()
+                conn.execute(
+                    "DELETE FROM challenges WHERE namespace = ? AND nonce = ?",
+                    (self.namespace, nonce),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        if row is None:
+            return None
+        return Challenge(
+            nonce=str(row["nonce"]),
+            address=str(row["address"]),
+            auth_type=str(row["auth_type"]),
+            issued_at=float(row["issued_at"]),
+            expires_at=float(row["expires_at"]),
+            pool_launcher_id_hex=str(row["pool_launcher_id_hex"]),
+            chia_network=str(row["chia_network"]),
+        )
 
 
 _store: Optional[ChallengeStore] = None
@@ -180,6 +378,10 @@ def get_store() -> ChallengeStore:
             ttl_seconds=s.challenge_ttl_seconds,
             max_pending=s.challenge_store_max_pending,
             per_ip_per_minute=s.challenge_per_ip_per_minute,
+            db_path=(
+                None if s.runtime_environment == "test" else s.challenge_store_path
+            ),
+            namespace="vault_registration",
         )
     return _store
 

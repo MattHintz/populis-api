@@ -175,6 +175,13 @@ def test_create_enrollment_fails_closed_without_bridge_pool(monkeypatch, tmp_pat
     assert "bridge coins" in resp.json()["detail"]
 
 
+def test_malformed_vault_launcher_path_is_rejected_before_handler():
+    with TestClient(app) as client:
+        response = client.get("/zkpassport/enrollments/not-a-launcher")
+
+    assert response.status_code == 422
+
+
 def test_create_enrollment_discovers_unspent_bridge_coins(monkeypatch, tmp_path):
     with _client(monkeypatch, tmp_path, bridge_records=[_bridge_record(amount=2)]) as client:
         created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})

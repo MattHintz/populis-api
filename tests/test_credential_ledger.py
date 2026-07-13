@@ -12,6 +12,7 @@ from solslot_api.config import Settings
 from solslot_api.credential_auth import (
     OwnerAuth,
     OwnerChallengeRequest,
+    credential_bls_signing_digest,
     issue_owner_challenge,
     verify_owner_auth,
 )
@@ -136,7 +137,9 @@ def test_bls_owner_challenge_verifies_without_an_evm_identity(tmp_path):
         vault_launcher_id=VAULT,
         request=OwnerChallengeRequest(action="stamp_prepare", payload=payload),
     )
-    signature = AugSchemeMPL.sign(owner_sk, bytes.fromhex(challenge.messageHex[2:]))
+    stored = get_credential_ledger(settings).get_owner_challenge(challenge.challengeId)
+    assert stored is not None
+    signature = AugSchemeMPL.sign(owner_sk, credential_bls_signing_digest(settings, stored))
     verified = verify_owner_auth(
         settings,
         vault_launcher_id=VAULT,

@@ -61,6 +61,9 @@ for _key in _ADMIN_ENV_INT_KEYS:
 os.environ["SOLSLOT_ALPHA_WRITES_ENABLED"] = "true"
 os.environ["SOLSLOT_MINTING_ENABLED"] = "true"
 os.environ["SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH"] = "0x" + "c1" * 32
+os.environ["SOLSLOT_RUNTIME_ENVIRONMENT"] = "test"
+os.environ["SOLSLOT_API_DOCS_ENABLED"] = "true"
+os.environ["SOLSLOT_CORS_ORIGINS"] = "http://localhost:4200,http://localhost:5173"
 
 
 @pytest.fixture(autouse=True)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import httpx
 from eth_abi import decode as abi_decode
@@ -20,7 +20,7 @@ from chia.wallet.lineage_proof import LineageProof
 from chia_rs import AugSchemeMPL, Coin, G1Element, G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Path as ApiPath, status
 from pydantic import BaseModel, Field, field_validator
 from web3 import Web3
 
@@ -48,6 +48,10 @@ _ATTESTATION_EVENT_SIGNATURE = (
     "uint64,bytes32,bytes32,bytes32,uint64,bytes32,bytes32,bytes32,uint16)"
 )
 _ATTESTATION_EVENT_TOPIC = bytes(Web3.keccak(text=_ATTESTATION_EVENT_SIGNATURE))
+VaultLauncherPath = Annotated[
+    str,
+    ApiPath(pattern=r"^(0x)?[0-9a-fA-F]{64}$"),
+]
 
 
 @dataclass(frozen=True)
@@ -982,7 +986,7 @@ async def create_enrollment(req: CreateEnrollmentRequest) -> EnrollmentRecord:
 
 
 @router.get("/{vault_launcher_id}", response_model=EnrollmentRecord)
-def get_enrollment(vault_launcher_id: str) -> EnrollmentRecord:
+def get_enrollment(vault_launcher_id: VaultLauncherPath) -> EnrollmentRecord:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
     record = get_credential_ledger(settings).get_enrollment(key)
@@ -998,7 +1002,10 @@ def get_enrollment(vault_launcher_id: str) -> EnrollmentRecord:
 
 
 @router.post("/{vault_launcher_id}/proof", response_model=EnrollmentRecord)
-def record_evm_proof(vault_launcher_id: str, req: RecordProofRequest) -> EnrollmentRecord:
+def record_evm_proof(
+    vault_launcher_id: VaultLauncherPath,
+    req: RecordProofRequest,
+) -> EnrollmentRecord:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
     vault_from_body = _normalize_hex32(req.vaultLauncherId, "vaultLauncherId")
@@ -1369,7 +1376,7 @@ async def _push_chia_stamp_and_mark_pending(
 
 @router.post("/{vault_launcher_id}/stamp/prepare", response_model=PrepareChiaStampResponse)
 def prepare_chia_stamp(
-    vault_launcher_id: str,
+    vault_launcher_id: VaultLauncherPath,
     req: OwnerAuthorizedMutation,
 ) -> PrepareChiaStampResponse:
     settings = _settings()
@@ -1439,7 +1446,7 @@ def prepare_chia_stamp(
 
 @router.post("/{vault_launcher_id}/stamp/submit", response_model=SubmitChiaStampResponse)
 async def submit_evm_chia_stamp(
-    vault_launcher_id: str,
+    vault_launcher_id: VaultLauncherPath,
     req: SubmitChiaStampRequest,
 ) -> SubmitChiaStampResponse:
     settings = _settings()
@@ -1678,7 +1685,7 @@ async def submit_evm_chia_stamp(
 
 @router.post("/{vault_launcher_id}/stamp/sync", response_model=SyncChiaStampResponse)
 def sync_chia_stamp(
-    vault_launcher_id: str,
+    vault_launcher_id: VaultLauncherPath,
     req: OwnerAuthorizedMutation,
 ) -> SyncChiaStampResponse:
     settings = _settings()
@@ -1699,7 +1706,7 @@ def sync_chia_stamp(
 
 @router.post("/{vault_launcher_id}/chia-confirmation", response_model=EnrollmentRecord)
 def record_chia_confirmation(
-    vault_launcher_id: str,
+    vault_launcher_id: VaultLauncherPath,
     req: RecordChiaConfirmationRequest,
 ) -> EnrollmentRecord:
     settings = _settings()

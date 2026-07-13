@@ -53,6 +53,7 @@ router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
 
 # First 4 bytes of keccak256("verifyAndEmit((bytes32,bytes32,uint64),bytes)").
 _VERIFY_AND_EMIT_SELECTOR = "0xd33b3d83"
+_ENROLLMENT_BINDING_ABI = "(bytes32,bytes32,uint64)"
 _REVERT_SELECTOR_RE = re.compile(r"0x[0-9a-fA-F]{8}")
 _KNOWN_REVERT_SELECTORS = {
     "0xd6bda275": (
@@ -136,6 +137,28 @@ class RelayResponse(BaseModel):
     tx_hash: str
     relayer: str
     signer: str
+
+
+def _decode_enrollment_calldata(data: bytes) -> tuple[str, str, int]:
+    """Decode the only enrollment binding accepted by the V2 emitter.
+
+    Credential commitments are deliberately absent from this tuple: the
+    emitter derives them from verifier-returned proof inputs.
+    """
+    expected_selector = Web3.to_bytes(hexstr=_VERIFY_AND_EMIT_SELECTOR)
+    if len(data) < 4 or data[:4] != expected_selector:
+        raise ValueError("calldata selector is not canonical verifyAndEmit")
+    binding, _proof = abi_decode([_ENROLLMENT_BINDING_ABI, "bytes"], data[4:])
+    vault_launcher_id = "0x" + bytes(binding[0]).hex()
+    bridge_parent_id = "0x" + bytes(binding[1]).hex()
+    bridge_amount = int(binding[2])
+    if vault_launcher_id == "0x" + "00" * 32:
+        raise ValueError("vaultLauncherId must be non-zero")
+    if bridge_parent_id == "0x" + "00" * 32:
+        raise ValueError("bridgeParentId must be non-zero")
+    if bridge_amount <= 0:
+        raise ValueError("bridgeAmount must be positive")
+    return vault_launcher_id, bridge_parent_id, bridge_amount
 
 
 def _require_relayer_account(settings: Settings):
@@ -232,13 +255,9 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     try:
         data_bytes = Web3.to_bytes(hexstr=req.data)
         sig_bytes = Web3.to_bytes(hexstr=req.signature)
-        binding, _proof = abi_decode(
-            ["(bytes32,bytes32,uint64)", "bytes"],
-            data_bytes[4:],
+        vault_launcher_id, bridge_parent_id, bridge_amount = _decode_enrollment_calldata(
+            data_bytes
         )
-        vault_launcher_id = "0x" + bytes(binding[0]).hex()
-        bridge_parent_id = "0x" + bytes(binding[1]).hex()
-        bridge_amount = int(binding[2])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=422,

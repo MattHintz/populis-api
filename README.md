@@ -41,13 +41,22 @@ python3.12 -m venv .venv
 Start the API only with a fresh V2 state directory:
 
 ```bash
+SOLSLOT_RUNTIME_ENVIRONMENT=development \
+SOLSLOT_API_DOCS_ENABLED=true \
+SOLSLOT_CORS_ORIGINS=http://localhost:4200 \
 SOLSLOT_ALPHA_WRITES_ENABLED=false \
 SOLSLOT_MINTING_ENABLED=false \
 .venv/bin/uvicorn solslot_api.app:app --host 127.0.0.1 --port 5001
 ```
 
-Public URLs remain under `/protocol-api` at the reverse proxy. OpenAPI must
-identify the service as `Solslot API` and include the enrollment routes.
+The release workflow verifies the OpenAPI schema in-process before deployment.
+Staging and production disable `/docs`, `/redoc`, and `/openapi.json`; public
+URLs remain under `/protocol-api` at the reverse proxy.
+
+Production must use the systemd command and proxy limits in
+[the staging deployment contract](docs/STAGING_BACKEND_DEPLOY.md). Never use
+`--reload`, never bind the application to `0.0.0.0`, and never expose the
+uvicorn port directly.
 
 ## Operator Documents
 

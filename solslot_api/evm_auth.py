@@ -24,6 +24,7 @@ from typing import Any
 from eth_account.messages import encode_typed_data
 from eth_keys import keys as eth_keys
 from eth_utils import keccak, to_checksum_address
+from chia.types.blockchain_format.program import Program
 
 from .config import get_settings
 
@@ -57,6 +58,49 @@ REGISTER_TYPES = {
 VAULT_SPEND_TYPEHASH_STRING = (
     "SolslotVaultSpend(bytes32 spend_case,bytes32 deed_launcher_id,bytes32 vault_coin_id)"
 )
+
+
+def registration_bls_message(
+    nonce_hex: str,
+    pool_launcher_id_hex: str,
+    auth_type: str,
+    chia_network: str,
+) -> bytes:
+    """Build the 32-byte V2 registration payload shown to Chia wallets."""
+    if auth_type != "chia_bls":
+        raise ValueError("BLS registration auth_type must be chia_bls")
+    nonce = bytes.fromhex(_strip0x(nonce_hex))
+    pool_launcher_id = bytes.fromhex(_strip0x(pool_launcher_id_hex))
+    if len(nonce) != 32 or len(pool_launcher_id) != 32:
+        raise ValueError("BLS registration nonce and pool launcher must be bytes32")
+    return bytes(
+        Program.to(
+            [
+                "SolslotVaultRegister",
+                2,
+                nonce,
+                pool_launcher_id,
+                auth_type,
+                chia_network,
+            ]
+        ).get_tree_hash()
+    )
+
+
+def registration_bls_signing_digest(
+    nonce_hex: str,
+    pool_launcher_id_hex: str,
+    auth_type: str,
+    chia_network: str,
+) -> bytes:
+    """Return the CHIP-0002 digest a Chia wallet must sign."""
+    message = registration_bls_message(
+        nonce_hex,
+        pool_launcher_id_hex,
+        auth_type,
+        chia_network,
+    )
+    return bytes(Program.to(("Chia Signed Message", message)).get_tree_hash())
 
 
 def eip712_domain() -> dict[str, Any]:
@@ -190,6 +234,8 @@ __all__ = [
     "eip712_domain",
     "normalize_evm_address",
     "registration_typed_data",
+    "registration_bls_message",
+    "registration_bls_signing_digest",
     "recover_evm_signer",
     "EvmRecovery",
     "keccak",
