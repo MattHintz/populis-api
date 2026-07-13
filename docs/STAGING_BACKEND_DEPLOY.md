@@ -18,7 +18,8 @@ Every normal deploy:
 7. Extracts to `/opt/solslot/api-staging/releases/<sha>/` and builds a fresh
    release virtual environment.
 8. Validates OpenAPI in-process before switching the `current` symlink.
-9. Restarts `solslot-api-staging.service`.
+9. Installs and restarts `solslot-api-staging.service` under the dedicated
+   `solslot-api` system account.
 10. Verifies local/public health, security headers, release identity, and that
     public OpenAPI routes are disabled.
 11. Keeps the five newest releases for rollback.
@@ -34,6 +35,10 @@ uses one worker because faucet coin selection is serialized in-process; adding
 workers before that coordinator is process-safe can create conflicting spends.
 Availability comes from systemd restart and atomic rollback, not unsafe worker
 fan-out.
+
+The workflow installs the complete unit, not a drop-in that depends on a
+retired service. If local health or release identity fails after the symlink
+switch, it restores the prior target before reporting failure.
 
 ## Persistent Layout
 

@@ -25,6 +25,7 @@ env:
   SHARED_ROOT: ${{ vars.SOLSLOT_API_SHARED_ROOT || '/opt/solslot/api-staging/shared' }}
   ENV_FILE_PATH: ${{ vars.SOLSLOT_API_ENV_FILE_PATH || '/opt/solslot/api-staging/shared/.env' }}
   SYSTEMD_SERVICE: ${{ vars.SOLSLOT_API_SYSTEMD_SERVICE || 'solslot-api-staging.service' }}
+  SYSTEMD_USER: ${{ vars.SOLSLOT_API_SYSTEMD_USER || 'solslot-api' }}
   APP_PORT: ${{ vars.SOLSLOT_API_PORT || '8790' }}
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   EXPECTED_HOSTNAME: ${{ vars.SOLSLOT_API_HOSTNAME || 'SolomonsLot' }}
@@ -208,16 +209,23 @@ jobs:
             state_dir="$shared_root/state"
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
+            systemd_user="${{ env.SYSTEMD_USER }}"
             app_port="${{ env.APP_PORT }}"
             actual_hostname="$(hostname)"
             if [ "$actual_hostname" != "${{ env.EXPECTED_HOSTNAME }}" ]; then
               echo "Refusing staging deploy: expected host ${{ env.EXPECTED_HOSTNAME }}, got $actual_hostname" >&2
               exit 1
             fi
+            if ! id "$systemd_user" >/dev/null 2>&1; then
+              sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin "$systemd_user"
+            fi
             sudo mkdir -p "$release_root/releases" "$state_dir"
-            sudo chown -R "$(id -un)":"$(id -gn)" "$release_root" "$shared_root"
             test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
             sudo test -f "$env_file" || (echo "Missing $env_file on staging host." && exit 1)
+            sudo chown -R "$(id -un)":"$(id -gn)" "$release_root/releases"
+            sudo chown -R "$systemd_user":"$systemd_user" "$shared_root"
+            sudo chmod 0700 "$shared_root" "$state_dir"
+            sudo chmod 0600 "$env_file"
 
             rm -rf "$release_dir"
             mkdir -p "$release_dir"
@@ -249,10 +257,24 @@ jobs:
             assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
             PY
 
-            ln -sfn "$release_dir" "$release_root/current"
-            sudo mkdir -p /etc/systemd/system/"$systemd_service".d
-            sudo tee /etc/systemd/system/"$systemd_service".d/solslot-staging.conf >/dev/null <<EOF
+            previous_target="$(readlink -f "$release_root/current" || true)"
+            if [ -n "$previous_target" ] && [ -f "$previous_target/release.json" ]; then
+              previous_app_module="$("$python_bin" -c 'import json, sys; print(json.load(open(sys.argv[1]))["app_module"])' "$previous_target/release.json" 2>/dev/null || true)"
+              if [ "$previous_app_module" != "$app_module" ]; then
+                previous_target=""
+              fi
+            fi
+            sudo ln -sfn "$release_dir" "$release_root/current"
+            sudo tee /etc/systemd/system/"$systemd_service" >/dev/null <<EOF
+            [Unit]
+            Description=Solslot API Staging
+            After=network-online.target
+            Wants=network-online.target
+
             [Service]
+            Type=simple
+            User=$systemd_user
+            Group=$systemd_user
             WorkingDirectory=$release_root/current
             EnvironmentFile=$env_file
             Environment=PYTHONUNBUFFERED=1
@@ -283,15 +305,32 @@ jobs:
             LockPersonality=true
             UMask=0077
             ReadWritePaths=$shared_root
+            Restart=on-failure
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
             EOF
             sudo systemctl daemon-reload
-            sudo systemctl restart "$systemd_service"
+            sudo systemctl enable "$systemd_service"
 
-            sleep 5
-            curl -fsS "http://127.0.0.1:$app_port/health"
-            curl -fsS "http://127.0.0.1:$app_port/release" \
-              | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
-            test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/openapi.json")" = "404"
+            verify_release() {
+              sleep 5
+              curl -fsS "http://127.0.0.1:$app_port/health" >/dev/null
+              curl -fsS "http://127.0.0.1:$app_port/release" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
+              test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/openapi.json")" = "404"
+            }
+
+            if ! sudo systemctl restart "$systemd_service" || ! verify_release; then
+              echo "New release failed local verification; restoring previous release." >&2
+              sudo systemctl stop "$systemd_service" || true
+              if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
+                sudo ln -sfn "$previous_target" "$release_root/current"
+                sudo systemctl restart "$systemd_service" || true
+              fi
+              exit 1
+            fi
 
             find "$release_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
               | sort -rn \
@@ -347,7 +386,7 @@ jobs:
             release_dir="$release_root/releases/$rollback_sha"
             test -d "$release_dir" || (echo "No release directory exists for $rollback_sha" && exit 1)
 
-            ln -sfn "$release_dir" "$release_root/current"
+            sudo ln -sfn "$release_dir" "$release_root/current"
             sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}"
             sleep 5
             curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health"
