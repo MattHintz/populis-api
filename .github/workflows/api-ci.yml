@@ -63,7 +63,7 @@ jobs:
           PY
 
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest tests -q
 
       - name: Namespace gate
         run: python scripts/check_namespace.py --paths .

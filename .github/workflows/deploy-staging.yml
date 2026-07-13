@@ -96,7 +96,7 @@ jobs:
           assert "Solslot" in app.title, app.title
           assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
           PY
-          pytest -q
+          pytest tests -q
           python scripts/check_namespace.py
 
       - name: Secret scan
