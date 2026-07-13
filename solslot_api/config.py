@@ -177,6 +177,10 @@ class Settings(BaseSettings):
         "governance_launcher_id",
         "protocol_config_launcher_id",
         "protocol_property_registry_launcher_id",
+        "protocol_did_singleton_struct_hex",
+        "protocol_did_puzhash",
+        "p2_pool_mod_hash",
+        "p2_vault_mod_hash",
         "vault_version_registry_launcher_id",
         "admin_records_path",
         "zkpassport_validator_seed_hex",
@@ -249,6 +253,14 @@ class Settings(BaseSettings):
     bootstrap_session_secret: str = ""
     bootstrap_session_ttl_seconds: int = Field(900, ge=1)
     bootstrap_cookie_secure: bool = True
+
+    # Canonical publish context. These values are populated only from the
+    # signed ceremony artifact and are required before a mint can be
+    # published. Draft creation may remain available without them.
+    protocol_did_singleton_struct_hex: Optional[str] = None
+    protocol_did_puzhash: Optional[str] = None
+    p2_pool_mod_hash: Optional[str] = None
+    p2_vault_mod_hash: Optional[str] = None
 
     # ── Protocol-config singleton (A.3) ───────────────────────────────────
     # On-chain replacement for the three trust-root env vars

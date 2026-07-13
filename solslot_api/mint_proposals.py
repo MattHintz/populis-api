@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 # Bumping this triggers ``_migrate`` on next ``MintProposalStore`` open.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # ── Lifecycle state machine ──────────────────────────────────────────────────
@@ -108,6 +108,8 @@ class StoredMintProposal:
     par_value: int
     asset_class: str
     property_id: str
+    collection_id: str
+    share_ppm: int
     jurisdiction: str
     royalty_puzhash: bytes
     royalty_bps: int
@@ -152,6 +154,8 @@ class StoredMintProposal:
             "par_value": self.par_value,
             "asset_class": self.asset_class,
             "property_id": self.property_id,
+            "collection_id": self.collection_id,
+            "share_ppm": self.share_ppm,
             "jurisdiction": self.jurisdiction,
             "royalty_puzhash": "0x" + self.royalty_puzhash.hex(),
             "royalty_bps": self.royalty_bps,
@@ -287,6 +291,8 @@ class MintProposalStore:
                 par_value                   INTEGER  NOT NULL,
                 asset_class                 TEXT     NOT NULL,
                 property_id                 TEXT     NOT NULL,
+                collection_id               TEXT     NOT NULL,
+                share_ppm                   INTEGER  NOT NULL,
                 jurisdiction                TEXT     NOT NULL,
                 royalty_puzhash             BLOB     NOT NULL,
                 royalty_bps                 INTEGER  NOT NULL,
@@ -322,6 +328,7 @@ class MintProposalStore:
                     'FAILED','EXECUTED','MINTED','CANCELED'
                 )),
                 CHECK (par_value > 0),
+                CHECK (share_ppm BETWEEN 1 AND 1000000),
                 CHECK (royalty_bps BETWEEN 0 AND 10000),
                 CHECK (length(royalty_puzhash)          = 32),
                 CHECK (smart_deed_inner_puzhash IS NULL OR length(smart_deed_inner_puzhash) = 32),
@@ -365,6 +372,25 @@ class MintProposalStore:
                 WHERE state NOT IN ('FAILED','CANCELED')
         """)
 
+    def _migrate_to_v3(self, cur: sqlite3.Cursor) -> None:
+        """Add NAV collection metadata to pre-V3 draft stores."""
+        columns = {
+            row["name"]
+            for row in cur.execute("PRAGMA table_info(mint_proposals)").fetchall()
+        }
+        if "collection_id" not in columns:
+            cur.execute("ALTER TABLE mint_proposals ADD COLUMN collection_id TEXT")
+            cur.execute("""
+                UPDATE mint_proposals
+                SET collection_id = property_id
+                WHERE collection_id IS NULL OR collection_id = ''
+            """)
+        if "share_ppm" not in columns:
+            cur.execute(
+                "ALTER TABLE mint_proposals "
+                "ADD COLUMN share_ppm INTEGER NOT NULL DEFAULT 1000000"
+            )
+
     # ── transaction helper ─────────────────────────────────────────
 
     @contextmanager
@@ -389,6 +415,8 @@ class MintProposalStore:
         par_value: int,
         asset_class: str,
         property_id: str,
+        collection_id: str,
+        share_ppm: int,
         jurisdiction: str,
         royalty_puzhash: bytes,
         royalty_bps: int,
@@ -425,6 +453,8 @@ class MintProposalStore:
             raise ValueError("royalty_puzhash must be bytes32")
         if par_value <= 0:
             raise ValueError("par_value must be positive")
+        if share_ppm <= 0 or share_ppm > 1_000_000:
+            raise ValueError("share_ppm must be in 1..1_000_000")
         if not 0 <= royalty_bps <= 10_000:
             raise ValueError("royalty_bps out of range")
         if quorum_required <= 0:
@@ -436,6 +466,9 @@ class MintProposalStore:
         if not canonical_pid:
             raise ValueError("property_id must be non-empty after stripping whitespace")
         property_id = canonical_pid
+        collection_id = collection_id.strip().upper()
+        if not collection_id:
+            raise ValueError("collection_id must be non-empty after stripping whitespace")
 
         proposal_id = _new_proposal_id()
         now = int(time.time())
@@ -447,15 +480,15 @@ class MintProposalStore:
                     """
                     INSERT INTO mint_proposals (
                         id, owner_pubkey, state,
-                        par_value, asset_class, property_id, jurisdiction,
+                        par_value, asset_class, property_id, collection_id, share_ppm, jurisdiction,
                         royalty_puzhash, royalty_bps,
                         vote_tally, quorum_required,
                         created_at, off_chain_metadata
-                    ) VALUES (?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    ) VALUES (?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                     """,
                     (
                         proposal_id, owner_pubkey,
-                        par_value, asset_class, property_id, jurisdiction,
+                        par_value, asset_class, property_id, collection_id, share_ppm, jurisdiction,
                         royalty_puzhash, royalty_bps,
                         quorum_required,
                         now, metadata_json,
@@ -858,6 +891,8 @@ def _row_to_record(row: sqlite3.Row) -> StoredMintProposal:
         par_value=int(row["par_value"]),
         asset_class=str(row["asset_class"]),
         property_id=str(row["property_id"]),
+        collection_id=str(row["collection_id"]),
+        share_ppm=int(row["share_ppm"]),
         jurisdiction=str(row["jurisdiction"]),
         royalty_puzhash=bytes(row["royalty_puzhash"]),
         royalty_bps=int(row["royalty_bps"]),

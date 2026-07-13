@@ -47,6 +47,8 @@ def _new_args(*, suffix: int = 0, owner: str = "0xowner") -> dict:
         par_value=1_000_000_000 + suffix,
         asset_class="RWA-RE-RES",
         property_id=f"US-TX-Travis-{suffix:04d}",
+        collection_id=f"SOL-AUSTIN-{suffix:04d}",
+        share_ppm=250_000,
         jurisdiction="US-TX-Travis",
         royalty_puzhash=_b32(0xAA),
         royalty_bps=200,
@@ -112,6 +114,8 @@ class TestCreate:
         assert rec.published_at is None
         assert rec.minted_at is None
         assert rec.deed_launcher_id is None
+        assert rec.collection_id == "SOL-AUSTIN-0001"
+        assert rec.share_ppm == 250_000
 
     def test_get_returns_inserted_record(self, store):
         rec = store.create(**_new_args(suffix=2))
@@ -156,6 +160,19 @@ class TestCreateValidation:
         args = _new_args(suffix=11)
         args["par_value"] = 0
         with pytest.raises(ValueError, match="par_value"):
+            store.create(**args)
+
+    @pytest.mark.parametrize("share_ppm", [0, -1, 1_000_001])
+    def test_share_ppm_out_of_range_rejected(self, store, share_ppm):
+        args = _new_args(suffix=11)
+        args["share_ppm"] = share_ppm
+        with pytest.raises(ValueError, match="share_ppm"):
+            store.create(**args)
+
+    def test_collection_id_is_required_after_normalization(self, store):
+        args = _new_args(suffix=11)
+        args["collection_id"] = "   "
+        with pytest.raises(ValueError, match="collection_id"):
             store.create(**args)
 
     @pytest.mark.parametrize("bps", [-1, 10_001, 100_000])

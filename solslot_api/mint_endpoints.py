@@ -117,6 +117,10 @@ class ProposeMintRequest(BaseModel):
                              description='e.g. "RWA-RE-RES" for residential real estate')
     property_id: str = Field(..., min_length=1, max_length=128,
                              description="Operator-assigned canonical id, e.g. \"US-TX-Travis-12345\"")
+    collection_id: str = Field(..., min_length=1, max_length=128,
+                               description="Canonical collection id used for NAV-registry pricing")
+    share_ppm: int = Field(..., ge=1, le=1_000_000,
+                           description="Share of collection NAV in ppm; 1000000 = 100%")
     jurisdiction: str = Field(..., min_length=1, max_length=64,
                               description="ISO-style jurisdiction code, e.g. \"US-TX-Travis\"")
     royalty_puzhash: str = Field(..., description="0x-prefixed 32-byte royalty payee puzzle hash")
@@ -127,6 +131,21 @@ class ProposeMintRequest(BaseModel):
     off_chain_metadata: Optional[dict[str, Any]] = Field(
         None, description="Free-form blob — title, address, photos, attestations etc.",
     )
+
+
+class PublishProposalMetadataRequest(BaseModel):
+    property_id_canon: str = Field(..., description="0x-prefixed bytes32")
+    collection_id_canon: str = Field(..., description="0x-prefixed bytes32")
+    share_ppm: int = Field(..., ge=1, le=1_000_000)
+    property_registry_puzzle_hash: str = Field(..., description="0x-prefixed bytes32")
+    par_value_mojos: int = Field(..., gt=0)
+    asset_class: int = Field(..., ge=0)
+    jurisdiction: str = Field(..., description="0x-prefixed UTF-8 bytes")
+    royalty_puzhash: str = Field(..., description="0x-prefixed bytes32")
+    royalty_bps: int = Field(..., ge=0, le=10_000)
+    quorum_threshold: int = Field(..., gt=0)
+    owner_member_hash: str = Field(..., description="0x-prefixed bytes32")
+    gov_member_hash: str = Field(..., description="0x-prefixed bytes32")
 
 
 class CancelMintRequest(BaseModel):
@@ -168,6 +187,8 @@ async def propose_mint(
             par_value=body.par_value,
             asset_class=body.asset_class,
             property_id=body.property_id,
+            collection_id=body.collection_id,
+            share_ppm=body.share_ppm,
             jurisdiction=body.jurisdiction,
             royalty_puzhash=royalty_puzhash,
             royalty_bps=body.royalty_bps,

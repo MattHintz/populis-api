@@ -118,6 +118,8 @@ def _propose_body(*, suffix: int = 0) -> dict[str, Any]:
         "par_value": 1_000_000_000 + suffix,
         "asset_class": "RWA-RE-RES",
         "property_id": f"US-TX-Travis-{suffix:04d}",
+        "collection_id": f"SOL-AUSTIN-{suffix:04d}",
+        "share_ppm": 250_000,
         "jurisdiction": "US-TX-Travis",
         "royalty_puzhash": "0x" + "aa" * 32,
         "royalty_bps": 200,
@@ -331,6 +333,8 @@ class TestPropose:
         assert body["owner_pubkey"] == _TEST_ADDRESS_LOWER
         # POP-CANON-014: stored property_id is the canonical (upper, stripped) form.
         assert body["property_id"] == "US-TX-TRAVIS-0001"
+        assert body["collection_id"] == "SOL-AUSTIN-0001"
+        assert body["share_ppm"] == 250_000
         # All four computed hashes are None at DRAFT.
         for k in ("smart_deed_inner_puzhash", "eve_inner_puzhash",
                   "deed_full_puzhash", "proposal_hash"):
@@ -370,6 +374,29 @@ class TestPropose:
             headers=_auth_header(token),
         )
         # Pydantic rejects ge=0 violations as 422 before reaching the handler.
+        assert resp.status_code == 422
+
+    @pytest.mark.parametrize("share_ppm", [0, 1_000_001])
+    def test_share_ppm_out_of_range_rejected(self, client, share_ppm):
+        token = _login(client)
+        bad = _propose_body(suffix=4)
+        bad["share_ppm"] = share_ppm
+        resp = client.post(
+            "/admin/mint/propose",
+            json=bad,
+            headers=_auth_header(token),
+        )
+        assert resp.status_code == 422
+
+    def test_collection_id_is_required(self, client):
+        token = _login(client)
+        bad = _propose_body(suffix=4)
+        del bad["collection_id"]
+        resp = client.post(
+            "/admin/mint/propose",
+            json=bad,
+            headers=_auth_header(token),
+        )
         assert resp.status_code == 422
 
     def test_duplicate_active_property_409(self, client):
