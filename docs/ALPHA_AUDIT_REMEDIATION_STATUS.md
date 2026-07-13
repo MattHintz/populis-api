@@ -20,7 +20,7 @@ never mistaken for a completed launch control.
 
 | Finding | State | Evidence or remaining gate |
 | --- | --- | --- |
-| C-1 provider credential in EVM history | Contained, not closed | Current public config is environment-only and release scans reject provider credentials. A private read-only pre-scrub bundle exists. Published history still requires the prepared targeted rewrite, and the provider account owner must revoke the credential. |
+| C-1 provider credential in EVM history | History fixed, provider revocation open | Both public EVM branches use scrubbed ancestry, current config is environment-only, CI rejects provider credentials, and the canonical local object database no longer contains the retired blob. A private mode-0400 pre-scrub bundle preserves evidence. The provider account owner must still revoke the credential. |
 | C-2 portal runtime coordinates | Contained | Public runtime files no longer contain active admin or ceremony coordinates. Fresh V2 coordinates may be published only through the signed ceremony artifact. |
 | C-3 retired pro-origin API | Contained, verification open | The reported API surface is not present on the reviewed staging runtime. The unrelated pro host must remain outside the protocol trust boundary and must not expose API mutation routes or wildcard CORS. |
 | C-4 challenge throttling | Code fixed, live write test pending | SQLite-WAL quotas persist across restarts and use the proxy-normalized peer IP. Writes are locked, so the public 429 saturation smoke is deferred until the controlled prelaunch window. |
