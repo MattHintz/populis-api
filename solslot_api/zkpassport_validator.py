@@ -76,9 +76,10 @@ def get_validator_info() -> ValidatorInfoResponse:
     the ``zkpassport_bridge_message.clsp`` puzzle (bridge policy hash).
     Returns 503 when ``SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX`` is not set.
     """
+    settings = _load_settings()
     sk = _get_sk()
     pk: G1Element = sk.get_g1()
     return ValidatorInfoResponse(
         pubkey_hex=bytes(pk).hex(),
-        threshold=1,
+        threshold=settings.zkpassport_validator_threshold,
     )

@@ -91,6 +91,15 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "Security headers and HSTS must be enabled in staging/production."
         )
+    if (
+        settings.runtime_environment == "production"
+        and settings.network == "mainnet"
+        and settings.zkpassport_validator_threshold < 2
+    ):
+        raise RuntimeError(
+            "Mainnet production requires SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD "
+            "of at least 2."
+        )
 
     insecure_origins: list[str] = []
     for origin in settings.allowed_origins():
@@ -313,6 +322,10 @@ class Settings(BaseSettings):
     # indexed EVM event and reserved Chia bridge coin have both been verified.
     # There is intentionally no public validator-signing endpoint.
     zkpassport_validator_seed_hex: Optional[str] = None
+    # Alpha may use one validator explicitly. A mainnet production process
+    # refuses to start below 2; the fresh bridge policy must commit to the
+    # same threshold and independent validator set.
+    zkpassport_validator_threshold: int = Field(1, ge=1, le=16)
 
     # ── zkPassport vault bridge policy hash ───────────────────────────
     # Canonical validator-set commitment curried into every vault at mint so

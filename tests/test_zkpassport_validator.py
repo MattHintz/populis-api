@@ -48,6 +48,17 @@ def test_validator_info_returns_only_public_key(client_with_seed):
     }
 
 
+def test_validator_info_reports_configured_policy_threshold(monkeypatch):
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX", SEED_HEX)
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD", "2")
+    _validator_sk.cache_clear()
+    with TestClient(app) as client:
+        response = client.get("/zkpassport/validator")
+    assert response.status_code == 200
+    assert response.json()["threshold"] == 2
+    _validator_sk.cache_clear()
+
+
 def test_validator_info_fails_closed_without_key(client_no_seed):
     response = client_no_seed.get("/zkpassport/validator")
     assert response.status_code == 503

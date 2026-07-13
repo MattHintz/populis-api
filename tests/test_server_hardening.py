@@ -137,6 +137,27 @@ def test_development_may_opt_into_http_cookie_and_docs() -> None:
     )
 
 
+def test_mainnet_production_rejects_single_validator_policy() -> None:
+    with pytest.raises(RuntimeError, match="VALIDATOR_THRESHOLD"):
+        validate_server_hardening_at_startup(
+            _staging(
+                runtime_environment="production",
+                network="mainnet",
+                zkpassport_validator_threshold=1,
+            )
+        )
+
+
+def test_mainnet_production_accepts_multi_validator_policy() -> None:
+    validate_server_hardening_at_startup(
+        _staging(
+            runtime_environment="production",
+            network="mainnet",
+            zkpassport_validator_threshold=2,
+        )
+    )
+
+
 def test_documentation_urls_are_disabled_when_not_explicitly_enabled() -> None:
     assert documentation_urls(Settings(api_docs_enabled=False)) == {
         "docs_url": None,
