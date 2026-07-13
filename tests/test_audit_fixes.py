@@ -22,6 +22,7 @@ Pass 2 audit (CANON_SOLSLOT_API_AUDIT_2026_04_26 Pass 2) findings covered:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -269,6 +270,28 @@ class TestRateLimit:
         second.issue("0xabc", "evm", source_ip="192.0.2.10")
         with pytest.raises(RateLimitedError, match="exceeded"):
             first.issue("0xabc", "evm", source_ip="192.0.2.10")
+
+    def test_persistent_quota_is_atomic_under_parallel_load(self, tmp_path) -> None:
+        quota = 12
+        store = ChallengeStore(
+            ttl_seconds=300,
+            max_pending=100,
+            per_ip_per_minute=quota,
+            db_path=tmp_path / "parallel-challenges.db",
+        )
+
+        def issue(_index: int) -> bool:
+            try:
+                store.issue("0xabc", "evm", source_ip="192.0.2.30")
+            except RateLimitedError:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=32) as workers:
+            accepted = list(workers.map(issue, range(100)))
+
+        assert sum(accepted) == quota
+        assert len(store) == quota
 
     def test_persistent_nonce_is_single_use_across_workers(self, tmp_path) -> None:
         path = tmp_path / "challenges.db"
