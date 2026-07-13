@@ -101,6 +101,18 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             "of at least 2."
         )
 
+    expected_evm_chain_id = 1 if settings.network == "mainnet" else 11155111
+    if settings.eip712_chain_id != expected_evm_chain_id:
+        raise RuntimeError(
+            "SOLSLOT_EIP712_CHAIN_ID does not match SOLSLOT_NETWORK: "
+            f"{settings.network} requires {expected_evm_chain_id}."
+        )
+    if settings.zkpassport_evm_chain_id != expected_evm_chain_id:
+        raise RuntimeError(
+            "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match SOLSLOT_NETWORK: "
+            f"{settings.network} requires {expected_evm_chain_id}."
+        )
+
     insecure_origins: list[str] = []
     for origin in settings.allowed_origins():
         lowered = origin.lower()
@@ -494,7 +506,8 @@ class Settings(BaseSettings):
     # V2 binds pool, auth type, and network. Other versions are rejected.
     eip712_version: str = "2"
     # MUST match EIP712_DOMAIN_CHAIN_ID in solslot_puzzles/vault_driver.py.
-    eip712_chain_id: int = 1
+    # The current Solslot V2 alpha vault is bound to Ethereum Sepolia.
+    eip712_chain_id: int = 11155111
 
     # ── DoS hardening (POP-CANON-003 / Strategy 7) ────────────────────────
     # Maximum number of pending challenges in memory at any time.  When the

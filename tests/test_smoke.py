@@ -92,7 +92,7 @@ def test_protocol(client: TestClient) -> None:
     r = client.get("/protocol")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["eip712_domain"]["chainId"] == 1
+    assert body["eip712_domain"]["chainId"] == 11155111
     assert "SolslotVaultSpend" in body["eip712_typehash_string"]
     assert body["vault_inner_mod_hash"].startswith("0x")
     assert len(body["vault_inner_mod_hash"]) == 66  # 0x + 32 bytes hex

@@ -153,9 +153,43 @@ def test_mainnet_production_accepts_multi_validator_policy() -> None:
         _staging(
             runtime_environment="production",
             network="mainnet",
+            eip712_chain_id=1,
+            zkpassport_evm_chain_id=1,
             zkpassport_validator_threshold=2,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("eip712_chain_id", 1, "SOLSLOT_EIP712_CHAIN_ID"),
+        (
+            "zkpassport_evm_chain_id",
+            1,
+            "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID",
+        ),
+    ],
+)
+def test_testnet11_rejects_mainnet_evm_chain_ids(
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        validate_server_hardening_at_startup(_staging(**{field: value}))
+
+
+def test_mainnet_rejects_sepolia_eip712_domain() -> None:
+    with pytest.raises(RuntimeError, match="SOLSLOT_EIP712_CHAIN_ID"):
+        validate_server_hardening_at_startup(
+            _staging(
+                runtime_environment="production",
+                network="mainnet",
+                zkpassport_validator_threshold=2,
+                zkpassport_evm_chain_id=1,
+            )
+        )
 
 
 def test_documentation_urls_are_disabled_when_not_explicitly_enabled() -> None:

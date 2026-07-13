@@ -276,6 +276,9 @@ jobs:
             EnvironmentFile=$env_file
             Environment=PYTHONUNBUFFERED=1
             Environment=SOLSLOT_RUNTIME_ENVIRONMENT=staging
+            Environment=SOLSLOT_NETWORK=testnet11
+            Environment=SOLSLOT_EIP712_CHAIN_ID=11155111
+            Environment=SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID=11155111
             Environment=SOLSLOT_API_DOCS_ENABLED=false
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
             Environment=SOLSLOT_SECURITY_HEADERS_ENABLED=true
@@ -316,6 +319,8 @@ jobs:
               curl -fsS "http://127.0.0.1:$app_port/health" >/dev/null
               curl -fsS "http://127.0.0.1:$app_port/release" \
                 | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
+              curl -fsS "http://127.0.0.1:$app_port/protocol" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None'
               test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/openapi.json")" = "404"
             }
 
@@ -340,6 +345,8 @@ jobs:
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
             | python -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/protocol" \
+            | python -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None'
           headers="$(mktemp)"
           curl -fsS -D "$headers" -o /dev/null "${{ env.PUBLIC_BASE_URL }}/health"
           grep -qi '^strict-transport-security: .*max-age=31536000' "$headers"
