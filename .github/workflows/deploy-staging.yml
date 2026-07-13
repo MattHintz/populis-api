@@ -100,16 +100,11 @@ jobs:
           python scripts/check_namespace.py
 
       - name: Secret scan
-        shell: bash
         env:
           APP_PACKAGE: ${{ steps.package.outputs.package_name }}
-        run: |
-          set -euo pipefail
-          pattern='sk_(live|test)_[A-Za-z0-9]+|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|MANDRILL_API_KEY=|STRIPE_SECRET_KEY=|BEGIN (RSA|EC|OPENSSH|PRIVATE)'
-          if grep -R -n -E "$pattern" "$APP_PACKAGE" tests .github --exclude="*.yml" --exclude="*.yaml"; then
-            echo "Secret-like value found in API source, tests, or workflows."
-            exit 1
-          fi
+        run: >-
+          python scripts/check_secrets.py --paths
+          "$APP_PACKAGE" tests scripts .github pyproject.toml
 
       - name: Write release metadata
         shell: bash
@@ -161,7 +156,9 @@ jobs:
 
       - name: Verify packaged namespace
         shell: bash
-        run: python scripts/check_namespace.py --paths "solslot-api-release-${GITHUB_SHA}.tgz"
+        run: |
+          python scripts/check_namespace.py --paths "solslot-api-release-${GITHUB_SHA}.tgz"
+          python scripts/check_secrets.py --paths "solslot-api-release-${GITHUB_SHA}.tgz"
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4

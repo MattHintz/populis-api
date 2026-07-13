@@ -69,11 +69,6 @@ jobs:
         run: python scripts/check_namespace.py --paths .
 
       - name: Secret scan
-        shell: bash
-        run: |
-          set -euo pipefail
-          pattern='sk_(live|test)_[A-Za-z0-9]+|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|MANDRILL_API_KEY=|STRIPE_SECRET_KEY=|BEGIN (RSA|EC|OPENSSH|PRIVATE)'
-          if grep -R -n -E "$pattern" solslot_api tests scripts .github; then
-            echo "Secret-like value found in tracked release material." >&2
-            exit 1
-          fi
+        run: >-
+          python scripts/check_secrets.py --paths
+          solslot_api tests scripts .github pyproject.toml
