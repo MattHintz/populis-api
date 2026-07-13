@@ -4,6 +4,28 @@ The canonical backend deploy is `.github/workflows/deploy-staging.yml` in the
 API repository. Do not copy individual Python files to the host and do not
 deploy from either frontend repository.
 
+## Canonical Runtime Ownership
+
+There is one staging API release path:
+
+- Source: `MattHintz/solslot-api`, branch `staging`.
+- Build and deploy: `.github/workflows/deploy-staging.yml`.
+- Runtime package: `solslot_api`.
+- Runtime unit: `solslot-api-staging.service`.
+- Release root: `/opt/solslot/api-staging`.
+- Public identity: `/protocol-api/release` must report the deployed API and
+  frozen protocol commits.
+
+Temporary clones, retired ceremony services, frontend workflows, and manual
+file copies are not deployment authorities. If their output differs from the
+public release endpoint, stop and diagnose the workflow target; do not patch a
+second process.
+
+An earlier staging experiment let public enrollment replenish an exhausted
+bridge pool. That behavior is retired. The current security boundary is
+intentional: enrollment only reserves existing confirmed coins, while
+replenishment is an explicit chain-admin-authenticated operation.
+
 ## Release Contract
 
 Every normal deploy:
