@@ -41,6 +41,7 @@ def bootstrap_env(monkeypatch, tmp_path):
     manifest_path = tmp_path / "bootstrap_manifest_v2.json"
     deployment_manifest_path = tmp_path / "deployment_manifest_v2.json"
     monkeypatch.setenv("SOLSLOT_ADMIN_TOKEN", "bootstrap-secret")
+    monkeypatch.setenv("SOLSLOT_CEREMONY_MODE_ENABLED", "true")
     monkeypatch.setenv("SOLSLOT_BOOTSTRAP_MANIFEST_PATH", str(manifest_path))
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(deployment_manifest_path))
     monkeypatch.setenv("SOLSLOT_BOOTSTRAP_SESSION_SECRET", "b" * 64)

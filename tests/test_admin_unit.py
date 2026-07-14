@@ -42,26 +42,42 @@ class TestRequireAdminToken:
         assert "disabled" in exc.value.detail.lower()
 
     def test_missing_authorization_header_returns_401(self) -> None:
-        settings = Settings(network="testnet11", admin_token="secret")
+        settings = Settings(
+            network="testnet11",
+            admin_token="secret",
+            ceremony_mode_enabled=True,
+        )
         with pytest.raises(HTTPException) as exc:
             require_admin_token(settings, authorization=None)
         assert exc.value.status_code == 401
 
     def test_malformed_authorization_returns_401(self) -> None:
-        settings = Settings(network="testnet11", admin_token="secret")
+        settings = Settings(
+            network="testnet11",
+            admin_token="secret",
+            ceremony_mode_enabled=True,
+        )
         with pytest.raises(HTTPException) as exc:
             require_admin_token(settings, authorization="Token wrong-format")
         assert exc.value.status_code == 401
 
     def test_wrong_token_returns_403(self) -> None:
-        settings = Settings(network="testnet11", admin_token="secret")
+        settings = Settings(
+            network="testnet11",
+            admin_token="secret",
+            ceremony_mode_enabled=True,
+        )
         with pytest.raises(HTTPException) as exc:
             require_admin_token(settings, authorization="Bearer wrong")
         assert exc.value.status_code == 403
 
     def test_correct_token_returns_none(self) -> None:
         """Successful auth: function returns None (no exception raised)."""
-        settings = Settings(network="testnet11", admin_token="secret")
+        settings = Settings(
+            network="testnet11",
+            admin_token="secret",
+            ceremony_mode_enabled=True,
+        )
         result = require_admin_token(settings, authorization="Bearer secret")
         assert result is None
 
@@ -69,7 +85,11 @@ class TestRequireAdminToken:
         """Tokens are compared via ``hmac.compare_digest`` to resist timing
         attacks.  We can't directly observe timing here but we can verify
         that wrong tokens of equal vs. unequal length both return 403."""
-        settings = Settings(network="testnet11", admin_token="abcdefgh")
+        settings = Settings(
+            network="testnet11",
+            admin_token="abcdefgh",
+            ceremony_mode_enabled=True,
+        )
         for wrong in ["12345678", "wrong", "abcdefghextra"]:
             with pytest.raises(HTTPException) as exc:
                 require_admin_token(settings, authorization=f"Bearer {wrong}")

@@ -9,6 +9,7 @@ from typing import Any
 
 from starlette.exceptions import HTTPException
 
+from .challenges import RequestRateLimiter
 from .config import Settings
 
 
@@ -36,6 +37,7 @@ class ServerHardeningMiddleware:
     def __init__(self, app: Any, *, settings: Settings) -> None:
         self.app = app
         self.settings = settings
+        self._challenge_limiter: RequestRateLimiter | None = None
 
     async def __call__(
         self,
@@ -58,6 +60,25 @@ class ServerHardeningMiddleware:
                         list(message.get("headers") or []),
                     )
             await send(message)
+
+        if self._is_public_challenge_request(scope):
+            source_ip = self._source_ip(scope)
+            try:
+                allowed = self._get_challenge_limiter().allow(source_ip)
+            except Exception:
+                await self._json_error(
+                    hardened_send,
+                    status_code=503,
+                    detail="Challenge rate limiter is unavailable.",
+                )
+                return
+            if not allowed:
+                await self._json_error(
+                    hardened_send,
+                    status_code=429,
+                    detail="Too many challenge requests. Try again later.",
+                )
+                return
 
         content_length = self._content_length(scope)
         if content_length is None:
@@ -147,6 +168,32 @@ class ServerHardeningMiddleware:
         except (UnicodeDecodeError, ValueError):
             return None
         return length if length >= 0 else None
+
+    def _get_challenge_limiter(self) -> RequestRateLimiter:
+        if self._challenge_limiter is None:
+            self._challenge_limiter = RequestRateLimiter(
+                self.settings.challenge_per_ip_per_minute,
+                db_path=(
+                    None
+                    if self.settings.runtime_environment == "test"
+                    else self.settings.challenge_store_path
+                ),
+            )
+        return self._challenge_limiter
+
+    @staticmethod
+    def _is_public_challenge_request(scope: dict[str, Any]) -> bool:
+        return (
+            str(scope.get("method", "")).upper() == "POST"
+            and scope.get("path") == "/auth/challenge"
+        )
+
+    @staticmethod
+    def _source_ip(scope: dict[str, Any]) -> str:
+        client = scope.get("client")
+        if isinstance(client, (tuple, list)) and client:
+            return str(client[0])
+        return "unknown"
 
     @staticmethod
     async def _json_error(

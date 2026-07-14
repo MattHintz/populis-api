@@ -29,6 +29,7 @@ env:
   APP_PORT: ${{ vars.SOLSLOT_API_PORT || '8790' }}
   PUBLIC_BASE_URL: https://staging.solslot.com/protocol-api
   EXPECTED_HOSTNAME: ${{ vars.SOLSLOT_API_HOSTNAME || 'SolomonsLot' }}
+  LEGACY_API_HOST: ${{ vars.SOLSLOT_LEGACY_API_HOST }}
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF }}
 
@@ -280,6 +281,9 @@ jobs:
             Environment=SOLSLOT_EIP712_CHAIN_ID=11155111
             Environment=SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID=11155111
             Environment=SOLSLOT_API_DOCS_ENABLED=false
+            Environment=SOLSLOT_ALPHA_WRITES_ENABLED=false
+            Environment=SOLSLOT_MINTING_ENABLED=false
+            Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
             Environment=SOLSLOT_SECURITY_HEADERS_ENABLED=true
             Environment=SOLSLOT_HSTS_ENABLED=true
@@ -322,6 +326,26 @@ jobs:
               curl -fsS "http://127.0.0.1:$app_port/protocol" \
                 | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None'
               test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/openapi.json")" = "404"
+              test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/zkpassport/validator")" = "404"
+              test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H 'Content-Type: application/json' \
+                -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
+                "http://127.0.0.1:$app_port/auth/challenge")" = "503"
+
+              cors_headers="$(mktemp)"
+              test "$(curl -sS -D "$cors_headers" -o /dev/null -w '%{http_code}' \
+                -X OPTIONS \
+                -H 'Origin: http://localhost:4200' \
+                -H 'Access-Control-Request-Method: POST' \
+                "http://127.0.0.1:$app_port/auth/challenge")" = "400"
+              ! grep -qi '^access-control-allow-origin:' "$cors_headers"
+              ! grep -qi '^access-control-allow-credentials:' "$cors_headers"
+              rm -f "$cors_headers"
+
+              sudo systemctl show "$systemd_service" --property=ExecStart --value \
+                | grep -q 'solslot_api.app:app'
+              ss -ltn | grep -Eq "127\\.0\\.0\\.1:$app_port[[:space:]]"
+              ! ss -ltn | grep -Eq "(0\\.0\\.0\\.0|\\[::\\]):$app_port[[:space:]]"
             }
 
             if ! sudo systemctl restart "$systemd_service" || ! verify_release; then
@@ -352,6 +376,29 @@ jobs:
           grep -qi '^strict-transport-security: .*max-age=31536000' "$headers"
           grep -qi '^x-content-type-options: nosniff' "$headers"
           test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/openapi.json")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/zkpassport/validator")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
+            "${{ env.PUBLIC_BASE_URL }}/auth/challenge")" = "503"
+
+          cors_headers="$(mktemp)"
+          test "$(curl -sS -D "$cors_headers" -o /dev/null -w '%{http_code}' \
+            -X OPTIONS \
+            -H 'Origin: http://localhost:4200' \
+            -H 'Access-Control-Request-Method: POST' \
+            "${{ env.PUBLIC_BASE_URL }}/auth/challenge")" = "400"
+          ! grep -qi '^access-control-allow-origin:' "$cors_headers"
+          ! grep -qi '^access-control-allow-credentials:' "$cors_headers"
+          rm -f "$cors_headers"
+
+          if [ -n "${{ env.LEGACY_API_HOST }}" ]; then
+            if curl -sS --connect-timeout 3 -o /dev/null \
+              "http://${{ env.LEGACY_API_HOST }}:5001/"; then
+              echo "Retired API port 5001 is publicly reachable." >&2
+              exit 1
+            fi
+          fi
 
       - name: Print staging API diagnostics on failure
         if: failure()

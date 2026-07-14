@@ -52,6 +52,93 @@ class RateLimitedError(Exception):
     """Raised when a single source IP has exceeded its per-minute quota."""
 
 
+class RequestRateLimiter:
+    """Count HTTP attempts before request-body validation.
+
+    Challenge issuance limits alone do not count malformed payloads because
+    FastAPI rejects those before entering the route. This limiter sits in the
+    outer ASGI middleware and uses SQLite-WAL in deployed environments so all
+    workers share one atomic quota.
+    """
+
+    def __init__(
+        self,
+        per_ip_per_minute: int,
+        *,
+        db_path: str | Path | None = None,
+        namespace: str = "http_auth_challenge",
+    ) -> None:
+        self.per_ip_per_minute = per_ip_per_minute
+        self.namespace = namespace
+        self._db_path = Path(db_path) if db_path is not None else None
+        self._ip_attempts: dict[str, deque[float]] = defaultdict(deque)
+        if self._db_path is not None:
+            self._init_db()
+
+    def allow(self, source_ip: str) -> bool:
+        now = time.time()
+        if self._db_path is None:
+            cutoff = now - 60.0
+            attempts = self._ip_attempts[source_ip]
+            while attempts and attempts[0] < cutoff:
+                attempts.popleft()
+            if len(attempts) >= self.per_ip_per_minute:
+                return False
+            attempts.append(now)
+            return True
+
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._db_path, timeout=5.0, isolation_level=None) as conn:
+            try:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM request_rate_events "
+                    "WHERE namespace = ? AND attempted_at < ?",
+                    (self.namespace, now - 60.0),
+                )
+                count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM request_rate_events "
+                        "WHERE namespace = ? AND source_ip = ? AND attempted_at >= ?",
+                        (self.namespace, source_ip, now - 60.0),
+                    ).fetchone()[0]
+                )
+                if count >= self.per_ip_per_minute:
+                    conn.commit()
+                    return False
+                conn.execute(
+                    "INSERT INTO request_rate_events(namespace, source_ip, attempted_at) "
+                    "VALUES (?, ?, ?)",
+                    (self.namespace, source_ip, now),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _init_db(self) -> None:
+        if self._db_path is None:
+            return
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS request_rate_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace TEXT NOT NULL,
+                    source_ip TEXT NOT NULL,
+                    attempted_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS request_rate_events_window_idx
+                    ON request_rate_events(namespace, source_ip, attempted_at);
+                """
+            )
+
+
 @dataclass
 class Challenge:
     nonce: str  # 0x-prefixed 32-byte hex

@@ -5,12 +5,17 @@ import asyncio
 import pytest
 import httpx
 from fastapi import FastAPI, Request
+from pydantic import BaseModel
 
 from solslot_api.config import Settings, validate_server_hardening_at_startup
 from solslot_api.server_hardening import (
     ServerHardeningMiddleware,
     documentation_urls,
 )
+
+
+class ChallengeBody(BaseModel):
+    address: str
 
 
 def _app(settings: Settings) -> FastAPI:
@@ -31,6 +36,10 @@ def _app(settings: Settings) -> FastAPI:
         await asyncio.sleep(0.05)
         return {"ok": True}
 
+    @app.post("/auth/challenge")
+    async def challenge(body: ChallengeBody) -> dict[str, str]:
+        return {"address": body.address}
+
     return app
 
 
@@ -42,6 +51,8 @@ def _staging(**overrides: object) -> Settings:
         "security_headers_enabled": True,
         "hsts_enabled": True,
         "cors_origins": "https://staging.solslot.com",
+        "alpha_writes_enabled": False,
+        "minting_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)
@@ -137,27 +148,122 @@ def test_development_may_opt_into_http_cookie_and_docs() -> None:
     )
 
 
-def test_mainnet_production_rejects_single_validator_policy() -> None:
+def test_staging_write_mode_rejects_single_validator_policy() -> None:
     with pytest.raises(RuntimeError, match="VALIDATOR_THRESHOLD"):
         validate_server_hardening_at_startup(
             _staging(
-                runtime_environment="production",
-                network="mainnet",
+                alpha_writes_enabled=True,
                 zkpassport_validator_threshold=1,
             )
         )
 
 
-def test_mainnet_production_accepts_multi_validator_policy() -> None:
+def test_read_only_staging_accepts_single_validator_default() -> None:
+    validate_server_hardening_at_startup(
+        _staging(alpha_writes_enabled=False, zkpassport_validator_threshold=1)
+    )
+
+
+def test_staging_write_mode_requires_chain_bound_admin_authority() -> None:
+    with pytest.raises(RuntimeError, match="chain-bound admin authority"):
+        validate_server_hardening_at_startup(
+            _staging(
+                alpha_writes_enabled=True,
+                zkpassport_validator_threshold=2,
+            )
+        )
+
+
+def test_staging_write_mode_accepts_complete_authority_coordinates() -> None:
     validate_server_hardening_at_startup(
         _staging(
-            runtime_environment="production",
-            network="mainnet",
-            eip712_chain_id=1,
-            zkpassport_evm_chain_id=1,
+            alpha_writes_enabled=True,
             zkpassport_validator_threshold=2,
+            protocol_admin_authority_v2_launcher_id="0x" + "11" * 32,
+            protocol_admin_authority_v2_mips_root_hash="0x" + "22" * 32,
+            protocol_admin_authority_v2_admins_hash="0x" + "33" * 32,
+            admin_records_path="./state/admin_records_v2.json",
         )
     )
+
+
+def test_ceremony_mode_requires_locked_minting_token_and_same_origin() -> None:
+    validate_server_hardening_at_startup(
+        _staging(
+            alpha_writes_enabled=True,
+            ceremony_mode_enabled=True,
+            zkpassport_validator_threshold=2,
+            admin_token="one-time-token",
+            cors_origins="",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="cannot configure CORS"):
+        validate_server_hardening_at_startup(
+            _staging(
+                alpha_writes_enabled=True,
+                ceremony_mode_enabled=True,
+                zkpassport_validator_threshold=2,
+                admin_token="one-time-token",
+            )
+        )
+
+
+def test_minting_cannot_be_enabled_while_alpha_writes_are_locked() -> None:
+    with pytest.raises(RuntimeError, match="MINTING_ENABLED"):
+        validate_server_hardening_at_startup(
+            _staging(minting_enabled=True, alpha_writes_enabled=False)
+        )
+
+
+@pytest.mark.asyncio
+async def test_challenge_limiter_counts_valid_and_invalid_requests() -> None:
+    settings = Settings(
+        runtime_environment="test",
+        challenge_per_ip_per_minute=3,
+    )
+    transport = httpx.ASGITransport(app=_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="https://test") as client:
+        invalid = await client.post("/auth/challenge", json={})
+        valid_one = await client.post(
+            "/auth/challenge",
+            json={"address": "0x1111111111111111111111111111111111111111"},
+        )
+        valid_two = await client.post(
+            "/auth/challenge",
+            json={"address": "0x2222222222222222222222222222222222222222"},
+        )
+        limited = await client.post("/auth/challenge", json={})
+
+    assert invalid.status_code == 422
+    assert valid_one.status_code == 200
+    assert valid_two.status_code == 200
+    assert limited.status_code == 429
+    assert limited.json() == {"detail": "Too many challenge requests. Try again later."}
+    assert limited.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_challenge_limiter_ignores_spoofed_forwarding_headers() -> None:
+    settings = Settings(
+        runtime_environment="test",
+        challenge_per_ip_per_minute=1,
+    )
+    transport = httpx.ASGITransport(app=_app(settings), client=("203.0.113.9", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="https://test") as client:
+        first = await client.post(
+            "/auth/challenge",
+            json={"address": "first"},
+            headers={"X-Forwarded-For": "198.51.100.1"},
+        )
+        second = await client.post(
+            "/auth/challenge",
+            json={"address": "second"},
+            headers={"X-Forwarded-For": "198.51.100.2"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
 
 
 @pytest.mark.parametrize(

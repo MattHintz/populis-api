@@ -1,0 +1,22 @@
+# Load this before every named vhost. Unknown Host/SNI values must never fall
+# through to another tenant's application.
+<VirtualHost *:80>
+    ServerName invalid.invalid
+    <Location />
+        Require all denied
+    </Location>
+    ErrorDocument 403 "Unknown virtual host"
+</VirtualHost>
+
+<IfModule mod_ssl.c>
+<VirtualHost *:443>
+    ServerName invalid.invalid
+    SSLEngine On
+    SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+    <Location />
+        Require all denied
+    </Location>
+    ErrorDocument 403 "Unknown virtual host"
+</VirtualHost>
+</IfModule>

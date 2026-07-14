@@ -17,7 +17,12 @@ def cors_middleware_options(settings: Settings) -> dict[str, Any]:
     return {
         "allow_origins": settings.allowed_origins(),
         "allow_origin_regex": dev_origin_regex,
-        "allow_credentials": True,
+        # Protocol and admin authentication use explicit bearer tokens or
+        # wallet signatures. Cross-origin cookies are never required. Keeping
+        # credentials disabled also prevents a compromised localhost service
+        # from turning a development CORS allowance into a credentialed
+        # staging request.
+        "allow_credentials": False,
         "allow_methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": [
             "Accept",

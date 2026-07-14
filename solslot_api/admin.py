@@ -63,6 +63,11 @@ def require_admin_token(
     Returns 401 when the Authorization header is missing or malformed.
     Returns 403 when the token doesn't match.
     """
+    if not settings.ceremony_mode_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The one-time ceremony operator surface is disabled.",
+        )
     if not settings.admin_token:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

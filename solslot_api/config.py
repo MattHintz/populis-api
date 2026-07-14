@@ -77,6 +77,15 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    if settings.minting_enabled and not settings.alpha_writes_enabled:
+        raise RuntimeError(
+            "SOLSLOT_MINTING_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+    if settings.ceremony_mode_enabled and not settings.alpha_writes_enabled:
+        raise RuntimeError(
+            "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+
     if settings.runtime_environment not in {"staging", "production"}:
         return
     if not settings.bootstrap_cookie_secure:
@@ -91,15 +100,44 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "Security headers and HSTS must be enabled in staging/production."
         )
-    if (
-        settings.runtime_environment == "production"
-        and settings.network == "mainnet"
-        and settings.zkpassport_validator_threshold < 2
-    ):
+    if settings.alpha_writes_enabled and settings.zkpassport_validator_threshold < 2:
         raise RuntimeError(
-            "Mainnet production requires SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD "
-            "of at least 2."
+            "Staging/production protocol writes require "
+            "SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD of at least 2."
         )
+
+    if settings.ceremony_mode_enabled:
+        if settings.network != "testnet11":
+            raise RuntimeError("Ceremony mode is restricted to testnet11.")
+        if settings.minting_enabled:
+            raise RuntimeError("Ceremony mode cannot enable minting.")
+        if not settings.admin_token:
+            raise RuntimeError(
+                "Ceremony mode requires a one-time SOLSLOT_ADMIN_TOKEN."
+            )
+        if settings.allowed_origins():
+            raise RuntimeError(
+                "Ceremony mode must be same-origin and cannot configure CORS origins."
+            )
+    elif settings.alpha_writes_enabled:
+        required_authority = {
+            "admin authority launcher": (
+                settings.effective_protocol_admin_authority_v2_launcher_id()
+            ),
+            "admin authority MIPS root": (
+                settings.effective_protocol_admin_authority_v2_mips_root_hash()
+            ),
+            "admin authority admins hash": (
+                settings.effective_protocol_admin_authority_v2_admins_hash()
+            ),
+            "chain-bound admin records": settings.effective_admin_records_path(),
+        }
+        missing = [name for name, value in required_authority.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "Protocol writes require a chain-bound admin authority; missing: "
+                + ", ".join(missing)
+            )
 
     expected_evm_chain_id = 1 if settings.network == "mainnet" else 11155111
     if settings.eip712_chain_id != expected_evm_chain_id:
@@ -219,6 +257,10 @@ class Settings(BaseSettings):
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
+    # One-shot testnet ceremony mode is the only state in which protocol
+    # writes may run before a chain-bound admin authority exists. It requires
+    # the bootstrap token, disables minting, and refuses all CORS origins.
+    ceremony_mode_enabled: bool = False
     release_metadata_path: str = "./release.json"
 
     # ── Auth / challenges ────────────────────────────────────────────────

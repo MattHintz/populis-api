@@ -43,32 +43,32 @@ def _preflight(origin: str, path: str = "/admin/bootstrap/challenge"):
         )
 
 
-def test_configured_origin_gets_credentialed_bootstrap_preflight() -> None:
+def test_configured_origin_gets_noncredentialed_preflight() -> None:
     resp = _preflight("http://localhost:4200")
 
     assert resp.status_code == 200
     assert resp.headers["access-control-allow-origin"] == "http://localhost:4200"
-    assert resp.headers["access-control-allow-credentials"] == "true"
+    assert "access-control-allow-credentials" not in resp.headers
     assert "authorization" in resp.headers["access-control-allow-headers"].lower()
 
 
-def test_localhost_dev_regex_gets_credentialed_preflight() -> None:
+def test_localhost_dev_regex_never_allows_credentials() -> None:
     resp = _preflight("http://127.0.0.1:49152")
 
     assert resp.status_code == 200
     assert resp.headers["access-control-allow-origin"] == "http://127.0.0.1:49152"
-    assert resp.headers["access-control-allow-credentials"] == "true"
+    assert "access-control-allow-credentials" not in resp.headers
 
 
-def test_unknown_origin_is_not_allowed_for_credentialed_preflight() -> None:
+def test_unknown_origin_is_not_allowed() -> None:
     resp = _preflight("https://evil.example")
 
     assert resp.status_code == 400
     assert "access-control-allow-origin" not in resp.headers
-    assert resp.headers["access-control-allow-credentials"] == "true"
+    assert "access-control-allow-credentials" not in resp.headers
 
 
-def test_cors_credentials_are_not_wildcarded() -> None:
+def test_cors_credentials_are_disabled() -> None:
     with _client() as client:
         resp = client.options(
             "/admin/auth/refresh",
@@ -80,14 +80,14 @@ def test_cors_credentials_are_not_wildcarded() -> None:
 
     assert resp.status_code == 200
     assert resp.headers["access-control-allow-origin"] == "http://localhost:4200"
-    assert resp.headers["access-control-allow-credentials"] == "true"
+    assert "access-control-allow-credentials" not in resp.headers
     assert resp.headers["access-control-allow-origin"] != "*"
 
 
 def test_cors_options_keep_existing_method_and_header_policy() -> None:
     opts = cors_middleware_options(Settings(runtime_environment="development"))
 
-    assert opts["allow_credentials"] is True
+    assert opts["allow_credentials"] is False
     assert opts["allow_methods"] == ["GET", "POST", "OPTIONS"]
     assert "Authorization" in opts["allow_headers"]
     assert "Content-Type" in opts["allow_headers"]

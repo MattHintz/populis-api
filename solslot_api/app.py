@@ -7,7 +7,6 @@ Endpoints:
   POST /vault/register/evm
   POST /vault/register/chia
   GET  /vault/{launcher_id}
-  GET  /zkpassport/validator
 
 Removed endpoints:
   GET  /vault/by-evm/{address}  --  POP-CANON-014: removed in this brick.
@@ -51,7 +50,6 @@ except ModuleNotFoundError as e:
     admin_roster_update_router = None
 from .mint_endpoints import router as mint_endpoints_router
 from .protocol_artifacts import router as protocol_artifacts_router
-from .zkpassport_validator import router as zkpassport_validator_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
@@ -287,9 +285,6 @@ if admin_roster_update_router is not None:
     app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
 app.include_router(protocol_artifacts_router)
-
-# Read-only zkPassport validator public-key metadata.
-app.include_router(zkpassport_validator_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)
