@@ -40,7 +40,8 @@ Every normal deploy:
 7. Extracts to
    `/opt/solslot/api-staging/releases/<api-sha>-<protocol-prefix>/` and builds
    a fresh release virtual environment. A ready release is immutable and may
-   be reused; the workflow never removes the active release directory.
+   be reused; the workflow writes `.release-ready` only after metadata and
+   import validation pass, and never removes the active release directory.
 8. Validates OpenAPI in-process before switching the `current` symlink.
 9. Installs and restarts `solslot-api-staging.service` under the dedicated
    `solslot-api` system account.
@@ -71,6 +72,8 @@ switch, it restores the prior target before reporting failure.
 /opt/solslot/api-staging/
   current -> releases/<api-sha>-<protocol-prefix>
   releases/<api-sha>-<protocol-prefix>/
+    .release-ready
+    release.json
   shared/
     .env
     state/
@@ -148,6 +151,9 @@ Dispatch the workflow with `rollback_sha` set to an existing release ID of the
 form `<api-sha>-<protocol-prefix>`. Rollback changes only the `current`
 symlink, restarts the service, and reruns local and public checks. It does not
 roll back shared state or ceremony coordinates.
+
+Rollback refuses any directory without `.release-ready` or whose
+`release.json` does not exactly match the requested API and protocol commits.
 
 If a release changed persistent schema incompatibly, stop and restore from the
 matching checksummed state backup rather than pointing old code at newer data.

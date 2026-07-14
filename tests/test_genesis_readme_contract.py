@@ -57,7 +57,8 @@ def test_admin_contract_separates_ceremony_and_chain_authority() -> None:
 def test_staging_contract_is_atomic_and_rollbackable() -> None:
     text = _read("docs/STAGING_BACKEND_DEPLOY.md")
     assert "exact 40-character protocol commit" in text
-    assert "/opt/solslot/api-staging/releases/<sha>/" in text
+    assert "/opt/solslot/api-staging/releases/<api-sha>-<protocol-prefix>/" in text
+    assert ".release-ready" in text
     assert "current` symlink" in text
     assert "five newest releases" in text
     assert "rollback_sha" in text
