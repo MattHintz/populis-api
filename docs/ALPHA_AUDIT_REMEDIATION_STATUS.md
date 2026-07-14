@@ -22,9 +22,9 @@ never mistaken for a completed launch control.
 - Protocol: `8d8c2ce` on `security/alpha-v2-remediation`; 716 tests pass.
 - EVM: `1f33083` on `security/alpha-v2-remediation`; 14 tests and the
   provider-credential gate pass.
-- Customer web: `2a29fca` on `security/alpha-v2-remediation`; 202 tests,
+- Customer web: `ac154b0` on `security/alpha-v2-remediation`; 202 tests,
   production build, source namespace gate, and compiled-release namespace
-  gate pass.
+  gate pass. Its dependency-free remote namespace workflow also passes.
 - Admin portal: `15cd90b` on `security/alpha-v2-remediation`; 792 tests,
   production build, source namespace gate, and compiled-release namespace
   gate pass.
