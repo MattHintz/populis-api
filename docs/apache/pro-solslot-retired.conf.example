@@ -1,0 +1,57 @@
+<VirtualHost *:80>
+    ServerName pro.solslot.com
+    Redirect permanent / https://pro.solslot.com/
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName pro.solslot.com
+
+    SSLEngine On
+    SSLCertificateFile /etc/pki/tls/certs/pro.solslot.com.crt
+    SSLCertificateKeyFile /etc/pki/tls/private/pro.solslot.com.key
+
+    ProxyPreserveHost On
+    ProxyRequests Off
+
+    # These are the only live application routes on this origin.
+    ProxyPass /solomon/webhook http://127.0.0.1:8080/webhook
+    ProxyPassReverse /solomon/webhook http://127.0.0.1:8080/webhook
+    ProxyPass /solomon/submit http://127.0.0.1:8080/submit
+    ProxyPassReverse /solomon/submit http://127.0.0.1:8080/submit
+    ProxyPass /solomon/healthz http://127.0.0.1:8080/healthz
+    ProxyPassReverse /solomon/healthz http://127.0.0.1:8080/healthz
+
+    ProxyPass /solomon-testnet/webhook http://127.0.0.1:8081/webhook
+    ProxyPassReverse /solomon-testnet/webhook http://127.0.0.1:8081/webhook
+    ProxyPass /solomon-testnet/submit http://127.0.0.1:8081/submit
+    ProxyPassReverse /solomon-testnet/submit http://127.0.0.1:8081/submit
+    ProxyPass /solomon-testnet/healthz http://127.0.0.1:8081/healthz
+    ProxyPassReverse /solomon-testnet/healthz http://127.0.0.1:8081/healthz
+
+    Redirect gone /protocol-api
+    Redirect gone /openapi.json
+    Redirect gone /docs
+    Redirect gone /login
+    Redirect gone /deploy_vault
+
+    DocumentRoot /var/www/pro-solslot-retired
+    <Directory "/var/www/pro-solslot-retired">
+        Options -Indexes
+        AllowOverride None
+        Require all granted
+        DirectoryIndex index.html
+    </Directory>
+
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Forwarded-Port "443"
+
+    Header always unset Access-Control-Allow-Origin
+    Header always unset Access-Control-Allow-Credentials
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer"
+    Header always set Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+
+    ErrorLog /var/log/httpd/pro.solslot.com_error.log
+    CustomLog /var/log/httpd/pro.solslot.com_access.log combined
+</VirtualHost>
