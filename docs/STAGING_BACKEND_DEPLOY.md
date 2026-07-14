@@ -37,13 +37,16 @@ Every normal deploy:
    package, app module, and UTC build time.
 5. Packages the complete release and scans the archive again.
 6. Uploads to `/tmp/solslot-api-release-<sha>.tgz`.
-7. Extracts to `/opt/solslot/api-staging/releases/<sha>/` and builds a fresh
-   release virtual environment.
+7. Extracts to
+   `/opt/solslot/api-staging/releases/<api-sha>-<protocol-prefix>/` and builds
+   a fresh release virtual environment. A ready release is immutable and may
+   be reused; the workflow never removes the active release directory.
 8. Validates OpenAPI in-process before switching the `current` symlink.
 9. Installs and restarts `solslot-api-staging.service` under the dedicated
    `solslot-api` system account.
-10. Verifies local/public health, security headers, release identity, and that
-    public OpenAPI routes are disabled.
+10. Verifies local/public health, security headers, release identity, loopback
+    binding, locked write surfaces, blocked localhost CORS, and disabled
+    OpenAPI and validator-metadata routes.
 11. Keeps the five newest releases for rollback.
 
 The systemd unit must run:
@@ -66,8 +69,8 @@ switch, it restores the prior target before reporting failure.
 
 ```text
 /opt/solslot/api-staging/
-  current -> releases/<sha>
-  releases/<sha>/
+  current -> releases/<api-sha>-<protocol-prefix>
+  releases/<api-sha>-<protocol-prefix>/
   shared/
     .env
     state/
@@ -122,9 +125,11 @@ any other source are ignored.
 
 ## Required GitHub Configuration
 
-The `staging` environment holds SSH secrets. Repository variables pin the
-expected host, service, release root, port, and exact protocol commit. The
-workflow refuses a host-name mismatch or branch-like protocol reference.
+The `staging` environment holds SSH secrets. Environment variables pin the
+expected host, service, release root, port, retired API host, and exact
+protocol commit. Environment values take precedence over repository values;
+update and verify both scopes when a pin exists in both. The workflow refuses
+a host-name mismatch or branch-like protocol reference.
 
 No passphrase, private key, bearer token, seed, or RPC secret belongs in a
 workflow variable, source file, release archive, or issue log.
@@ -139,9 +144,10 @@ chain-bound admin JWT.
 
 ## Rollback
 
-Dispatch the workflow with `rollback_sha` set to an existing release. Rollback
-changes only the `current` symlink, restarts the service, and reruns local and
-public checks. It does not roll back shared state or ceremony coordinates.
+Dispatch the workflow with `rollback_sha` set to an existing release ID of the
+form `<api-sha>-<protocol-prefix>`. Rollback changes only the `current`
+symlink, restarts the service, and reruns local and public checks. It does not
+roll back shared state or ceremony coordinates.
 
 If a release changed persistent schema incompatibly, stop and restore from the
 matching checksummed state backup rather than pointing old code at newer data.
