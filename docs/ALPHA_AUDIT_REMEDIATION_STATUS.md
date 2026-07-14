@@ -7,8 +7,10 @@ never mistaken for a completed launch control.
 
 ## Canonical Live Baseline
 
-- API release: `37b82ba46c0e2ce1d387f73127c2c3b785c44767`.
-- Protocol dependency: `9b0a411c035ee23fca197b2de20122eeaabfafdf`.
+- API release: `8e2d697fc2164780d4f817ac7d913472c1f631e0`.
+- Protocol dependency: `8d8c2ce508777317ccb27a5a62732ec6ade3f091`.
+- Compound release ID:
+  `8e2d697fc2164780d4f817ac7d913472c1f631e0-8d8c2ce50877`.
 - Runtime: `solslot-api-staging.service` under `/opt/solslot/api-staging`.
 - Network binding: Chia `testnet11` and Ethereum Sepolia `11155111`.
 - Public API documentation: disabled.
@@ -18,13 +20,15 @@ never mistaken for a completed launch control.
 
 ## Canonical Security Branches
 
-- API: `238d2fa` on `security/alpha-v2-remediation`; 507 tests pass.
+- API: `dcfa0d2` on `security/alpha-v2-remediation`; 510 tests pass. The
+  deployed code commit is `8e2d697`; later commits update evidence only.
 - Protocol: `8d8c2ce` on `security/alpha-v2-remediation`; 716 tests pass.
 - EVM: `1f33083` on `security/alpha-v2-remediation`; 14 tests and the
   provider-credential gate pass.
-- Customer web: `ac154b0` on `security/alpha-v2-remediation`; 202 tests,
+- Customer web: `320d867` on `security/alpha-v2-remediation`; 202 tests,
   production build, source namespace gate, and compiled-release namespace
-  gate pass. Its dependency-free remote namespace workflow also passes.
+  gate pass. Its staging deployment and dependency-free remote namespace
+  workflow also pass.
 - Admin portal: `15cd90b` on `security/alpha-v2-remediation`; 792 tests,
   production build, source namespace gate, and compiled-release namespace
   gate pass.
@@ -42,13 +46,18 @@ never mistaken for a completed launch control.
 | --- | --- | --- |
 | C-1 provider credential in EVM history | History fixed, provider revocation open | Both public EVM branches use scrubbed ancestry, current config is environment-only, CI rejects provider credentials, and the canonical local object database no longer contains the retired blob. A private mode-0400 pre-scrub bundle preserves evidence. The provider account owner must still revoke the credential. |
 | C-2 portal runtime coordinates | Contained | Public runtime files no longer contain active admin or ceremony coordinates. Fresh V2 coordinates may be published only through the signed ceremony artifact. |
-| C-3 retired pro-origin API | Contained, verification open | The reported API surface is not present on the reviewed staging runtime. The unrelated pro host must remain outside the protocol trust boundary and must not expose API mutation routes or wildcard CORS. |
-| C-4 challenge throttling | Code fixed, live write test pending | SQLite-WAL quotas persist across restarts and use the proxy-normalized peer IP. A 100-request concurrent regression admits exactly the configured 12 requests. Writes are locked, so the public 429 saturation smoke is deferred until the controlled prelaunch window. |
+| C-3 retired API on public port `5001` | Contained live | The PM2 process is removed and saved, direct port `5001` refuses connections, port `8790` is externally unreachable, and no retired database or state was deleted. |
+| C-4 credentialed localhost CORS | Contained live | Staging rejects localhost and attacker-origin preflights without allow-origin or allow-credentials. Pro mutation routes are retired at `410` and return no CORS grant. |
+| C-5 challenge throttling | Code fixed, live write test pending | SQLite-WAL quotas persist across restarts, count valid and invalid requests before body validation, and use the proxy-normalized peer IP. A concurrent regression admits only the configured quota. Writes are locked, so the public 429 saturation smoke is deferred until the controlled prelaunch window. |
+| C-6 cross-tenant default vhost | Contained live | The staging VPS loads a first/default deny vhost. Unknown Solslot Host/SNI values return `403`; intended named vhosts remain available. |
+| C-7 protocol and retired API co-served on pro | Contained live | Pro serves only a static mainnet-disabled page; retired protocol routes return `410`; the separate Solomon health route remains available. |
+| C-8 chain authority not enforced | Contained, not completed | Authority reports `not-deployed`, all writes and ceremony operations are locked, and non-ceremony write mode now requires complete chain-bound authority coordinates. Closure requires the fresh V2 genesis. |
+| C-9 threshold-one validator | Contained, not completed | Public validator metadata and generic signing routes return `404`; staging and production refuse write mode below threshold two. Closure requires independently controlled validator keys and an audited threshold implementation. |
 | H-1 raw protocol manifest disclosure | Fixed live | `/protocol` returns typed public coordinates only; faucet fields and the raw manifest are null. |
 | H-2 authority commitment disclosure | Risk removed from current staging | Authority is disabled and all fields are null. Future launcher and commitment hashes are public on-chain verification data, never an authorization source. Admin records and Merkle paths remain private. |
 | H-3 public database listener | Fixed live | Port 3306 is not reachable publicly; the database listener is loopback-only. |
 | H-4 permissive CORS | Fixed live | Staging accepts exact HTTPS origins only, rejects wildcard headers, and normalizes forwarding headers at the proxy. |
-| H-5 validator threshold one | Contained | Clean staging has no validator. Mainnet production refuses to start below threshold two; the fresh ceremony must use independent keys and a matching bridge policy. |
+| H-5 legacy SSH ciphers | Not reproduced | Effective host configurations expose only ChaCha20, AES-CTR, and AES-GCM cipher suites. CBC and 3DES are not enabled. |
 | M-1 academy DNS 1014 | DNS fixed, Intercom activation open | The Intercom CNAME is DNS-only and resolves correctly. The Intercom workspace must finish custom-domain validation and certificate activation before closure. |
 | M-2 malformed enrollment 500 | Fixed live | Malformed launcher paths return 422. |
 | Committee endpoints | Protocol-authenticated by design | Read access and signed-bundle forwarding are public; the API cannot create SGT authority. Consensus and signature tests remain part of the launch gate. |
