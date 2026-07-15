@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import time
 from pathlib import Path
@@ -42,6 +43,36 @@ class ValidatorEvidenceError(RuntimeError):
     """The coordinator claim is not independently provable."""
 
 
+def _is_protected_systemd_credential(path: Path, mode: int) -> bool:
+    """Recognize systemd's read-only credential mount across supported hosts."""
+    credentials_directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not credentials_directory or path.name != "validator-seed":
+        return False
+    try:
+        directory = Path(credentials_directory)
+        directory_stat = directory.stat()
+        path_stat = path.stat()
+        if path.parent.resolve(strict=True) != directory.resolve(strict=True):
+            return False
+    except OSError:
+        return False
+
+    # Ubuntu's id-mapped credential mount reports 0440/root:root to the
+    # service while Amazon Linux reports 0400 owned by the service account.
+    # In both cases the mount and credential are immutable to the signer.
+    forbidden_file_bits = (
+        stat.S_IWUSR | stat.S_IXUSR | stat.S_IWGRP | stat.S_IXGRP | stat.S_IRWXO
+    )
+    forbidden_directory_bits = stat.S_IWGRP | stat.S_IRWXO
+    return (
+        bool(mode & stat.S_IRUSR)
+        and not mode & forbidden_file_bits
+        and not stat.S_IMODE(directory_stat.st_mode) & forbidden_directory_bits
+        and path_stat.st_uid == directory_stat.st_uid
+        and path_stat.st_gid == directory_stat.st_gid
+    )
+
+
 def canonical_claim_json(claim: ValidatorClaim) -> str:
     return json.dumps(
         claim.model_dump(mode="json"),
@@ -57,7 +88,9 @@ def load_validator_private_key(settings: ValidatorSettings) -> PrivateKey:
     if path.is_symlink() or not path.is_file():
         raise ValidatorEvidenceError("validator seed file is missing or is a symlink")
     mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+    if mode & (stat.S_IRWXG | stat.S_IRWXO) and not _is_protected_systemd_credential(
+        path, mode
+    ):
         raise ValidatorEvidenceError("validator seed file must not be accessible by group/other")
     try:
         seed = bytes.fromhex(path.read_text(encoding="ascii").strip().removeprefix("0x"))

@@ -77,3 +77,72 @@ def test_seed_file_permissions_fail_closed(tmp_path) -> None:
         assert "group/other" in str(exc)
     else:
         raise AssertionError("world-readable validator seed was accepted")
+
+
+def test_group_readable_seed_outside_systemd_credentials_fails_closed(
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path)
+    seed_file = tmp_path / "validator.seed"
+    seed_file.chmod(0o640)
+
+    try:
+        load_validator_private_key(settings)
+    except ValidatorEvidenceError as exc:
+        assert "group/other" in str(exc)
+    else:
+        raise AssertionError("ordinary group-readable validator seed was accepted")
+
+
+def test_ubuntu_systemd_credential_mount_is_accepted(tmp_path, monkeypatch) -> None:
+    credentials_directory = tmp_path / "credentials"
+    credentials_directory.mkdir(mode=0o750)
+    seed_file = credentials_directory / "validator-seed"
+    seed_file.write_text((bytes([31]) * 32).hex() + "\n", encoding="ascii")
+    seed_file.chmod(0o440)
+    settings = _settings(tmp_path)
+    settings.seed_file = str(seed_file)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_directory))
+
+    private_key = load_validator_private_key(settings)
+
+    assert "0x" + bytes(private_key.get_g1()).hex() == settings.roster_pubkeys[0]
+
+
+def test_writable_systemd_credential_directory_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    credentials_directory = tmp_path / "credentials"
+    credentials_directory.mkdir(mode=0o770)
+    credentials_directory.chmod(0o770)
+    seed_file = credentials_directory / "validator-seed"
+    seed_file.write_text((bytes([31]) * 32).hex() + "\n", encoding="ascii")
+    seed_file.chmod(0o440)
+    settings = _settings(tmp_path)
+    settings.seed_file = str(seed_file)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_directory))
+
+    try:
+        load_validator_private_key(settings)
+    except ValidatorEvidenceError as exc:
+        assert "group/other" in str(exc)
+    else:
+        raise AssertionError("credential from a group-writable directory was accepted")
+
+
+def test_writable_systemd_credential_file_fails_closed(tmp_path, monkeypatch) -> None:
+    credentials_directory = tmp_path / "credentials"
+    credentials_directory.mkdir(mode=0o750)
+    seed_file = credentials_directory / "validator-seed"
+    seed_file.write_text((bytes([31]) * 32).hex() + "\n", encoding="ascii")
+    seed_file.chmod(0o640)
+    settings = _settings(tmp_path)
+    settings.seed_file = str(seed_file)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_directory))
+
+    try:
+        load_validator_private_key(settings)
+    except ValidatorEvidenceError as exc:
+        assert "group/other" in str(exc)
+    else:
+        raise AssertionError("writable systemd credential was accepted")
