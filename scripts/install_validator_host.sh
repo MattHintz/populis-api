@@ -147,15 +147,19 @@ if ! systemctl restart solslot-validator.service; then
   journalctl -u solslot-validator.service -n 100 --no-pager >&2
   exit 1
 fi
-sleep 3
-systemctl is-active --quiet solslot-validator.service || {
-  rollback_release
-  journalctl -u solslot-validator.service -n 100 --no-pager >&2
-  exit 1
-}
-ss -ltn | grep -Eq "$wg_ip:9443[[:space:]]" || {
+validator_ready=false
+for _ in $(seq 1 30); do
+  if systemctl is-active --quiet solslot-validator.service \
+    && ss -ltn | grep -Eq "$wg_ip:9443[[:space:]]"; then
+    validator_ready=true
+    break
+  fi
+  sleep 1
+done
+[ "$validator_ready" = true ] || {
   rollback_release
   echo "validator is not bound to the WireGuard address" >&2
+  journalctl -u solslot-validator.service -n 100 --no-pager >&2
   exit 1
 }
 ! ss -ltn | grep -Eq "(0.0.0.0|\[::\]):9443[[:space:]]" || {
