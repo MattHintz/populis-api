@@ -232,6 +232,8 @@ jobs:
             archive="/tmp/solslot-api-release-$release_sha.tgz"
             shared_root="${{ env.SHARED_ROOT }}"
             state_dir="$shared_root/state"
+            transaction_dir="$shared_root/deployments"
+            transaction_file="$transaction_dir/deploy-$release_sha.previous"
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             systemd_user="${{ env.SYSTEMD_USER }}"
@@ -245,12 +247,12 @@ jobs:
             if ! id "$systemd_user" >/dev/null 2>&1; then
               sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin "$systemd_user"
             fi
-            sudo mkdir -p "$release_root/releases" "$state_dir"
+            sudo mkdir -p "$release_root/releases" "$state_dir" "$transaction_dir"
             test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
             sudo test -f "$env_file" || (echo "Missing $env_file on staging host." && exit 1)
             sudo chown -R "$(id -un)":"$(id -gn)" "$release_root/releases"
             sudo chown -R "$systemd_user":"$systemd_user" "$shared_root"
-            sudo chmod 0700 "$shared_root" "$state_dir"
+            sudo chmod 0700 "$shared_root" "$state_dir" "$transaction_dir"
             sudo chmod 0600 "$env_file"
 
             python_bin="$(command -v python3.12 || command -v python3.11 || true)"
@@ -282,6 +284,37 @@ jobs:
               exit 1
             fi
             previous_target="$(readlink -f "$release_root/current" || true)"
+            previous_release_body="$(mktemp)"
+            previous_public_release_body="$(mktemp)"
+            if [ -n "$previous_target" ] \
+              && [ -f "$previous_target/.release-ready" ] \
+              && [ -f "$previous_target/release.json" ] \
+              && curl -fsS "http://127.0.0.1:$app_port/release" \
+                >"$previous_release_body" \
+              && curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
+                >"$previous_public_release_body" \
+              && "$python_bin" - "$previous_target/release.json" \
+                "$previous_release_body" "$previous_public_release_body" <<'PY'
+            import json
+            import sys
+
+            expected = json.load(open(sys.argv[1], encoding="utf-8"))
+            for path in sys.argv[2:]:
+                live = json.load(open(path, encoding="utf-8"))
+                release = live["release"]
+                assert live["available"] is True
+                assert release["apiCommit"] == expected["api_commit"]
+                assert release["protocolCommit"] == expected["protocol_commit"]
+            PY
+            then
+              touch "$previous_target/.release-verified"
+            fi
+            rm -f "$previous_release_body" "$previous_public_release_body"
+            if [ -n "$previous_target" ] \
+              && [ ! -f "$previous_target/.release-verified" ]; then
+              echo "Current release has no matching local/public verification evidence." >&2
+              exit 1
+            fi
 
             if [ -e "$release_dir" ] && [ ! -f "$release_dir/.release-ready" ]; then
               if [ "$previous_target" = "$release_dir" ]; then
@@ -341,6 +374,9 @@ jobs:
                 previous_target=""
               fi
             fi
+            printf '%s\n' "$previous_target" \
+              | sudo tee "$transaction_file" >/dev/null
+            sudo chmod 0600 "$transaction_file"
             sudo ln -sfn "$release_dir" "$release_root/current"
             sudo tee /etc/systemd/system/"$systemd_service" >/dev/null <<EOF
             [Unit]
@@ -540,8 +576,10 @@ jobs:
                 sudo ln -sfn "$previous_target" "$release_root/current"
                 sudo systemctl restart "$systemd_service" || true
               fi
+              sudo rm -f "$transaction_file"
               exit 1
             fi
+            touch "$release_dir/.release-local-verified"
 
             find "$release_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
               | sort -rn \
@@ -588,6 +626,65 @@ jobs:
             fi
           fi
 
+      - name: Finalize successful deployment transaction
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            protocol_ref="${{ env.PROTOCOL_REF }}"
+            release_id="${{ github.sha }}-${protocol_ref:0:12}"
+            release_dir="${{ env.RELEASE_ROOT }}/releases/$release_id"
+            transaction_file="${{ env.SHARED_ROOT }}/deployments/deploy-${{ github.sha }}.previous"
+            test "$(readlink -f '${{ env.RELEASE_ROOT }}/current')" = "$release_dir"
+            test -f "$release_dir/.release-local-verified"
+            touch "$release_dir/.release-verified"
+            sudo rm -f "$transaction_file"
+
+      - name: Restore previous release after failed public verification
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            release_root="${{ env.RELEASE_ROOT }}"
+            transaction_file="${{ env.SHARED_ROOT }}/deployments/deploy-${{ github.sha }}.previous"
+            if ! sudo test -f "$transaction_file"; then
+              echo "No active deployment transaction requires restoration."
+              exit 0
+            fi
+            previous_target="$(sudo cat "$transaction_file")"
+            case "$previous_target" in
+              "$release_root"/releases/*) ;;
+              *)
+                echo "Deployment transaction has no valid previous release." >&2
+                exit 1
+                ;;
+            esac
+            test -d "$previous_target"
+            test -f "$previous_target/.release-verified"
+            sudo ln -sfn "$previous_target" "$release_root/current"
+            sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}"
+            for attempt in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" >/dev/null; then
+                sudo rm -f "$transaction_file"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Previous release did not recover within 30 seconds." >&2
+            exit 1
+
       - name: Print staging API diagnostics on failure
         if: failure()
         uses: appleboy/ssh-action@v1.0.3
@@ -632,6 +729,7 @@ jobs:
             release_dir="$release_root/releases/$rollback_id"
             test -d "$release_dir" || (echo "No release directory exists for $rollback_id" && exit 1)
             test -f "$release_dir/.release-ready" || (echo "Release $rollback_id is incomplete" && exit 1)
+            test -f "$release_dir/.release-verified" || (echo "Release $rollback_id never passed runtime verification" && exit 1)
 
             "$release_dir/.venv/bin/python" -c '
             import json, pathlib, sys
@@ -647,28 +745,95 @@ jobs:
             ' "$rollback_id" "$release_dir/release.json"
 
             previous_target="$(readlink -f "$release_root/current" || true)"
+            case "$previous_target" in
+              "$release_root"/releases/*) ;;
+              *)
+                echo "Current release is not a canonical release target." >&2
+                exit 1
+                ;;
+            esac
+            test -f "$previous_target/.release-verified" || (echo "Current release has no public verification marker" && exit 1)
+            transaction_dir="${{ env.SHARED_ROOT }}/deployments"
+            transaction_file="$transaction_dir/rollback-${{ github.run_id }}.previous"
+            sudo mkdir -p "$transaction_dir"
+            sudo chmod 0700 "$transaction_dir"
+            printf '%s\n' "$previous_target" \
+              | sudo tee "$transaction_file" >/dev/null
+            sudo chmod 0600 "$transaction_file"
 
             sudo ln -sfn "$release_dir" "$release_root/current"
+            wait_for_rollback_health() {
+              local attempt
+              for attempt in $(seq 1 30); do
+                if curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" >/dev/null; then
+                  return 0
+                fi
+                if ! sudo systemctl is-active --quiet "${{ env.SYSTEMD_SERVICE }}"; then
+                  echo "Rollback service stopped before becoming healthy." >&2
+                  return 1
+                fi
+                sleep 1
+              done
+              echo "Rollback health check timed out after 30 seconds." >&2
+              return 1
+            }
+
+            require_rollback_http_code() {
+              local expected="$1"
+              local url="$2"
+              shift 2
+              local actual
+              actual="$(curl -sS -o /dev/null -w '%{http_code}' "$@" "$url")" || return 1
+              if [ "$actual" != "$expected" ]; then
+                echo "Expected HTTP $expected from $url, received $actual." >&2
+                return 1
+              fi
+            }
+
             verify_rollback() {
-              sleep 5
-              curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health"
-              test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json")" = "404"
-              test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${{ env.APP_PORT }}/zkpassport/validator")" = "404"
-              test "$(curl -sS -o /dev/null -w '%{http_code}' \
+              local cors_headers
+              wait_for_rollback_health || return 1
+              curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/release" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; rollback_id=sys.argv[1]; api_sha, protocol_prefix=rollback_id.split("-", 1); assert data["available"] is True; assert release["apiCommit"] == api_sha; assert release["protocolCommit"].startswith(protocol_prefix)' "$rollback_id" \
+                || return 1
+              require_rollback_http_code 404 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" \
+                || return 1
+              require_rollback_http_code 404 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/zkpassport/validator" \
+                || return 1
+              require_rollback_http_code 404 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/v1/zkpassport/sign" \
+                -H 'Content-Type: application/json' -d '{}' \
+                || return 1
+              require_rollback_http_code 503 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/auth/challenge" \
                 -H 'Content-Type: application/json' \
                 -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
-                "http://127.0.0.1:${{ env.APP_PORT }}/auth/challenge")" = "503"
-              headers="$(mktemp)"
-              test "$(curl -sS -D "$headers" -o /dev/null -w '%{http_code}' \
+                || return 1
+              cors_headers="$(mktemp)" || return 1
+              require_rollback_http_code 400 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/auth/challenge" \
+                -D "$cors_headers" \
                 -X OPTIONS \
                 -H 'Origin: http://localhost:4200' \
                 -H 'Access-Control-Request-Method: POST' \
-                "http://127.0.0.1:${{ env.APP_PORT }}/auth/challenge")" = "400"
-              ! grep -qi '^access-control-allow-origin:' "$headers"
-              ! grep -qi '^access-control-allow-credentials:' "$headers"
-              rm -f "$headers"
-              ss -ltn | grep -Eq "127\\.0\\.0\\.1:${{ env.APP_PORT }}[[:space:]]"
-              ! ss -ltn | grep -Eq "(0\\.0\\.0\\.0|\\[::\\]):${{ env.APP_PORT }}[[:space:]]"
+                || { rm -f "$cors_headers"; return 1; }
+              if grep -qi '^access-control-allow-origin:' "$cors_headers" \
+                || grep -qi '^access-control-allow-credentials:' "$cors_headers"; then
+                echo "Blocked localhost origin received CORS authorization." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              rm -f "$cors_headers"
+              ss -ltn | grep -Eq \
+                "127\\.0\\.0\\.1:${{ env.APP_PORT }}[[:space:]]" \
+                || return 1
+              if ss -ltn | grep -Eq \
+                "(0\\.0\\.0\\.0|\\[::\\]):${{ env.APP_PORT }}[[:space:]]"; then
+                echo "Rollback target is listening on a public address." >&2
+                return 1
+              fi
             }
 
             if ! sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}" || ! verify_rollback; then
@@ -677,19 +842,79 @@ jobs:
                 sudo ln -sfn "$previous_target" "$release_root/current"
                 sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}" || true
               fi
+              sudo rm -f "$transaction_file"
               exit 1
             fi
 
       - name: Verify public rollback
+        env:
+          ROLLBACK_RELEASE_ID: ${{ github.event.inputs.rollback_sha }}
         run: |
           set -euo pipefail
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
+            | python -c 'import json, os, sys; data=json.load(sys.stdin); release=data["release"]; api_sha, protocol_prefix=os.environ["ROLLBACK_RELEASE_ID"].split("-", 1); assert data["available"] is True; assert release["apiCommit"] == api_sha; assert release["protocolCommit"].startswith(protocol_prefix)'
           test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/openapi.json")" = "404"
           test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/zkpassport/validator")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' -d '{}' \
+            "${{ env.PUBLIC_BASE_URL }}/v1/zkpassport/sign")" = "404"
           test "$(curl -sS -o /dev/null -w '%{http_code}' \
             -H 'Content-Type: application/json' \
             -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
             "${{ env.PUBLIC_BASE_URL }}/auth/challenge")" = "503"
+
+      - name: Finalize successful rollback transaction
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            sudo rm -f "${{ env.SHARED_ROOT }}/deployments/rollback-${{ github.run_id }}.previous"
+
+      - name: Restore pre-rollback release after failed public verification
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SERVER_IP }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            release_root="${{ env.RELEASE_ROOT }}"
+            transaction_file="${{ env.SHARED_ROOT }}/deployments/rollback-${{ github.run_id }}.previous"
+            if ! sudo test -f "$transaction_file"; then
+              echo "No active rollback transaction requires restoration."
+              exit 0
+            fi
+            previous_target="$(sudo cat "$transaction_file")"
+            case "$previous_target" in
+              "$release_root"/releases/*) ;;
+              *)
+                echo "Rollback transaction has no valid previous release." >&2
+                exit 1
+                ;;
+            esac
+            test -d "$previous_target"
+            test -f "$previous_target/.release-verified"
+            sudo ln -sfn "$previous_target" "$release_root/current"
+            sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}"
+            for attempt in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" >/dev/null; then
+                sudo rm -f "$transaction_file"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Pre-rollback release did not recover within 30 seconds." >&2
+            exit 1
 
   runtime-diagnostics:
     if: ${{ github.event.inputs.diagnostics_only == 'true' }}

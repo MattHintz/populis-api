@@ -41,3 +41,15 @@ def test_release_verification_is_explicitly_fail_closed() -> None:
     assert "require_http_code 404" in text
     assert "require_http_code 503" in text
     assert "Coordinator health check timed out after 30 seconds." in text
+
+
+def test_deploy_and_rollback_are_two_phase_transactions() -> None:
+    text = _workflow_text()
+
+    assert 'touch "$release_dir/.release-local-verified"' in text
+    assert 'touch "$release_dir/.release-verified"' in text
+    assert "Release $rollback_id never passed runtime verification" in text
+    assert "Restore previous release after failed public verification" in text
+    assert "Restore pre-rollback release after failed public verification" in text
+    assert "wait_for_rollback_health || return 1" in text
+    assert 'release["apiCommit"] == api_sha' in text

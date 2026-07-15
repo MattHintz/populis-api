@@ -39,3 +39,19 @@ The published RC2 tags remain unchanged as evidence of the rejected candidate.
 RC3 must pass the same full build, test, namespace, secret, reproducibility,
 local health, public health, and release-identity gates before it becomes the
 locked staging baseline.
+
+## RC3 Result And RC4 Control-Plane Delta
+
+Workflow run `29393614263` passed the RC3 reproducible build, full API suite,
+archive scans, atomic server deploy, local checks, public checks, and release
+identity verification. The live locked release reported API commit
+`310bae6f962204f6c2cd2a4ab5c155078c008aeb` and protocol commit
+`93a6311762452aeb9010e800c2f0f091f69587ad`.
+
+The post-deploy control-plane review found that the separate manual rollback
+path still inherited the conditional-shell behavior corrected in the normal
+deploy path. RC4 therefore changes deployment control only: rollback checks
+are explicit and identity-bound, only publicly verified releases are eligible,
+and both normal deploy and rollback retain a protected previous-target
+transaction until external verification succeeds. A public verification
+failure restores the previous verified release automatically.

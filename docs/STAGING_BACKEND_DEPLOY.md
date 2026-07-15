@@ -50,7 +50,11 @@ Every normal deploy:
 10. Verifies local/public health, security headers, release identity, loopback
     binding, locked write surfaces, blocked localhost CORS, and disabled
     OpenAPI and validator-metadata routes.
-11. Keeps the five newest releases for rollback.
+11. Writes a local-verification marker after local checks and promotes it to a
+    full release-verification marker only after public checks, retains the
+    previous target through that promotion, and restores it automatically if
+    the external check fails.
+12. Keeps the five newest releases for rollback.
 
 The API release archive also contains the private signer application and host
 templates, but the coordinator service always starts `solslot_api.app:app`.
@@ -80,9 +84,13 @@ switch, it restores the prior target before reporting failure.
   current -> releases/<api-sha>-<protocol-prefix>
   releases/<api-sha>-<protocol-prefix>/
     .release-ready
+    .release-local-verified
+    .release-verified
     release.json
   shared/
     .env
+    deployments/
+      <active transaction>.previous
     state/
       deployment_manifest_v2.json
       bootstrap_manifest_v2.json
@@ -190,6 +198,10 @@ roll back shared state or ceremony coordinates.
 
 Rollback refuses any directory without `.release-ready` or whose
 `release.json` does not exactly match the requested API and protocol commits.
+It also requires `.release-verified`, so an archive that imported successfully
+but failed runtime or public acceptance can never become a rollback target.
+Rollback itself is transactional: local and public identity/security checks
+must pass, otherwise the pre-rollback release is restored.
 
 If a release changed persistent schema incompatibly, stop and restore from the
 matching checksummed state backup rather than pointing old code at newer data.
