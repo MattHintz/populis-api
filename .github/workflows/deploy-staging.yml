@@ -32,6 +32,10 @@ env:
   LEGACY_API_HOST: ${{ vars.SOLSLOT_LEGACY_API_HOST }}
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF }}
+  # Published by Cloudflare at https://api.cloudflare.com/client/v4/ips.
+  # Keep this reviewed, versioned pin in sync with that authoritative list.
+  CLOUDFLARE_PROXY_CIDRS: >-
+    173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32
 
 jobs:
   build-release:
@@ -232,6 +236,7 @@ jobs:
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             systemd_user="${{ env.SYSTEMD_USER }}"
             app_port="${{ env.APP_PORT }}"
+            trusted_proxy_cidrs="${{ env.CLOUDFLARE_PROXY_CIDRS }}"
             actual_hostname="$(hostname)"
             if [ "$actual_hostname" != "${{ env.EXPECTED_HOSTNAME }}" ]; then
               echo "Refusing staging deploy: expected host ${{ env.EXPECTED_HOSTNAME }}, got $actual_hostname" >&2
@@ -258,6 +263,24 @@ jobs:
             if sys.version_info < (3, 11):
                 raise SystemExit(f"Python 3.11+ is required, found {sys.version}")
             PY
+            "$python_bin" - "$trusted_proxy_cidrs" <<'PY'
+            import ipaddress
+            import sys
+
+            networks = [
+                ipaddress.ip_network(value, strict=True)
+                for value in sys.argv[1].split(",")
+                if value
+            ]
+            if not networks or not {network.version for network in networks} == {4, 6}:
+                raise SystemExit("Cloudflare proxy pin must contain IPv4 and IPv6 ranges")
+            PY
+            if sudo grep -Eq \
+              '^[[:space:]]*SOLSLOT_VALIDATOR_SEED_(FILE|HEX)[[:space:]]*=' \
+              "$env_file"; then
+              echo "Coordinator environment contains validator seed configuration." >&2
+              exit 1
+            fi
             previous_target="$(readlink -f "$release_root/current" || true)"
 
             if [ -e "$release_dir" ] && [ ! -f "$release_dir/.release-ready" ]; then
@@ -341,8 +364,11 @@ jobs:
             Environment=SOLSLOT_MINTING_ENABLED=false
             Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
+            Environment=SOLSLOT_VAULT_SESSION_COOKIE_SECURE=true
             Environment=SOLSLOT_SECURITY_HEADERS_ENABLED=true
             Environment=SOLSLOT_HSTS_ENABLED=true
+            Environment="SOLSLOT_TRUSTED_PROXY_CIDRS=$trusted_proxy_cidrs"
+            Environment=SOLSLOT_CORS_ORIGINS=https://staging.solslot.com
             Environment=SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304
             Environment=SOLSLOT_REQUEST_TIMEOUT_SECONDS=30
             Environment=SOLSLOT_CHALLENGE_STORE_PATH=$state_dir/challenges_v2.db
@@ -374,47 +400,137 @@ jobs:
             sudo systemctl daemon-reload
             sudo systemctl enable "$systemd_service"
 
+            wait_for_health() {
+              local attempt
+              for attempt in $(seq 1 30); do
+                if curl -fsS "http://127.0.0.1:$app_port/health" >/dev/null; then
+                  return 0
+                fi
+                if ! sudo systemctl is-active --quiet "$systemd_service"; then
+                  echo "Coordinator service stopped before becoming healthy." >&2
+                  return 1
+                fi
+                sleep 1
+              done
+              echo "Coordinator health check timed out after 30 seconds." >&2
+              return 1
+            }
+
+            require_http_code() {
+              local expected="$1"
+              local url="$2"
+              shift 2
+              local actual
+              actual="$(curl -sS -o /dev/null -w '%{http_code}' "$@" "$url")" || return 1
+              if [ "$actual" != "$expected" ]; then
+                echo "Expected HTTP $expected from $url, received $actual." >&2
+                return 1
+              fi
+            }
+
             verify_release() {
-              sleep 5
-              curl -fsS "http://127.0.0.1:$app_port/health" >/dev/null
+              local cors_headers
+              local main_pid
+
+              wait_for_health || return 1
               curl -fsS "http://127.0.0.1:$app_port/release" \
-                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ github.sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"' \
+                || return 1
               curl -fsS "http://127.0.0.1:$app_port/protocol" \
-                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None'
-              test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/openapi.json")" = "404"
-              test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/zkpassport/validator")" = "404"
-              test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None' \
+                || return 1
+              require_http_code 404 "http://127.0.0.1:$app_port/openapi.json" \
+                || return 1
+              require_http_code 404 \
+                "http://127.0.0.1:$app_port/zkpassport/validator" \
+                || return 1
+              require_http_code 404 \
+                "http://127.0.0.1:$app_port/v1/zkpassport/sign" \
                 -H 'Content-Type: application/json' -d '{}' \
-                "http://127.0.0.1:$app_port/v1/zkpassport/sign")" = "404"
-              test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                || return 1
+              require_http_code 503 \
+                "http://127.0.0.1:$app_port/auth/challenge" \
                 -H 'Content-Type: application/json' \
                 -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
-                "http://127.0.0.1:$app_port/auth/challenge")" = "503"
+                || return 1
 
-              cors_headers="$(mktemp)"
-              test "$(curl -sS -D "$cors_headers" -o /dev/null -w '%{http_code}' \
+              cors_headers="$(mktemp)" || return 1
+              require_http_code 400 \
+                "http://127.0.0.1:$app_port/auth/challenge" \
+                -D "$cors_headers" \
                 -X OPTIONS \
                 -H 'Origin: http://localhost:4200' \
                 -H 'Access-Control-Request-Method: POST' \
-                "http://127.0.0.1:$app_port/auth/challenge")" = "400"
-              ! grep -qi '^access-control-allow-origin:' "$cors_headers"
-              ! grep -qi '^access-control-allow-credentials:' "$cors_headers"
+                || { rm -f "$cors_headers"; return 1; }
+              if grep -qi '^access-control-allow-origin:' "$cors_headers"; then
+                echo "Blocked localhost origin received a CORS allow-origin header." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              if grep -qi '^access-control-allow-credentials:' "$cors_headers"; then
+                echo "Blocked localhost origin received a credentials header." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              rm -f "$cors_headers"
+
+              cors_headers="$(mktemp)" || return 1
+              require_http_code 200 \
+                "http://127.0.0.1:$app_port/auth/challenge" \
+                -D "$cors_headers" \
+                -X OPTIONS \
+                -H 'Origin: https://staging.solslot.com' \
+                -H 'Access-Control-Request-Method: POST' \
+                || { rm -f "$cors_headers"; return 1; }
+              if ! grep -qi \
+                '^access-control-allow-origin: https://staging\.solslot\.com' \
+                "$cors_headers"; then
+                echo "Staging origin did not receive its exact CORS header." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              if grep -qi '^access-control-allow-credentials:' "$cors_headers"; then
+                echo "Staging CORS unexpectedly permits credentials." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
               rm -f "$cors_headers"
 
               sudo systemctl show "$systemd_service" --property=ExecStart --value \
-                | grep -q 'solslot_api.app:app'
-              if sudo find "$release_dir" "$shared_root" -xdev -type f \
-                -iname '*validator*seed*' -print -quit | grep -q .; then
+                | grep -q 'solslot_api.app:app' \
+                || return 1
+              if sudo find "$release_dir" -xdev -type f \
+                -iname '*.seed' -print -quit | grep -q .; then
+                echo "Validator seed file exists in the coordinator release." >&2
+                return 1
+              fi
+              if sudo find "$shared_root" -xdev -type f \
+                \( -iname '*.seed' -o -iname '*.seed.hex' \) \
+                -print -quit | grep -q .; then
                 echo "Validator seed material exists on the coordinator." >&2
                 return 1
               fi
+              if sudo test -e /etc/solslot-validator/private/validator.seed; then
+                echo "Validator host material exists on the coordinator." >&2
+                return 1
+              fi
               main_pid="$(sudo systemctl show "$systemd_service" --property=MainPID --value)"
-              if sudo grep -zq '^SOLSLOT_VALIDATOR_SEED_FILE=' "/proc/$main_pid/environ"; then
+              if ! [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Coordinator service has no live main process." >&2
+                return 1
+              fi
+              if sudo grep -zEq '^SOLSLOT_VALIDATOR_SEED_(FILE|HEX)=' \
+                "/proc/$main_pid/environ"; then
                 echo "Coordinator process received validator seed configuration." >&2
                 return 1
               fi
-              ss -ltn | grep -Eq "127\\.0\\.0\\.1:$app_port[[:space:]]"
-              ! ss -ltn | grep -Eq "(0\\.0\\.0\\.0|\\[::\\]):$app_port[[:space:]]"
+              ss -ltn | grep -Eq "127\\.0\\.0\\.1:$app_port[[:space:]]" \
+                || return 1
+              if ss -ltn | grep -Eq \
+                "(0\\.0\\.0\\.0|\\[::\\]):$app_port[[:space:]]"; then
+                echo "Coordinator port is listening on a public address." >&2
+                return 1
+              fi
             }
 
             if ! sudo systemctl restart "$systemd_service" || ! verify_release; then

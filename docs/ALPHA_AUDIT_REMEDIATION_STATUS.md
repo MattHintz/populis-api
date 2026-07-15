@@ -105,7 +105,7 @@ Alpha remains blocked on the following external and release-control work:
 1. Revoke and replace the exposed provider credential. Complete the RC2
    carryover record for reusable credentials; generate only signer 1/2,
    WireGuard, mTLS, invitation, and one-time ceremony material.
-2. Treat RC2 as frozen only after all five remote tags resolve to clean release
+2. Treat RC3 as frozen only after all five remote tags resolve to clean release
    commits and every required local and CI gate passes against those SHAs.
 3. Obtain independent protocol, EVM, credential-bridge, and ceremony approval
    against those exact commits. No unresolved security finding is accepted.

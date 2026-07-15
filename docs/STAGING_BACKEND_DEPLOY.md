@@ -100,15 +100,19 @@ State files are never packaged, copied from an earlier ceremony, or deleted by
 release cleanup.
 
 The workflow pins `SOLSLOT_RUNTIME_ENVIRONMENT=staging`, secure bootstrap
-cookies, HSTS/security headers, a 4 MiB application body limit, and a 30 second
-request timeout in the systemd drop-in. Staging startup fails if public docs,
-development CORS, insecure cookies, or disabled security headers are detected.
-The effective service environment must include:
+cookies, HSTS/security headers, the reviewed Cloudflare IPv4 and IPv6 source
+ranges, a 4 MiB application body limit, and a 30 second request timeout in the
+systemd unit. Staging startup fails if the proxy pin is absent, public docs or
+development CORS are enabled, cookies are insecure, or security headers are
+disabled. The effective service environment must include:
 
 ```text
 SOLSLOT_API_DOCS_ENABLED=false
 SOLSLOT_SECURITY_HEADERS_ENABLED=true
 SOLSLOT_HSTS_ENABLED=true
+SOLSLOT_VAULT_SESSION_COOKIE_SECURE=true
+SOLSLOT_TRUSTED_PROXY_CIDRS=<reviewed Cloudflare IPv4 and IPv6 ranges>
+SOLSLOT_CORS_ORIGINS=https://staging.solslot.com
 SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304
 SOLSLOT_REQUEST_TIMEOUT_SECONDS=30
 SOLSLOT_CHALLENGE_STORE_PATH=/opt/solslot/api-staging/shared/state/challenges_v2.db
@@ -118,6 +122,19 @@ The challenge database is SQLite-WAL state shared by vault registration and
 admin-login namespaces. It makes issuance quotas and nonce consumption atomic
 across process restarts and future worker fan-out. Never place it inside a
 release directory or replace it during a code rollback.
+
+The Cloudflare range pin is non-secret infrastructure configuration. Its
+versioned value lives in the staging workflow and is sourced from
+`https://api.cloudflare.com/client/v4/ips`. Compare it with that endpoint
+before each release candidate and whenever Cloudflare announces an address
+change. Do not replace it with a broad public range or a forwarded-header
+wildcard.
+
+The staging unit overrides any stale CORS value in the shared environment and
+permits only `https://staging.solslot.com`, without credentialed cross-origin
+requests. The production unit is independently pinned to the production
+origin; do not combine development, staging, and production origins in one
+runtime setting.
 
 ## Reverse Proxy Contract
 
@@ -143,6 +160,12 @@ a host-name mismatch or branch-like protocol reference.
 
 No passphrase, private key, bearer token, seed, or RPC secret belongs in a
 workflow variable, source file, release archive, or issue log.
+
+The coordinator preflight rejects validator seed configuration in its private
+environment, conventional signer-host seed paths, and actual `.seed` files in
+release or shared state. Public seed-generation tooling is intentionally part
+of the release archive so operators can prepare signer hosts offline; its
+filename is not evidence that a private seed is present.
 
 Reusable credentials follow
 `docs/CREDENTIAL_CARRYOVER_RC2_20260714.md`. A release does not trigger blanket
