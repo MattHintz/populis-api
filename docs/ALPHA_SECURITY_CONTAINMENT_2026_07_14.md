@@ -38,7 +38,7 @@ manifest, enrollment ledger, or Chia state directory was deleted.
 
 ## Verification
 
-- API suite: `510 passed`.
+- Deployed containment release API suite: `510 passed`.
 - Customer staging bundle: build passed; generated namespace gate passed for
   510 files.
 - API source namespace gate: passed.
@@ -53,18 +53,26 @@ manifest, enrollment ledger, or Chia state directory was deleted.
 - The host `current` symlink resolves to the compound API/protocol release;
   its `.release-ready` marker is present and only `127.0.0.1:8790` listens.
 
+The newer remediation candidate is not deployed or frozen. Current local
+evidence is 529 API tests, 742 protocol tests, 17 EVM tests, 220 customer-web
+tests, 778 admin-portal tests, and 11 focused legacy Beta backend tests. All
+six active namespace surfaces and their applicable builds, secret scans, and
+whitespace gates pass. These results do not authorize a ceremony from the
+dirty worktrees.
+
 ## Still Blocking Alpha
 
 1. Revoke the exposed third-party RPC credential at the provider. Source
    removal and scans do not invalidate a copied credential.
 2. Complete the independent protocol and EVM review, including the pool V3
    and credential bridge changes.
-3. Implement and audit threshold validator signing; a configured number alone
-   is not sufficient.
-4. Deploy a fresh chain-bound admin authority and rotate all ceremony secrets.
-5. Run a clean V2 genesis from frozen, clean commits and publish signed,
-   checksummed artifacts.
-6. Complete a new zkPassport-to-EVM-to-Chia vault stamp and prove recovery
+3. Audit the implemented 2-of-3 validator coordinator and provision three
+   independently controlled signer hosts over private authenticated transport.
+4. Commit and freeze the five remediation worktrees, deploy a fresh chain-bound
+   admin authority, and rotate all ceremony secrets.
+5. Pass the live API preflight plus offline `pre-broadcast` gate, run one clean
+   V2 genesis, then pass the signed/checksummed `post-genesis` gate.
+6. Complete new EVM and BLS zkPassport-to-EVM-to-Chia vault stamps and prove recovery
    with browser state cleared before enabling offers or minting.
 7. Save and set `academy.solslot.com` live in Intercom, then require a public
    `200` response before marking the Help Center operational.

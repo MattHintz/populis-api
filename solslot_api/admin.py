@@ -4,25 +4,14 @@ Run-once ceremony routes use ``SOLSLOT_ADMIN_TOKEN`` while the bootstrap is
 unlocked. Post-genesis mutation routes require a short-lived JWT derived from
 the current chain-bound admin records.
 
-Endpoints:
-  POST /admin/deploy/protocol      — atomic 4-coin deployment of the full stack
-  GET  /admin/deployment           — current persisted manifest
-  POST /admin/governance/propose   — open a new proposal (SGT lock + bill)
-  POST /admin/governance/vote      — cast additional SGT lock votes
-  POST /admin/governance/execute   — fire a passed proposal (after deadline)
-  POST /admin/governance/expire    — clear a below-quorum proposal
-
-The governance endpoints are deliberately lower-level: they take the raw
-SGT spend bundle from the operator's own wallet driver and only handle the
-tracker-side spend.  This avoids embedding wallet management in the API
-while still letting the operator drive a full governance flow.
+The active post-genesis surface is limited to authenticated bridge-pool
+replenishment. Genesis coordinates are immutable and come only from the
+threshold-signed V2 public artifact.
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -30,9 +19,8 @@ from pydantic import BaseModel, Field
 
 from .admin_auth import require_admin_jwt
 from .config import Settings, get_settings
-from .deployment_manifest import load_deployment_manifest
-from .protocol_config import build_snapshot as build_protocol_config_snapshot
 from .credential_auth import require_alpha_writes
+from .public_artifact import PublicArtifactError, load_signed_public_artifact
 
 
 # Heavy chia/CLVM imports are deferred to inside the request handlers
@@ -156,58 +144,6 @@ def _coin_from_record(rec: dict):
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
-class DeployRequest(BaseModel):
-    """Request body for ``POST /admin/deploy/protocol``."""
-
-    quorum_bps: int = Field(5000, ge=1, le=10000)
-    voting_window_seconds: int = Field(300, ge=1)
-    sgt_total_supply: int = Field(1_000_000, ge=1)
-    min_proposal_stake: int = Field(10_000, ge=1)
-    fp_scale: int = Field(1000, ge=1)
-    initial_pool_status: int = Field(1, ge=0, le=1)
-    fee_per_spend: int = Field(0, ge=0)
-    # Optional: restrict to specific faucet coins by name.  When omitted, the
-    # 4 smallest unspent faucet coins are used (smallest-first to minimize
-    # change output count).  SGT genesis needs ≥ sgt_total_supply mojos in
-    # one of them.
-    sgt_coin_id: Optional[str] = None
-    pool_coin_id: Optional[str] = None
-    did_coin_id: Optional[str] = None
-    gov_coin_id: Optional[str] = None
-    dry_run: bool = Field(
-        False,
-        description=(
-            "When true, compute and return the deployment plan without "
-            "pushing the bundle to chain or persisting the manifest."
-        ),
-    )
-
-
-class DeployResponse(BaseModel):
-    spend_bundle_id: Optional[str]
-    pushed: bool
-    manifest: dict[str, Any]
-
-
-class ManifestResponse(BaseModel):
-    deployed: bool
-    manifest: Optional[dict[str, Any]] = None
-
-
-class ProtocolConfigFinalizeRequest(BaseModel):
-    launcher_id: str = Field(..., min_length=1)
-
-
-class ProtocolConfigFinalizeResponse(BaseModel):
-    updated: bool
-    env_file_path: str
-    previous_protocol_config_launcher_id: Optional[str]
-    protocol_config_launcher_id: str
-    protocol_config_hash: Optional[str]
-    protocol_config_version: int
-    network: str
-
-
 class BridgePoolTopUpRequest(BaseModel):
     count: int = Field(6, ge=1, le=50)
     start_amount: int = Field(1, ge=1)
@@ -232,191 +168,6 @@ class BridgePoolTopUpResponse(BaseModel):
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
-@router.get("/deployment", response_model=ManifestResponse,
-            dependencies=[Depends(require_admin_token)])
-async def get_deployment(
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> ManifestResponse:
-    """Return the persisted deployment manifest if present."""
-    path = Path(settings.deployment_manifest_path)
-    if not path.exists():
-        return ManifestResponse(deployed=False, manifest=None)
-    try:
-        manifest = load_deployment_manifest(path)
-    except (ValueError, json.JSONDecodeError) as e:
-        logger.exception("Failed to load deployment manifest %s: %s", path, e)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Manifest at {path} is corrupt: {e}",
-        ) from e
-    return ManifestResponse(deployed=True, manifest=manifest)
-
-
-@router.post("/protocol-config/finalize", response_model=ProtocolConfigFinalizeResponse,
-             dependencies=[Depends(require_admin_token)])
-async def finalize_protocol_config(
-    body: ProtocolConfigFinalizeRequest,
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> ProtocolConfigFinalizeResponse:
-    require_alpha_writes(settings)
-    launcher_id = _normalize_32_byte_hex(body.launcher_id, "launcher_id")
-    env_path = _settings_env_file_path()
-    previous = settings.protocol_config_launcher_id
-    _upsert_env_assignment(env_path, "SOLSLOT_PROTOCOL_CONFIG_LAUNCHER_ID", launcher_id)
-    get_settings.cache_clear()
-    reloaded = get_settings()
-    if reloaded.protocol_config_launcher_id != launcher_id:
-        raise HTTPException(
-            status_code=500,
-            detail="Protocol config launcher id was written but settings reload did not observe it.",
-        )
-    snapshot = _protocol_config_snapshot(reloaded)
-    return ProtocolConfigFinalizeResponse(
-        updated=previous != launcher_id,
-        env_file_path=str(env_path),
-        previous_protocol_config_launcher_id=previous,
-        protocol_config_launcher_id=reloaded.protocol_config_launcher_id,
-        protocol_config_hash=snapshot.content_hash_hex,
-        protocol_config_version=snapshot.config_version,
-        network=snapshot.chia_network,
-    )
-
-
-@router.post("/deploy/protocol", response_model=DeployResponse,
-             dependencies=[Depends(require_admin_token)])
-async def deploy_protocol(
-    body: DeployRequest,
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> DeployResponse:
-    if not body.dry_run:
-        require_alpha_writes(settings)
-    """Atomically deploy the protocol stack to chain.
-
-    Selects 4 unspent faucet coins (or uses the explicitly-named ones from
-    the request), computes the deployment plan, builds the signed
-    SpendBundle, optionally pushes it to coinset.org, and persists the
-    manifest to disk.
-
-    A re-deploy is rejected if a manifest already exists — the operator
-    must remove the file (or change ``deployment_manifest_path``) to
-    deliberately re-deploy.
-    """
-    # Lazy CLVM imports — see module note about LazyNode thread binding
-    from chia_rs.sized_bytes import bytes32
-    from solslot_puzzles.protocol_deployment import (
-        ProtocolDeploymentParams,
-        ProtocolDeploymentPlan,
-        build_deployment_bundle,
-        plan_to_manifest_dict,
-        save_manifest,
-    )
-
-    manifest_path = Path(settings.deployment_manifest_path)
-    if manifest_path.exists() and not body.dry_run:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Deployment manifest already exists at {manifest_path}; "
-                "remove it (or change SOLSLOT_DEPLOYMENT_MANIFEST_PATH) to "
-                "deliberately re-deploy."
-            ),
-        )
-
-    faucet = _faucet_or_503()
-    coinset = _coinset_or_502()
-
-    # Fetch unspent faucet coins (excluding any explicitly-named coins from
-    # the request, those are looked up directly).
-    coin_records = await coinset.get_coin_records_by_puzzle_hash(
-        "0x" + faucet.address_puzzle_hash.hex(), include_spent=False
-    )
-    unspent: list = []
-    for rec in coin_records:
-        if rec.get("spent_block_index") in (0, None):
-            unspent.append(_coin_from_record(rec))
-
-    sgt_amount_required = body.sgt_total_supply + body.fee_per_spend
-    launcher_amount_required = 1 + body.fee_per_spend
-
-    sgt_coin = _select_coin_by_id(unspent, body.sgt_coin_id, sgt_amount_required, "sgt_coin")
-    pool_coin = _select_coin_by_id(unspent, body.pool_coin_id, launcher_amount_required, "pool_coin")
-    did_coin = _select_coin_by_id(unspent, body.did_coin_id, launcher_amount_required, "did_coin")
-    gov_coin = _select_coin_by_id(unspent, body.gov_coin_id, launcher_amount_required, "gov_coin")
-
-    # Distinct coins
-    selected_names = {sgt_coin.name(), pool_coin.name(), did_coin.name(), gov_coin.name()}
-    if len(selected_names) != 4:
-        raise HTTPException(
-            status_code=409,
-            detail="Selected coins must be 4 distinct unspent faucet coins.",
-        )
-
-    plan = ProtocolDeploymentPlan(
-        network=settings.network,
-        params=ProtocolDeploymentParams(
-            quorum_bps=body.quorum_bps,
-            voting_window_seconds=body.voting_window_seconds,
-            sgt_total_supply=body.sgt_total_supply,
-            min_proposal_stake=body.min_proposal_stake,
-            fp_scale=body.fp_scale,
-            initial_pool_status=body.initial_pool_status,
-        ),
-        faucet_inner_puzhash=faucet.address_puzzle_hash,
-        sgt_genesis_coin_id=bytes32(sgt_coin.name()),
-        pool_genesis_coin_id=bytes32(pool_coin.name()),
-        did_genesis_coin_id=bytes32(did_coin.name()),
-        gov_genesis_coin_id=bytes32(gov_coin.name()),
-    )
-
-    if body.dry_run:
-        return DeployResponse(
-            spend_bundle_id=None,
-            pushed=False,
-            manifest=plan_to_manifest_dict(plan),
-        )
-
-    deployment = build_deployment_bundle(
-        plan=plan,
-        faucet=faucet,
-        sgt_coin=sgt_coin,
-        pool_coin=pool_coin,
-        did_coin=did_coin,
-        gov_coin=gov_coin,
-        fee_per_spend=body.fee_per_spend,
-    )
-
-    try:
-        push_result = await coinset.push_tx(_spend_bundle_to_json(deployment.spend_bundle))
-    except Exception as e:
-        logger.exception("coinset push_tx failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"coinset.org rejected the spend: {e}") from e
-
-    if not push_result.get("success"):
-        status_msg = push_result.get("status") or push_result.get("error") or push_result
-        logger.warning("Deployment push_tx returned non-success: %s", status_msg)
-        # Don't persist the manifest if the push failed — caller can re-run.
-        raise HTTPException(
-            status_code=502,
-            detail=f"Deployment bundle was rejected: {status_msg}",
-        )
-
-    # Persist the manifest only after a successful push.
-    save_manifest(plan, manifest_path)
-    logger.info(
-        "Protocol deployed: tracker_launcher_id=%s pool_launcher_id=%s "
-        "did_launcher_id=%s sgt_genesis=%s",
-        plan.tracker_launcher_id.hex(),
-        plan.pool_launcher_id.hex(),
-        plan.did_launcher_id.hex(),
-        plan.sgt_genesis_coin_id.hex(),
-    )
-    return DeployResponse(
-        spend_bundle_id=deployment.spend_bundle_id,
-        pushed=True,
-        manifest=plan_to_manifest_dict(plan),
-    )
-
-
 @router.post(
     "/zkpassport/bridge-pool/top-up",
     response_model=BridgePoolTopUpResponse,
@@ -437,10 +188,17 @@ async def top_up_zkpassport_bridge_pool(
         require_alpha_writes(settings)
     faucet = _faucet_or_503()
     coinset = _coinset_or_502()
-    bridge_policy_hash = _normalize_32_byte_hex(
-        settings.zkpassport_bridge_policy_hash,
-        "zkpassport_bridge_policy_hash",
-    )
+    try:
+        artifact = load_signed_public_artifact(settings)
+        bridge_policy_hash = _normalize_32_byte_hex(
+            artifact["bridgePolicy"]["policyHash"],
+            "signed bridge policy hash",
+        )
+    except (KeyError, TypeError, PublicArtifactError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A valid signed V2 artifact is required for bridge replenishment.",
+        ) from exc
 
     amounts = [body.start_amount + offset for offset in range(body.count)]
     total_required = sum(amounts) + body.fee
@@ -515,13 +273,6 @@ async def top_up_zkpassport_bridge_pool(
     )
 
 
-def _settings_env_file_path() -> Path:
-    configured = Settings.model_config.get("env_file", ".env")
-    if isinstance(configured, (list, tuple)):
-        configured = configured[0] if configured else ".env"
-    return Path(str(configured))
-
-
 def _normalize_32_byte_hex(value: str, label: str) -> str:
     raw = value.strip()
     if raw.startswith("0X"):
@@ -535,48 +286,6 @@ def _normalize_32_byte_hex(value: str, label: str) -> str:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"{label} must be hex.") from e
     return "0x" + raw.lower()
-
-
-def _upsert_env_assignment(path: Path, key: str, value: str) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    out: list[str] = []
-    seen = False
-    for line in lines:
-        stripped = line.strip()
-        candidate = stripped.removeprefix("export ").split("=", 1)[0].strip() if "=" in stripped else ""
-        if candidate == key:
-            out.append(f"{key}={value}")
-            seen = True
-        else:
-            out.append(line)
-    if not seen:
-        if out and out[-1].strip():
-            out.append("")
-        out.append(f"{key}={value}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
-    path.chmod(0o600)
-
-
-def _protocol_config_snapshot(settings: Settings):
-    pool_launcher_id = settings.pool_launcher_id
-    governance_launcher_id = settings.governance_launcher_id
-    try:
-        manifest_path = Path(settings.deployment_manifest_path)
-        if manifest_path.exists():
-            manifest = load_deployment_manifest(manifest_path)
-            pool_launcher_id = manifest["pool_launcher_id"]
-            governance_launcher_id = manifest["tracker_launcher_id"]
-    except Exception:
-        pass
-    return build_protocol_config_snapshot(
-        settings,
-        pool_launcher_id_hex=pool_launcher_id,
-        governance_launcher_id_hex=governance_launcher_id,
-    )
 
 
 def _select_coin_by_id(

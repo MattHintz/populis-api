@@ -473,6 +473,49 @@ def get_store() -> ChallengeStore:
     return _store
 
 
+def preflight_challenge_storage(settings: object) -> None:
+    """Prove deployed challenge state is persistent and writable at boot.
+
+    A relative default is convenient for development, but it is dangerous in
+    an atomic release directory: a restart or rollback can silently reset the
+    quota ledger.  Staging and production therefore require one absolute,
+    writable SQLite path outside the release tree.  Initialising both stores
+    here also turns a permissions or read-only-filesystem mistake into a
+    failed deployment instead of a public 503 on the first challenge.
+    """
+    runtime_environment = str(getattr(settings, "runtime_environment", ""))
+    if runtime_environment not in {"staging", "production"}:
+        return
+
+    configured_path = str(getattr(settings, "challenge_store_path", "")).strip()
+    path = Path(configured_path)
+    if not configured_path or not path.is_absolute():
+        raise RuntimeError(
+            "SOLSLOT_CHALLENGE_STORE_PATH must be an absolute shared-state "
+            "path in staging/production."
+        )
+
+    try:
+        RequestRateLimiter(
+            int(getattr(settings, "challenge_per_ip_per_minute")),
+            db_path=path,
+        )
+        ChallengeStore(
+            ttl_seconds=int(getattr(settings, "challenge_ttl_seconds")),
+            max_pending=int(getattr(settings, "challenge_store_max_pending")),
+            per_ip_per_minute=int(
+                getattr(settings, "challenge_per_ip_per_minute")
+            ),
+            db_path=path,
+            namespace="vault_registration",
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            "SOLSLOT_CHALLENGE_STORE_PATH is not writable SQLite state: "
+            f"{path}"
+        ) from exc
+
+
 def reset_store_for_tests() -> None:
     """Reset the module-level store (test-only helper)."""
     global _store

@@ -17,7 +17,7 @@ Pass 2 audit (CANON_SOLSLOT_API_AUDIT_2026_04_26 Pass 2) findings covered:
   - POP-CANON-008 / CL-1 + Producer Deadline — Faucet consolidation worker (opt-in, joins fragmented UTXOs)
   - POP-CANON-009 / Documentation drift — faucet_max_spend_mojos enforced via select_coin max_amount
   - POP-CANON-010 / LD-2                — coinset query pagination via start_height (limit unsupported upstream)
-  - POP-CANON-011 / SN-3                — pool_launcher_id read from manifest fresh on each request
+  - POP-CANON-011 / SN-3                — pool launcher comes only from signed V2 artifact
 """
 from __future__ import annotations
 
@@ -605,6 +605,7 @@ class TestChallengeDoSFalsifiers:
             deployment_manifest_path="/tmp/no-solslot-test-manifest.json",
             pool_launcher_id=None,
             network="testnet11",
+            trusted_proxy_cidr_list=lambda: [],
         )
 
     def _request(self, *, xff: str, peer: str = "203.0.113.10"):
@@ -613,6 +614,10 @@ class TestChallengeDoSFalsifiers:
         return SimpleNamespace(
             headers={"x-forwarded-for": xff},
             client=SimpleNamespace(host=peer),
+            scope={
+                "client": (peer, 443),
+                "headers": [(b"x-forwarded-for", xff.encode("ascii"))],
+            },
         )
 
     @pytest.mark.asyncio
@@ -831,134 +836,78 @@ class TestCoinsetPaginationCursor:
 
 
 # ============================================================================
-# POP-CANON-011 — pool_launcher_id resolution prefers manifest over cached env
+# POP-CANON-011 — pool launcher resolution requires signed V2 authority
 # ============================================================================
-class TestPoolLauncherManifestPreference:
-    """Pre-fix: ``settings.pool_launcher_id`` was the single source for both
-    /auth/challenge and /vault/register/chia.  The Settings instance is
-    cached by ``@lru_cache`` and reads env vars at process start; an admin
-    redeploying the protocol via ``/admin/deploy/protocol`` writes a new
-    manifest to disk but does NOT update Settings.  Result: post-redeploy
-    challenges and BLS registrations bind to the OLD pool until restart.
+class TestPoolLauncherSignedArtifactAuthority:
+    """Vault registration must fail closed without signed ceremony authority."""
 
-    Post-fix: ``_pool_launcher_id_or_zero(settings)`` and its companion
-    ``_read_pool_launcher_from_manifest(path)`` read the manifest fresh
-    from disk on every call, falling back to the env value if no manifest
-    exists.  Mirrors Chia's "no @lru_cache on Service config" pattern."""
-
-    def _make_settings(self, manifest_path: str, env_pool_id):
-        """Build a Settings-like stub with the two fields the resolver reads."""
+    def test_signed_artifact_pool_is_used(self, monkeypatch):
         from types import SimpleNamespace
 
-        return SimpleNamespace(
-            deployment_manifest_path=manifest_path,
-            pool_launcher_id=env_pool_id,
-        )
-
-    def test_manifest_pool_id_wins_over_env(self, tmp_path):
-        """When the manifest exists with a pool_launcher_id, the resolver
-        must return that value, NOT the env-based fallback."""
-        import json
-
+        from solslot_api import app as app_module
         from solslot_api.app import _pool_launcher_id_or_zero
 
-        manifest = tmp_path / "manifest.json"
-        manifest.write_text(json.dumps({
-            "pool_launcher_id": "0x" + "ab" * 32,
-            "tracker_launcher_id": "0x" + "cd" * 32,
-            "did_launcher_id": "0x" + "ef" * 32,
-            "sgt_genesis_coin_id": "0x" + "01" * 32,
-        }))
-
-        settings = self._make_settings(
-            str(manifest),
-            env_pool_id="0x" + "ff" * 32,  # stale env value
+        monkeypatch.setattr(
+            app_module,
+            "load_signed_public_artifact",
+            lambda _settings: {"launcherIds": {"pool": "0x" + "ab" * 32}},
         )
-        result = _pool_launcher_id_or_zero(settings)
-        assert result.hex() == "ab" * 32, (
-            "manifest must win over the cached env value (POP-CANON-011)"
+        settings = SimpleNamespace(
+            pool_launcher_id="0x" + "ff" * 32,
+            deployment_manifest_path="/untrusted/manifest.json",
         )
+        assert _pool_launcher_id_or_zero(settings).hex() == "ab" * 32
 
-    def test_env_used_when_manifest_missing(self, tmp_path):
-        """When no manifest exists, the resolver falls back to the env value
-        — the bootstrap default before any deploy."""
+    def test_missing_artifact_disables_registration(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+        from solslot_api import app as app_module
+        from solslot_api.app import _pool_launcher_id_or_zero
+        from solslot_api.public_artifact import PublicArtifactMissing
+
+        def missing(_settings):
+            raise PublicArtifactMissing("missing")
+
+        monkeypatch.setattr(app_module, "load_signed_public_artifact", missing)
+        with pytest.raises(HTTPException) as exc:
+            _pool_launcher_id_or_zero(SimpleNamespace(pool_launcher_id=None))
+        assert exc.value.status_code == 503
+
+    def test_incomplete_artifact_disables_registration(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+        from solslot_api import app as app_module
         from solslot_api.app import _pool_launcher_id_or_zero
 
-        settings = self._make_settings(
-            str(tmp_path / "no_such_file.json"),
-            env_pool_id="0x" + "cc" * 32,
+        monkeypatch.setattr(
+            app_module,
+            "load_signed_public_artifact",
+            lambda _settings: {"launcherIds": {}},
         )
-        result = _pool_launcher_id_or_zero(settings)
-        assert result.hex() == "cc" * 32
+        with pytest.raises(HTTPException) as exc:
+            _pool_launcher_id_or_zero(
+                SimpleNamespace(pool_launcher_id="0x" + "ff" * 32)
+            )
+        assert exc.value.status_code == 503
 
-    def test_zero_when_neither_present(self, tmp_path):
-        """No manifest + no env = zero placeholder (Phase-0 smoke testing)."""
+    def test_artifact_is_rechecked_for_each_registration(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from solslot_api import app as app_module
         from solslot_api.app import _pool_launcher_id_or_zero
 
-        settings = self._make_settings(
-            str(tmp_path / "no_such_file.json"),
-            env_pool_id=None,
+        state = {"pool": "0x" + "aa" * 32}
+        monkeypatch.setattr(
+            app_module,
+            "load_signed_public_artifact",
+            lambda _settings: {"launcherIds": {"pool": state["pool"]}},
         )
-        result = _pool_launcher_id_or_zero(settings)
-        assert result.hex() == "00" * 32
-
-    def test_manifest_read_picks_up_new_pool_after_redeploy(self, tmp_path):
-        """The simulated admin redeploy: write manifest A, read pool_id A;
-        overwrite manifest with B, read pool_id B — without any cache
-        clear or process restart.  This is the core POP-CANON-011 property."""
-        import json
-
-        from solslot_api.app import _pool_launcher_id_or_zero
-
-        manifest = tmp_path / "manifest.json"
-        settings = self._make_settings(str(manifest), env_pool_id=None)
-
-        # First deploy: pool A.
-        manifest.write_text(json.dumps({"pool_launcher_id": "0x" + "aa" * 32}))
-        first = _pool_launcher_id_or_zero(settings)
-        assert first.hex() == "aa" * 32
-
-        # Admin redeploys: pool B replaces pool A on disk.
-        manifest.write_text(json.dumps({"pool_launcher_id": "0x" + "bb" * 32}))
-        second = _pool_launcher_id_or_zero(settings)
-        assert second.hex() == "bb" * 32, (
-            "post-redeploy resolution must see the new pool without restart"
-        )
-        assert second != first, "the two resolutions MUST differ"
-
-    def test_malformed_manifest_falls_back_to_env(self, tmp_path):
-        """A corrupt manifest file must NOT raise; the resolver falls back
-        to the env value.  Defensive behaviour for partial admin writes."""
-        from solslot_api.app import _pool_launcher_id_or_zero
-
-        manifest = tmp_path / "manifest.json"
-        manifest.write_text("{ this is not valid json")
-
-        settings = self._make_settings(
-            str(manifest),
-            env_pool_id="0x" + "ee" * 32,
-        )
-        result = _pool_launcher_id_or_zero(settings)
-        assert result.hex() == "ee" * 32, (
-            "malformed manifest must not crash the resolver"
-        )
-
-    def test_manifest_without_pool_key_falls_back_to_env(self, tmp_path):
-        """A valid manifest that simply doesn't carry pool_launcher_id falls
-        back to env."""
-        import json
-
-        from solslot_api.app import _pool_launcher_id_or_zero
-
-        manifest = tmp_path / "manifest.json"
-        manifest.write_text(json.dumps({"some_other_key": "value"}))
-
-        settings = self._make_settings(
-            str(manifest),
-            env_pool_id="0x" + "dd" * 32,
-        )
-        result = _pool_launcher_id_or_zero(settings)
-        assert result.hex() == "dd" * 32
+        settings = SimpleNamespace()
+        assert _pool_launcher_id_or_zero(settings).hex() == "aa" * 32
+        state["pool"] = "0x" + "bb" * 32
+        assert _pool_launcher_id_or_zero(settings).hex() == "bb" * 32
 
 
 # ============================================================================

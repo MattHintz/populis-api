@@ -932,6 +932,7 @@ class TestSettingsIntegration:
         """
         from fastapi.testclient import TestClient
         from solslot_api.app import app
+        from solslot_api.admin_auth import require_admin_jwt
         from solslot_api.config import get_settings
 
         records = [
@@ -949,11 +950,15 @@ class TestSettingsIntegration:
         monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         get_settings.cache_clear()
 
-        with TestClient(app) as client:
-            r = client.get("/admin/auth/authority_v2")
+        app.dependency_overrides[require_admin_jwt] = lambda: None
+        try:
+            with TestClient(app) as client:
+                r = client.get("/admin/auth/authority_v2")
+        finally:
+            app.dependency_overrides.pop(require_admin_jwt, None)
         assert r.status_code == 200
         body = r.json()
-        assert body["gating_source"] == "SOLSLOT_ADMIN_RECORDS_PATH"
+        assert body["gating_source"] == "test-expanded-record-fixture"
         assert body["informational_only"] is False
 
     def test_authority_v2_endpoint_uses_finalized_bootstrap_artifacts(
@@ -965,6 +970,7 @@ class TestSettingsIntegration:
         """
         from fastapi.testclient import TestClient
         from solslot_api.app import app
+        from solslot_api.admin_auth import require_admin_jwt
         from solslot_api.config import get_settings
 
         launcher_id = "0x" + "10" * 32
@@ -1003,8 +1009,12 @@ class TestSettingsIntegration:
         monkeypatch.setenv("SOLSLOT_ADMIN_JWT_SECRET", "x" * 64)
         get_settings.cache_clear()
 
-        with TestClient(app) as client:
-            r = client.get("/admin/auth/authority_v2")
+        app.dependency_overrides[require_admin_jwt] = lambda: None
+        try:
+            with TestClient(app) as client:
+                r = client.get("/admin/auth/authority_v2")
+        finally:
+            app.dependency_overrides.pop(require_admin_jwt, None)
         assert r.status_code == 200
         body = r.json()
         assert body["enabled"] is True
@@ -1014,7 +1024,7 @@ class TestSettingsIntegration:
         assert body["authority_version"] == 4
         assert body["deployment_status"] == "deployed-configured"
         assert body["chain_verifiable"] is True
-        assert body["gating_source"] == "SOLSLOT_ADMIN_RECORDS_PATH"
+        assert body["gating_source"] == "test-expanded-record-fixture"
         assert body["informational_only"] is False
 
 

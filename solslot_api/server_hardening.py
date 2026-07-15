@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Mapping
 
 from starlette.exceptions import HTTPException
 
@@ -188,12 +189,8 @@ class ServerHardeningMiddleware:
             and scope.get("path") == "/auth/challenge"
         )
 
-    @staticmethod
-    def _source_ip(scope: dict[str, Any]) -> str:
-        client = scope.get("client")
-        if isinstance(client, (tuple, list)) and client:
-            return str(client[0])
-        return "unknown"
+    def _source_ip(self, scope: dict[str, Any]) -> str:
+        return trusted_client_ip(scope, self.settings)
 
     @staticmethod
     async def _json_error(
@@ -219,4 +216,41 @@ class ServerHardeningMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
-__all__ = ["ServerHardeningMiddleware", "documentation_urls"]
+def trusted_client_ip(scope: Mapping[str, Any], settings: Settings) -> str:
+    """Resolve a client IP without accepting spoofable forwarding headers."""
+    client = scope.get("client")
+    peer = str(client[0]) if isinstance(client, (tuple, list)) and client else "unknown"
+    try:
+        peer_address = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+
+    trusted = False
+    for value in settings.trusted_proxy_cidr_list():
+        try:
+            if peer_address in ipaddress.ip_network(value, strict=True):
+                trusted = True
+                break
+        except ValueError:
+            continue
+    if not trusted:
+        return peer_address.compressed
+
+    forwarded = [
+        value.decode("ascii", errors="ignore").strip()
+        for name, value in scope.get("headers") or []
+        if name.lower() == b"cf-connecting-ip"
+    ]
+    if len(forwarded) != 1:
+        return peer_address.compressed
+    try:
+        return ipaddress.ip_address(forwarded[0]).compressed
+    except ValueError:
+        return peer_address.compressed
+
+
+__all__ = [
+    "ServerHardeningMiddleware",
+    "documentation_urls",
+    "trusted_client_ip",
+]

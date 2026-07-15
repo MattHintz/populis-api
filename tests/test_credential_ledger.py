@@ -7,14 +7,19 @@ from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from fastapi import HTTPException, Request
 
 from solslot_api.config import Settings
 from solslot_api.credential_auth import (
     OwnerAuth,
     OwnerChallengeRequest,
+    VAULT_SESSION_COOKIE,
     credential_bls_signing_digest,
+    issue_vault_session,
     issue_owner_challenge,
     verify_owner_auth,
+    verify_vault_session,
+    vault_session_payload,
 )
 from solslot_api.credential_ledger import (
     LedgerCircuitOpen,
@@ -90,11 +95,11 @@ def test_evm_owner_challenge_is_payload_bound_and_single_use(tmp_path):
             evm_address=account.address,
         )
     )
-    payload = {"vaultLauncherId": VAULT}
+    payload = vault_session_payload(settings)
     challenge = issue_owner_challenge(
         settings,
         vault_launcher_id=VAULT,
-        request=OwnerChallengeRequest(action="create", payload=payload),
+        request=OwnerChallengeRequest(action="session_login", payload=payload),
     )
     signed = Account.sign_message(
         encode_typed_data(full_message=challenge.typedData),
@@ -105,7 +110,7 @@ def test_evm_owner_challenge_is_payload_bound_and_single_use(tmp_path):
     verified = verify_owner_auth(
         settings,
         vault_launcher_id=VAULT,
-        action="create",
+        action="session_login",
         payload=payload,
         owner_auth=auth,
     )
@@ -114,10 +119,30 @@ def test_evm_owner_challenge_is_payload_bound_and_single_use(tmp_path):
         verify_owner_auth(
             settings,
             vault_launcher_id=VAULT,
-            action="create",
+            action="session_login",
             payload=payload,
             owner_auth=auth,
         )
+
+    token, public_session = issue_vault_session(settings, verified)
+    request = Request(
+        {
+            "type": "http",
+            "headers": [
+                (
+                    b"cookie",
+                    f"{VAULT_SESSION_COOKIE}={token}".encode("ascii"),
+                )
+            ],
+        }
+    )
+    recovered = verify_vault_session(settings, request, VAULT)
+    assert public_session.protocolVersion == "solslot-v2"
+    assert recovered.owner_key == account.address.lower()
+    assert recovered.vault_launcher_id == VAULT
+    with pytest.raises(HTTPException, match="does not match") as mismatch:
+        verify_vault_session(settings, request, "0x" + "99" * 32)
+    assert mismatch.value.status_code == 403
 
 
 def test_bls_owner_challenge_verifies_without_an_evm_identity(tmp_path):
@@ -131,11 +156,11 @@ def test_bls_owner_challenge_verifies_without_an_evm_identity(tmp_path):
             evm_address=None,
         )
     )
-    payload: dict[str, object] = {}
+    payload = {"evmTxHash": "0x" + "aa" * 32}
     challenge = issue_owner_challenge(
         settings,
         vault_launcher_id=VAULT,
-        request=OwnerChallengeRequest(action="stamp_prepare", payload=payload),
+        request=OwnerChallengeRequest(action="relay", payload=payload),
     )
     stored = get_credential_ledger(settings).get_owner_challenge(challenge.challengeId)
     assert stored is not None
@@ -143,7 +168,7 @@ def test_bls_owner_challenge_verifies_without_an_evm_identity(tmp_path):
     verified = verify_owner_auth(
         settings,
         vault_launcher_id=VAULT,
-        action="stamp_prepare",
+        action="relay",
         payload=payload,
         owner_auth=OwnerAuth(
             challengeId=challenge.challengeId,
@@ -234,4 +259,64 @@ def test_relay_nonce_budget_and_circuit_persist(tmp_path):
             per_owner_per_minute=10,
             per_vault_per_hour=10,
             global_gas_per_day=1000,
+        )
+
+
+def test_submitted_relay_is_bound_to_transaction_owner_vault_and_bridge(tmp_path):
+    settings = _settings(tmp_path)
+    ledger = get_credential_ledger(settings)
+    ledger.reserve_enrollment(record=_enrollment(), owner_key="owner")
+    request_digest = "0x" + "31" * 32
+    transaction_hash = "0x" + "32" * 32
+    ledger.reserve_relay(
+        request_digest=request_digest,
+        vault_launcher_id=VAULT,
+        owner_key="owner",
+        source_ip="127.0.0.1",
+        bridge_coin_id=BRIDGE,
+        forwarder_nonce=3,
+        inner_gas=100,
+        per_ip_per_minute=10,
+        per_owner_per_minute=10,
+        per_vault_per_hour=10,
+        global_gas_per_day=1000,
+    )
+
+    with pytest.raises(LedgerConflict):
+        ledger.require_submitted_relay(
+            transaction_hash=transaction_hash,
+            vault_launcher_id=VAULT,
+            owner_key="owner",
+            bridge_coin_id=BRIDGE,
+        )
+
+    ledger.finish_relay(
+        request_digest=request_digest,
+        tx_hash=transaction_hash,
+        error=None,
+        failure_threshold=5,
+        cooldown_seconds=60,
+    )
+    ledger.require_submitted_relay(
+        transaction_hash=transaction_hash,
+        vault_launcher_id=VAULT,
+        owner_key="owner",
+        bridge_coin_id=BRIDGE,
+    )
+
+    with pytest.raises(LedgerConflict):
+        ledger.require_submitted_relay(
+            transaction_hash=transaction_hash,
+            vault_launcher_id=VAULT,
+            owner_key="other",
+            bridge_coin_id=BRIDGE,
+        )
+
+    with pytest.raises(LedgerConflict):
+        ledger.finish_relay(
+            request_digest=request_digest,
+            tx_hash=transaction_hash,
+            error=None,
+            failure_threshold=5,
+            cooldown_seconds=60,
         )

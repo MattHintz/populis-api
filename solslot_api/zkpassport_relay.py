@@ -41,13 +41,14 @@ from web3 import Web3
 from web3.exceptions import ContractLogicError
 
 from .config import Settings
-from .credential_auth import OwnerAuth, verify_owner_auth
+from .credential_auth import OwnerAuth, verify_owner_auth, verify_vault_session
 from .credential_ledger import (
     LedgerCircuitOpen,
     LedgerConflict,
     LedgerRateLimited,
     get_credential_ledger,
 )
+from .server_hardening import trusted_client_ip
 
 router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
 
@@ -106,6 +107,29 @@ _FORWARDER_ABI = [
         "outputs": [{"name": "", "type": "uint256"}],
     },
 ]
+_EMITTER_SECURITY_ABI = [
+    {
+        "type": "function",
+        "name": "bridgePolicyHash",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "bytes32"}],
+    },
+    {
+        "type": "function",
+        "name": "isTrustedForwarder",
+        "stateMutability": "view",
+        "inputs": [{"name": "forwarder", "type": "address"}],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "type": "function",
+        "name": "trustedDirectRelayer",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "address"}],
+    },
+]
 
 
 def _load_settings() -> Settings:
@@ -130,13 +154,19 @@ class RelayRequest(BaseModel):
     deadline: int
     data: str
     signature: str
-    ownerAuth: OwnerAuth
 
 
 class RelayResponse(BaseModel):
     tx_hash: str
     relayer: str
     signer: str
+
+
+class BlsRelayRequest(BaseModel):
+    """Canonical emitter calldata authorized by the owning Chia BLS key."""
+
+    data: str = Field(..., min_length=10)
+    ownerAuth: OwnerAuth
 
 
 def _decode_enrollment_calldata(data: bytes) -> tuple[str, str, int]:
@@ -223,6 +253,45 @@ def _simulate_forwarded_inner_call(
     return "The emitter simulation succeeded; the failure is in the forwarder execution path."
 
 
+def _verify_emitter_deployment(
+    w3: Web3,
+    settings: Settings,
+    emitter_address: str,
+    *,
+    expected_forwarder: str | None = None,
+    expected_direct_relayer: str | None = None,
+) -> None:
+    expected_policy = str(settings.zkpassport_bridge_policy_hash or "").lower()
+    if re.fullmatch(r"0x[0-9a-f]{64}", expected_policy) is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The canonical zkPassport bridge policy is not configured.",
+        )
+    emitter = w3.eth.contract(address=emitter_address, abi=_EMITTER_SECURITY_ABI)
+    deployed_policy = Web3.to_hex(emitter.functions.bridgePolicyHash().call()).lower()
+    if deployed_policy != expected_policy:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configured emitter does not use the canonical Chia bridge policy.",
+        )
+    if expected_forwarder and not emitter.functions.isTrustedForwarder(
+        expected_forwarder
+    ).call():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configured emitter does not trust the canonical Solslot forwarder.",
+        )
+    if expected_direct_relayer:
+        deployed_relayer = Web3.to_checksum_address(
+            emitter.functions.trustedDirectRelayer().call()
+        )
+        if deployed_relayer != Web3.to_checksum_address(expected_direct_relayer):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Configured emitter does not trust this BLS relayer account.",
+            )
+
+
 @router.post(
     "/relay",
     response_model=RelayResponse,
@@ -264,14 +333,8 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
             detail=f"request.data is not canonical Solslot V2 enrollment calldata: {exc}",
         ) from exc
 
-    auth_payload = req.model_dump(by_alias=True, exclude={"ownerAuth"})
-    verified_owner = verify_owner_auth(
-        settings,
-        vault_launcher_id=vault_launcher_id,
-        action="relay",
-        payload=auth_payload,
-        owner_auth=req.ownerAuth,
-    )
+    auth_payload = req.model_dump(by_alias=True)
+    verified_owner = verify_vault_session(settings, request, vault_launcher_id)
     if verified_owner.vault_record.owner_evm_address and (
         verified_owner.vault_record.owner_evm_address.lower() != signer.lower()
     ):
@@ -327,6 +390,12 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
                 status_code=503,
                 detail="Fresh Solslot V2 forwarder or emitter bytecode is missing.",
             )
+        _verify_emitter_deployment(
+            w3,
+            settings,
+            emitter_addr,
+            expected_forwarder=forwarder_addr,
+        )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -368,7 +437,7 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     request_digest = "0x" + hashlib.sha256(
         json.dumps(auth_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    source_ip = request.client.host if request.client else "unknown"
+    source_ip = trusted_client_ip(request.scope, settings)
     try:
         ledger.reserve_relay(
             request_digest=request_digest,
@@ -425,3 +494,188 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
         cooldown_seconds=settings.zkpassport_relay_circuit_cooldown_seconds,
     )
     return RelayResponse(tx_hash=tx_hash_hex, relayer=account.address, signer=signer)
+
+
+@router.post(
+    "/relay/bls",
+    response_model=RelayResponse,
+    summary="Relay a Chia-owner-authorized zkPassport proof",
+)
+def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
+    """Sponsor a direct emitter call for a BLS-owned vault.
+
+    A Chia owner cannot sign an ERC-2771 ``ForwardRequest``. Instead, the
+    owner signs a one-use CHIP-0002 challenge over the exact canonical
+    emitter calldata. The relayer is the EVM event sender, while the later
+    Chia stamp and validator claim remain authorized by the canonical BLS
+    vault owner.
+    """
+
+    settings = _load_settings()
+    account = _require_relayer_account(settings)
+    if not settings.zkpassport_emitter_address:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Fresh Solslot V2 emitter address is not configured.",
+        )
+    try:
+        emitter_addr = Web3.to_checksum_address(settings.zkpassport_emitter_address)
+        data_bytes = Web3.to_bytes(hexstr=req.data)
+        vault_launcher_id, bridge_parent_id, bridge_amount = _decode_enrollment_calldata(
+            data_bytes
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=422,
+            detail=f"request.data is not canonical Solslot V2 enrollment calldata: {exc}",
+        ) from exc
+
+    session = verify_vault_session(settings, request, vault_launcher_id)
+    if session.auth_type != "chia_bls":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="EVM vaults must use a signed ForwardRequest.",
+        )
+    verified_owner = verify_owner_auth(
+        settings,
+        vault_launcher_id=vault_launcher_id,
+        action="relay",
+        payload={"data": req.data.lower()},
+        owner_auth=req.ownerAuth,
+    )
+    if (
+        verified_owner.auth_type != "chia_bls"
+        or verified_owner.owner_key.lower() != session.owner_key.lower()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The relay authorization does not match the vault session owner.",
+        )
+
+    ledger = get_credential_ledger(settings)
+    enrollment = ledger.get_enrollment(vault_launcher_id.lower())
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Enrollment not found for relay binding.")
+    if str(enrollment.get("status")) != "reserved":
+        raise HTTPException(status_code=409, detail="Enrollment is not awaiting an EVM proof.")
+    if (
+        str(enrollment.get("bridgeParentId", "")).lower() != bridge_parent_id.lower()
+        or int(enrollment.get("bridgeAmount", 0)) != bridge_amount
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Relay binding does not match the reserved Chia bridge coin.",
+        )
+
+    w3 = _w3(settings.zkpassport_evm_rpc_url)
+    try:
+        if int(w3.eth.chain_id) != settings.zkpassport_evm_chain_id:
+            raise HTTPException(
+                status_code=503,
+                detail="Configured zkPassport RPC is on the wrong EVM chain.",
+            )
+        if not w3.eth.get_code(emitter_addr):
+            raise HTTPException(
+                status_code=503,
+                detail="Fresh Solslot V2 emitter bytecode is missing.",
+            )
+        _verify_emitter_deployment(
+            w3,
+            settings,
+            emitter_addr,
+            expected_direct_relayer=account.address,
+        )
+        transaction = {
+            "from": account.address,
+            "to": emitter_addr,
+            "value": 0,
+            "data": data_bytes,
+        }
+        w3.eth.call(transaction)
+        estimated = int(w3.eth.estimate_gas(transaction))
+    except HTTPException:
+        raise
+    except ContractLogicError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Emitter simulation reverted: {_describe_revert(exc)}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"RPC simulation failed: {exc}") from exc
+    if estimated <= 0 or estimated > _MAX_INNER_GAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Estimated emitter gas must be in (0, {_MAX_INNER_GAS}].",
+        )
+
+    relayer_nonce = int(w3.eth.get_transaction_count(account.address, "pending"))
+    request_digest = "0x" + hashlib.sha256(
+        json.dumps(
+            {
+                "mode": "chia_bls",
+                "vaultLauncherId": vault_launcher_id,
+                "data": req.data.lower(),
+                "owner": session.owner_key.lower(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    source_ip = trusted_client_ip(request.scope, settings)
+    try:
+        ledger.reserve_relay(
+            request_digest=request_digest,
+            vault_launcher_id=vault_launcher_id,
+            owner_key=session.owner_key,
+            source_ip=source_ip,
+            bridge_coin_id=str(enrollment["bridgeCoinId"]),
+            forwarder_nonce=relayer_nonce,
+            inner_gas=estimated,
+            per_ip_per_minute=settings.zkpassport_relay_per_ip_per_minute,
+            per_owner_per_minute=settings.zkpassport_relay_per_owner_per_minute,
+            per_vault_per_hour=settings.zkpassport_relay_per_vault_per_hour,
+            global_gas_per_day=settings.zkpassport_relay_global_gas_per_day,
+        )
+    except LedgerRateLimited as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except LedgerCircuitOpen as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        tx = {
+            "from": account.address,
+            "to": emitter_addr,
+            "value": 0,
+            "data": data_bytes,
+            "nonce": relayer_nonce,
+            "chainId": settings.zkpassport_evm_chain_id,
+            "gas": int(estimated * 1.25),
+            "gasPrice": int(w3.eth.gas_price),
+        }
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    except Exception as exc:  # noqa: BLE001
+        ledger.finish_relay(
+            request_digest=request_digest,
+            tx_hash=None,
+            error=str(exc),
+            failure_threshold=settings.zkpassport_relay_circuit_failure_threshold,
+            cooldown_seconds=settings.zkpassport_relay_circuit_cooldown_seconds,
+        )
+        raise HTTPException(status_code=502, detail=f"Relay submission failed: {exc}") from exc
+
+    tx_hash_hex = w3.to_hex(tx_hash)
+    ledger.finish_relay(
+        request_digest=request_digest,
+        tx_hash=tx_hash_hex,
+        error=None,
+        failure_threshold=settings.zkpassport_relay_circuit_failure_threshold,
+        cooldown_seconds=settings.zkpassport_relay_circuit_cooldown_seconds,
+    )
+    return RelayResponse(
+        tx_hash=tx_hash_hex,
+        relayer=account.address,
+        signer=session.owner_key,
+    )

@@ -20,6 +20,7 @@ from solslot_api.admin_authority_v2 import (
     build_admin_authority_v2_snapshot,
 )
 from solslot_api.app import app
+from solslot_api.admin_auth import require_admin_jwt
 from solslot_api.config import get_settings
 from solslot_puzzles.admin_authority_v2_driver import (
     EMPTY_LIST_HASH,
@@ -54,7 +55,9 @@ def fresh_settings(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     get_settings.cache_clear()
+    app.dependency_overrides[require_admin_jwt] = lambda: None
     yield get_settings()
+    app.dependency_overrides.pop(require_admin_jwt, None)
     get_settings.cache_clear()
 
 
@@ -329,15 +332,15 @@ class TestAuthorityV2Endpoint:
         assert body["deployment_status"] == "hash-config-only"
         assert body["chain_verifiable"] is False
 
-    def test_endpoint_does_not_require_authentication(self, fresh_settings):
-        """The endpoint is intentionally public so external auditors
-        can fetch it without operator credentials. We assert this by
-        not setting any auth header and getting a 200 back.
-        """
+    def test_endpoint_requires_authentication(self, fresh_settings):
+        """Roster commitments are unavailable without an admin JWT."""
+        app.dependency_overrides.pop(require_admin_jwt, None)
         client = self._client()
         resp = client.get("/admin/auth/authority_v2")
-        assert resp.status_code == 200
+        assert resp.status_code in {401, 503}
+        assert "mips_root_hash" not in resp.json()
         assert "authorization" not in resp.request.headers
+        app.dependency_overrides[require_admin_jwt] = lambda: None
 
     def test_endpoint_500s_on_malformed_settings(
         self, fresh_settings, monkeypatch

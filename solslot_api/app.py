@@ -37,7 +37,7 @@ from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 
 from .admin import router as admin_router
-from .admin_bootstrap import router as admin_bootstrap_router
+from .genesis import router as genesis_router
 from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
@@ -57,6 +57,7 @@ from .challenges import (
     ChallengeStoreFullError,
     RateLimitedError,
     get_store as get_challenge_store,
+    preflight_challenge_storage,
 )
 from .coinset_client import CoinsetClient
 from .config import (
@@ -67,8 +68,12 @@ from .config import (
     validate_server_hardening_at_startup,
 )
 from .credential_auth import require_alpha_writes
-from .deployment_manifest import load_deployment_manifest
 from .protocol_config import build_snapshot as build_protocol_config_snapshot
+from .public_artifact import (
+    PublicArtifactError,
+    PublicArtifactMissing,
+    load_signed_public_artifact,
+)
 from .release_metadata import ReleaseMetadata, load_release_metadata
 from .singletons import build_singletons_snapshot
 from .cors import cors_middleware_options
@@ -83,7 +88,11 @@ from .evm_auth import (
 )
 from .faucet import Faucet
 from .state import VaultRecord, VaultRegistry, get_registry
-from .server_hardening import ServerHardeningMiddleware, documentation_urls
+from .server_hardening import (
+    ServerHardeningMiddleware,
+    documentation_urls,
+    trusted_client_ip,
+)
 from .vault_launcher import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1, build_and_sign_launch
 from .vault_version_registry import (
     VaultVersionRegistrySnapshot,
@@ -185,6 +194,7 @@ async def lifespan(app: FastAPI):
     validate_secret_env_file_permissions()
     settings = get_settings()
     validate_server_hardening_at_startup(settings)
+    preflight_challenge_storage(settings)
 
     # POP-CANON-016: fail fast at boot if the admin desk is enabled but
     # SOLSLOT_ADMIN_JWT_SECRET is unset.  This complements the runtime
@@ -274,9 +284,11 @@ app.add_middleware(
     settings=_server_settings,
 )
 
-# Run-once ceremony routes use the bootstrap operator token.
+# Run-once V2 ceremony routes use the operator token plus threshold admin
+# signatures. The retired single-session bootstrap router is intentionally
+# not mounted.
 app.include_router(admin_router)
-app.include_router(admin_bootstrap_router)
+app.include_router(genesis_router)
 
 # Post-genesis admin desk: wallet-signed JWT auth backed only by verified
 # records committed by the current admin-authority singleton.
@@ -341,6 +353,8 @@ class ProtocolInfo(BaseModel):
     faucet_balance_mojos: Optional[int]
     deployed: bool = False
     deployment_manifest: Optional[dict[str, Any]] = None
+    artifact_hash: Optional[str] = None
+    source_shas: Optional[dict[str, str]] = None
     # ── A.3 protocol-config singleton fields ──────────────────────────
     # Deterministic hash of (pool_launcher_id, governance_launcher_id,
     # network, protocol_config_version).  When the operator has launched
@@ -512,23 +526,32 @@ async def release(
 async def protocol(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ProtocolInfo:
-    # Auto-discover the deployment manifest if present (dict-only, no CLVM
-    # Program instantiation on the request thread).
-    deployed = False
-    deployment_manifest: Optional[dict[str, Any]] = None
-    pool_launcher_from_manifest: Optional[str] = settings.pool_launcher_id
-    gov_launcher_from_manifest: Optional[str] = settings.governance_launcher_id
     try:
-        from pathlib import Path
+        artifact = load_signed_public_artifact(settings)
+    except PublicArtifactMissing:
+        artifact = None
+    except PublicArtifactError as exc:
+        logger.error("Signed V2 public artifact failed verification: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="The signed V2 public artifact failed verification.",
+        ) from exc
 
-        manifest_path = Path(settings.deployment_manifest_path)
-        if manifest_path.exists():
-            deployment_manifest = load_deployment_manifest(manifest_path)
-            deployed = True
-            pool_launcher_from_manifest = deployment_manifest["pool_launcher_id"]
-            gov_launcher_from_manifest = deployment_manifest["tracker_launcher_id"]
-    except Exception as e:
-        logger.warning("Failed to read deployment manifest: %s", e)
+    launchers = artifact["launcherIds"] if artifact else {}
+    pool_launcher = launchers.get("pool")
+    governance_launcher = launchers.get("governance")
+    protocol_config_launcher = launchers.get("protocolConfig")
+    vault_registry_launcher = launchers.get("vaultVersionRegistry")
+    state_versions = artifact.get("stateVersions", {}) if artifact else {}
+
+    artifact_settings = settings.model_copy(
+        update={
+            "protocol_config_launcher_id": protocol_config_launcher,
+            "protocol_config_version": int(state_versions.get("protocolConfig", 1)),
+            "vault_version_registry_launcher_id": vault_registry_launcher,
+            "vault_version_registry_version": int(state_versions.get("vault", 1)),
+        }
+    )
 
     # POP-CANON-A3: compute the protocol_config_hash from whichever
     # source (manifest > env) the API is currently trusting.  Frontends
@@ -536,16 +559,16 @@ async def protocol(
     # recompute it from on-chain singleton state and refuse to sign
     # when the two diverge.
     protocol_snapshot = build_protocol_config_snapshot(
-        settings,
-        pool_launcher_id_hex=pool_launcher_from_manifest,
-        governance_launcher_id_hex=gov_launcher_from_manifest,
+        artifact_settings,
+        pool_launcher_id_hex=pool_launcher,
+        governance_launcher_id_hex=governance_launcher,
     )
 
     # POP-CANON-A1 + A.4: surface the on-chain mint-proposal +
     # property-registry singleton handles.  Mod-hashes are static
     # across the deployment; launcher_id is operator-configurable
     # (None until the property-registry is launched on-chain).
-    singletons_snapshot = build_singletons_snapshot(settings)
+    singletons_snapshot = build_singletons_snapshot(artifact_settings)
 
     # POP-CANON-A.5: surface the on-chain vault-version registry singleton
     # descriptor.  Mod-hash and current vault code are static across the
@@ -553,14 +576,14 @@ async def protocol(
     # computable only when the pool launcher is configured (the params hash
     # binds the pool launcher id).
     vault_registry_snapshot = build_vault_version_registry_snapshot(
-        settings,
-        pool_launcher_id_hex=pool_launcher_from_manifest,
+        artifact_settings,
+        pool_launcher_id_hex=pool_launcher,
     )
 
     return ProtocolInfo(
         network=settings.network,
-        pool_launcher_id=pool_launcher_from_manifest,
-        governance_launcher_id=gov_launcher_from_manifest,
+        pool_launcher_id=pool_launcher,
+        governance_launcher_id=governance_launcher,
         vault_inner_mod_hash=VAULT_INNER_MOD_HASH_HEX,
         eip712_domain=eip712_domain(),
         eip712_typehash_string=VAULT_SPEND_TYPEHASH_STRING,
@@ -568,18 +591,20 @@ async def protocol(
         # belongs on authenticated admin surfaces, not the public snapshot.
         faucet_address=None,
         faucet_balance_mojos=None,
-        deployed=deployed,
+        deployed=artifact is not None,
         # Canonical public coordinates are exposed as typed fields below. The
         # raw ceremony manifest can contain operational metadata and is never
         # returned from this unauthenticated route.
         deployment_manifest=None,
+        artifact_hash=artifact.get("artifactHash") if artifact else None,
+        source_shas=dict(artifact["sourceShas"]) if artifact else None,
         protocol_config_hash=protocol_snapshot.content_hash_hex,
-        protocol_config_launcher_id=protocol_snapshot.protocol_config_launcher_id_hex,
+        protocol_config_launcher_id=protocol_config_launcher,
         protocol_config_version=protocol_snapshot.config_version,
-        property_registry_launcher_id=singletons_snapshot.property_registry_launcher_id_hex,
+        property_registry_launcher_id=None,
         property_registry_mod_hash=singletons_snapshot.property_registry_mod_hash_hex,
         mint_proposal_mod_hash=singletons_snapshot.mint_proposal_mod_hash_hex,
-        vault_version_registry_launcher_id=vault_registry_snapshot.vault_version_registry_launcher_id_hex,
+        vault_version_registry_launcher_id=vault_registry_launcher,
         vault_version_registry_mod_hash=vault_registry_snapshot.vault_version_registry_mod_hash_hex,
         vault_version=vault_registry_snapshot.vault_version,
         vault_canonical_params_hash=vault_registry_snapshot.canonical_params_hash_hex,
@@ -606,7 +631,7 @@ async def request_challenge(
     require_alpha_writes(settings)
     pool_id_hex = _require_vault_protocol_ready(settings)
     network = settings.network
-    source_ip = _client_ip(request)
+    source_ip = _client_ip(request, settings)
     try:
         ch = store.issue(
             body.address,
@@ -959,66 +984,20 @@ def _strip0x(s: str) -> str:
 
 
 def _pool_launcher_id_or_zero(settings: Settings) -> bytes32:
-    """Return the configured pool launcher id, or a 32-zero placeholder on
-    testnet while the pool has not been deployed yet.
+    """Return the pool launcher committed by the signed V2 artifact.
 
-    A zero pool id is acceptable for Phase-0 smoke testing: the vault still
-    launches, but pool-mediated flows will fail until a real pool is pinned.
-
-    POP-CANON-011 fix (2026-04-26): prefer the deployment manifest over the
-    cached env-based ``settings.pool_launcher_id``.  The manifest is the
-    source of truth post-deploy; the env value is the bootstrap default.
-    Reading fresh from disk on each call mirrors Chia's "no @lru_cache on
-    Service config" pattern and eliminates stale-pool drift after an
-    admin redeploy without process restart.
-
-    Resolution order:
-      1. ``deployment_manifest.pool_launcher_id`` if the manifest exists.
-      2. ``settings.pool_launcher_id`` (env / .env fallback).
-      3. 32-zero placeholder (Phase-0 smoke testing).
-    """
-    pool_id = _read_pool_launcher_from_manifest(settings.deployment_manifest_path)
-    if pool_id is not None:
-        return bytes32.fromhex(_strip0x(pool_id))
-    if settings.pool_launcher_id:
-        return bytes32.fromhex(_strip0x(settings.pool_launcher_id))
-    return bytes32(b"\x00" * 32)
-
-
-def _read_pool_launcher_from_manifest(manifest_path: str) -> Optional[str]:
-    """Read ``pool_launcher_id`` from the deployment manifest if it exists.
-
-    Returns the post-deploy pool_launcher_id, or None on any error
-    (file missing, malformed JSON, missing key).  Callers MUST fall back
-    to ``settings.pool_launcher_id`` and then to the zero placeholder.
-
-    Errors are swallowed because the manifest may be momentarily malformed
-    during a partial admin write; this function must never raise.
-
-    POP-CANON-011 fix.
-
-    Note: this deliberately uses plain ``json.loads`` rather than
-    ``solslot_puzzles.protocol_deployment.load_manifest_dict``.  The latter
-    enforces a strict schema (all 18 required fields) which is the right
-    contract for the ``/admin/deployment`` introspection endpoint, but
-    overkill — and a stability liability — for the hot path that just
-    needs one well-known field.  An admin manifest with an evolving schema
-    must not break new-challenge issuance.
+    The historical function name is retained for internal call compatibility;
+    it no longer returns a zero placeholder or trusts mutable environment and
+    deployment-manifest coordinates.
     """
     try:
-        import json
-        from pathlib import Path
-
-        p = Path(manifest_path)
-        if not p.exists():
-            return None
-        raw = json.loads(p.read_text())
-        pool_id = raw.get("pool_launcher_id")
-        if pool_id and not pool_id.startswith("0x"):
-            pool_id = "0x" + pool_id
-        return pool_id
-    except Exception:
-        return None
+        artifact = load_signed_public_artifact(settings)
+        return bytes32.fromhex(_strip0x(artifact["launcherIds"]["pool"]))
+    except (KeyError, PublicArtifactError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Vault registration is disabled until a signed V2 genesis artifact is active.",
+        ) from exc
 
 
 def _pool_launcher_id_hex(settings: Settings) -> str:
@@ -1027,6 +1006,15 @@ def _pool_launcher_id_hex(settings: Settings) -> str:
 
 
 def _require_vault_protocol_ready(settings: Settings) -> str:
+    try:
+        artifact = load_signed_public_artifact(settings)
+    except PublicArtifactError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Vault registration is disabled until a signed V2 genesis artifact is active.",
+        ) from exc
+    launchers = artifact["launcherIds"]
+    bridge_policy = artifact["bridgePolicy"]["policyHash"]
     if not settings.zkpassport_bridge_policy_hash:
         raise HTTPException(
             status_code=409,
@@ -1036,6 +1024,11 @@ def _require_vault_protocol_ready(settings: Settings) -> str:
         settings.zkpassport_bridge_policy_hash,
         "SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH",
     )
+    if settings.zkpassport_bridge_policy_hash.lower() != bridge_policy.lower():
+        raise HTTPException(
+            status_code=409,
+            detail="Configured bridge policy does not match the signed V2 artifact.",
+        )
     protocol_config_launcher_id = getattr(settings, "protocol_config_launcher_id", None)
     if not protocol_config_launcher_id:
         raise HTTPException(
@@ -1047,35 +1040,20 @@ def _require_vault_protocol_ready(settings: Settings) -> str:
         "SOLSLOT_PROTOCOL_CONFIG_LAUNCHER_ID",
     )
 
-    try:
-        from pathlib import Path
-
-        manifest = load_deployment_manifest(Path(settings.deployment_manifest_path))
-    except Exception as e:
-        raise HTTPException(
-            status_code=409,
-            detail="Vault registration is disabled until protocol genesis has a valid deployment manifest.",
-        ) from e
-
     pool_id_hex = _require_nonzero_bytes32_hex(
-        manifest.get("pool_launcher_id"),
-        "deployment_manifest.pool_launcher_id",
+        launchers.get("pool"),
+        "public_artifact.launcherIds.pool",
     )
     governance_id_hex = _require_nonzero_bytes32_hex(
-        manifest.get("tracker_launcher_id"),
-        "deployment_manifest.tracker_launcher_id",
+        launchers.get("governance"),
+        "public_artifact.launcherIds.governance",
     )
-
-    snapshot = build_protocol_config_snapshot(
-        settings,
-        pool_launcher_id_hex=pool_id_hex,
-        governance_launcher_id_hex=governance_id_hex,
-    )
-    if snapshot.content_hash_hex is None:
+    if protocol_config_launcher_id.lower() != str(launchers.get("protocolConfig", "")).lower():
         raise HTTPException(
             status_code=409,
-            detail="Vault registration is disabled until A.3 commits to pool, governance, network, and version.",
+            detail="Configured protocol-config launcher does not match the signed V2 artifact.",
         )
+    _require_nonzero_bytes32_hex(governance_id_hex, "public_artifact.launcherIds.governance")
     return pool_id_hex
 
 
@@ -1094,15 +1072,13 @@ def _require_nonzero_bytes32_hex(value: object, field_name: str) -> str:
     return "0x" + parsed.hex()
 
 
-def _client_ip(request: Request) -> str:
+def _client_ip(request: Request, settings: Settings) -> str:
     """Extract the client IP for per-IP rate limiting.
 
-    Uses the immediate peer address rather than trusting client-supplied
-    forwarding headers.
+    Trusts Cloudflare's client header only when the immediate peer belongs to
+    an explicitly configured Cloudflare source range.
     """
-    if request.client is not None:
-        return request.client.host
-    return "unknown"
+    return trusted_client_ip(request.scope, settings)
 
 
 async def _push_or_fail(coinset: CoinsetClient, spend_bundle: Any) -> tuple[bool, Optional[str]]:

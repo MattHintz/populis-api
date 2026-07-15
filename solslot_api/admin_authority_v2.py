@@ -40,6 +40,11 @@ from solslot_puzzles.admin_authority_v2_driver import (
 )
 
 from .config import Settings
+from .public_artifact import (
+    PublicArtifactError,
+    PublicArtifactMissing,
+    load_signed_public_artifact,
+)
 
 
 @dataclass(frozen=True)
@@ -137,29 +142,61 @@ def _resolve_phase(enabled: bool, chain_verifiable: bool, gating: bool) -> str:
 def build_admin_authority_v2_snapshot(
     settings: Settings,
 ) -> AdminAuthorityV2Snapshot:
-    """Construct a deterministic V2 snapshot from live settings.
+    """Construct a deterministic V2 snapshot from the signed artifact.
 
-    Returns an ``enabled=False`` snapshot when the launcher id is unset.
+    The explicit test environment retains the old settings-driven fixture
+    path so historical puzzle-hash tests remain isolated. Deployed runtimes
+    never read mutable launcher/hash settings for this snapshot.
 
     Raises:
         ValueError: if any hash setting is malformed (non-hex,
             wrong length). Surface as a 500 on the endpoint so
             operators see misconfiguration immediately.
     """
-    launcher_id = settings.effective_protocol_admin_authority_v2_launcher_id()
-    mips_root = _decode_hash_setting(
-        settings.effective_protocol_admin_authority_v2_mips_root_hash(),
-        "protocol_admin_authority_v2_mips_root_hash",
-    )
-    admins = _decode_hash_setting(
-        settings.effective_protocol_admin_authority_v2_admins_hash(),
-        "protocol_admin_authority_v2_admins_hash",
-    )
-    pending = _decode_hash_setting(
-        settings.protocol_admin_authority_v2_pending_ops_hash,
-        "protocol_admin_authority_v2_pending_ops_hash",
-    )
-    version = settings.effective_protocol_admin_authority_v2_version()
+    if settings.runtime_environment == "test":
+        launcher_id = settings.effective_protocol_admin_authority_v2_launcher_id()
+        mips_root = _decode_hash_setting(
+            settings.effective_protocol_admin_authority_v2_mips_root_hash(),
+            "protocol_admin_authority_v2_mips_root_hash",
+        )
+        admins = _decode_hash_setting(
+            settings.effective_protocol_admin_authority_v2_admins_hash(),
+            "protocol_admin_authority_v2_admins_hash",
+        )
+        pending = _decode_hash_setting(
+            settings.protocol_admin_authority_v2_pending_ops_hash,
+            "protocol_admin_authority_v2_pending_ops_hash",
+        )
+        version = settings.effective_protocol_admin_authority_v2_version()
+        gating = bool(settings.effective_admin_records_path())
+    else:
+        try:
+            artifact = load_signed_public_artifact(settings)
+        except PublicArtifactMissing:
+            artifact = None
+        except PublicArtifactError as exc:
+            raise ValueError(f"signed V2 public artifact is invalid: {exc}") from exc
+        if artifact is None:
+            launcher_id = None
+            mips_root = None
+            admins = None
+            pending = None
+            version = 1
+            gating = False
+        else:
+            authority = artifact["adminAuthority"]
+            launcher_id = str(artifact["launcherIds"]["adminAuthority"])
+            mips_root = _decode_hash_setting(
+                str(authority["mipsRootHash"]),
+                "public_artifact.adminAuthority.mipsRootHash",
+            )
+            admins = _decode_hash_setting(
+                str(authority["rosterHash"]),
+                "public_artifact.adminAuthority.rosterHash",
+            )
+            pending = EMPTY_LIST_HASH
+            version = int(artifact["stateVersions"]["adminAuthority"])
+            gating = True
 
     enabled = bool(launcher_id)
     has_hash_config = bool(mips_root or admins or pending)
@@ -198,7 +235,7 @@ def build_admin_authority_v2_snapshot(
         phase=_resolve_phase(
             enabled,
             chain_verifiable,
-            bool(settings.effective_admin_records_path()),
+            gating,
         ),
         deployment_status=deployment_status,
         chain_verifiable=chain_verifiable,

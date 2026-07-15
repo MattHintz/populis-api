@@ -16,6 +16,11 @@ from pydantic import BaseModel, Field, model_validator
 from .bootstrap_manifest import _assert_public_artifact, content_hash
 from .config import Settings, get_settings
 from .credential_auth import require_minting_writes
+from .public_artifact import (
+    PublicArtifactError,
+    PublicArtifactMissing,
+    load_signed_public_artifact,
+)
 
 
 router = APIRouter(prefix="/protocol", tags=["protocol-artifacts"])
@@ -36,6 +41,25 @@ PurchaseIntentState = Literal[
 ]
 
 
+@router.get("/artifact", response_model=dict[str, Any])
+async def get_signed_public_artifact(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Return only the administrator-signed V2 ceremony artifact."""
+    try:
+        return load_signed_public_artifact(settings)
+    except PublicArtifactMissing as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except PublicArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The signed V2 public artifact failed verification.",
+        ) from exc
+
+
 class ProtocolPaymentTerms(BaseModel):
     currency: str = Field(..., min_length=1, max_length=32)
     amount: int = Field(..., gt=0)
@@ -45,6 +69,9 @@ class ProtocolPaymentTerms(BaseModel):
 
 
 class BuildProtocolOfferArtifactRequest(BaseModel):
+    protocol_version: Literal["solslot-v2"]
+    network: Literal["testnet11"]
+    genesis_artifact_hash: str = Field(..., min_length=66, max_length=66)
     instance_id: str = Field(..., min_length=1, max_length=128)
     purchase_intent_id: str = Field(..., min_length=1, max_length=128)
     rail: ProtocolRail
@@ -53,6 +80,8 @@ class BuildProtocolOfferArtifactRequest(BaseModel):
     collection_id: str = Field(..., min_length=1, max_length=256)
     share_ppm: int = Field(..., ge=1, le=1_000_000)
     vault_launcher_id: str = Field(..., min_length=1, max_length=132)
+    current_vault_coin_id: str = Field(..., min_length=66, max_length=66)
+    identity_attest_root: str = Field(..., min_length=66, max_length=66)
     expires_at: int = Field(..., gt=0, description="Unix seconds")
     payment_terms: ProtocolPaymentTerms
     raw_offer: Optional[str] = Field(None, max_length=2_000_000)
@@ -136,7 +165,44 @@ async def build_protocol_offer_artifact(
             status_code=status.HTTP_409_CONFLICT,
             detail="A current, server-confirmed V2 Chia vault credential is required.",
         )
-    artifact = _build_artifact(body, settings, receipt=receipt.model_dump())
+    expected_current_coin_id = _normalize_hex32(
+        body.current_vault_coin_id,
+        "current_vault_coin_id",
+    )
+    expected_identity_root = _normalize_hex32(
+        body.identity_attest_root,
+        "identity_attest_root",
+    )
+    if (
+        receipt.chiaVaultCoinId != expected_current_coin_id
+        or receipt.identityAttestRoot != expected_identity_root
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The requested vault coin or identity root is no longer current.",
+        )
+    try:
+        genesis_artifact = load_signed_public_artifact(settings)
+    except PublicArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The signed V2 genesis artifact is unavailable or invalid.",
+        ) from exc
+    expected_genesis_hash = _normalize_hex32(
+        body.genesis_artifact_hash,
+        "genesis_artifact_hash",
+    )
+    if genesis_artifact.get("artifactHash") != expected_genesis_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The requested genesis artifact is not the active signed artifact.",
+        )
+    artifact = _build_artifact(
+        body,
+        settings,
+        receipt=receipt.model_dump(),
+        genesis_artifact=genesis_artifact,
+    )
     try:
         _assert_public_artifact(artifact, "protocol_offer_artifact")
     except ValueError as e:
@@ -209,7 +275,9 @@ def _build_artifact(
     settings: Settings,
     *,
     receipt: dict[str, Any],
+    genesis_artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
+    launchers = _mapping(genesis_artifact.get("launcherIds"))
     protocol = {
         "instanceId": body.instance_id,
         "purchaseIntentId": body.purchase_intent_id,
@@ -231,20 +299,16 @@ def _build_artifact(
         "version": 2,
         "kind": "solslot_protocol_offer",
         "network": settings.network,
+        "genesisArtifactHash": genesis_artifact["artifactHash"],
         "protocol": protocol,
         "vaultCredentialReceipt": receipt,
         "paymentTerms": body.payment_terms.model_dump(exclude_none=True),
         "metadata": body.metadata,
         "issuedAt": int(time.time()),
     }
-    if settings.pool_launcher_id:
-        artifact["poolLauncherId"] = settings.pool_launcher_id
-    if settings.protocol_config_launcher_id:
-        artifact["protocolConfigLauncherId"] = settings.protocol_config_launcher_id
-    if settings.vault_version_registry_launcher_id:
-        artifact["vaultVersionRegistryLauncherId"] = (
-            settings.vault_version_registry_launcher_id
-        )
+    artifact["poolLauncherId"] = launchers["pool"]
+    artifact["protocolConfigLauncherId"] = launchers["protocolConfig"]
+    artifact["vaultVersionRegistryLauncherId"] = launchers["vaultVersionRegistry"]
     return artifact
 
 
@@ -315,18 +379,62 @@ def _artifact_rejection_reasons(
     ):
         reasons.append("credential_chia_confirmation_missing")
     if settings is not None:
+        try:
+            genesis_artifact = load_signed_public_artifact(settings)
+        except PublicArtifactError:
+            reasons.append("active_genesis_artifact_unavailable")
+            return reasons
+        launchers = _mapping(genesis_artifact.get("launcherIds"))
+        if artifact.get("genesisArtifactHash") != genesis_artifact.get("artifactHash"):
+            reasons.append("genesis_artifact_hash_mismatch")
         if artifact.get("network") != settings.network:
             reasons.append("active_network_mismatch")
         coordinate_pairs = (
-            ("poolLauncherId", settings.pool_launcher_id),
-            ("protocolConfigLauncherId", settings.protocol_config_launcher_id),
-            ("vaultVersionRegistryLauncherId", settings.vault_version_registry_launcher_id),
+            ("poolLauncherId", launchers.get("pool")),
+            ("protocolConfigLauncherId", launchers.get("protocolConfig")),
+            ("vaultVersionRegistryLauncherId", launchers.get("vaultVersionRegistry")),
         )
         for field, expected in coordinate_pairs:
             if not expected or artifact.get(field) != expected:
                 reasons.append(f"{field}_mismatch")
-        if receipt.get("bridgePolicyHash") != settings.zkpassport_bridge_policy_hash:
+        bridge_policy = _mapping(genesis_artifact.get("bridgePolicy"))
+        if receipt.get("bridgePolicyHash") != bridge_policy.get("policyHash"):
             reasons.append("credential_bridge_policy_mismatch")
+        try:
+            from .zkpassport_enrollments import _normalize_hex32, _sync_chia_stamp
+
+            vault_launcher_id = _normalize_hex32(
+                str(protocol.get("vaultLauncherId") or ""),
+                "vaultLauncherId",
+            )
+            current_enrollment = _sync_chia_stamp(settings, vault_launcher_id)
+            current_receipt = current_enrollment.receipt
+            if (
+                current_enrollment.status != "chia_confirmed"
+                or current_receipt is None
+                or current_receipt.vaultLauncherId != receipt.get("vaultLauncherId")
+                or current_receipt.identityAttestRoot != receipt.get("identityAttestRoot")
+                or current_receipt.chiaVaultCoinId != receipt.get("chiaVaultCoinId")
+                or current_receipt.confirmedBlockIndex
+                != receipt.get("confirmedBlockIndex")
+            ):
+                reasons.append("credential_not_current_on_chia")
+        except (HTTPException, ValueError, TypeError):
+            reasons.append("credential_not_current_on_chia")
+        retired = {
+            str(value).lower()
+            for value in genesis_artifact.get("retiredCoordinates", [])
+            if isinstance(value, str)
+        }
+        coordinate_values = [artifact.get(field) for field, _expected in coordinate_pairs]
+        coordinate_values.extend(
+            (protocol.get("deedLauncherId"), protocol.get("vaultLauncherId"))
+        )
+        if any(
+            isinstance(value, str) and value.lower() in retired
+            for value in coordinate_values
+        ):
+            reasons.append("retired_coordinate")
     return reasons
 
 

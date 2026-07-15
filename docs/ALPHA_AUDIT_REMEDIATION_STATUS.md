@@ -5,7 +5,7 @@ protocol, EVM contracts, customer web, admin portal, DNS, and staging host.
 It records containment separately from final closure so a disabled feature is
 never mistaken for a completed launch control.
 
-## Canonical Live Baseline
+## Deployed Locked Baseline
 
 - API release: `8e2d697fc2164780d4f817ac7d913472c1f631e0`.
 - Protocol dependency: `8d8c2ce508777317ccb27a5a62732ec6ade3f091`.
@@ -15,30 +15,40 @@ never mistaken for a completed launch control.
 - Network binding: Chia `testnet11` and Ethereum Sepolia `11155111`.
 - Public API documentation: disabled.
 - Alpha writes and minting: disabled.
-- Validator: unconfigured on the clean staging state.
+- Validator: unconfigured on the locked staging state.
 - Ceremony coordinates: absent; the vulnerable deployment is not reused.
 
-## Canonical Security Branches
+## Candidate Security Worktrees
 
-- API: `dcfa0d2` on `security/alpha-v2-remediation`; 510 tests pass. The
-  deployed code commit is `8e2d697`; later commits update evidence only.
-- Protocol: `8d8c2ce` on `security/alpha-v2-remediation`; 716 tests pass.
-- EVM: `1f33083` on `security/alpha-v2-remediation`; 14 tests and the
-  provider-credential gate pass.
-- Customer web: `320d867` on `security/alpha-v2-remediation`; 202 tests,
-  production build, source namespace gate, and compiled-release namespace
-  gate pass. Its staging deployment and dependency-free remote namespace
-  workflow also pass.
-- Admin portal: `15cd90b` on `security/alpha-v2-remediation`; 792 tests,
-  production build, source namespace gate, and compiled-release namespace
+The candidate worktrees below are deliberately **not frozen**. They contain
+the remediation implementation but remain dirty and therefore fail the new
+ceremony repository gate by design. Their listed SHAs are branch bases, not
+release approvals or ceremony inputs.
+
+- API base `d5d3459c713a1bac602d46e455c9ddbc4eaf3587`: 529 tests pass;
+  namespace and whitespace gates pass.
+- Protocol base `8d8c2ce508777317ccb27a5a62732ec6ade3f091`: 742 tests pass,
+  including deterministic eight-surface ceremony, Pool V3, signed artifact,
+  2-of-3 bridge, and split preflight regressions.
+- EVM base `1f330831271948875ea4b7c5671709d05be465d6`: 17 tests, compile,
+  provider-secret scan, namespace gate, and whitespace gate pass.
+- Customer web base `320d8677b883c0e23a02237324553520790bd6d8`: 220 tests,
+  staging build, source namespace scan, compiled bundle scan, public-secret
+  scan, and whitespace gate pass.
+- Admin portal base `15cd90be8c22cf35deb6f4629d8769a0ac3d529a`: 778 tests,
+  staging build, source namespace scan, compiled bundle scan, and whitespace
   gate pass.
-- Six cross-repository V2 schema contracts pass across protocol, API, EVM,
-  customer web, and admin portal. The EVM emitter accepts only enrollment
-  binding data, derives proof fields from the verifier adapter, and computes
-  credential commitments internally.
-- All five namespace gates now reject plain-text and hex-encoded retired
-  namespace material. The portal's stale V1 bootstrap memo bytes were removed,
-  and every active protocol announcement reader/builder uses prefix `0x53`.
+- Legacy Beta backend base `aa1f4f63be4e49836aafd9f019980f02d47d1590`:
+  11 focused protocol-intent tests plus compile, namespace, and whitespace
+  gates pass. It remains outside the five-source ceremony artifact.
+
+Cross-repository V2 schema contracts pass across protocol, API, EVM, customer
+web, and admin portal. The emitter accepts enrollment binding data, derives
+proof fields from the verifier adapter, and computes credential commitments
+internally. Active announcement readers and builders use prefix `0x53`.
+
+No ceremony may begin until these changes are reviewed, committed, rebuilt
+from clean checkouts, and recorded as five new full source SHAs.
 
 ## Finding Ledger
 
@@ -52,7 +62,7 @@ never mistaken for a completed launch control.
 | C-6 cross-tenant default vhost | Contained live | The staging VPS loads a first/default deny vhost. Unknown Solslot Host/SNI values return `403`; intended named vhosts remain available. |
 | C-7 protocol and retired API co-served on pro | Contained live | Pro serves only a static mainnet-disabled page; retired protocol routes return `410`; the separate Solomon health route remains available. |
 | C-8 chain authority not enforced | Contained, not completed | Authority reports `not-deployed`, all writes and ceremony operations are locked, and non-ceremony write mode now requires complete chain-bound authority coordinates. Closure requires the fresh V2 genesis. |
-| C-9 threshold-one validator | Contained, not completed | Public validator metadata and generic signing routes return `404`; staging and production refuse write mode below threshold two. Closure requires independently controlled validator keys and an audited threshold implementation. |
+| C-9 threshold-one validator | Code completed, provisioning and audit open | Public validator metadata and generic signing routes return `404`; the coordinator stores no private key; the bridge and coordinator require two signatures from exactly three distinct planned keys. Closure requires three separately controlled signer hosts, private transport, live failover evidence, and independent review. |
 | H-1 raw protocol manifest disclosure | Fixed live | `/protocol` returns typed public coordinates only; faucet fields and the raw manifest are null. |
 | H-2 authority commitment disclosure | Risk removed from current staging | Authority is disabled and all fields are null. Future launcher and commitment hashes are public on-chain verification data, never an authorization source. Admin records and Merkle paths remain private. |
 | H-3 public database listener | Fixed live | Port 3306 is not reachable publicly; the database listener is loopback-only. |
@@ -90,10 +100,25 @@ and use workflow diagnostics when they differ.
 
 ## Launch Blockers
 
-Alpha remains blocked on the clean V2 protocol and EVM re-audit, provider-key
-revocation, portal/customer-web convergence, secret rotation, signed ceremony
-artifacts, fresh contract and singleton deployment, and complete EVM plus BLS
-zkPassport-to-Chia confirmation with storage-free recovery.
+Alpha remains blocked on the following external and release-control work:
+
+1. Revoke the exposed provider credential and rotate every staging, ceremony,
+   signer, relayer, deployer, SSH, CI, JWT, admin, faucet, and database secret.
+2. Review and commit all five dirty candidate worktrees, reproduce every gate
+   from clean checkouts, and freeze five new full source SHAs.
+3. Obtain independent protocol, EVM, credential-bridge, and ceremony approval
+   against those exact commits. No unresolved security finding is accepted.
+4. Provision three separately controlled validator hosts and prove true 2-of-3
+   behavior over private authenticated transport.
+5. Deploy fresh reviewed Sepolia contracts, wait 12 confirmations, fund nine
+   fresh Chia inputs, enroll three administrators, and pass both live and
+   offline pre-broadcast gates.
+6. Broadcast one deterministic ceremony, obtain three Chia confirmations,
+   collect two artifact signatures, write the lock last, deploy pinned
+   consumers, and pass the offline post-genesis gate.
+7. Complete fresh EVM and BLS zkPassport-to-Chia stamps, validator failover,
+   replay rejection, and storage-free recovery before offers can be enabled.
+8. Complete the Academy custom-domain activation and public certificate check.
 
 No current browser result is accepted as full-cycle credential success. That
 gate requires a fresh V2 EVM vault and a fresh V2 BLS vault to reach

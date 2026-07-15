@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from chia_rs import AugSchemeMPL
+
+from solslot_api.config import Settings, get_settings
+from solslot_api.genesis import get_genesis_store, router
+from solslot_api.genesis_store import GenesisStore
+
+
+ADMIN_TOKEN = "test-ceremony-operator-token"
+
+
+def _signature(account, typed_data: dict) -> str:
+    signed = account.sign_message(encode_typed_data(full_message=typed_data))
+    return "0x" + bytes(signed.signature).hex()
+
+
+def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
+    settings = Settings(
+        runtime_environment="test",
+        network="testnet11",
+        alpha_writes_enabled=True,
+        minting_enabled=False,
+        ceremony_mode_enabled=True,
+        admin_token=ADMIN_TOKEN,
+        genesis_db_path=str(tmp_path / "genesis.db"),
+        genesis_output_dir=str(tmp_path / "ceremonies"),
+        genesis_audit_approval_path=str(tmp_path / "approval.json"),
+        cors_origins="",
+    )
+    store = GenesisStore(settings.genesis_db_path)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_genesis_store] = lambda: store
+    return TestClient(app), store, settings
+
+
+def _headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+def _create_and_enroll(client: TestClient) -> tuple[str, list]:
+    commits = {name: f"{index:x}" * 40 for index, name in enumerate(
+        ("protocol", "evm", "api", "customerWeb", "adminPortal"), start=1
+    )}
+    response = client.post(
+        "/admin/genesis/drafts",
+        json={"sourceShas": commits},
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    ceremony_id = response.json()["ceremony_id"]
+    accounts = [Account.create(f"admin-{slot}") for slot in (1, 2, 3)]
+    for slot, account in enumerate(accounts, start=1):
+        issued = client.post(
+            f"/admin/genesis/{ceremony_id}/invitations/{slot}",
+            headers=_headers(),
+        )
+        assert issued.status_code == 200, issued.text
+        token = issued.json()["invitationFragment"].split("=", 1)[1]
+        prepared = client.post(
+            "/admin/genesis/invitations/prepare",
+            json={"token": token, "wallet": account.address},
+        )
+        assert prepared.status_code == 200, prepared.text
+        accepted = client.post(
+            "/admin/genesis/invitations/accept",
+            json={
+                "token": token,
+                "wallet": account.address,
+                "signature": _signature(account, prepared.json()["typedData"]),
+            },
+        )
+        assert accepted.status_code == 200, accepted.text
+    frozen = client.post(
+        f"/admin/genesis/{ceremony_id}/roster/freeze", headers=_headers()
+    )
+    assert frozen.status_code == 200, frozen.text
+    assert frozen.json()["state"] == "roster_frozen"
+    return ceremony_id, accounts
+
+
+def _plan_body() -> dict:
+    funding_names = (
+        "sgt",
+        "pool",
+        "did",
+        "governance",
+        "navRegistry",
+        "protocolConfig",
+        "adminAuthority",
+        "vaultVersionRegistry",
+        "bridgeBatch",
+    )
+    validators = [
+        bytes(AugSchemeMPL.key_gen(bytes([index]) * 32).get_g1()).hex()
+        for index in (21, 22, 23)
+    ]
+    governance = bytes(AugSchemeMPL.key_gen(b"g" * 32).get_g1()).hex()
+    return {
+        "evmAddresses": {
+            "forwarder": "0x" + "a1" * 20,
+            "verifierAdapter": "0x" + "a2" * 20,
+            "attestationEmitter": "0x" + "a3" * 20,
+        },
+        "fundingCoinIds": {
+            name: "0x" + f"{index:02x}" * 32
+            for index, name in enumerate(funding_names, start=1)
+        },
+        "faucetPuzzleHash": "0x" + "31" * 32,
+        "governanceBlsPubkey": "0x" + governance,
+        "validatorPubkeys": ["0x" + value for value in validators],
+        "trustedTreasuryReservePuzzleHash": "0x" + "41" * 32,
+        "trustedProtocolTreasuryPuzzleHash": "0x" + "42" * 32,
+        "trustedGovernanceRewardsPuzzleHash": "0x" + "43" * 32,
+        "trustedGovernanceRewardsRoot": "0x" + "44" * 32,
+        "retiredCoordinates": ["0x" + "51" * 32],
+        "protocolParameters": {
+            "quorumBps": 5000,
+            "votingWindowSeconds": 300,
+            "sgtTotalSupply": 1_000_000,
+            "minProposalStake": 10_000,
+            "fpScale": 1000,
+            "minNavRegistryVersion": 1,
+            "initialPoolStatus": 1,
+            "initialTotalPoolTokenSupply": 0,
+            "initialTreasuryReserveTokens": 0,
+        },
+    }
+
+
+def test_three_admin_http_flow_reaches_plan_approval(tmp_path) -> None:
+    client, store, _ = _client(tmp_path)
+    ceremony_id, accounts = _create_and_enroll(client)
+    created = client.post(
+        f"/admin/genesis/{ceremony_id}/plan",
+        json=_plan_body(),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    typed_data = created.json()["typedData"]
+    assert typed_data["primaryType"] == "SolslotGenesisPlan"
+    for slot, account in enumerate(accounts[:2], start=1):
+        prepared = client.post(
+            f"/admin/genesis/{ceremony_id}/plan/signatures/prepare",
+            json={"slot": slot},
+        )
+        assert prepared.status_code == 200, prepared.text
+        assert prepared.json()["typedData"] == typed_data
+        assert prepared.json()["slot"] == slot
+        signed = client.post(
+            f"/admin/genesis/{ceremony_id}/plan/signatures",
+            json={
+                "slot": slot,
+                "signature": _signature(account, prepared.json()["typedData"]),
+            },
+        )
+        assert signed.status_code == 200, signed.text
+    final = store.get(ceremony_id)
+    assert final["state"] == "plan_approved"
+    assert len(final["plan_signatures"]) == 2
+
+
+def test_wrong_admin_cannot_sign_frozen_plan(tmp_path) -> None:
+    client, _, _ = _client(tmp_path)
+    ceremony_id, _ = _create_and_enroll(client)
+    created = client.post(
+        f"/admin/genesis/{ceremony_id}/plan",
+        json=_plan_body(),
+        headers=_headers(),
+    )
+    typed_data = created.json()["typedData"]
+    attacker = Account.create("not-an-admin")
+    response = client.post(
+        f"/admin/genesis/{ceremony_id}/plan/signatures",
+        json={"slot": 1, "signature": _signature(attacker, typed_data)},
+    )
+    assert response.status_code == 403
+
+
+def test_operator_routes_require_ceremony_token(tmp_path) -> None:
+    client, _, _ = _client(tmp_path)
+    response = client.post(
+        "/admin/genesis/drafts",
+        json={
+            "sourceShas": {
+                "protocol": "1" * 40,
+                "evm": "2" * 40,
+                "api": "3" * 40,
+                "customerWeb": "4" * 40,
+                "adminPortal": "5" * 40,
+            }
+        },
+    )
+    assert response.status_code == 401

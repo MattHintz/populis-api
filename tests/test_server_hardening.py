@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import httpx
@@ -8,9 +9,11 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 from solslot_api.config import Settings, validate_server_hardening_at_startup
+from solslot_api.challenges import RequestRateLimiter, preflight_challenge_storage
 from solslot_api.server_hardening import (
     ServerHardeningMiddleware,
     documentation_urls,
+    trusted_client_ip,
 )
 
 
@@ -50,9 +53,24 @@ def _staging(**overrides: object) -> Settings:
         "bootstrap_cookie_secure": True,
         "security_headers_enabled": True,
         "hsts_enabled": True,
+        "trusted_proxy_cidrs": "203.0.113.0/24,2001:db8:1234::/48",
         "cors_origins": "https://staging.solslot.com",
         "alpha_writes_enabled": False,
+        "vault_session_jwt_secret": "v" * 32,
         "minting_enabled": False,
+        "zkpassport_validator_urls": [
+            "https://validator-0.internal",
+            "https://validator-1.internal",
+            "https://validator-2.internal",
+        ],
+        "zkpassport_validator_pubkeys": [
+            "0x" + "11" * 48,
+            "0x" + "22" * 48,
+            "0x" + "33" * 48,
+        ],
+        "zkpassport_validator_mtls_ca_path": "/run/secrets/validator-ca.pem",
+        "zkpassport_validator_mtls_cert_path": "/run/secrets/coordinator-cert.pem",
+        "zkpassport_validator_mtls_key_path": "/run/secrets/coordinator-key.pem",
     }
     values.update(overrides)
     return Settings(**values)
@@ -69,6 +87,7 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
         ("api_docs_enabled", True, "API_DOCS_ENABLED"),
         ("security_headers_enabled", False, "Security headers"),
         ("hsts_enabled", False, "Security headers"),
+        ("vault_session_cookie_secure", False, "VAULT_SESSION_COOKIE_SECURE"),
         ("cors_origins", "http://localhost:4200", "CORS origins"),
         ("cors_origins", "*", "CORS origins"),
     ],
@@ -164,25 +183,11 @@ def test_read_only_staging_accepts_single_validator_default() -> None:
     )
 
 
-def test_staging_write_mode_requires_chain_bound_admin_authority() -> None:
-    with pytest.raises(RuntimeError, match="chain-bound admin authority"):
-        validate_server_hardening_at_startup(
-            _staging(
-                alpha_writes_enabled=True,
-                zkpassport_validator_threshold=2,
-            )
-        )
-
-
-def test_staging_write_mode_accepts_complete_authority_coordinates() -> None:
+def test_http_posture_does_not_accept_mutable_authority_coordinates() -> None:
     validate_server_hardening_at_startup(
         _staging(
             alpha_writes_enabled=True,
             zkpassport_validator_threshold=2,
-            protocol_admin_authority_v2_launcher_id="0x" + "11" * 32,
-            protocol_admin_authority_v2_mips_root_hash="0x" + "22" * 32,
-            protocol_admin_authority_v2_admins_hash="0x" + "33" * 32,
-            admin_records_path="./state/admin_records_v2.json",
         )
     )
 
@@ -264,6 +269,70 @@ async def test_challenge_limiter_ignores_spoofed_forwarding_headers() -> None:
 
     assert first.status_code == 200
     assert second.status_code == 429
+
+
+def test_persistent_challenge_limiter_is_atomic_across_workers(tmp_path) -> None:
+    path = tmp_path / "shared" / "challenges.db"
+    workers = [
+        RequestRateLimiter(25, db_path=path),
+        RequestRateLimiter(25, db_path=path),
+    ]
+
+    def attempt(index: int) -> bool:
+        return workers[index % len(workers)].allow("198.51.100.44")
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        results = list(executor.map(attempt, range(200)))
+
+    assert sum(results) == 25
+    assert results.count(False) == 175
+
+
+def test_deployed_challenge_store_requires_absolute_shared_path(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="absolute shared-state path"):
+        preflight_challenge_storage(
+            _staging(challenge_store_path="./state/challenges_v2.db")
+        )
+
+    absolute_path = tmp_path / "shared" / "challenges_v2.db"
+    preflight_challenge_storage(
+        _staging(challenge_store_path=str(absolute_path))
+    )
+    assert absolute_path.is_file()
+
+
+def test_client_ip_accepts_cloudflare_header_only_from_trusted_peer() -> None:
+    settings = Settings(trusted_proxy_cidrs="203.0.113.0/24")
+    trusted_scope = {
+        "client": ("203.0.113.9", 443),
+        "headers": [(b"cf-connecting-ip", b"198.51.100.44")],
+    }
+    direct_scope = {
+        "client": ("192.0.2.9", 443),
+        "headers": [(b"cf-connecting-ip", b"198.51.100.44")],
+    }
+    assert trusted_client_ip(trusted_scope, settings) == "198.51.100.44"
+    assert trusted_client_ip(direct_scope, settings) == "192.0.2.9"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"cf-connecting-ip", b"not-an-ip")],
+        [
+            (b"cf-connecting-ip", b"198.51.100.1"),
+            (b"cf-connecting-ip", b"198.51.100.2"),
+        ],
+    ],
+)
+def test_client_ip_falls_back_to_proxy_for_ambiguous_header(headers) -> None:
+    settings = Settings(trusted_proxy_cidrs="203.0.113.0/24")
+    assert (
+        trusted_client_ip(
+            {"client": ("203.0.113.9", 443), "headers": headers}, settings
+        )
+        == "203.0.113.9"
+    )
 
 
 @pytest.mark.parametrize(

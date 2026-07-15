@@ -54,6 +54,30 @@ def _v2_manifest() -> dict:
     }
 
 
+def _signed_artifact(manifest: dict) -> dict:
+    return {
+        "artifactHash": "0x" + "ab" * 32,
+        "sourceShas": {
+            "protocol": "1" * 40,
+            "evm": "2" * 40,
+            "api": "3" * 40,
+            "customerWeb": "4" * 40,
+            "adminPortal": "5" * 40,
+        },
+        "launcherIds": {
+            "pool": manifest["pool_launcher_id"],
+            "did": manifest["did_launcher_id"],
+            "governance": manifest["tracker_launcher_id"],
+            "navRegistry": "0x" + "da" * 32,
+            "protocolConfig": "0x" + "ee" * 32,
+            "adminAuthority": "0x" + "db" * 32,
+            "vaultVersionRegistry": "0x" + "dc" * 32,
+        },
+        "bridgePolicy": {"policyHash": "0x" + "c1" * 32},
+        "stateVersions": {"protocolConfig": 1, "vault": 1},
+    }
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     manifest_path = tmp_path / "deployment_manifest_v2.json"
@@ -63,6 +87,10 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", manifest["pool_launcher_id"])
     monkeypatch.setenv("SOLSLOT_GOVERNANCE_LAUNCHER_ID", manifest["tracker_launcher_id"])
     monkeypatch.setenv("SOLSLOT_PROTOCOL_CONFIG_LAUNCHER_ID", "0x" + "ee" * 32)
+    monkeypatch.setattr(
+        "solslot_api.app.load_signed_public_artifact",
+        lambda _settings: _signed_artifact(manifest),
+    )
     get_settings.cache_clear()
     # `with` triggers Starlette's lifespan (populates app.state).
     with TestClient(app) as c:
@@ -99,6 +127,7 @@ def test_protocol(client: TestClient) -> None:
     assert body["faucet_address"] is None
     assert body["faucet_balance_mojos"] is None
     assert body["deployment_manifest"] is None
+    assert body["artifact_hash"] == "0x" + "ab" * 32
 
 
 def test_evm_challenge_roundtrip(client: TestClient, local_acct) -> None:

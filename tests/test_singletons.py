@@ -95,7 +95,7 @@ class TestProtocolEndpoint:
             # Launcher id is None when env unset.
             assert body["property_registry_launcher_id"] is None
 
-    def test_property_registry_launcher_id_surfaced(
+    def test_property_registry_environment_launcher_is_ignored(
         self, fresh_settings, monkeypatch
     ):
         monkeypatch.setenv(
@@ -106,7 +106,7 @@ class TestProtocolEndpoint:
         with TestClient(app) as client:
             resp = client.get("/protocol")
             body = resp.json()
-            assert body["property_registry_launcher_id"] == PROPERTY_REGISTRY_LAUNCHER
+            assert body["property_registry_launcher_id"] is None
 
     def test_mod_hashes_match_drivers(self, fresh_settings):
         """The /protocol response's mod-hashes match solslot_puzzles drivers."""

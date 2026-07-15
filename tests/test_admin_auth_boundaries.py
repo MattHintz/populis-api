@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable
 
 from fastapi import APIRouter
 from fastapi.routing import APIRoute
 
-from solslot_api import admin, admin_auth, admin_bootstrap, mint_endpoints
+from solslot_api import admin, admin_auth, mint_endpoints
+from solslot_api.app import app
 from solslot_api.admin import require_admin_token
 from solslot_api.admin_auth import require_admin_jwt
-from solslot_api.admin_bootstrap import (
-    require_bootstrap_session,
-    require_recovery_anchor_handoff_auth,
-)
 
 
 def _api_routes(router: APIRouter) -> list[APIRoute]:
@@ -90,7 +86,7 @@ def test_committee_routes_stay_outside_admin_jwt_boundary() -> None:
         assert require_admin_token not in calls
 
 
-def test_admin_auth_refresh_is_the_only_jwt_gated_auth_route() -> None:
+def test_admin_auth_private_reads_and_refresh_are_jwt_gated() -> None:
     assert _route_keys(admin_auth.router) == {
         ("POST", "/admin/auth/challenge"),
         ("POST", "/admin/auth/login"),
@@ -105,64 +101,29 @@ def test_admin_auth_refresh_is_the_only_jwt_gated_auth_route() -> None:
         if require_admin_jwt in _dependency_calls(_route(admin_auth.router, method, path))
     }
 
-    assert jwt_routes == {("POST", "/admin/auth/refresh")}
+    assert jwt_routes == {
+        ("GET", "/admin/auth/authority_v2"),
+        ("POST", "/admin/auth/refresh"),
+    }
 
 
 def test_protocol_operator_routes_have_explicit_authority_boundaries() -> None:
-    static_token_routes = {
-        ("GET", "/admin/deployment"),
-        ("POST", "/admin/deploy/protocol"),
-        ("POST", "/admin/protocol-config/finalize"),
-    }
     chain_admin_routes = {
         ("POST", "/admin/zkpassport/bridge-pool/top-up"),
     }
-    expected = static_token_routes | chain_admin_routes
-
-    assert _route_keys(admin.router) == expected
-    for method, path in static_token_routes:
-        calls = _dependency_calls(_route(admin.router, method, path))
-        assert require_admin_token in calls
+    assert _route_keys(admin.router) == chain_admin_routes
     for method, path in chain_admin_routes:
         calls = _dependency_calls(_route(admin.router, method, path))
         assert require_admin_jwt in calls
         assert require_admin_token not in calls
 
 
-def test_bootstrap_routes_keep_scoped_auth_boundary() -> None:
-    assert _route_keys(admin_bootstrap.router) == {
-        ("POST", "/admin/bootstrap/challenge"),
-        ("GET", "/admin/bootstrap/status"),
-        ("POST", "/admin/bootstrap/finalize"),
-        ("GET", "/admin/bootstrap/recovery-anchor/publish-intent"),
-        ("POST", "/admin/bootstrap/recovery-anchor/create-coin-preview"),
-        ("POST", "/admin/bootstrap/recovery-anchor/verify"),
+def test_retired_bootstrap_routes_are_not_mounted() -> None:
+    mounted = {
+        route.path
+        for route in app.routes
+        if isinstance(route, APIRoute)
     }
-
-    finalize_calls = _dependency_calls(
-        _route(admin_bootstrap.router, "POST", "/admin/bootstrap/finalize")
-    )
-    assert require_bootstrap_session in finalize_calls
-    assert require_admin_jwt not in finalize_calls
-    assert require_admin_token not in finalize_calls
-
-    for method, path in {
-        ("GET", "/admin/bootstrap/recovery-anchor/publish-intent"),
-        ("POST", "/admin/bootstrap/recovery-anchor/create-coin-preview"),
-    }:
-        calls = _dependency_calls(_route(admin_bootstrap.router, method, path))
-        assert require_recovery_anchor_handoff_auth in calls
-        assert require_admin_token not in calls
-
-    for method, path in {
-        ("GET", "/admin/bootstrap/status"),
-        ("POST", "/admin/bootstrap/recovery-anchor/verify"),
-    }:
-        calls = _dependency_calls(_route(admin_bootstrap.router, method, path))
-        assert require_admin_jwt not in calls
-        assert require_admin_token not in calls
-        assert require_bootstrap_session not in calls
-
-    challenge_source = inspect.getsource(admin_bootstrap.bootstrap_challenge)
-    assert "require_admin_token(settings, authorization)" in challenge_source
-    assert "require_admin_jwt" not in challenge_source
+    assert not any(path.startswith("/admin/bootstrap") for path in mounted)
+    assert "/admin/deployment" not in mounted
+    assert "/admin/protocol-config/finalize" not in mounted

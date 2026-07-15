@@ -11,20 +11,15 @@ What this file covers:
   four auth states (disabled / missing / wrong / correct).
 - ``_select_coin_by_id`` selects the smallest-fitting coin or the
   named coin, and rejects insufficient amounts.
-- The ``DeployRequest`` schema enforces field bounds (quorum_bps,
-  min_proposal_stake, etc.) at the pydantic layer.
-- The ``ManifestResponse`` round-trips a saved-to-disk manifest dict.
+- Bridge replenishment request bounds and deterministic coin IDs.
 """
 from __future__ import annotations
 
-from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
 from solslot_api.admin import (
     BridgePoolTopUpRequest,
-    DeployRequest,
-    ManifestResponse,
     _coin_id_from_fields,
     _select_coin_by_id,
     require_admin_token,
@@ -159,44 +154,6 @@ class TestSelectCoin:
         assert coins[0].amount == 200
 
 
-# ── DeployRequest schema ─────────────────────────────────────────────────────
-class TestDeployRequestSchema:
-    def test_defaults_match_protocol_doc(self) -> None:
-        body = DeployRequest()
-        assert body.quorum_bps == 5000
-        assert body.voting_window_seconds == 300
-        assert body.sgt_total_supply == 1_000_000
-        assert body.min_proposal_stake == 10_000
-        assert body.fp_scale == 1000
-        assert body.initial_pool_status == 1
-        assert body.fee_per_spend == 0
-        assert body.dry_run is False
-
-    def test_quorum_bps_capped_at_10000(self) -> None:
-        with pytest.raises(ValueError):
-            DeployRequest(quorum_bps=10001)
-
-    def test_quorum_bps_must_be_positive(self) -> None:
-        with pytest.raises(ValueError):
-            DeployRequest(quorum_bps=0)
-
-    def test_min_proposal_stake_must_be_positive(self) -> None:
-        with pytest.raises(ValueError):
-            DeployRequest(min_proposal_stake=0)
-
-    def test_initial_pool_status_must_be_0_or_1(self) -> None:
-        DeployRequest(initial_pool_status=0)  # FROZEN
-        DeployRequest(initial_pool_status=1)  # ACTIVE
-        with pytest.raises(ValueError):
-            DeployRequest(initial_pool_status=2)
-
-    def test_fee_per_spend_non_negative(self) -> None:
-        DeployRequest(fee_per_spend=0)
-        DeployRequest(fee_per_spend=1000)
-        with pytest.raises(ValueError):
-            DeployRequest(fee_per_spend=-1)
-
-
 class TestBridgePoolTopUpRequest:
     def test_defaults_create_six_one_mojo_series(self) -> None:
         body = BridgePoolTopUpRequest()
@@ -217,23 +174,6 @@ class TestBridgePoolTopUpRequest:
         assert one != two
         assert one.startswith("0x")
         assert len(one) == 66
-
-
-# ── Manifest response shape ──────────────────────────────────────────────────
-class TestManifestResponse:
-    def test_no_manifest_serialises_correctly(self) -> None:
-        r = ManifestResponse(deployed=False, manifest=None)
-        assert r.model_dump() == {"deployed": False, "manifest": None}
-
-    def test_manifest_dict_passes_through(self) -> None:
-        manifest = {
-            "network": "testnet11",
-            "params": {"quorum_bps": 5000},
-            "tracker_launcher_id": "0x" + "ab" * 32,
-        }
-        r = ManifestResponse(deployed=True, manifest=manifest)
-        assert r.deployed is True
-        assert r.manifest == manifest
 
 
 # ── Settings round-trip ──────────────────────────────────────────────────────

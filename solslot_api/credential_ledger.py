@@ -565,7 +565,7 @@ class CredentialLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._conn.execute(
+                updated = self._conn.execute(
                     """
                     UPDATE relay_attempts
                     SET status = ?, tx_hash = ?, error = ?, updated_at = ?
@@ -579,6 +579,10 @@ class CredentialLedger:
                         request_digest.lower(),
                     ),
                 )
+                if updated.rowcount != 1:
+                    raise LedgerConflict(
+                        "The relay reservation is missing or was already finalized."
+                    )
                 circuit = self._conn.execute(
                     "SELECT consecutive_failures FROM relay_circuit WHERE singleton = 1"
                 ).fetchone()
@@ -597,6 +601,45 @@ class CredentialLedger:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def require_submitted_relay(
+        self,
+        *,
+        transaction_hash: str,
+        vault_launcher_id: str,
+        owner_key: str,
+        bridge_coin_id: str,
+    ) -> None:
+        """Require an API-authorized relay submission for a BLS attestation event."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT vault_launcher_id, owner_key, bridge_coin_id
+                FROM relay_attempts
+                WHERE tx_hash = ? AND status = 'submitted'
+                """,
+                (transaction_hash.lower(),),
+            ).fetchall()
+        if len(rows) != 1:
+            raise LedgerConflict(
+                "The BLS attestation event is not bound to one submitted relay."
+            )
+        row = rows[0]
+        expected = (
+            vault_launcher_id.lower(),
+            owner_key.lower(),
+            bridge_coin_id.lower(),
+        )
+        observed = (
+            str(row["vault_launcher_id"]).lower(),
+            str(row["owner_key"]).lower(),
+            str(row["bridge_coin_id"]).lower(),
+        )
+        if observed != expected:
+            raise LedgerConflict(
+                "The submitted BLS relay does not match this vault owner and bridge coin."
+            )
 
 
 def _canonical_json(value: Any) -> str:

@@ -20,6 +20,19 @@ IDENTITY_ROOT = "0x" + "44" * 32
 BRIDGE_POLICY = "0x" + "c1" * 32
 
 
+def _active_genesis_artifact() -> dict:
+    return {
+        "artifactHash": "0x" + "d1" * 32,
+        "launcherIds": {
+            "pool": "0x" + "aa" * 32,
+            "protocolConfig": "0x" + "bb" * 32,
+            "vaultVersionRegistry": "0x" + "cc" * 32,
+        },
+        "bridgePolicy": {"policyHash": BRIDGE_POLICY},
+        "retiredCoordinates": ["0x" + "e1" * 32],
+    }
+
+
 @pytest.fixture(autouse=True)
 def isolate_protocol_artifact_env(monkeypatch, tmp_path):
     monkeypatch.setenv(
@@ -74,6 +87,10 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
         "solslot_api.zkpassport_enrollments._sync_chia_stamp",
         confirmed_enrollment,
     )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts.load_signed_public_artifact",
+        lambda _settings: _active_genesis_artifact(),
+    )
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -81,6 +98,9 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
 
 def _request(**overrides):
     base = {
+        "protocol_version": "solslot-v2",
+        "network": "testnet11",
+        "genesis_artifact_hash": "0x" + "d1" * 32,
         "instance_id": "solslot-staging",
         "purchase_intent_id": "pi_test_001",
         "rail": "chia",
@@ -89,6 +109,8 @@ def _request(**overrides):
         "collection_id": "SOL-LOT-AUSTIN-ALPHA",
         "share_ppm": 25_000,
         "vault_launcher_id": VAULT_ID,
+        "current_vault_coin_id": "0x" + "88" * 32,
+        "identity_attest_root": IDENTITY_ROOT,
         "expires_at": int(time.time()) + 3600,
         "payment_terms": {
             "currency": "wUSDC",
@@ -233,3 +255,56 @@ def test_build_fails_closed_without_server_confirmed_receipt(monkeypatch):
         response = client.post("/protocol/offer-artifacts", json=_request())
     assert response.status_code == 409
     assert "not chain-confirmed" in response.text
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        (
+            "current_vault_coin_id",
+            "0x" + "99" * 32,
+            "vault coin or identity root is no longer current",
+        ),
+        (
+            "identity_attest_root",
+            "0x" + "99" * 32,
+            "vault coin or identity root is no longer current",
+        ),
+        (
+            "genesis_artifact_hash",
+            "0x" + "99" * 32,
+            "genesis artifact is not the active signed artifact",
+        ),
+    ),
+)
+def test_build_rejects_stale_client_trust_context(field, value, message):
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(**{field: value}),
+        )
+    assert response.status_code == 409
+    assert message in response.text
+
+
+def test_verify_rejects_receipt_that_is_no_longer_current(monkeypatch):
+    with TestClient(app) as client:
+        built = client.post("/protocol/offer-artifacts", json=_request()).json()
+
+        def stale_enrollment(_settings, _vault_launcher_id):
+            raise HTTPException(status_code=409, detail="Current vault coin changed.")
+
+        monkeypatch.setattr(
+            "solslot_api.zkpassport_enrollments._sync_chia_stamp",
+            stale_enrollment,
+        )
+        verified = client.post(
+            "/protocol/offer-artifacts/verify",
+            json={
+                "artifact": built["artifact"],
+                "artifact_hash": built["artifact_hash"],
+            },
+        )
+    assert verified.status_code == 200
+    assert verified.json()["valid"] is False
+    assert "credential_not_current_on_chia" in verified.json()["reasons"]

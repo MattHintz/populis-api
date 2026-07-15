@@ -7,6 +7,7 @@ are the two values that MUST be set in production.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import stat
@@ -27,7 +28,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_FAUCET_MNEMONIC",
         "SOLSLOT_CHALLENGE_SECRET",
         "SOLSLOT_BOOTSTRAP_SESSION_SECRET",
-        "SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX",
+        "SOLSLOT_VAULT_SESSION_JWT_SECRET",
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
     }
@@ -88,9 +89,32 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
+    proxy_cidrs = settings.trusted_proxy_cidr_list()
+    if not proxy_cidrs:
+        raise RuntimeError(
+            "SOLSLOT_TRUSTED_PROXY_CIDRS must contain the Cloudflare source "
+            "ranges in staging/production."
+        )
+    for value in proxy_cidrs:
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"SOLSLOT_TRUSTED_PROXY_CIDRS contains invalid CIDR {value!r}."
+            ) from exc
+        minimum_prefix = 8 if network.version == 4 else 16
+        if network.prefixlen < minimum_prefix:
+            raise RuntimeError(
+                f"SOLSLOT_TRUSTED_PROXY_CIDRS range {value!r} is too broad."
+            )
     if not settings.bootstrap_cookie_secure:
         raise RuntimeError(
             "SOLSLOT_BOOTSTRAP_COOKIE_SECURE must be true in staging/production."
+        )
+    if not settings.vault_session_cookie_secure:
+        raise RuntimeError(
+            "SOLSLOT_VAULT_SESSION_COOKIE_SECURE must be true in "
+            "staging/production."
         )
     if settings.api_docs_enabled:
         raise RuntimeError(
@@ -100,11 +124,51 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "Security headers and HSTS must be enabled in staging/production."
         )
-    if settings.alpha_writes_enabled and settings.zkpassport_validator_threshold < 2:
-        raise RuntimeError(
-            "Staging/production protocol writes require "
-            "SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD of at least 2."
-        )
+    if settings.alpha_writes_enabled:
+        if len(settings.vault_session_jwt_secret) < 32:
+            raise RuntimeError(
+                "SOLSLOT_VAULT_SESSION_JWT_SECRET must contain at least 32 "
+                "characters before protocol writes are enabled."
+            )
+        if settings.zkpassport_validator_threshold != 2:
+            raise RuntimeError(
+                "Staging/production protocol writes require an exact 2-of-3 "
+                "zkPassport validator quorum in SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD."
+            )
+        if len(settings.zkpassport_validator_urls) != 3:
+            raise RuntimeError(
+                "SOLSLOT_ZKPASSPORT_VALIDATOR_URLS must configure three signers."
+            )
+        if len(settings.zkpassport_validator_pubkeys) != 3:
+            raise RuntimeError(
+                "SOLSLOT_ZKPASSPORT_VALIDATOR_PUBKEYS must configure three public keys."
+            )
+        if len(set(settings.zkpassport_validator_pubkeys)) != 3:
+            raise RuntimeError("zkPassport validator public keys must be distinct.")
+        for index, pubkey in enumerate(settings.zkpassport_validator_pubkeys):
+            try:
+                raw_pubkey = bytes.fromhex(pubkey.removeprefix("0x"))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"zkPassport validator public key {index} is not valid hex."
+                ) from exc
+            if len(raw_pubkey) != 48:
+                raise RuntimeError(
+                    f"zkPassport validator public key {index} must be 48 bytes."
+                )
+        for url in settings.zkpassport_validator_urls:
+            if not url.startswith("https://"):
+                raise RuntimeError("Validator signer URLs must use HTTPS.")
+        if not all(
+            (
+                settings.zkpassport_validator_mtls_ca_path,
+                settings.zkpassport_validator_mtls_cert_path,
+                settings.zkpassport_validator_mtls_key_path,
+            )
+        ):
+            raise RuntimeError(
+                "Validator quorum calls require CA, client certificate, and client key paths."
+            )
 
     if settings.ceremony_mode_enabled:
         if settings.network != "testnet11":
@@ -119,25 +183,10 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             raise RuntimeError(
                 "Ceremony mode must be same-origin and cannot configure CORS origins."
             )
-    elif settings.alpha_writes_enabled:
-        required_authority = {
-            "admin authority launcher": (
-                settings.effective_protocol_admin_authority_v2_launcher_id()
-            ),
-            "admin authority MIPS root": (
-                settings.effective_protocol_admin_authority_v2_mips_root_hash()
-            ),
-            "admin authority admins hash": (
-                settings.effective_protocol_admin_authority_v2_admins_hash()
-            ),
-            "chain-bound admin records": settings.effective_admin_records_path(),
-        }
-        missing = [name for name, value in required_authority.items() if not value]
-        if missing:
-            raise RuntimeError(
-                "Protocol writes require a chain-bound admin authority; missing: "
-                + ", ".join(missing)
-            )
+    # Post-ceremony authority is validated cryptographically from the signed
+    # V2 artifact by ``validate_admin_config_at_startup``. Keeping that check
+    # out of this HTTP-posture validator avoids a second mutable coordinate
+    # source and a circular trust dependency.
 
     expected_evm_chain_id = 1 if settings.network == "mainnet" else 11155111
     if settings.eip712_chain_id != expected_evm_chain_id:
@@ -221,7 +270,9 @@ class Settings(BaseSettings):
         "p2_vault_mod_hash",
         "vault_version_registry_launcher_id",
         "admin_records_path",
-        "zkpassport_validator_seed_hex",
+        "zkpassport_validator_mtls_ca_path",
+        "zkpassport_validator_mtls_cert_path",
+        "zkpassport_validator_mtls_key_path",
         "zkpassport_relayer_private_key_hex",
         "zkpassport_bridge_policy_hash",
         "zkpassport_forwarder_address",
@@ -247,6 +298,9 @@ class Settings(BaseSettings):
     hsts_enabled: bool = True
     max_request_body_bytes: int = Field(4 * 1024 * 1024, ge=1, le=16 * 1024 * 1024)
     request_timeout_seconds: float = Field(30.0, gt=0, le=120.0)
+    # Only immediate peers in these Cloudflare source ranges may supply
+    # CF-Connecting-IP. Keep this list synchronized from infrastructure code.
+    trusted_proxy_cidrs: str = ""
 
     # ── Network ───────────────────────────────────────────────────────────
     network: Literal["testnet11", "mainnet"] = "testnet11"
@@ -267,6 +321,14 @@ class Settings(BaseSettings):
     challenge_ttl_seconds: int = 300
     # 32-byte hex string.  If empty a random one is generated per-process.
     challenge_secret: str = ""
+    # HttpOnly, same-site session issued after a normal wallet login. The
+    # session authenticates silent credential workflow transitions; it never
+    # substitutes for the two exact action signatures (proof relay and Chia
+    # vault stamp).
+    vault_session_jwt_secret: str = ""
+    vault_session_ttl_seconds: int = Field(900, ge=300, le=3600)
+    vault_session_cookie_secure: bool = True
+    vault_session_cookie_path: str = "/protocol-api"
 
     # ── Faucet (launcher payer) ──────────────────────────────────────────
     # ONE of these three must be set; without any the backend refuses to
@@ -287,11 +349,18 @@ class Settings(BaseSettings):
     # testnet they are pinned here.  Vaults must reference the same pool.
     pool_launcher_id: Optional[str] = None
     governance_launcher_id: Optional[str] = None
-    # Path to the persisted deployment manifest (JSON).  When set and present,
-    # the API loads the plan on startup so it can serve /admin/deployment and
-    # the protocol-aware vault flows without re-deploying.
+    # Retained only as an offline evidence/recovery input. Active runtime
+    # coordinates come exclusively from the signed V2 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
+    public_artifact_path: str = "./state/public_artifact_v2.json"
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
+    genesis_db_path: str = "./state/genesis_ceremony_v2.db"
+    genesis_output_dir: str = "./state/genesis_ceremonies"
+    genesis_audit_approval_path: str = "./state/genesis_audit_approval_v2.json"
+    genesis_invitation_ttl_seconds: int = Field(1800, ge=1800, le=1800)
+    genesis_plan_ttl_seconds: int = Field(3600, ge=900, le=7200)
+    genesis_sepolia_confirmations: int = Field(12, ge=12, le=12)
+    genesis_chia_confirmations: int = Field(3, ge=3, le=3)
     bootstrap_session_secret: str = ""
     bootstrap_session_ttl_seconds: int = Field(900, ge=1)
     bootstrap_cookie_secure: bool = True
@@ -379,19 +448,17 @@ class Settings(BaseSettings):
     # spend; default 1 = "initial deployment".
     vault_version_registry_version: int = 1
 
-    # ── zkPassport validator node ─────────────────────────────────────────
-    # 32-byte hex seed for the BLS validator keypair that countersigns
-    # VaultAttestationVerified EVM events.  Generate with:
-    #   python3 -c "import secrets; print(secrets.token_bytes(32).hex())"
-    # Store as SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX in .env (mode 0600).
-    # This key is used only by the internal enrollment state machine after an
-    # indexed EVM event and reserved Chia bridge coin have both been verified.
-    # There is intentionally no public validator-signing endpoint.
-    zkpassport_validator_seed_hex: Optional[str] = None
-    # Alpha may use one validator explicitly. A mainnet production process
-    # refuses to start below 2; the fresh bridge policy must commit to the
-    # same threshold and independent validator set.
-    zkpassport_validator_threshold: int = Field(1, ge=1, le=16)
+    # ── zkPassport validator quorum ───────────────────────────────────────
+    # The coordinator owns no validator private key. These ordered arrays
+    # commit to three independent signer services; the same order is curried
+    # into the Chia bridge puzzle. Production calls use mutual TLS.
+    zkpassport_validator_urls: list[str] = Field(default_factory=list)
+    zkpassport_validator_pubkeys: list[str] = Field(default_factory=list)
+    zkpassport_validator_threshold: int = Field(2, ge=1, le=3)
+    zkpassport_validator_mtls_ca_path: Optional[str] = None
+    zkpassport_validator_mtls_cert_path: Optional[str] = None
+    zkpassport_validator_mtls_key_path: Optional[str] = None
+    zkpassport_validator_timeout_seconds: float = Field(8.0, gt=0, le=30)
 
     # ── zkPassport vault bridge policy hash ───────────────────────────
     # Canonical validator-set commitment curried into every vault at mint so
@@ -590,6 +657,13 @@ class Settings(BaseSettings):
 
     def allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    def trusted_proxy_cidr_list(self) -> list[str]:
+        return [
+            value.strip()
+            for value in self.trusted_proxy_cidrs.split(",")
+            if value.strip()
+        ]
 
     def effective_admin_allowlist_set(self) -> set[str]:
         """Return EVM admins derived only from hash-verified V2 records."""

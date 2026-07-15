@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import jwt as pyjwt
 from chia.types.blockchain_format.program import Program
 from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
 from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1
@@ -22,13 +24,8 @@ from .state import VaultRecord, get_registry
 
 
 CredentialAction = Literal[
-    "create",
-    "record_proof",
+    "session_login",
     "relay",
-    "stamp_prepare",
-    "stamp_submit",
-    "stamp_sync",
-    "chia_confirmation",
 ]
 
 CREDENTIAL_ACTION_PRIMARY_TYPE = "SolslotVaultCredentialAction"
@@ -69,11 +66,150 @@ class OwnerChallengeResponse(BaseModel):
     messageHex: str | None = None
 
 
+class VaultSessionResponse(BaseModel):
+    vaultLauncherId: str
+    authType: Literal["evm", "chia_bls"]
+    network: str
+    protocolVersion: Literal["solslot-v2"] = "solslot-v2"
+    expiresAt: int
+
+
 @dataclass(frozen=True)
 class VerifiedOwner:
     owner_key: str
     auth_type: Literal["evm", "chia_bls"]
     vault_record: VaultRecord
+
+
+@dataclass(frozen=True)
+class VerifiedVaultSession:
+    owner_key: str
+    auth_type: Literal["evm", "chia_bls"]
+    vault_launcher_id: str
+    network: str
+    expires_at: int
+    vault_record: VaultRecord
+
+
+VAULT_SESSION_COOKIE = "solslot_vault_session_v2"
+VAULT_SESSION_AUDIENCE = "solslot-credential-v2"
+VAULT_SESSION_ISSUER = "solslot-api"
+
+
+def vault_session_payload(settings: Settings) -> dict[str, Any]:
+    return {
+        "network": settings.network,
+        "protocolVersion": "solslot-v2",
+    }
+
+
+def issue_vault_session(
+    settings: Settings,
+    verified_owner: VerifiedOwner,
+) -> tuple[str, VaultSessionResponse]:
+    secret = _vault_session_secret(settings)
+    now = int(time.time())
+    expires_at = now + settings.vault_session_ttl_seconds
+    vault = "0x" + verified_owner.vault_record.launcher_id.hex()
+    claims = {
+        "iss": VAULT_SESSION_ISSUER,
+        "aud": VAULT_SESSION_AUDIENCE,
+        "sub": verified_owner.owner_key,
+        "jti": secrets.token_hex(16),
+        "iat": now,
+        "exp": expires_at,
+        "vaultLauncherId": vault,
+        "authType": verified_owner.auth_type,
+        "network": settings.network,
+        "protocolVersion": "solslot-v2",
+    }
+    token = pyjwt.encode(claims, secret, algorithm="HS256")
+    return token, VaultSessionResponse(
+        vaultLauncherId=vault,
+        authType=verified_owner.auth_type,
+        network=settings.network,
+        expiresAt=expires_at,
+    )
+
+
+def verify_vault_session(
+    settings: Settings,
+    request: Request,
+    vault_launcher_id: str,
+) -> VerifiedVaultSession:
+    vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
+    token = request.cookies.get(VAULT_SESSION_COOKIE)
+    authorization = request.headers.get("authorization", "")
+    if not token and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A fresh vault-owner session is required.",
+        )
+    try:
+        claims = pyjwt.decode(
+            token,
+            _vault_session_secret(settings),
+            algorithms=["HS256"],
+            audience=VAULT_SESSION_AUDIENCE,
+            issuer=VAULT_SESSION_ISSUER,
+        )
+    except pyjwt.ExpiredSignatureError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="The vault-owner session expired. Reconnect the wallet.",
+        ) from exc
+    except pyjwt.InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="The vault-owner session is invalid.",
+        ) from exc
+    if (
+        claims.get("vaultLauncherId") != vault
+        or claims.get("network") != settings.network
+        or claims.get("protocolVersion") != "solslot-v2"
+        or claims.get("authType") not in {"evm", "chia_bls"}
+        or not claims.get("sub")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The vault-owner session does not match this vault and network.",
+        )
+    record = require_vault_record(vault)
+    expected_owner = (
+        record.owner_evm_address.lower()
+        if record.owner_evm_address
+        else "0x" + bytes(record.owner_pubkey).hex()
+    )
+    expected_auth_type = "evm" if record.auth_type == AUTH_TYPE_SECP256K1 else "chia_bls"
+    if (
+        str(claims["sub"]).lower() != expected_owner.lower()
+        or claims["authType"] != expected_auth_type
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The vault-owner session no longer matches canonical ownership.",
+        )
+    return VerifiedVaultSession(
+        owner_key=expected_owner,
+        auth_type=expected_auth_type,
+        vault_launcher_id=vault,
+        network=settings.network,
+        expires_at=int(claims["exp"]),
+        vault_record=record,
+    )
+
+
+def _vault_session_secret(settings: Settings) -> str:
+    if len(settings.vault_session_jwt_secret) >= 32:
+        return settings.vault_session_jwt_secret
+    if settings.runtime_environment == "test":
+        return "solslot-test-vault-session-secret-v2"
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Vault-owner sessions are not configured.",
+    )
 
 
 def normalize_hex32(value: object, field: str) -> str:
@@ -309,13 +445,19 @@ __all__ = [
     "OwnerAuth",
     "OwnerChallengeRequest",
     "OwnerChallengeResponse",
+    "VAULT_SESSION_COOKIE",
+    "VaultSessionResponse",
     "VerifiedOwner",
+    "VerifiedVaultSession",
     "credential_payload_hash",
     "credential_bls_message",
     "credential_bls_signing_digest",
     "credential_typed_data",
     "issue_owner_challenge",
+    "issue_vault_session",
     "require_alpha_writes",
     "require_minting_writes",
     "verify_owner_auth",
+    "verify_vault_session",
+    "vault_session_payload",
 ]

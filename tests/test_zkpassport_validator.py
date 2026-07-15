@@ -16,5 +16,5 @@ def test_validator_routes_do_not_exist() -> None:
     assert "/zkpassport/sign" not in paths
 
 
-def test_validator_seed_is_classified_as_secret():
-    assert "SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX" in SECRET_ENV_FILE_KEYS
+def test_api_has_no_validator_private_seed_configuration():
+    assert "SOLSLOT_ZKPASSPORT_VALIDATOR_SEED_HEX" not in SECRET_ENV_FILE_KEYS

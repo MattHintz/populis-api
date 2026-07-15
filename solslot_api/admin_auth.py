@@ -43,6 +43,12 @@ from pydantic import BaseModel, Field, model_validator
 from .challenges import ChallengeStore, ChallengeStoreFullError, RateLimitedError
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
+from .public_artifact import (
+    PublicArtifactError,
+    PublicArtifactMissing,
+    signed_admin_allowlist,
+)
+from .server_hardening import trusted_client_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/auth", tags=["admin-auth"])
@@ -132,6 +138,22 @@ _admin_challenges: Optional[ChallengeStore] = None
 _resolved_jwt_secret: Optional[str] = None
 
 
+def _effective_admin_allowlist(settings: Settings) -> set[str]:
+    """Resolve active admins from the signed release artifact.
+
+    Historical unit tests still exercise the expanded-record parser in the
+    explicit ``test`` environment. Deployed environments never consult that
+    file and fail closed when the signed artifact is missing or invalid.
+    """
+    if settings.runtime_environment == "test":
+        return settings.effective_admin_allowlist_set()
+    try:
+        return signed_admin_allowlist(settings)
+    except (PublicArtifactMissing, PublicArtifactError) as exc:
+        logger.error("Admin authority artifact is unavailable: %s", exc)
+        return set()
+
+
 def get_admin_challenges() -> ChallengeStore:
     global _admin_challenges
     if _admin_challenges is None:
@@ -178,9 +200,9 @@ def get_jwt_secret(settings: Optional[Settings] = None) -> str:
     # Fail fast when the admin desk is enabled but
     # the JWT secret is not.  Allow the random-fallback path only
     # when the admin desk itself is disabled (no verified records).
-    if s.effective_admin_allowlist_set():
+    if _effective_admin_allowlist(s):
         raise RuntimeError(
-            "Admin desk is enabled by SOLSLOT_ADMIN_RECORDS_PATH but "
+            "Admin desk is enabled by the signed V2 artifact but "
             "SOLSLOT_ADMIN_JWT_SECRET is "
             "empty.  Multi-worker deployments would generate divergent "
             "per-process secrets, causing intermittent 403s when load-"
@@ -228,7 +250,42 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
             "admin-authority singleton."
         )
 
-    # Chain-verified admin records are the only authority source.
+    if settings.runtime_environment != "test" and settings.admin_records_path:
+        raise RuntimeError(
+            "SOLSLOT_ADMIN_RECORDS_PATH is retired for deployed V2 releases. "
+            "Administrator identities come from the signed public artifact."
+        )
+
+    if settings.runtime_environment != "test":
+        try:
+            allowlist = signed_admin_allowlist(settings)
+        except PublicArtifactMissing as exc:
+            if settings.alpha_writes_enabled and not settings.ceremony_mode_enabled:
+                raise RuntimeError(
+                    "Protocol writes require a signed V2 public artifact."
+                ) from exc
+            logger.info("Admin desk disabled (signed V2 artifact unavailable).")
+            return
+        except PublicArtifactError as exc:
+            raise RuntimeError(
+                f"Signed V2 public artifact failed admin startup validation: {exc}"
+            ) from exc
+
+        if not allowlist:
+            raise RuntimeError("Signed V2 artifact contains no administrator identities.")
+        if not settings.admin_jwt_secret:
+            raise RuntimeError(
+                "Admin desk is enabled by the signed V2 artifact but "
+                "SOLSLOT_ADMIN_JWT_SECRET is empty. Set a stable "
+                "high-entropy value before starting the API."
+            )
+        logger.info(
+            "Admin desk gated by the signed V2 artifact: %d administrator slots.",
+            len(allowlist) // 2,
+        )
+        return
+
+    # The expanded records parser remains covered by isolated historical tests.
     #
     # When admin_records_path is set, load the JSON, verify it binds to
     # the configured launcher_id, and verify its admins_hash matches
@@ -303,7 +360,7 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
             len(records.eip712_evm_address_set()),
         )
 
-    if not settings.effective_admin_allowlist_set():
+    if not _effective_admin_allowlist(settings):
         logger.info("Admin desk disabled (no chain-verified admin records).")
         return
 
@@ -403,7 +460,7 @@ def require_admin_jwt(
         restart, even if the JWT itself is still cryptographically
         valid under the unchanged secret).
     """
-    if not settings.effective_admin_allowlist_set():
+    if not _effective_admin_allowlist(settings):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -429,7 +486,7 @@ def require_admin_jwt(
     # cycle, regardless of whether their JWT is still within its TTL.
     # Without this check, refresh-after-revocation chains keep a
     # compromised admin authoritative until the API process restarts.
-    if claims.sub.lower() not in settings.effective_admin_allowlist_set():
+    if claims.sub.lower() not in _effective_admin_allowlist(settings):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -495,13 +552,13 @@ async def admin_challenge(
     /login.  Issuing a challenge is harmless even for an unrecognised
     pubkey because the challenge is single-use and TTL'd.
     """
-    if not settings.effective_admin_allowlist_set():
+    if not _effective_admin_allowlist(settings):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin desk is disabled (no chain-verified admin records).",
         )
 
-    source_ip = request.client.host if request.client else None
+    source_ip = trusted_client_ip(request.scope, settings)
     store = get_admin_challenges()
     try:
         ch = store.issue(
@@ -562,7 +619,7 @@ async def admin_login(
       501  auth_type=='chia_bls' (BLS verification deferred to a
            later checkpoint; see the module-level comment)
     """
-    if not settings.effective_admin_allowlist_set():
+    if not _effective_admin_allowlist(settings):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin desk is disabled (no chain-verified admin records).",
@@ -619,7 +676,7 @@ async def admin_login(
     # convention — short hex) OR the recovered compressed pubkey
     # (33-byte hex), so an operator can configure whichever they
     # prefer.  Compare lowercased.
-    allowlist = settings.effective_admin_allowlist_set()
+    allowlist = _effective_admin_allowlist(settings)
     candidates = {
         recovery.address.lower(),
         recovery.compressed_pubkey_hex.lower(),
@@ -646,11 +703,15 @@ async def admin_login(
     return AdminLoginResponse(jwt=token, expires_at=exp, owner=sub)
 
 
-@router.get("/authority_v2", tags=["admin-auth"])
+@router.get(
+    "/authority_v2",
+    tags=["admin-auth"],
+    dependencies=[Depends(require_admin_jwt)],
+)
 async def admin_authority_v2(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
-    """Public read of the current on-chain admin-authority singleton.
+    """Authenticated operator read of the admin-authority singleton.
 
     The singleton uses CHIP-0043 MIPS composition:
     each admin slot holds a OneOfN of personal auth methods (BLS,
@@ -660,10 +721,9 @@ async def admin_authority_v2(
 
     Returns the deterministic ``state_hash`` along with the launcher
     coin id, MIPS root hash, admins hash, pending-ops hash, and
-    authority version. The endpoint is intentionally unauthenticated:
-    any third party can fetch it, walk the singleton lineage on
-    coinset.org, and verify the operator is publishing the same state
-    on-chain.
+    authority version. These roster commitments are not part of the
+    public API surface; external verification uses the signed public
+    artifact and direct singleton lineage reads.
 
     When the operator has not configured v2 (no launcher id, no state
     hashes), the response has ``enabled: false`` and most fields are
@@ -675,6 +735,13 @@ async def admin_authority_v2(
     """
     from .admin_authority_v2 import build_admin_authority_v2_snapshot
     snap = build_admin_authority_v2_snapshot(settings)
+    authority_is_gating = bool(_effective_admin_allowlist(settings))
+    if settings.runtime_environment == "test" and settings.effective_admin_records_path():
+        gating_source = "test-expanded-record-fixture"
+    elif authority_is_gating:
+        gating_source = "signed-v2-public-artifact"
+    else:
+        gating_source = "disabled"
     return {
         "enabled": snap.enabled,
         "launcher_id": snap.launcher_id_hex,
@@ -686,12 +753,8 @@ async def admin_authority_v2(
         "deployment_status": snap.deployment_status,
         "chain_verifiable": snap.chain_verifiable,
         "phase": snap.phase,
-        "gating_source": (
-            "SOLSLOT_ADMIN_RECORDS_PATH"
-            if settings.effective_admin_records_path()
-            else "disabled"
-        ),
-        "informational_only": not bool(settings.effective_admin_records_path()),
+        "gating_source": gating_source,
+        "informational_only": not authority_is_gating,
     }
 
 

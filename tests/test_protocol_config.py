@@ -180,7 +180,7 @@ class TestProtocolEndpoint:
             assert body["protocol_config_version"] == 1
             assert body["protocol_config_launcher_id"] is None
 
-    def test_returns_hash_when_launchers_configured(
+    def test_environment_launchers_cannot_select_public_snapshot(
         self, fresh_settings, monkeypatch
     ):
         monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", POOL_HEX)
@@ -190,28 +190,20 @@ class TestProtocolEndpoint:
             resp = client.get("/protocol")
             assert resp.status_code == 200
             body = resp.json()
-            assert body["protocol_config_hash"] is not None
-            assert body["protocol_config_hash"].startswith("0x")
-            # Hash equals direct driver computation.
-            expected = compute_content_hash(
-                pool_launcher_id=bytes32.fromhex(POOL_HEX[2:]),
-                gov_tracker_launcher_id=bytes32.fromhex(GOV_HEX[2:]),
-                network_id=NETWORK_ID_TESTNET11,
-                config_version=1,
-            )
-            assert body["protocol_config_hash"] == "0x" + expected.hex()
+            assert body["protocol_config_hash"] is None
+            assert body["protocol_config_launcher_id"] is None
 
     def test_version_default_is_one(self, fresh_settings):
         with TestClient(app) as client:
             resp = client.get("/protocol")
             assert resp.json()["protocol_config_version"] == 1
 
-    def test_version_override_via_env(self, fresh_settings, monkeypatch):
+    def test_version_override_via_env_is_ignored(self, fresh_settings, monkeypatch):
         monkeypatch.setenv("SOLSLOT_PROTOCOL_CONFIG_VERSION", "7")
         get_settings.cache_clear()
         with TestClient(app) as client:
             resp = client.get("/protocol")
-            assert resp.json()["protocol_config_version"] == 7
+            assert resp.json()["protocol_config_version"] == 1
 
 
 # ── /protocol vault-version registry wiring (A.5) ───────────────────────
@@ -241,10 +233,9 @@ class TestVaultVersionRegistryEndpoint:
             assert body["vault_canonical_params_hash"] is None
             assert body["vault_version_registry_content_hash"] is None
 
-    def test_registry_content_hash_matches_driver(self, fresh_settings, monkeypatch):
-        """The API helper must produce the SAME content hash as the solslot_puzzles
-        driver — that's the cross-repo contract for the on-chain registry.
-        """
+    def test_registry_environment_coordinates_are_ignored(
+        self, fresh_settings, monkeypatch
+    ):
         monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", POOL_HEX)
         monkeypatch.setenv("SOLSLOT_GOVERNANCE_LAUNCHER_ID", GOV_HEX)
         monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_POLICY_HEX)
@@ -255,29 +246,14 @@ class TestVaultVersionRegistryEndpoint:
             resp = client.get("/protocol")
             assert resp.status_code == 200
             body = resp.json()
-            assert body["vault_version_registry_launcher_id"] == VAULT_VERSION_REGISTRY_HEX
+            assert body["vault_version_registry_launcher_id"] is None
             assert body["vault_version"] == 1
-            assert body["vault_canonical_params_hash"] is not None
-            assert body["vault_version_registry_content_hash"] is not None
+            assert body["vault_canonical_params_hash"] is None
+            assert body["vault_version_registry_content_hash"] is None
 
-            # Recompute the canonical params hash and content hash directly from
-            # the driver to prove the API wiring matches the on-chain puzzle.
-            canonical_params_hash = compute_vault_canonical_params_hash(
-                pool_singleton_mod_hash=SINGLETON_MOD_HASH,
-                pool_launcher_id=bytes32.fromhex(POOL_HEX[2:]),
-                pool_singleton_launcher_puzzle_hash=SINGLETON_LAUNCHER_HASH,
-                zkpassport_bridge_policy_hash=bytes32.fromhex(BRIDGE_POLICY_HEX[2:]),
-            )
-            assert body["vault_canonical_params_hash"] == "0x" + canonical_params_hash.hex()
-
-            expected_content_hash = compute_vault_registry_content_hash(
-                vault_inner_mod_hash=bytes32.fromhex(body["vault_inner_mod_hash"][2:]),
-                canonical_params_hash=canonical_params_hash,
-                vault_version=1,
-            )
-            assert body["vault_version_registry_content_hash"] == "0x" + expected_content_hash.hex()
-
-    def test_registry_version_override_via_env(self, fresh_settings, monkeypatch):
+    def test_registry_version_override_via_env_is_ignored(
+        self, fresh_settings, monkeypatch
+    ):
         monkeypatch.setenv("SOLSLOT_POOL_LAUNCHER_ID", POOL_HEX)
         monkeypatch.setenv("SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH", BRIDGE_POLICY_HEX)
         monkeypatch.setenv("SOLSLOT_VAULT_VERSION_REGISTRY_VERSION", "3")
@@ -286,4 +262,4 @@ class TestVaultVersionRegistryEndpoint:
         with TestClient(app) as client:
             resp = client.get("/protocol")
             body = resp.json()
-            assert body["vault_version"] == 3
+            assert body["vault_version"] == 1
