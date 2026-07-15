@@ -105,7 +105,7 @@ jobs:
           APP_PACKAGE: ${{ steps.package.outputs.package_name }}
         run: >-
           python scripts/check_secrets.py --paths
-          "$APP_PACKAGE" tests scripts .github pyproject.toml
+          "$APP_PACKAGE" tests scripts ops config .github pyproject.toml
 
       - name: Write release metadata
         shell: bash
@@ -115,7 +115,8 @@ jobs:
         run: |
           set -euo pipefail
           protocol_commit="$(git -C protocol rev-parse HEAD)"
-          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          built_at="$(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ)"
           python - <<PY
           import json
           data = {
@@ -127,6 +128,7 @@ jobs:
               "protocol_ref": "${PROTOCOL_REF}",
               "protocol_commit": "${protocol_commit}",
               "built_at_utc": "${built_at}",
+              "source_date_epoch": ${source_date_epoch},
               "package_name": "${APP_PACKAGE}",
               "app_module": "${APP_MODULE}",
           }
@@ -141,19 +143,38 @@ jobs:
           APP_PACKAGE: ${{ steps.package.outputs.package_name }}
         run: |
           set -euo pipefail
-          tar \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.pytest_cache' \
-            --exclude='__pycache__' \
-            --exclude='.venv' \
-            --exclude='*.pyc' \
-            -czf "solslot-api-release-${GITHUB_SHA}.tgz" \
-            "$APP_PACKAGE" \
-            protocol \
-            pyproject.toml \
-            README.md \
-            release.json
+          source_date_epoch="$(python -c 'import json; print(json.load(open("release.json"))["source_date_epoch"])')"
+          package_release() {
+            local output="$1"
+            tar \
+              --sort=name \
+              --mtime="@$source_date_epoch" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --format=gnu \
+              --exclude='.git' \
+              --exclude='.github' \
+              --exclude='.pytest_cache' \
+              --exclude='__pycache__' \
+              --exclude='.venv' \
+              --exclude='*.pyc' \
+              -cf - \
+              "$APP_PACKAGE" \
+              protocol \
+              config \
+              ops \
+              scripts \
+              pyproject.toml \
+              README.md \
+              release.json \
+              | gzip -n > "$output"
+          }
+          package_release "solslot-api-release-${GITHUB_SHA}.tgz"
+          package_release "solslot-api-release-${GITHUB_SHA}.repeat.tgz"
+          cmp "solslot-api-release-${GITHUB_SHA}.tgz" \
+            "solslot-api-release-${GITHUB_SHA}.repeat.tgz"
+          rm "solslot-api-release-${GITHUB_SHA}.repeat.tgz"
 
       - name: Verify packaged namespace
         shell: bash
@@ -249,7 +270,26 @@ jobs:
 
             if [ ! -f "$release_dir/.release-ready" ]; then
               mkdir -p "$release_dir"
-              tar -xzf "$archive" -C "$release_dir"
+              "$python_bin" - "$archive" <<'PY'
+            import pathlib
+            import sys
+            import tarfile
+
+            with tarfile.open(sys.argv[1], "r:gz") as archive:
+                for member in archive.getmembers():
+                    path = pathlib.PurePosixPath(member.name)
+                    if path.is_absolute() or ".." in path.parts:
+                        raise SystemExit(f"unsafe release archive path: {member.name}")
+                    if member.isdev() or member.isfifo():
+                        raise SystemExit(
+                            f"unsupported special file in release archive: {member.name}"
+                        )
+                    if member.issym() or member.islnk():
+                        target = pathlib.PurePosixPath(member.linkname)
+                        if target.is_absolute() or ".." in target.parts:
+                            raise SystemExit(f"unsafe release archive link: {member.name}")
+            PY
+              tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$release_dir"
               cd "$release_dir"
               package_name="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["package_name"])')"
               app_module="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["app_module"])')"
@@ -344,6 +384,9 @@ jobs:
               test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/openapi.json")" = "404"
               test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$app_port/zkpassport/validator")" = "404"
               test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H 'Content-Type: application/json' -d '{}' \
+                "http://127.0.0.1:$app_port/v1/zkpassport/sign")" = "404"
+              test "$(curl -sS -o /dev/null -w '%{http_code}' \
                 -H 'Content-Type: application/json' \
                 -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
                 "http://127.0.0.1:$app_port/auth/challenge")" = "503"
@@ -360,6 +403,16 @@ jobs:
 
               sudo systemctl show "$systemd_service" --property=ExecStart --value \
                 | grep -q 'solslot_api.app:app'
+              if sudo find "$release_dir" "$shared_root" -xdev -type f \
+                -iname '*validator*seed*' -print -quit | grep -q .; then
+                echo "Validator seed material exists on the coordinator." >&2
+                return 1
+              fi
+              main_pid="$(sudo systemctl show "$systemd_service" --property=MainPID --value)"
+              if sudo grep -zq '^SOLSLOT_VALIDATOR_SEED_FILE=' "/proc/$main_pid/environ"; then
+                echo "Coordinator process received validator seed configuration." >&2
+                return 1
+              fi
               ss -ltn | grep -Eq "127\\.0\\.0\\.1:$app_port[[:space:]]"
               ! ss -ltn | grep -Eq "(0\\.0\\.0\\.0|\\[::\\]):$app_port[[:space:]]"
             }
@@ -393,6 +446,9 @@ jobs:
           grep -qi '^x-content-type-options: nosniff' "$headers"
           test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/openapi.json")" = "404"
           test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/zkpassport/validator")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' -d '{}' \
+            "${{ env.PUBLIC_BASE_URL }}/v1/zkpassport/sign")" = "404"
           test "$(curl -sS -o /dev/null -w '%{http_code}' \
             -H 'Content-Type: application/json' \
             -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \

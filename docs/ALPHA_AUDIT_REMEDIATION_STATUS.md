@@ -54,7 +54,7 @@ from clean checkouts, and recorded as five new full source SHAs.
 
 | Finding | State | Evidence or remaining gate |
 | --- | --- | --- |
-| C-1 provider credential in EVM history | History fixed, provider revocation open | Both public EVM branches use scrubbed ancestry, current config is environment-only, CI rejects provider credentials, and the canonical local object database no longer contains the retired blob. A private mode-0400 pre-scrub bundle preserves evidence. The provider account owner must still revoke the credential. |
+| C-1 provider credential in EVM history | Active source fixed, provider revocation open | Current configuration is environment-only and CI rejects provider credentials. Public exposure cannot be undone by another shared-history rewrite, so the provider account owner must revoke the old credential and install a least-privilege replacement outside source control. |
 | C-2 portal runtime coordinates | Contained | Public runtime files no longer contain active admin or ceremony coordinates. Fresh V2 coordinates may be published only through the signed ceremony artifact. |
 | C-3 retired API on public port `5001` | Contained live | The PM2 process is removed and saved, direct port `5001` refuses connections, port `8790` is externally unreachable, and no retired database or state was deleted. |
 | C-4 credentialed localhost CORS | Contained live | Staging rejects localhost and attacker-origin preflights without allow-origin or allow-credentials. Pro mutation routes are retired at `410` and return no CORS grant. |
@@ -102,10 +102,11 @@ and use workflow diagnostics when they differ.
 
 Alpha remains blocked on the following external and release-control work:
 
-1. Revoke the exposed provider credential and rotate every staging, ceremony,
-   signer, relayer, deployer, SSH, CI, JWT, admin, faucet, and database secret.
-2. Review and commit all five dirty candidate worktrees, reproduce every gate
-   from clean checkouts, and freeze five new full source SHAs.
+1. Revoke and replace the exposed provider credential. Complete the RC2
+   carryover record for reusable credentials; generate only signer 1/2,
+   WireGuard, mTLS, invitation, and one-time ceremony material.
+2. Treat RC2 as frozen only after all five remote tags resolve to clean release
+   commits and every required local and CI gate passes against those SHAs.
 3. Obtain independent protocol, EVM, credential-bridge, and ceremony approval
    against those exact commits. No unresolved security finding is accepted.
 4. Provision three separately controlled validator hosts and prove true 2-of-3

@@ -34,8 +34,10 @@ Every normal deploy:
 2. Installs both in an isolated Python 3.12 environment.
 3. Runs compile/import smoke, full pytest, namespace scan, and secret scan.
 4. Writes `release.json` with API commit, protocol commit, repositories,
-   package, app module, and UTC build time.
-5. Packages the complete release and scans the archive again.
+   package, app module, and a UTC build epoch normalized to the API commit.
+5. Packages the complete release twice with normalized ownership, ordering,
+   timestamps, and gzip headers; requires byte-for-byte equality; then scans
+   the archive again.
 6. Uploads to `/tmp/solslot-api-release-<sha>.tgz`.
 7. Extracts to
    `/opt/solslot/api-staging/releases/<api-sha>-<protocol-prefix>/` and builds
@@ -49,6 +51,11 @@ Every normal deploy:
     binding, locked write surfaces, blocked localhost CORS, and disabled
     OpenAPI and validator-metadata routes.
 11. Keeps the five newest releases for rollback.
+
+The API release archive also contains the private signer application and host
+templates, but the coordinator service always starts `solslot_api.app:app`.
+It must never start or mount `solslot_api.validator_app:app`. Signers are
+deployed independently on their private hosts using the same frozen archive.
 
 The systemd unit must run:
 
@@ -136,6 +143,12 @@ a host-name mismatch or branch-like protocol reference.
 
 No passphrase, private key, bearer token, seed, or RPC secret belongs in a
 workflow variable, source file, release archive, or issue log.
+
+Reusable credentials follow
+`docs/CREDENTIAL_CARRYOVER_RC2_20260714.md`. A release does not trigger blanket
+rotation. The exposed provider credential must be revoked and replaced; new
+signer and private-network credentials are installed directly on their target
+hosts.
 
 ## Bridge Pool
 

@@ -1,0 +1,21 @@
+# Install only on the coordinator as /etc/wireguard/wg0.conf with mode 0600.
+# Signer peers initiate their sessions, so the hub does not need peer endpoints.
+[Interface]
+Address = 10.77.0.1/24
+ListenPort = 51820
+PrivateKey = <coordinator-wireguard-private-key>
+
+[Peer]
+# Vaults EC2, signer 0
+PublicKey = <signer-0-wireguard-public-key>
+AllowedIPs = 10.77.0.10/32
+
+[Peer]
+# Ubuntu VPS, signer 1
+PublicKey = <signer-1-wireguard-public-key>
+AllowedIPs = 10.77.0.11/32
+
+[Peer]
+# Fallback host, signer 2
+PublicKey = <signer-2-wireguard-public-key>
+AllowedIPs = 10.77.0.12/32

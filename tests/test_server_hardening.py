@@ -59,9 +59,9 @@ def _staging(**overrides: object) -> Settings:
         "vault_session_jwt_secret": "v" * 32,
         "minting_enabled": False,
         "zkpassport_validator_urls": [
-            "https://validator-0.internal",
-            "https://validator-1.internal",
-            "https://validator-2.internal",
+            "https://10.77.0.10:9443",
+            "https://10.77.0.11:9443",
+            "https://10.77.0.12:9443",
         ],
         "zkpassport_validator_pubkeys": [
             "0x" + "11" * 48,
@@ -173,6 +173,20 @@ def test_staging_write_mode_rejects_single_validator_policy() -> None:
             _staging(
                 alpha_writes_enabled=True,
                 zkpassport_validator_threshold=1,
+            )
+        )
+
+
+def test_staging_write_mode_rejects_validator_outside_fixed_wireguard_topology() -> None:
+    with pytest.raises(RuntimeError, match="WireGuard signer topology"):
+        validate_server_hardening_at_startup(
+            _staging(
+                alpha_writes_enabled=True,
+                zkpassport_validator_urls=[
+                    "https://validator-0.example.com",
+                    "https://10.77.0.11:9443",
+                    "https://10.77.0.12:9443",
+                ],
             )
         )
 

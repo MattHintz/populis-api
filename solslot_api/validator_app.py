@@ -1,0 +1,155 @@
+"""Private mTLS-only FastAPI application for one validator signer."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, ConfigDict
+
+from .release_metadata import load_release_metadata
+from .validator_ledger import ValidatorLedger
+from .validator_quorum import ValidatorClaim, ValidatorSignatureResponse
+from .validator_service import (
+    ValidatorEvidenceError,
+    load_validator_artifact,
+    load_validator_private_key,
+    sign_validator_claim,
+)
+from .validator_settings import ValidatorSettings, get_validator_settings
+
+
+class ValidatorSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: ValidatorClaim
+    claimHash: str
+
+
+class ValidatorHealthResponse(BaseModel):
+    status: str
+    signerIndex: int
+    validatorPubkey: str
+    apiCommit: str
+    protocolCommit: str
+    network: str
+    bridgePolicyHash: str
+    evmAddresses: dict[str, str]
+    artifactHash: str | None
+    artifactReady: bool
+    ledgerReady: bool
+
+
+def create_validator_app(
+    *,
+    settings: ValidatorSettings | None = None,
+    ledger: ValidatorLedger | None = None,
+) -> FastAPI:
+    configured = settings
+    configured_ledger = ledger
+
+    def current_settings() -> ValidatorSettings:
+        return configured or get_validator_settings()
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        signer_settings = current_settings()
+        load_validator_private_key(signer_settings)
+        active_ledger = configured_ledger or ValidatorLedger(
+            signer_settings.ledger_db_path
+        )
+        if not active_ledger.healthcheck():
+            raise RuntimeError("validator signature ledger failed SQLite quick_check")
+        application.state.validator_ledger = active_ledger
+        try:
+            yield
+        finally:
+            if configured_ledger is None:
+                active_ledger.close()
+
+    application = FastAPI(
+        title="Solslot Validator Signer",
+        version="2",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+
+    @application.get("/health", response_model=ValidatorHealthResponse)
+    def health() -> ValidatorHealthResponse:
+        signer_settings = current_settings()
+        private_key = load_validator_private_key(signer_settings)
+        release = load_release_metadata(signer_settings.release_metadata_path)
+        if release is None:
+            raise HTTPException(status_code=503, detail="release metadata is missing")
+        artifact_hash: str | None = None
+        artifact_ready = False
+        if Path(signer_settings.public_artifact_path).is_file():
+            try:
+                artifact, _ = load_validator_artifact(signer_settings)
+                artifact_hash = str(artifact["artifactHash"])
+                artifact_ready = True
+            except ValidatorEvidenceError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        return ValidatorHealthResponse(
+            status="healthy",
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey="0x" + bytes(private_key.get_g1()).hex(),
+            apiCommit=release.apiCommit,
+            protocolCommit=release.protocolCommit,
+            network=signer_settings.network,
+            bridgePolicyHash=signer_settings.bridge_policy_hash,
+            evmAddresses={
+                "forwarder": signer_settings.evm_forwarder_address,
+                "verifierAdapter": signer_settings.evm_verifier_adapter_address,
+                "attestationEmitter": signer_settings.evm_attestation_emitter_address,
+            },
+            artifactHash=artifact_hash,
+            artifactReady=artifact_ready,
+            ledgerReady=active_ledger.healthcheck(),
+        )
+
+    @application.post(
+        "/v1/zkpassport/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign(request: ValidatorSignRequest) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_validator_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    return application
+
+
+app = create_validator_app()
+
+
+__all__ = [
+    "ValidatorHealthResponse",
+    "ValidatorSignRequest",
+    "app",
+    "create_validator_app",
+]

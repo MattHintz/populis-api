@@ -156,9 +156,16 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 raise RuntimeError(
                     f"zkPassport validator public key {index} must be 48 bytes."
                 )
-        for url in settings.zkpassport_validator_urls:
-            if not url.startswith("https://"):
-                raise RuntimeError("Validator signer URLs must use HTTPS.")
+        expected_validator_urls = [
+            "https://10.77.0.10:9443",
+            "https://10.77.0.11:9443",
+            "https://10.77.0.12:9443",
+        ]
+        if settings.zkpassport_validator_urls != expected_validator_urls:
+            raise RuntimeError(
+                "SOLSLOT_ZKPASSPORT_VALIDATOR_URLS must use the ordered private "
+                "WireGuard signer topology."
+            )
         if not all(
             (
                 settings.zkpassport_validator_mtls_ca_path,
@@ -168,6 +175,11 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         ):
             raise RuntimeError(
                 "Validator quorum calls require CA, client certificate, and client key paths."
+            )
+        if settings.zkpassport_evm_min_confirmations < 12:
+            raise RuntimeError(
+                "Protocol writes require at least 12 Sepolia confirmations for "
+                "zkPassport attestation events."
             )
 
     if settings.ceremony_mode_enabled:
@@ -502,7 +514,7 @@ class Settings(BaseSettings):
     # Fresh V2 addresses are intentionally unset until the EVM ceremony.
     zkpassport_forwarder_address: Optional[str] = None
     zkpassport_emitter_address: Optional[str] = None
-    zkpassport_evm_min_confirmations: int = Field(2, ge=1)
+    zkpassport_evm_min_confirmations: int = Field(12, ge=1)
 
     # Persistent relay limits. Each axis is enforced independently so one
     # account, vault, source, or bridge coin cannot drain the sponsored key.

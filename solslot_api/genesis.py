@@ -27,6 +27,11 @@ from .genesis_store import (
     GenesisStore,
     GenesisStoreError,
 )
+from .validator_quorum import (
+    ValidatorHealthResponse,
+    ValidatorQuorumError,
+    probe_validator_health,
+)
 
 
 router = APIRouter(prefix="/admin/genesis", tags=["admin-genesis"])
@@ -632,14 +637,17 @@ def _validate_audit_approval(
         raise GenesisConflict("validator health evidence is missing")
     if validators.get("threshold") != 2 or validators.get("pubkeys") != expected_keys:
         raise GenesisConflict("validator health evidence does not match plan")
-    if validators.get("healthy") != [True, True, True]:
-        raise GenesisConflict("all three validator signers must be healthy")
     return approval
 
 
 async def _prepare_bundle(
     settings: Settings, record: Mapping[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    tuple[ValidatorHealthResponse, ...],
+]:
     faucet = _faucet()
     if _hex(faucet.address_puzzle_hash).lower() != str(
         record["plan_input"]["faucetPuzzleHash"]
@@ -663,7 +671,20 @@ async def _prepare_bundle(
     approval = _validate_audit_approval(
         settings, record, plan, str(result["spendBundleId"])
     )
-    return plan, result, approval
+    try:
+        validator_health = await probe_validator_health(
+            settings,
+            expected_api_commit=str(record["draft"]["sourceShas"]["api"]),
+            expected_protocol_commit=str(record["draft"]["sourceShas"]["protocol"]),
+            expected_network=str(plan["network"]),
+            expected_bridge_policy_hash=str(plan["puzzleHashes"]["bridgePolicy"]),
+            expected_evm_addresses={
+                key: str(plan["evmAddresses"][key]) for key in REQUIRED_EVM_ADDRESSES
+            },
+        )
+    except (KeyError, TypeError, ValidatorQuorumError) as exc:
+        raise GenesisConflict(f"live validator preflight failed: {exc}") from exc
+    return plan, result, approval, validator_health
 
 
 @router.post("/{ceremony_id}/preflight", dependencies=[Depends(require_admin_token)])
@@ -676,7 +697,7 @@ async def preflight(
         record = store.get(ceremony_id.lower())
         if record["state"] != "plan_approved":
             raise GenesisConflict("two administrator plan signatures are required")
-        plan, bundle, approval = await _prepare_bundle(settings, record)
+        plan, bundle, approval, validator_health = await _prepare_bundle(settings, record)
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
             raise GenesisConflict("ceremony output directory is not empty")
@@ -690,6 +711,9 @@ async def preflight(
             + hashlib.sha256(
                 json.dumps(approval, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
+            "validatorHealth": [
+                item.model_dump(mode="json") for item in validator_health
+            ],
         }
     except GenesisStoreError as exc:
         _raise_store_error(exc)
@@ -705,7 +729,7 @@ async def broadcast(
         record = store.get(ceremony_id.lower())
         if record["state"] != "plan_approved":
             raise GenesisConflict("two administrator plan signatures are required")
-        plan, bundle, approval = await _prepare_bundle(settings, record)
+        plan, bundle, approval, validator_health = await _prepare_bundle(settings, record)
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
             raise GenesisConflict("ceremony output directory is not empty")
@@ -713,6 +737,13 @@ async def broadcast(
         _atomic_json(output / "plan.json", plan)
         _atomic_json(output / "spend_bundle.json", bundle["spendBundle"])
         _atomic_json(output / "audit_approval.json", approval)
+        _atomic_json(
+            output / "validator_health.json",
+            {
+                "checkedAt": int(time.time()),
+                "signers": [item.model_dump(mode="json") for item in validator_health],
+            },
+        )
         try:
             response = await _coinset().push_tx(bundle["spendBundle"])
         except Exception as exc:

@@ -1,0 +1,11 @@
+# Install as /etc/wireguard/wg0.conf with mode 0600.
+# Replace placeholders from the private ceremony network archive.
+[Interface]
+Address = <signer-wireguard-address>/32
+PrivateKey = <signer-wireguard-private-key>
+
+[Peer]
+PublicKey = <coordinator-wireguard-public-key>
+AllowedIPs = 10.77.0.1/32
+Endpoint = <coordinator-public-ip>:51820
+PersistentKeepalive = 25

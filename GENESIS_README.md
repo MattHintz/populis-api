@@ -13,8 +13,9 @@ Do not begin until:
 - full suites and exploit regressions pass from those exact commits;
 - release archives and compiled assets pass the namespace scanner;
 - the independent pool and credential-path reviews are signed off;
-- all staging deployer, faucet, validator, relayer, bootstrap, admin, JWT,
-  SSH, and CI credentials have been rotated;
+- the credential carryover record is complete, the provider credential found
+  in public history is revoked and replaced, signer 1/2 and private-network
+  material are generated, and the one-time ceremony token is ready;
 - `SOLSLOT_ALPHA_WRITES_ENABLED=false` and
   `SOLSLOT_MINTING_ENABLED=false` are confirmed publicly.
 

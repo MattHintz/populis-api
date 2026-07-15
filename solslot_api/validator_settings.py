@@ -1,0 +1,96 @@
+"""Configuration owned exclusively by an isolated validator signer."""
+
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_HEX32_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_PUBKEY_RE = re.compile(r"^(0x)?[0-9a-fA-F]{96}$")
+
+
+class ValidatorSettings(BaseSettings):
+    """Fail-closed signer settings.
+
+    The signer uses a dedicated prefix and intentionally does not read an env
+    file. Systemd supplies non-secret configuration and a path to a credential
+    file; the seed itself never enters the process environment.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SOLSLOT_VALIDATOR_",
+        env_file=None,
+        extra="ignore",
+    )
+
+    signer_index: int = Field(..., ge=0, le=2)
+    seed_file: str
+    ledger_db_path: str = "./state/validator_signatures_v2.db"
+    public_artifact_path: str = "./state/public_artifact_v2.json"
+    release_metadata_path: str = "./release.json"
+
+    network: Literal["testnet11"] = "testnet11"
+    coinset_base_url: str = "https://testnet11.api.coinset.org"
+    evm_rpc_url: str
+    evm_chain_id: int = Field(11155111, ge=11155111, le=11155111)
+    evm_min_confirmations: int = Field(12, ge=12, le=12)
+    proof_max_age_seconds: int = Field(7 * 24 * 60 * 60, ge=3600, le=7 * 24 * 60 * 60)
+    claim_clock_skew_seconds: int = Field(90, ge=10, le=300)
+
+    bridge_policy_hash: str
+    roster_pubkeys: list[str] = Field(min_length=3, max_length=3)
+    evm_forwarder_address: str
+    evm_verifier_adapter_address: str
+    evm_attestation_emitter_address: str
+
+    @field_validator("bridge_policy_hash")
+    @classmethod
+    def _hex32(cls, value: str) -> str:
+        if not _HEX32_RE.fullmatch(value):
+            raise ValueError("bridge_policy_hash must be a 32-byte hex value")
+        return "0x" + value.removeprefix("0x").lower()
+
+    @field_validator("roster_pubkeys")
+    @classmethod
+    def _pubkeys(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            if not _PUBKEY_RE.fullmatch(value):
+                raise ValueError("roster_pubkeys entries must be 48-byte hex values")
+            normalized.append("0x" + value.removeprefix("0x").lower())
+        if len(set(normalized)) != 3:
+            raise ValueError("roster_pubkeys must contain three distinct keys")
+        return normalized
+
+    @field_validator(
+        "evm_forwarder_address",
+        "evm_verifier_adapter_address",
+        "evm_attestation_emitter_address",
+    )
+    @classmethod
+    def _address(cls, value: str) -> str:
+        if not _ADDRESS_RE.fullmatch(value):
+            raise ValueError("EVM addresses must be 0x-prefixed 20-byte values")
+        return value.lower()
+
+    @model_validator(mode="after")
+    def _https_endpoints(self) -> "ValidatorSettings":
+        if not self.coinset_base_url.startswith("https://"):
+            raise ValueError("coinset_base_url must use HTTPS")
+        if not self.evm_rpc_url.startswith("https://"):
+            raise ValueError("evm_rpc_url must use HTTPS")
+        return self
+
+
+@lru_cache(maxsize=1)
+def get_validator_settings() -> ValidatorSettings:
+    return ValidatorSettings()
+
+
+__all__ = ["ValidatorSettings", "get_validator_settings"]

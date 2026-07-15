@@ -129,6 +129,22 @@ class ValidatorSignatureResponse(BaseModel):
     signature: str
 
 
+class ValidatorHealthResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    signerIndex: int = Field(..., ge=0, le=2)
+    validatorPubkey: str
+    apiCommit: str
+    protocolCommit: str
+    network: str
+    bridgePolicyHash: str
+    evmAddresses: dict[str, str]
+    artifactHash: str | None = None
+    artifactReady: bool
+    ledgerReady: bool
+
+
 @dataclass(frozen=True)
 class ValidatorQuorumResult:
     signer_indices: tuple[int, ...]
@@ -165,6 +181,101 @@ def configured_bridge_policy_hash(settings: Settings) -> str:
     return "0x" + bytes(validator_set.policy_hash).hex()
 
 
+def _private_validator_client(settings: Settings) -> httpx.AsyncClient:
+    ca_path = Path(str(settings.zkpassport_validator_mtls_ca_path or ""))
+    cert_path = Path(str(settings.zkpassport_validator_mtls_cert_path or ""))
+    key_path = Path(str(settings.zkpassport_validator_mtls_key_path or ""))
+    for path, label in (
+        (ca_path, "validator CA"),
+        (cert_path, "validator client certificate"),
+        (key_path, "validator client key"),
+    ):
+        if not path.is_file():
+            raise ValidatorQuorumError(f"{label} file is unavailable")
+    return httpx.AsyncClient(
+        verify=str(ca_path),
+        cert=(str(cert_path), str(key_path)),
+        timeout=settings.zkpassport_validator_timeout_seconds,
+    )
+
+
+async def probe_validator_health(
+    settings: Settings,
+    *,
+    expected_api_commit: str,
+    expected_protocol_commit: str,
+    expected_network: str,
+    expected_bridge_policy_hash: str,
+    expected_evm_addresses: dict[str, str],
+    client: httpx.AsyncClient | None = None,
+) -> tuple[ValidatorHealthResponse, ...]:
+    """Contact every private signer and bind health to the ceremony plan."""
+    pubkeys = configured_validator_pubkeys(settings)
+    if configured_bridge_policy_hash(settings) != expected_bridge_policy_hash.lower():
+        raise ValidatorQuorumError(
+            "ceremony bridge policy does not match configured validator roster"
+        )
+    normalized_addresses = {
+        key: value.lower() for key, value in expected_evm_addresses.items()
+    }
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_health(index: int, url: str) -> ValidatorHealthResponse:
+        response = await client.get(url.rstrip("/") + "/health")
+        response.raise_for_status()
+        parsed = ValidatorHealthResponse.model_validate(response.json())
+        expected_pubkey = "0x" + pubkeys[index].hex()
+        checks = (
+            (parsed.status, "healthy", "status"),
+            (parsed.signerIndex, index, "signer index"),
+            (parsed.validatorPubkey.lower(), expected_pubkey, "validator public key"),
+            (parsed.apiCommit, expected_api_commit, "API commit"),
+            (parsed.protocolCommit, expected_protocol_commit, "protocol commit"),
+            (parsed.network, expected_network, "network"),
+            (
+                parsed.bridgePolicyHash.lower(),
+                expected_bridge_policy_hash.lower(),
+                "bridge policy",
+            ),
+            (
+                {key: value.lower() for key, value in parsed.evmAddresses.items()},
+                normalized_addresses,
+                "EVM addresses",
+            ),
+            (parsed.ledgerReady, True, "signature ledger"),
+        )
+        for observed, expected, label in checks:
+            if observed != expected:
+                raise ValidatorQuorumError(
+                    f"validator signer {index} {label} does not match ceremony"
+                )
+        return parsed
+
+    try:
+        results = await asyncio.gather(
+            *(
+                request_health(index, url)
+                for index, url in enumerate(settings.zkpassport_validator_urls)
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    failures = [
+        f"signer {index}: {result}"
+        for index, result in enumerate(results)
+        if isinstance(result, BaseException)
+    ]
+    if failures:
+        raise ValidatorQuorumError(
+            "live validator preflight failed: " + "; ".join(failures)
+        )
+    return tuple(result for result in results if isinstance(result, ValidatorHealthResponse))
+
+
 async def collect_validator_quorum(
     settings: Settings,
     claim: ValidatorClaim,
@@ -182,21 +293,7 @@ async def collect_validator_quorum(
 
     owns_client = client is None
     if client is None:
-        ca_path = Path(str(settings.zkpassport_validator_mtls_ca_path or ""))
-        cert_path = Path(str(settings.zkpassport_validator_mtls_cert_path or ""))
-        key_path = Path(str(settings.zkpassport_validator_mtls_key_path or ""))
-        for path, label in (
-            (ca_path, "validator CA"),
-            (cert_path, "validator client certificate"),
-            (key_path, "validator client key"),
-        ):
-            if not path.is_file():
-                raise ValidatorQuorumError(f"{label} file is unavailable")
-        client = httpx.AsyncClient(
-            verify=str(ca_path),
-            cert=(str(cert_path), str(key_path)),
-            timeout=settings.zkpassport_validator_timeout_seconds,
-        )
+        client = _private_validator_client(settings)
 
     async def request_signature(index: int, url: str) -> tuple[int, G2Element] | None:
         endpoint = url.rstrip("/") + "/v1/zkpassport/sign"
@@ -255,9 +352,11 @@ async def collect_validator_quorum(
 
 __all__ = [
     "ValidatorClaim",
+    "ValidatorHealthResponse",
     "ValidatorQuorumError",
     "ValidatorQuorumResult",
     "collect_validator_quorum",
     "configured_bridge_policy_hash",
     "configured_validator_pubkeys",
+    "probe_validator_health",
 ]

@@ -119,9 +119,16 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
         raise PublicArtifactError("protocol release commit does not match signed artifact")
 
 
-def load_signed_public_artifact(settings: Settings) -> dict[str, Any]:
-    """Read, cryptographically verify, and runtime-bind the V2 artifact."""
-    path = Path(settings.public_artifact_path)
+def verify_signed_public_artifact_file(path_value: str | Path) -> dict[str, Any]:
+    """Read and cryptographically verify a V2 public artifact.
+
+    Runtime services which do not share the coordinator's mutable settings
+    (notably the isolated validator signers) use this narrower entry point.
+    It verifies the complete artifact schema and administrator signature
+    quorum, but deliberately leaves host-specific runtime binding to the
+    caller.
+    """
+    path = Path(path_value)
     if not path.is_file():
         raise PublicArtifactMissing("signed V2 public artifact is unavailable")
     try:
@@ -134,6 +141,12 @@ def load_signed_public_artifact(settings: Settings) -> dict[str, Any]:
         verify_public_artifact(payload, signature_verifier=_verify_admin_signature)
     except (TypeError, ValueError) as exc:
         raise PublicArtifactError(f"signed V2 public artifact is invalid: {exc}") from exc
+    return payload
+
+
+def load_signed_public_artifact(settings: Settings) -> dict[str, Any]:
+    """Read, cryptographically verify, and runtime-bind the V2 artifact."""
+    payload = verify_signed_public_artifact_file(settings.public_artifact_path)
     _verify_runtime_bindings(settings, payload)
     return payload
 
@@ -168,4 +181,5 @@ __all__ = [
     "PublicArtifactMissing",
     "load_signed_public_artifact",
     "signed_admin_allowlist",
+    "verify_signed_public_artifact_file",
 ]

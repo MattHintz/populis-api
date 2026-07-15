@@ -11,6 +11,7 @@ from solslot_api.validator_quorum import (
     ValidatorClaim,
     ValidatorQuorumError,
     collect_validator_quorum,
+    probe_validator_health,
 )
 from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
 
@@ -130,3 +131,80 @@ async def test_claim_policy_must_match_ordered_validator_set():
     async with _client(keys, claim, failures=set()) as client:
         with pytest.raises(ValidatorQuorumError, match="bridge policy"):
             await collect_validator_quorum(_settings(keys), claim, client=client)
+
+
+def _health_client(keys, *, wrong_api_index: int | None = None):
+    policy_hash = "0x" + bytes(
+        make_bridge_policy_hash([bytes(key.get_g1()) for key in keys], 2)
+    ).hex()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        return httpx.Response(
+            200,
+            json={
+                "status": "healthy",
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "apiCommit": "f" * 40 if index == wrong_api_index else "a" * 40,
+                "protocolCommit": "b" * 40,
+                "network": "testnet11",
+                "bridgePolicyHash": policy_hash,
+                "evmAddresses": {
+                    "forwarder": "0x" + "11" * 20,
+                    "verifierAdapter": "0x" + "22" * 20,
+                    "attestationEmitter": "0x" + "33" * 20,
+                },
+                "artifactHash": None,
+                "artifactReady": False,
+                "ledgerReady": True,
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+async def test_live_health_binds_all_signers_to_ceremony_release_and_addresses():
+    keys = _keys()
+    policy_hash = "0x" + bytes(
+        make_bridge_policy_hash([bytes(key.get_g1()) for key in keys], 2)
+    ).hex()
+    async with _health_client(keys) as client:
+        health = await probe_validator_health(
+            _settings(keys),
+            expected_api_commit="a" * 40,
+            expected_protocol_commit="b" * 40,
+            expected_network="testnet11",
+            expected_bridge_policy_hash=policy_hash,
+            expected_evm_addresses={
+                "forwarder": "0x" + "11" * 20,
+                "verifierAdapter": "0x" + "22" * 20,
+                "attestationEmitter": "0x" + "33" * 20,
+            },
+            client=client,
+        )
+    assert [item.signerIndex for item in health] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_uploaded_healthy_flags_cannot_hide_stale_live_signer_release():
+    keys = _keys()
+    policy_hash = "0x" + bytes(
+        make_bridge_policy_hash([bytes(key.get_g1()) for key in keys], 2)
+    ).hex()
+    async with _health_client(keys, wrong_api_index=1) as client:
+        with pytest.raises(ValidatorQuorumError, match="API commit"):
+            await probe_validator_health(
+                _settings(keys),
+                expected_api_commit="a" * 40,
+                expected_protocol_commit="b" * 40,
+                expected_network="testnet11",
+                expected_bridge_policy_hash=policy_hash,
+                expected_evm_addresses={
+                    "forwarder": "0x" + "11" * 20,
+                    "verifierAdapter": "0x" + "22" * 20,
+                    "attestationEmitter": "0x" + "33" * 20,
+                },
+                client=client,
+            )

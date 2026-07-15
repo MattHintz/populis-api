@@ -68,8 +68,10 @@ dirty worktrees.
    and credential bridge changes.
 3. Audit the implemented 2-of-3 validator coordinator and provision three
    independently controlled signer hosts over private authenticated transport.
-4. Commit and freeze the five remediation worktrees, deploy a fresh chain-bound
-   admin authority, and rotate all ceremony secrets.
+4. Commit and freeze the five remediation worktrees, complete the credential
+   carryover record, replace the exposed provider credential, provision signer
+   1/2 and private-network credentials, and create fresh one-time ceremony
+   material.
 5. Pass the live API preflight plus offline `pre-broadcast` gate, run one clean
    V2 genesis, then pass the signed/checksummed `post-genesis` gate.
 6. Complete new EVM and BLS zkPassport-to-EVM-to-Chia vault stamps and prove recovery
