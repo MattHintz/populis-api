@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -192,10 +193,22 @@ def _private_validator_client(settings: Settings) -> httpx.AsyncClient:
     ):
         if not path.is_file():
             raise ValidatorQuorumError(f"{label} file is unavailable")
+
+    try:
+        ssl_context = ssl.create_default_context(cafile=str(ca_path))
+        ssl_context.load_cert_chain(
+            certfile=str(cert_path),
+            keyfile=str(key_path),
+        )
+    except (OSError, ssl.SSLError) as exc:
+        raise ValidatorQuorumError(
+            "validator mTLS client credentials are invalid"
+        ) from exc
+
     return httpx.AsyncClient(
-        verify=str(ca_path),
-        cert=(str(cert_path), str(key_path)),
+        verify=ssl_context,
         timeout=settings.zkpassport_validator_timeout_seconds,
+        trust_env=False,
     )
 
 

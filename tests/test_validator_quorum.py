@@ -6,6 +6,7 @@ import httpx
 import pytest
 from chia_rs import AugSchemeMPL, G1Element
 
+from solslot_api import validator_quorum
 from solslot_api.config import Settings
 from solslot_api.validator_quorum import (
     ValidatorClaim,
@@ -66,6 +67,51 @@ def _claim(keys) -> ValidatorClaim:
         bridge_coin_id="0x" + "0f" * 32,
         validator_message="0x" + "10" * 32,
     )
+
+
+def test_private_validator_client_loads_mtls_chain_into_ssl_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    ca_path = tmp_path / "ca.crt"
+    cert_path = tmp_path / "coordinator.crt"
+    key_path = tmp_path / "coordinator.key"
+    for path in (ca_path, cert_path, key_path):
+        path.write_text("test", encoding="ascii")
+
+    loaded_chain: list[tuple[str, str]] = []
+
+    class FakeSslContext:
+        def load_cert_chain(self, *, certfile: str, keyfile: str) -> None:
+            loaded_chain.append((certfile, keyfile))
+
+    ssl_context = FakeSslContext()
+    monkeypatch.setattr(
+        validator_quorum.ssl,
+        "create_default_context",
+        lambda *, cafile: ssl_context if cafile == str(ca_path) else None,
+    )
+
+    client_kwargs: dict[str, object] = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            client_kwargs.update(kwargs)
+
+    monkeypatch.setattr(validator_quorum.httpx, "AsyncClient", FakeAsyncClient)
+
+    settings = Settings(
+        runtime_environment="test",
+        zkpassport_validator_mtls_ca_path=str(ca_path),
+        zkpassport_validator_mtls_cert_path=str(cert_path),
+        zkpassport_validator_mtls_key_path=str(key_path),
+    )
+    validator_quorum._private_validator_client(settings)
+
+    assert loaded_chain == [(str(cert_path), str(key_path))]
+    assert client_kwargs["verify"] is ssl_context
+    assert client_kwargs["trust_env"] is False
+    assert "cert" not in client_kwargs
 
 
 def _client(keys, claim, failures: set[int], forged: set[int] = set()):
