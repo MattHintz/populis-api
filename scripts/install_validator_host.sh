@@ -68,7 +68,15 @@ install -d -m 0700 -o solslot-validator -g solslot-validator /var/lib/solslot-va
 install -d -m 0700 /etc/solslot-validator/private
 release_id="$(sha256sum "$archive" | awk '{print substr($1,1,24)}')"
 release_dir="/opt/solslot/validator/releases/$release_id"
-previous="$(readlink -f /opt/solslot/validator/current || true)"
+current_link=/opt/solslot/validator/current
+previous=""
+if [ -L "$current_link" ]; then
+  previous="$(readlink -f "$current_link" || true)"
+fi
+if [ -e "$current_link" ] && [ ! -L "$current_link" ]; then
+  echo "validator current path exists and is not a symlink" >&2
+  exit 1
+fi
 if [ ! -f "$release_dir/.release-ready" ]; then
   rm -rf "$release_dir"
   mkdir -p "$release_dir"
@@ -82,6 +90,10 @@ if [ ! -f "$release_dir/.release-ready" ]; then
     "$release_dir/solslot_api/validator_service.py"
   touch "$release_dir/.release-ready"
 fi
+# The installer runs with a restrictive umask, but the isolated service account
+# still needs to traverse and import the immutable release tree.
+chown -R root:solslot-validator "$release_dir"
+chmod -R u=rwX,g=rX,o= "$release_dir"
 
 "$release_dir/.venv/bin/python" - "$env_file" "$index" "$seed_file" <<'PY'
 import os
@@ -114,16 +126,19 @@ install -m 0640 -o root -g solslot-validator "$env_file" /etc/solslot-validator/
 
 unit_template="$release_dir/ops/validator/solslot-validator.service.in"
 [ -f "$unit_template" ] || { echo "release lacks validator unit template" >&2; exit 1; }
-ln -sfn "$release_dir" /opt/solslot/validator/current
+ln -sfn "$release_dir" "$current_link"
 sed -e "s/@SIGNER_INDEX@/$index/g" -e "s/@WIREGUARD_IP@/$wg_ip/g" \
   "$unit_template" > /etc/systemd/system/solslot-validator.service
 systemctl daemon-reload
 systemctl enable solslot-validator.service
 
 rollback_release() {
-  if [ -n "$previous" ] && [ -d "$previous" ]; then
-    ln -sfn "$previous" /opt/solslot/validator/current
+  if [ -n "$previous" ] && [ "$previous" != "$current_link" ] && [ -d "$previous" ]; then
+    ln -sfn "$previous" "$current_link"
     systemctl restart solslot-validator.service || true
+  else
+    rm -f "$current_link"
+    systemctl stop solslot-validator.service || true
   fi
 }
 
