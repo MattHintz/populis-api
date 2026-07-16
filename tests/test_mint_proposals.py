@@ -65,6 +65,10 @@ def _publish_args(*, suffix: int = 0) -> dict:
         proposal_hash=_b32(0xE0 + (suffix & 0x0F)),
         proposal_tracker_coin_id=_b32(0x11),
         sgt_lock_coin_id=_b32(0x22),
+        proposal_singleton_launcher_id=_b32(0x33),
+        property_registry_coin_id=_b32(0x44),
+        property_registry_puzzle_hash=_b32(0x55),
+        deed_launcher_id=_b32(0x66),
         published_bundle_id="bundle",
         deadline=2_000_000_000,
     )
@@ -114,6 +118,8 @@ class TestCreate:
         assert rec.published_at is None
         assert rec.minted_at is None
         assert rec.deed_launcher_id is None
+        assert rec.proposal_singleton_launcher_id is None
+        assert rec.property_registry_coin_id is None
         assert rec.collection_id == "SOL-AUSTIN-0001"
         assert rec.share_ppm == 250_000
 
@@ -532,6 +538,9 @@ class TestPublicDict:
         assert d["on_chain"] == {
             "proposal_tracker_coin_id": None,
             "sgt_lock_coin_id": None,
+            "proposal_singleton_launcher_id": None,
+            "property_registry_coin_id": None,
+            "property_registry_puzzle_hash": None,
             "deed_launcher_id": None,
             "published_bundle_id": None,
             "executed_bundle_id": None,

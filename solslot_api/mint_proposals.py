@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import sqlite3
 import threading
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 # Bumping this triggers ``_migrate`` on next ``MintProposalStore`` open.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # ── Lifecycle state machine ──────────────────────────────────────────────────
@@ -126,6 +127,9 @@ class StoredMintProposal:
 
     proposal_tracker_coin_id: Optional[bytes]
     sgt_lock_coin_id: Optional[bytes]
+    proposal_singleton_launcher_id: Optional[bytes]
+    property_registry_coin_id: Optional[bytes]
+    property_registry_puzzle_hash: Optional[bytes]
     published_bundle_id: Optional[str]
     executed_bundle_id: Optional[str]
     deed_launcher_id: Optional[bytes]
@@ -180,6 +184,15 @@ class StoredMintProposal:
                 "sgt_lock_coin_id":
                     ("0x" + self.sgt_lock_coin_id.hex())
                     if self.sgt_lock_coin_id else None,
+                "proposal_singleton_launcher_id":
+                    ("0x" + self.proposal_singleton_launcher_id.hex())
+                    if self.proposal_singleton_launcher_id else None,
+                "property_registry_coin_id":
+                    ("0x" + self.property_registry_coin_id.hex())
+                    if self.property_registry_coin_id else None,
+                "property_registry_puzzle_hash":
+                    ("0x" + self.property_registry_puzzle_hash.hex())
+                    if self.property_registry_puzzle_hash else None,
                 "deed_launcher_id":
                     ("0x" + self.deed_launcher_id.hex())
                     if self.deed_launcher_id else None,
@@ -308,6 +321,9 @@ class MintProposalStore:
 
                 proposal_tracker_coin_id    BLOB,
                 sgt_lock_coin_id            BLOB,
+                proposal_singleton_launcher_id BLOB,
+                property_registry_coin_id   BLOB,
+                property_registry_puzzle_hash BLOB,
                 published_bundle_id         TEXT,
                 executed_bundle_id          TEXT,
                 deed_launcher_id            BLOB,
@@ -337,6 +353,9 @@ class MintProposalStore:
                 CHECK (proposal_hash            IS NULL OR length(proposal_hash)            = 32),
                 CHECK (proposal_tracker_coin_id IS NULL OR length(proposal_tracker_coin_id) = 32),
                 CHECK (sgt_lock_coin_id         IS NULL OR length(sgt_lock_coin_id)         = 32),
+                CHECK (proposal_singleton_launcher_id IS NULL OR length(proposal_singleton_launcher_id) = 32),
+                CHECK (property_registry_coin_id IS NULL OR length(property_registry_coin_id) = 32),
+                CHECK (property_registry_puzzle_hash IS NULL OR length(property_registry_puzzle_hash) = 32),
                 CHECK (deed_launcher_id         IS NULL OR length(deed_launcher_id)         = 32)
             )
         """)
@@ -391,6 +410,25 @@ class MintProposalStore:
                 "ADD COLUMN share_ppm INTEGER NOT NULL DEFAULT 1000000"
             )
 
+    def _migrate_to_v4(self, cur: sqlite3.Cursor) -> None:
+        """Persist every immutable coordinate needed to validate EXECUTE.
+
+        Older stores can continue to read their historical rows, but those
+        rows intentionally cannot use the V2 execute path until republished
+        into the fresh disposable-genesis state directory.
+        """
+        columns = {
+            row["name"]
+            for row in cur.execute("PRAGMA table_info(mint_proposals)").fetchall()
+        }
+        for name in (
+            "proposal_singleton_launcher_id",
+            "property_registry_coin_id",
+            "property_registry_puzzle_hash",
+        ):
+            if name not in columns:
+                cur.execute(f"ALTER TABLE mint_proposals ADD COLUMN {name} BLOB")
+
     # ── transaction helper ─────────────────────────────────────────
 
     @contextmanager
@@ -422,6 +460,7 @@ class MintProposalStore:
         royalty_bps: int,
         quorum_required: int,
         off_chain_metadata: Optional[dict[str, Any]] = None,
+        proposal_id: Optional[str] = None,
     ) -> StoredMintProposal:
         """Insert a fresh DRAFT proposal carrying only the operator
         metadata fields.
@@ -470,7 +509,12 @@ class MintProposalStore:
         if not collection_id:
             raise ValueError("collection_id must be non-empty after stripping whitespace")
 
-        proposal_id = _new_proposal_id()
+        if proposal_id is None:
+            proposal_id = _new_proposal_id()
+        elif not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", proposal_id):
+            raise ValueError(
+                "proposal_id must contain only letters, digits, '.', '_', ':', or '-'"
+            )
         now = int(time.time())
         metadata_json = json.dumps(off_chain_metadata) if off_chain_metadata else None
 
@@ -616,6 +660,10 @@ class MintProposalStore:
         proposal_hash: bytes,
         proposal_tracker_coin_id: bytes,
         sgt_lock_coin_id: bytes,
+        proposal_singleton_launcher_id: bytes,
+        property_registry_coin_id: bytes,
+        property_registry_puzzle_hash: bytes,
+        deed_launcher_id: bytes,
         published_bundle_id: str,
         deadline: int,
     ) -> StoredMintProposal:
@@ -642,6 +690,10 @@ class MintProposalStore:
             ("proposal_hash",            proposal_hash),
             ("proposal_tracker_coin_id", proposal_tracker_coin_id),
             ("sgt_lock_coin_id",         sgt_lock_coin_id),
+            ("proposal_singleton_launcher_id", proposal_singleton_launcher_id),
+            ("property_registry_coin_id", property_registry_coin_id),
+            ("property_registry_puzzle_hash", property_registry_puzzle_hash),
+            ("deed_launcher_id", deed_launcher_id),
         ):
             if not _is_bytes32(value):
                 raise ValueError(f"{label} must be bytes32")
@@ -659,6 +711,10 @@ class MintProposalStore:
                     ("proposal_hash",            proposal_hash),
                     ("proposal_tracker_coin_id", proposal_tracker_coin_id),
                     ("sgt_lock_coin_id",         sgt_lock_coin_id),
+                    ("proposal_singleton_launcher_id", proposal_singleton_launcher_id),
+                    ("property_registry_coin_id", property_registry_coin_id),
+                    ("property_registry_puzzle_hash", property_registry_puzzle_hash),
+                    ("deed_launcher_id", deed_launcher_id),
                     ("published_bundle_id",      published_bundle_id),
                     ("deadline",                 deadline),
                     ("published_at",             int(time.time())),
@@ -748,6 +804,29 @@ class MintProposalStore:
                 ("executed_bundle_id", executed_bundle_id),
                 ("executed_at",        int(time.time())),
             ],
+        )
+
+    def set_chain_executed(
+        self,
+        proposal_id: str,
+        *,
+        executed_bundle_id: str,
+    ) -> StoredMintProposal:
+        """Record an accepted canonical chain execution bundle.
+
+        The local vote cache can lag the singleton.  A successfully accepted
+        five-spend EXECUTE bundle is stronger evidence than that cache, so the
+        canonical execute endpoint may advance from any open voting state.
+        The CLVM bundle still enforces quorum and deadline.
+        """
+        return self._transition(
+            proposal_id,
+            target_state="EXECUTED",
+            updates=[
+                ("executed_bundle_id", executed_bundle_id),
+                ("executed_at", int(time.time())),
+            ],
+            allowed_from={"PROPOSED", "VOTING", "PASSED"},
         )
 
     def set_minted(
@@ -921,6 +1000,18 @@ def _row_to_record(row: sqlite3.Row) -> StoredMintProposal:
         sgt_lock_coin_id=(
             bytes(row["sgt_lock_coin_id"])
             if row["sgt_lock_coin_id"] is not None else None
+        ),
+        proposal_singleton_launcher_id=(
+            bytes(row["proposal_singleton_launcher_id"])
+            if row["proposal_singleton_launcher_id"] is not None else None
+        ),
+        property_registry_coin_id=(
+            bytes(row["property_registry_coin_id"])
+            if row["property_registry_coin_id"] is not None else None
+        ),
+        property_registry_puzzle_hash=(
+            bytes(row["property_registry_puzzle_hash"])
+            if row["property_registry_puzzle_hash"] is not None else None
         ),
         published_bundle_id=row["published_bundle_id"],
         executed_bundle_id=row["executed_bundle_id"],

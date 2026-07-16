@@ -9,9 +9,13 @@ from .config import Settings
 
 
 class PublishProposalMetadata(BaseModel):
+    property_id: str = Field(..., min_length=1, max_length=128)
+    collection_id: str = Field(..., min_length=1, max_length=128)
+    asset_class_name: str = Field(..., min_length=1, max_length=64)
     property_id_canon: str = Field(..., description="0x-prefixed bytes32")
     collection_id_canon: str = Field(..., description="0x-prefixed bytes32")
     share_ppm: int = Field(..., ge=1, le=1_000_000)
+    property_registry_coin_id: str = Field(..., description="0x-prefixed bytes32")
     property_registry_puzzle_hash: str = Field(..., description="0x-prefixed bytes32")
     par_value_mojos: int = Field(..., gt=0)
     asset_class: int = Field(..., ge=0)
@@ -21,6 +25,7 @@ class PublishProposalMetadata(BaseModel):
     quorum_threshold: int = Field(..., gt=0)
     owner_member_hash: str = Field(..., description="0x-prefixed bytes32")
     gov_member_hash: str = Field(..., description="0x-prefixed bytes32")
+    voting_deadline: int = Field(..., gt=0)
 
 
 def build_protocol_publish_context(settings: Settings) -> dict[str, str]:
@@ -47,10 +52,13 @@ def build_protocol_publish_context(settings: Settings) -> dict[str, str]:
 
 
 def metadata_bytes(metadata: PublishProposalMetadata) -> dict[str, bytes | int]:
-    data = metadata.model_dump()
+    data = metadata.model_dump(
+        exclude={"property_id", "collection_id", "asset_class_name"}
+    )
     bytes32_fields = {
         "property_id_canon",
         "collection_id_canon",
+        "property_registry_coin_id",
         "property_registry_puzzle_hash",
         "royalty_puzhash",
         "owner_member_hash",

@@ -67,10 +67,14 @@ def test_mint_admin_routes_are_jwt_gated() -> None:
         assert require_admin_token not in calls
 
 
-def test_committee_routes_stay_outside_admin_jwt_boundary() -> None:
-    expected = {
+def test_committee_route_auth_boundaries_are_explicit() -> None:
+    public = {
         ("GET", "/admin/committee/proposals"),
         ("POST", "/admin/committee/vote"),
+    }
+    operator = {
+        ("POST", "/admin/committee/propose"),
+        ("POST", "/admin/committee/execute"),
     }
 
     actual = {
@@ -79,10 +83,14 @@ def test_committee_routes_stay_outside_admin_jwt_boundary() -> None:
         if key[1].startswith("/admin/committee")
     }
 
-    assert actual == expected
-    for method, path in expected:
+    assert actual == public | operator
+    for method, path in public:
         calls = _dependency_calls(_route(mint_endpoints.router, method, path))
         assert require_admin_jwt not in calls
+        assert require_admin_token not in calls
+    for method, path in operator:
+        calls = _dependency_calls(_route(mint_endpoints.router, method, path))
+        assert require_admin_jwt in calls
         assert require_admin_token not in calls
 
 

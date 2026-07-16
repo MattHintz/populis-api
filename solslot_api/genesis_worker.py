@@ -301,6 +301,11 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
             spend_bundle_id=str(payload["spendBundleId"]),
             confirmed_block_index=int(payload["confirmedBlockIndex"]),
             build_timestamp=payload.get("buildTimestamp"),
+            review_class=str(
+                payload["ceremony"]["draft"].get(
+                    "reviewClass", "independent-release-review"
+                )
+            ),
         )
         return {"plan": canonical_plan, "artifact": artifact}
 

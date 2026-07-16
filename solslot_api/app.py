@@ -542,6 +542,7 @@ async def protocol(
     governance_launcher = launchers.get("governance")
     protocol_config_launcher = launchers.get("protocolConfig")
     vault_registry_launcher = launchers.get("vaultVersionRegistry")
+    property_registry_launcher = launchers.get("propertyRegistry")
     state_versions = artifact.get("stateVersions", {}) if artifact else {}
 
     artifact_settings = settings.model_copy(
@@ -550,6 +551,7 @@ async def protocol(
             "protocol_config_version": int(state_versions.get("protocolConfig", 1)),
             "vault_version_registry_launcher_id": vault_registry_launcher,
             "vault_version_registry_version": int(state_versions.get("vault", 1)),
+            "protocol_property_registry_launcher_id": property_registry_launcher,
         }
     )
 
@@ -601,7 +603,7 @@ async def protocol(
         protocol_config_hash=protocol_snapshot.content_hash_hex,
         protocol_config_launcher_id=protocol_config_launcher,
         protocol_config_version=protocol_snapshot.config_version,
-        property_registry_launcher_id=None,
+        property_registry_launcher_id=property_registry_launcher,
         property_registry_mod_hash=singletons_snapshot.property_registry_mod_hash_hex,
         mint_proposal_mod_hash=singletons_snapshot.mint_proposal_mod_hash_hex,
         vault_version_registry_launcher_id=vault_registry_launcher,

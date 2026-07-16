@@ -19,6 +19,16 @@ async def main() -> int:
     parser.add_argument("--forwarder", required=True)
     parser.add_argument("--verifier-adapter", required=True)
     parser.add_argument("--attestation-emitter", required=True)
+    artifact = parser.add_mutually_exclusive_group()
+    artifact.add_argument(
+        "--require-artifact-hash",
+        help="Require all three signers to load this finalized signed artifact.",
+    )
+    artifact.add_argument(
+        "--require-no-artifact",
+        action="store_true",
+        help="Require a clean pre-genesis signer with no artifact installed.",
+    )
     args = parser.parse_args()
     settings = Settings()
     health = await probe_validator_health(
@@ -32,6 +42,14 @@ async def main() -> int:
             "verifierAdapter": args.verifier_adapter.lower(),
             "attestationEmitter": args.attestation_emitter.lower(),
         },
+        expected_artifact_ready=(
+            True
+            if args.require_artifact_hash
+            else False
+            if args.require_no_artifact
+            else None
+        ),
+        expected_artifact_hash=args.require_artifact_hash,
     )
     print(json.dumps([item.model_dump(mode="json") for item in health], indent=2))
     return 0

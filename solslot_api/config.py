@@ -369,6 +369,7 @@ class Settings(BaseSettings):
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
     genesis_audit_approval_path: str = "./state/genesis_audit_approval_v2.json"
+    genesis_evm_deployment_path: str = "./state/genesis_evm_deployment_v2.json"
     genesis_invitation_ttl_seconds: int = Field(1800, ge=1800, le=1800)
     genesis_plan_ttl_seconds: int = Field(3600, ge=900, le=7200)
     genesis_sepolia_confirmations: int = Field(12, ge=12, le=12)

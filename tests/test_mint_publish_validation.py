@@ -24,9 +24,13 @@ def _settings(**updates: object) -> Settings:
 
 def _metadata(**updates: object) -> PublishProposalMetadata:
     values: dict[str, object] = {
+        "property_id": "PROPERTY-1",
+        "collection_id": "COLLECTION-1",
+        "asset_class_name": "RWA-RE-RES",
         "property_id_canon": "0x" + "01" * 32,
         "collection_id_canon": "0x" + "02" * 32,
         "share_ppm": 250_000,
+        "property_registry_coin_id": "0x" + "07" * 32,
         "property_registry_puzzle_hash": "0x" + "03" * 32,
         "par_value_mojos": 50_000,
         "asset_class": 1,
@@ -36,6 +40,7 @@ def _metadata(**updates: object) -> PublishProposalMetadata:
         "quorum_threshold": 10_000,
         "owner_member_hash": "0x" + "05" * 32,
         "gov_member_hash": "0x" + "06" * 32,
+        "voting_deadline": 2_000_000_000,
     }
     values.update(updates)
     return PublishProposalMetadata(**values)

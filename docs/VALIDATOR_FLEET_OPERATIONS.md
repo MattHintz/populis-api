@@ -118,13 +118,18 @@ not satisfy preflight.
   --bridge-policy-hash 0x<policy> \
   --forwarder 0x<address> \
   --verifier-adapter 0x<address> \
-  --attestation-emitter 0x<address>
+  --attestation-emitter 0x<address> \
+  --require-no-artifact
 ```
 
 Each response must match signer index, ordered BLS roster, API and protocol
 commits, network, bridge policy, fresh EVM addresses, and ledger readiness.
 All three signers must be healthy before genesis, even though runtime claim
-authorization accepts any valid two.
+authorization accepts any valid two. They must report `artifactReady: false`
+at this phase because a signed artifact cannot exist before genesis confirms.
+After finalization and artifact installation, rerun the same command with
+`--require-artifact-hash 0x<artifact-hash>`; all three must then report
+`artifactReady: true` before credential or mint writes are enabled.
 
 The public coordinator must return `404` for `/v1/zkpassport/sign` and must
 not publish validator OpenAPI. Confirm no seed exists under the coordinator

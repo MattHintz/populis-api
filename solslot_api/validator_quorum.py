@@ -220,6 +220,8 @@ async def probe_validator_health(
     expected_network: str,
     expected_bridge_policy_hash: str,
     expected_evm_addresses: dict[str, str],
+    expected_artifact_ready: bool | None = None,
+    expected_artifact_hash: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> tuple[ValidatorHealthResponse, ...]:
     """Contact every private signer and bind health to the ceremony plan."""
@@ -264,6 +266,21 @@ async def probe_validator_health(
                 raise ValidatorQuorumError(
                     f"validator signer {index} {label} does not match ceremony"
                 )
+        if (
+            expected_artifact_ready is not None
+            and parsed.artifactReady is not expected_artifact_ready
+        ):
+            raise ValidatorQuorumError(
+                f"validator signer {index} artifact readiness does not match ceremony phase"
+            )
+        if expected_artifact_hash is not None and (
+            not parsed.artifactReady
+            or str(parsed.artifactHash or "").lower()
+            != expected_artifact_hash.lower()
+        ):
+            raise ValidatorQuorumError(
+                f"validator signer {index} artifact hash does not match finalized genesis"
+            )
         return parsed
 
     try:

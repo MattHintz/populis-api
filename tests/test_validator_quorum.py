@@ -179,7 +179,12 @@ async def test_claim_policy_must_match_ordered_validator_set():
             await collect_validator_quorum(_settings(keys), claim, client=client)
 
 
-def _health_client(keys, *, wrong_api_index: int | None = None):
+def _health_client(
+    keys,
+    *,
+    wrong_api_index: int | None = None,
+    artifact_hash: str | None = None,
+):
     policy_hash = "0x" + bytes(
         make_bridge_policy_hash([bytes(key.get_g1()) for key in keys], 2)
     ).hex()
@@ -201,8 +206,8 @@ def _health_client(keys, *, wrong_api_index: int | None = None):
                     "verifierAdapter": "0x" + "22" * 20,
                     "attestationEmitter": "0x" + "33" * 20,
                 },
-                "artifactHash": None,
-                "artifactReady": False,
+                "artifactHash": artifact_hash,
+                "artifactReady": artifact_hash is not None,
                 "ledgerReady": True,
             },
         )
@@ -231,6 +236,49 @@ async def test_live_health_binds_all_signers_to_ceremony_release_and_addresses()
             client=client,
         )
     assert [item.signerIndex for item in health] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_live_health_binds_pre_and_post_genesis_artifact_phase():
+    keys = _keys()
+    policy_hash = "0x" + bytes(
+        make_bridge_policy_hash([bytes(key.get_g1()) for key in keys], 2)
+    ).hex()
+    kwargs = {
+        "expected_api_commit": "a" * 40,
+        "expected_protocol_commit": "b" * 40,
+        "expected_network": "testnet11",
+        "expected_bridge_policy_hash": policy_hash,
+        "expected_evm_addresses": {
+            "forwarder": "0x" + "11" * 20,
+            "verifierAdapter": "0x" + "22" * 20,
+            "attestationEmitter": "0x" + "33" * 20,
+        },
+    }
+    async with _health_client(keys) as client:
+        await probe_validator_health(
+            _settings(keys),
+            **kwargs,
+            expected_artifact_ready=False,
+            client=client,
+        )
+    artifact_hash = "0x" + "44" * 32
+    async with _health_client(keys, artifact_hash=artifact_hash) as client:
+        await probe_validator_health(
+            _settings(keys),
+            **kwargs,
+            expected_artifact_ready=True,
+            expected_artifact_hash=artifact_hash,
+            client=client,
+        )
+    async with _health_client(keys) as client:
+        with pytest.raises(ValidatorQuorumError, match="artifact readiness"):
+            await probe_validator_health(
+                _settings(keys),
+                **kwargs,
+                expected_artifact_ready=True,
+                client=client,
+            )
 
 
 @pytest.mark.asyncio

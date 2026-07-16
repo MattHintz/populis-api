@@ -11,7 +11,7 @@ import sys
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -27,6 +27,7 @@ from .genesis_store import (
     GenesisStore,
     GenesisStoreError,
 )
+from .genesis_evm import GenesisEvmEvidenceError, verify_genesis_evm_deployment
 from .validator_quorum import (
     ValidatorHealthResponse,
     ValidatorQuorumError,
@@ -50,6 +51,8 @@ REQUIRED_AUDIT_LANES = (
     "credentialBridge",
     "ceremonyOrchestrator",
 )
+INDEPENDENT_REVIEW_CLASS = "independent-release-review"
+INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS = "internal-engineering-testnet"
 
 
 class ApiModel(BaseModel):
@@ -58,6 +61,9 @@ class ApiModel(BaseModel):
 
 class DraftRequest(ApiModel):
     source_shas: dict[str, str] = Field(alias="sourceShas")
+    review_class: Literal[
+        "independent-release-review", "internal-engineering-testnet"
+    ] = Field(INDEPENDENT_REVIEW_CLASS, alias="reviewClass")
 
     @field_validator("source_shas")
     @classmethod
@@ -315,6 +321,7 @@ async def create_draft(
         "schemaVersion": 2,
         "network": "testnet11",
         "evmChainId": 11155111,
+        "reviewClass": body.review_class,
         "sourceShas": body.source_shas,
     }
     try:
@@ -640,6 +647,74 @@ def _validate_audit_approval(
     return approval
 
 
+def _internal_review_approval(
+    record: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    spend_bundle_id: str,
+    evm_evidence: Mapping[str, Any],
+    validator_health: tuple[ValidatorHealthResponse, ...],
+) -> dict[str, Any]:
+    invitations = sorted(
+        record.get("invitations") or [], key=lambda item: int(item.get("slot", 0))
+    )
+    if len(invitations) != 3 or any(
+        not item.get("wallet_address") or not item.get("compressed_pubkey")
+        for item in invitations
+    ):
+        raise GenesisConflict("internal testnet review requires three enrolled administrators")
+    plan_signatures = sorted(
+        record.get("plan_signatures") or [], key=lambda item: int(item.get("slot", 0))
+    )
+    signer_slots = [int(item.get("slot", 0)) for item in plan_signatures]
+    if len(set(signer_slots)) < 2:
+        raise GenesisConflict("internal testnet review requires two administrator signatures")
+    if len(validator_health) != 3:
+        raise GenesisConflict("internal testnet review requires three live validators")
+    if any(item.artifactReady for item in validator_health):
+        raise GenesisConflict(
+            "a pre-genesis validator has a stale signed artifact installed"
+        )
+
+    contracts = evm_evidence.get("contracts")
+    if not isinstance(contracts, Mapping) or set(contracts) != set(
+        REQUIRED_EVM_ADDRESSES
+    ):
+        raise GenesisConflict("live EVM deployment evidence is incomplete")
+    return {
+        "schemaVersion": 2,
+        "reviewClass": INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
+        "auditStatus": "unaudited",
+        "testOnly": True,
+        "ceremonyId": record["ceremony_id"],
+        "planHash": record["plan_hash"],
+        "sourceShas": record["draft"]["sourceShas"],
+        "consensusSimulationBundleId": spend_bundle_id,
+        "administratorReview": {
+            "threshold": 2,
+            "roster": [
+                {
+                    "slot": int(item["slot"]),
+                    "wallet": str(item["wallet_address"]).lower(),
+                    "compressedPubkey": str(item["compressed_pubkey"]).lower(),
+                }
+                for item in invitations
+            ],
+            "planSignerSlots": signer_slots,
+        },
+        "evmManifestArtifactHash": evm_evidence["manifestArtifactHash"],
+        "evmCheckedAtBlock": evm_evidence["checkedAtBlock"],
+        "evmContracts": {name: dict(contracts[name]) for name in REQUIRED_EVM_ADDRESSES},
+        "validators": {
+            "threshold": 2,
+            "pubkeys": list(plan["validatorSet"]["pubkeys"]),
+            "healthy": [True, True, True],
+            "signerIndices": [item.signerIndex for item in validator_health],
+            "artifactReady": [item.artifactReady for item in validator_health],
+            "ledgerReady": [item.ledgerReady for item in validator_health],
+        },
+    }
+
+
 async def _prepare_bundle(
     settings: Settings, record: Mapping[str, Any]
 ) -> tuple[
@@ -668,9 +743,6 @@ async def _prepare_bundle(
     plan = result["plan"]
     if plan != record["plan"] or result["planHash"] != record["plan_hash"]:
         raise GenesisConflict("stored ceremony plan does not reproduce exactly")
-    approval = _validate_audit_approval(
-        settings, record, plan, str(result["spendBundleId"])
-    )
     try:
         validator_health = await probe_validator_health(
             settings,
@@ -681,9 +753,37 @@ async def _prepare_bundle(
             expected_evm_addresses={
                 key: str(plan["evmAddresses"][key]) for key in REQUIRED_EVM_ADDRESSES
             },
+            expected_artifact_ready=False,
         )
     except (KeyError, TypeError, ValidatorQuorumError) as exc:
         raise GenesisConflict(f"live validator preflight failed: {exc}") from exc
+    review_class = str(
+        record.get("draft", {}).get("reviewClass", INDEPENDENT_REVIEW_CLASS)
+    )
+    if review_class == INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS:
+        if str(plan.get("network")) != "testnet11":
+            raise GenesisConflict(
+                "internal engineering review is permitted on testnet11 only"
+            )
+        try:
+            evm_evidence = await asyncio.to_thread(
+                verify_genesis_evm_deployment, settings, record, plan
+            )
+        except GenesisEvmEvidenceError as exc:
+            raise GenesisConflict(f"live Sepolia preflight failed: {exc}") from exc
+        approval = _internal_review_approval(
+            record,
+            plan,
+            str(result["spendBundleId"]),
+            evm_evidence,
+            validator_health,
+        )
+    elif review_class == INDEPENDENT_REVIEW_CLASS:
+        approval = _validate_audit_approval(
+            settings, record, plan, str(result["spendBundleId"])
+        )
+    else:
+        raise GenesisConflict("unsupported genesis review class")
     return plan, result, approval, validator_health
 
 
@@ -707,6 +807,8 @@ async def preflight(
             "planHash": plan["planHash"],
             "spendBundleId": bundle["spendBundleId"],
             "spendCount": bundle["spendCount"],
+            "reviewClass": approval.get("reviewClass", INDEPENDENT_REVIEW_CLASS),
+            "auditStatus": approval.get("auditStatus", "independently-reviewed"),
             "auditApprovalHash": "0x"
             + hashlib.sha256(
                 json.dumps(approval, sort_keys=True, separators=(",", ":")).encode()
@@ -964,6 +1066,9 @@ async def finalize(
         lock = {
             "schemaVersion": 2,
             "protocolVersion": "solslot-v2",
+            "reviewClass": artifact["reviewClass"],
+            "testOnly": artifact["testOnly"],
+            "auditStatus": artifact["auditStatus"],
             "ceremonyId": ceremony_id.lower(),
             "planHash": record["plan_hash"],
             "artifactHash": artifact["artifactHash"],

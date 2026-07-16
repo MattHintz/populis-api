@@ -50,11 +50,15 @@ def _create_and_enroll(client: TestClient) -> tuple[str, list]:
     )}
     response = client.post(
         "/admin/genesis/drafts",
-        json={"sourceShas": commits},
+        json={
+            "sourceShas": commits,
+            "reviewClass": "internal-engineering-testnet",
+        },
         headers=_headers(),
     )
     assert response.status_code == 200, response.text
     ceremony_id = response.json()["ceremony_id"]
+    assert response.json()["draft"]["reviewClass"] == "internal-engineering-testnet"
     accounts = [Account.create(f"admin-{slot}") for slot in (1, 2, 3)]
     for slot, account in enumerate(accounts, start=1):
         issued = client.post(
@@ -198,3 +202,22 @@ def test_operator_routes_require_ceremony_token(tmp_path) -> None:
         },
     )
     assert response.status_code == 401
+
+
+def test_draft_rejects_unknown_review_class(tmp_path) -> None:
+    client, _, _ = _client(tmp_path)
+    response = client.post(
+        "/admin/genesis/drafts",
+        json={
+            "sourceShas": {
+                "protocol": "1" * 40,
+                "evm": "2" * 40,
+                "api": "3" * 40,
+                "customerWeb": "4" * 40,
+                "adminPortal": "5" * 40,
+            },
+            "reviewClass": "self-approved-mainnet",
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 422

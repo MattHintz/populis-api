@@ -570,26 +570,48 @@ class TestCancel:
         assert resp.json()["id"] != rec["id"]
 
 
-# ── 501 stubs ───────────────────────────────────────────────────────────────
-class TestStepBStubs:
-    def test_publish_returns_501(self, client):
+# ── Working publish / execute aliases ───────────────────────────────────────
+class TestMintChainAliases:
+    def test_publish_route_is_implemented(self, client):
         token = _login(client)
         resp = client.post(
             "/admin/mint/anything/publish",
-            json={},
+            json={
+                "spend_bundle": TestCommitteeVote._valid_bundle_json(),
+                "proposal_metadata": {
+                    "property_id": "PROPERTY-1",
+                    "collection_id": "COLLECTION-1",
+                    "asset_class_name": "RWA-RE-RES",
+                    "property_id_canon": "0x" + "01" * 32,
+                    "collection_id_canon": "0x" + "02" * 32,
+                    "share_ppm": 250_000,
+                    "property_registry_coin_id": "0x" + "03" * 32,
+                    "property_registry_puzzle_hash": "0x" + "04" * 32,
+                    "par_value_mojos": 1,
+                    "asset_class": 1,
+                    "jurisdiction": "0x5553",
+                    "royalty_puzhash": "0x" + "05" * 32,
+                    "royalty_bps": 0,
+                    "quorum_threshold": 1,
+                    "owner_member_hash": "0x" + "06" * 32,
+                    "gov_member_hash": "0x" + "00" * 32,
+                    "voting_deadline": 2_000_000_000,
+                },
+            },
             headers=_auth_header(token),
         )
-        assert resp.status_code == 501
-        assert "Step B" in resp.json()["detail"]
+        assert resp.status_code == 502  # route reached Coinset dependency
+        assert resp.status_code != 501
 
-    def test_execute_returns_501(self, client):
+    def test_execute_route_is_implemented(self, client):
         token = _login(client)
         resp = client.post(
             "/admin/mint/anything/execute",
-            json={},
+            json={"spend_bundle": TestCommitteeVote._valid_bundle_json()},
             headers=_auth_header(token),
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 502
+        assert resp.status_code != 501
 
 # ── Committee vote forwarder (Brick 3.5c-3) ─────────────────────────────────
 class TestCommitteeVote:

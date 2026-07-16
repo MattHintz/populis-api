@@ -12,7 +12,9 @@ Do not begin until:
   clean;
 - full suites and exploit regressions pass from those exact commits;
 - release archives and compiled assets pass the namespace scanner;
-- the independent pool and credential-path reviews are signed off;
+- either the independent review lanes are signed off, or this is an explicit
+  `internal-engineering-testnet` disposable run with three distinct enrolled
+  administrators and normal 2-of-3 plan/artifact signatures;
 - the credential carryover record is complete, the provider credential found
   in public history is revoked and replaced, signer 1/2 and private-network
   material are generated, and the one-time ceremony token is ready;
@@ -66,10 +68,12 @@ The signed public bundle must include:
 - `protocolVersion: "solslot-v2"`
 - protocol, API, EVM, customer-web, and admin-portal commit SHAs
 - build timestamp and artifact hash
+- explicit `reviewClass`, `testOnly`, and `auditStatus` markers
 - all puzzle module hashes and singleton launcher IDs
 - `sgtGenesisCoinId` and `sgtTailHash`
 - pool V3 and SmartDeed V2 versions
 - governance singleton struct
+- protocol DID singleton material and the empty property-registry authority
 - bridge policy and fresh EVM contract addresses
 - admin authority and vault-version-registry state
 - a complete retired-coordinate denylist
@@ -92,7 +96,9 @@ Before enabling minting:
 5. Attempt replay of owner challenge, relay request, event, nullifier, and
    bridge coin; every replay must fail.
 6. Confirm Beta ignores Alpha vaults and credentials.
-7. Confirm Alpha contains no listing before the admin and committee mint flow.
+7. For an internal disposable run, mint one synthetic SmartDeed through the
+   complete admin proposal, SGT vote, and five-spend committee execution path;
+   then exercise one offer, pool/deposit, and redemption path.
 8. Run ceremony preflight without report-only mode and archive its clean exit.
 
 Only then may an authorized operator set both write gates true and mint the
