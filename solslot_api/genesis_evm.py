@@ -150,7 +150,9 @@ def verify_genesis_evm_deployment(
                 20,
                 f"{name} receipt contract address",
             )
-            code = bytes(web3.eth.get_code(addresses[name]))
+            code = bytes(
+                web3.eth.get_code(Web3.to_checksum_address(addresses[name]))
+            )
         except GenesisEvmEvidenceError:
             raise
         except Exception as exc:
@@ -190,7 +192,9 @@ def verify_genesis_evm_deployment(
         "zkPassport root verifier address",
     )
     try:
-        root_code = bytes(web3.eth.get_code(root_address))
+        root_code = bytes(
+            web3.eth.get_code(Web3.to_checksum_address(root_address))
+        )
     except Exception as exc:
         raise GenesisEvmEvidenceError(
             "could not verify zkPassport root verifier bytecode"

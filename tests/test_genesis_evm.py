@@ -122,11 +122,13 @@ def _install_fake_web3(monkeypatch, deployment, code, *, peak=120):
 
         @staticmethod
         def get_code(address):
+            assert RealWeb3.is_checksum_address(address)
             return code[str(address).lower()]
 
     class FakeWeb3:
         HTTPProvider = staticmethod(lambda *_args, **_kwargs: object())
         keccak = staticmethod(RealWeb3.keccak)
+        to_checksum_address = staticmethod(RealWeb3.to_checksum_address)
 
         def __init__(self, _provider):
             self.eth = FakeEth()
