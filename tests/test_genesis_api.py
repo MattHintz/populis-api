@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from chia_rs import AugSchemeMPL
 
+import solslot_api.genesis as genesis_module
 from solslot_api.config import Settings, get_settings
 from solslot_api.genesis import get_genesis_store, router
 from solslot_api.genesis_store import GenesisStore
@@ -168,6 +172,64 @@ def test_three_admin_http_flow_reaches_plan_approval(tmp_path) -> None:
     final = store.get(ceremony_id)
     assert final["state"] == "plan_approved"
     assert len(final["plan_signatures"]) == 2
+
+
+def test_preflight_returns_canonical_review_approval_for_offline_gate(
+    tmp_path, monkeypatch
+) -> None:
+    client, store, _ = _client(tmp_path)
+    ceremony_id, accounts = _create_and_enroll(client)
+    created = client.post(
+        f"/admin/genesis/{ceremony_id}/plan",
+        json=_plan_body(),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    for slot, account in enumerate(accounts[:2], start=1):
+        prepared = client.post(
+            f"/admin/genesis/{ceremony_id}/plan/signatures/prepare",
+            json={"slot": slot},
+        )
+        signed = client.post(
+            f"/admin/genesis/{ceremony_id}/plan/signatures",
+            json={
+                "slot": slot,
+                "signature": _signature(account, prepared.json()["typedData"]),
+            },
+        )
+        assert signed.status_code == 200, signed.text
+
+    approval = {
+        "schemaVersion": 2,
+        "reviewClass": "internal-engineering-testnet",
+        "auditStatus": "unaudited",
+        "testOnly": True,
+        "ceremonyId": ceremony_id,
+    }
+    spend_bundle_id = "0x" + "ab" * 32
+
+    async def fake_prepare_bundle(settings, record):
+        del settings
+        return (
+            record["plan"],
+            {"spendBundleId": spend_bundle_id, "spendCount": 9},
+            approval,
+            (),
+        )
+
+    monkeypatch.setattr(genesis_module, "_prepare_bundle", fake_prepare_bundle)
+    response = client.post(
+        f"/admin/genesis/{ceremony_id}/preflight",
+        headers=_headers(),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ready"] is True
+    assert body["reviewApproval"] == approval
+    assert body["auditApprovalHash"] == "0x" + hashlib.sha256(
+        json.dumps(approval, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def test_wrong_admin_cannot_sign_frozen_plan(tmp_path) -> None:

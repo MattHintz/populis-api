@@ -813,6 +813,7 @@ async def preflight(
             + hashlib.sha256(
                 json.dumps(approval, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
+            "reviewApproval": approval,
             "validatorHealth": [
                 item.model_dump(mode="json") for item in validator_health
             ],
