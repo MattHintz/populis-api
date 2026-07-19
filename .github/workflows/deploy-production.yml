@@ -1,0 +1,982 @@
+name: Production Coordinator Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: "Exact 40-character API commit SHA to deploy."
+        required: true
+        type: string
+      diagnostics_only:
+        description: "Inspect the live production API without deploying a release."
+        required: false
+        type: boolean
+        default: false
+      rollback_sha:
+        description: "Existing release ID to roll back to. Leave blank for a normal deploy."
+        required: false
+        type: string
+concurrency:
+  group: solslot-api-production
+  cancel-in-progress: false
+
+env:
+  RELEASE_SHA: ${{ inputs.release_sha }}
+  RELEASE_ROOT: ${{ vars.SOLSLOT_API_RELEASE_ROOT || '/opt/solslot/api-production' }}
+  SHARED_ROOT: ${{ vars.SOLSLOT_API_SHARED_ROOT || '/opt/solslot/api-production/shared' }}
+  ENV_FILE_PATH: ${{ vars.SOLSLOT_API_ENV_FILE_PATH || '/opt/solslot/api-production/shared/.env' }}
+  SYSTEMD_SERVICE: ${{ vars.SOLSLOT_API_SYSTEMD_SERVICE || 'solslot-api-production.service' }}
+  SYSTEMD_USER: ${{ vars.SOLSLOT_API_SYSTEMD_USER || 'solslot-api' }}
+  APP_PORT: ${{ vars.SOLSLOT_API_PORT || '8791' }}
+  PUBLIC_BASE_URL: https://solslot.com/protocol-api
+  EXPECTED_HOSTNAME: ${{ vars.SOLSLOT_API_HOSTNAME || 'SolomonsLot' }}
+  LEGACY_API_HOST: ${{ vars.SOLSLOT_LEGACY_API_HOST }}
+  PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
+  PROTOCOL_REF: ${{ vars.SOLSLOT_PROTOCOL_REF }}
+  # Published by Cloudflare at https://api.cloudflare.com/client/v4/ips.
+  # Keep this reviewed, versioned pin in sync with that authoritative list.
+  CLOUDFLARE_PROXY_CIDRS: >-
+    173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32
+
+jobs:
+  build-release:
+    if: ${{ (github.event.inputs.diagnostics_only != 'true') && (github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null) }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout API
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Require frozen release commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_sha must be an exact 40-character commit SHA." >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          if [[ ! "$PROTOCOL_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "SOLSLOT_PROTOCOL_REF must be an exact 40-character commit SHA." >&2
+            exit 1
+          fi
+
+      - name: Checkout protocol package
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PROTOCOL_REPOSITORY }}
+          ref: ${{ env.PROTOCOL_REF }}
+          path: protocol
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Detect app package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d solslot_api ]; then
+            package_name=solslot_api
+          else
+            echo "No solslot_api package directory found." >&2
+            exit 1
+          fi
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "app_module=$package_name.app:app" >> "$GITHUB_OUTPUT"
+
+      - name: Install and test
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel
+          # Chia 2.7.x requires the yanked zstd 1.5.7.3 wheel exactly.
+          python -m pip install -c constraints.lock zstd==1.5.7.3
+          python -m pip install -c constraints.lock -e protocol -e '.[dev]'
+          PYTHON=python bash scripts/check_dependency_audit.sh
+          python -m compileall -q "$APP_PACKAGE"
+          python - <<'PY'
+          import importlib
+          import os
+          package = os.environ["APP_PACKAGE"]
+          module = importlib.import_module(f"{package}.app")
+          app = module.app
+          paths = app.openapi().get("paths", {})
+          assert "Solslot" in app.title, app.title
+          assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
+          PY
+          python -m pytest tests -q
+          python scripts/check_namespace.py
+
+      - name: Secret scan
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+        run: >-
+          python scripts/check_secrets.py --paths
+          "$APP_PACKAGE" tests scripts ops config .github pyproject.toml
+          constraints.lock
+
+      - name: Write release metadata
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+          APP_MODULE: ${{ steps.package.outputs.app_module }}
+        run: |
+          set -euo pipefail
+          protocol_commit="$(git -C protocol rev-parse HEAD)"
+          source_date_epoch="$(git show -s --format=%ct "$RELEASE_SHA")"
+          built_at="$(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+          python - <<PY
+          import json
+          data = {
+              "schemaVersion": 2,
+              "protocolVersion": "solslot-v2",
+              "api_commit": "${RELEASE_SHA}",
+              "api_repository": "${GITHUB_REPOSITORY}",
+              "protocol_repository": "${PROTOCOL_REPOSITORY}",
+              "protocol_ref": "${PROTOCOL_REF}",
+              "protocol_commit": "${protocol_commit}",
+              "built_at_utc": "${built_at}",
+              "source_date_epoch": ${source_date_epoch},
+              "package_name": "${APP_PACKAGE}",
+              "app_module": "${APP_MODULE}",
+          }
+          with open("release.json", "w", encoding="utf-8") as fh:
+              json.dump(data, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          PY
+
+      - name: Package release
+        shell: bash
+        env:
+          APP_PACKAGE: ${{ steps.package.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(python -c 'import json; print(json.load(open("release.json"))["source_date_epoch"])')"
+          package_release() {
+            local output="$1"
+            tar \
+              --sort=name \
+              --mtime="@$source_date_epoch" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --format=gnu \
+              --exclude='.git' \
+              --exclude='.github' \
+              --exclude='.pytest_cache' \
+              --exclude='__pycache__' \
+              --exclude='.venv' \
+              --exclude='*.pyc' \
+              -cf - \
+              "$APP_PACKAGE" \
+              protocol \
+              config \
+              ops \
+              scripts \
+              constraints.lock \
+              pyproject.toml \
+              README.md \
+              release.json \
+              | gzip -n > "$output"
+          }
+          package_release "solslot-api-release-${RELEASE_SHA}.tgz"
+          package_release "solslot-api-release-${RELEASE_SHA}.repeat.tgz"
+          cmp "solslot-api-release-${RELEASE_SHA}.tgz" \
+            "solslot-api-release-${RELEASE_SHA}.repeat.tgz"
+          rm "solslot-api-release-${RELEASE_SHA}.repeat.tgz"
+
+      - name: Verify packaged namespace
+        shell: bash
+        run: |
+          python scripts/check_namespace.py --paths "solslot-api-release-${RELEASE_SHA}.tgz"
+          python scripts/check_secrets.py --paths "solslot-api-release-${RELEASE_SHA}.tgz"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solslot-api-release-${{ inputs.release_sha }}
+          path: solslot-api-release-${{ inputs.release_sha }}.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Copy release to production
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          source: solslot-api-release-${{ inputs.release_sha }}.tgz
+          target: /tmp
+          rm: false
+
+  deploy-release:
+    needs: build-release
+    if: ${{ github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy release atomically
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+
+            release_root="${{ env.RELEASE_ROOT }}"
+            release_sha="${{ inputs.release_sha }}"
+            protocol_ref="${{ env.PROTOCOL_REF }}"
+            release_id="$release_sha-${protocol_ref:0:12}"
+            release_dir="$release_root/releases/$release_id"
+            archive="/tmp/solslot-api-release-$release_sha.tgz"
+            shared_root="${{ env.SHARED_ROOT }}"
+            state_dir="$shared_root/state"
+            transaction_dir="$shared_root/deployments"
+            transaction_file="$transaction_dir/deploy-$release_sha.previous"
+            env_file="${{ env.ENV_FILE_PATH }}"
+            systemd_service="${{ env.SYSTEMD_SERVICE }}"
+            systemd_user="${{ env.SYSTEMD_USER }}"
+            app_port="${{ env.APP_PORT }}"
+            trusted_proxy_cidrs="${{ env.CLOUDFLARE_PROXY_CIDRS }}"
+            actual_hostname="$(hostname)"
+            if [ "$actual_hostname" != "${{ env.EXPECTED_HOSTNAME }}" ]; then
+              echo "Refusing production deploy: expected host ${{ env.EXPECTED_HOSTNAME }}, got $actual_hostname" >&2
+              exit 1
+            fi
+            if ! id "$systemd_user" >/dev/null 2>&1; then
+              sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin "$systemd_user"
+            fi
+            sudo mkdir -p "$release_root/releases" "$state_dir" "$transaction_dir"
+            test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
+            sudo test -f "$env_file" || (echo "Missing $env_file on production host." && exit 1)
+            sudo chown -R "$(id -un)":"$(id -gn)" "$release_root/releases"
+            sudo chown -R "$systemd_user":"$systemd_user" "$shared_root"
+            sudo chmod 0700 "$shared_root" "$state_dir" "$transaction_dir"
+            sudo chmod 0600 "$env_file"
+
+            python_bin="$(command -v python3.12 || command -v python3.11 || true)"
+            if [ -z "$python_bin" ]; then
+              echo "Python 3.11+ is required on the production host."
+              exit 1
+            fi
+            "$python_bin" - <<'PY'
+            import sys
+            if sys.version_info < (3, 11):
+                raise SystemExit(f"Python 3.11+ is required, found {sys.version}")
+            PY
+            "$python_bin" - "$trusted_proxy_cidrs" <<'PY'
+            import ipaddress
+            import sys
+
+            networks = [
+                ipaddress.ip_network(value, strict=True)
+                for value in sys.argv[1].split(",")
+                if value
+            ]
+            if not networks or not {network.version for network in networks} == {4, 6}:
+                raise SystemExit("Cloudflare proxy pin must contain IPv4 and IPv6 ranges")
+            PY
+            if sudo grep -Eq \
+              '^[[:space:]]*SOLSLOT_VALIDATOR_SEED_(FILE|HEX)[[:space:]]*=' \
+              "$env_file"; then
+              echo "Coordinator environment contains validator seed configuration." >&2
+              exit 1
+            fi
+            previous_target="$(readlink -f "$release_root/current" || true)"
+            previous_release_body="$(mktemp)"
+            previous_public_release_body="$(mktemp)"
+            if [ -n "$previous_target" ] \
+              && [ -f "$previous_target/.release-ready" ] \
+              && [ -f "$previous_target/release.json" ] \
+              && curl -fsS "http://127.0.0.1:$app_port/release" \
+                >"$previous_release_body" \
+              && curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
+                >"$previous_public_release_body" \
+              && "$python_bin" - "$previous_target/release.json" \
+                "$previous_release_body" "$previous_public_release_body" <<'PY'
+            import json
+            import sys
+
+            expected = json.load(open(sys.argv[1], encoding="utf-8"))
+            for path in sys.argv[2:]:
+                live = json.load(open(path, encoding="utf-8"))
+                release = live["release"]
+                assert live["available"] is True
+                assert release["apiCommit"] == expected["api_commit"]
+                assert release["protocolCommit"] == expected["protocol_commit"]
+            PY
+            then
+              touch "$previous_target/.release-verified"
+            fi
+            rm -f "$previous_release_body" "$previous_public_release_body"
+            if [ -n "$previous_target" ] \
+              && [ ! -f "$previous_target/.release-verified" ]; then
+              echo "Current release has no matching local/public verification evidence." >&2
+              exit 1
+            fi
+
+            if [ -e "$release_dir" ] && [ ! -f "$release_dir/.release-ready" ]; then
+              if [ "$previous_target" = "$release_dir" ]; then
+                echo "Refusing to replace the active release directory $release_dir." >&2
+                exit 1
+              fi
+              rm -rf "$release_dir"
+            fi
+
+            if [ ! -f "$release_dir/.release-ready" ]; then
+              mkdir -p "$release_dir"
+              "$python_bin" - "$archive" <<'PY'
+            import pathlib
+            import sys
+            import tarfile
+
+            with tarfile.open(sys.argv[1], "r:gz") as archive:
+                for member in archive.getmembers():
+                    path = pathlib.PurePosixPath(member.name)
+                    if path.is_absolute() or ".." in path.parts:
+                        raise SystemExit(f"unsafe release archive path: {member.name}")
+                    if member.isdev() or member.isfifo():
+                        raise SystemExit(
+                            f"unsupported special file in release archive: {member.name}"
+                        )
+                    if member.issym() or member.islnk():
+                        target = pathlib.PurePosixPath(member.linkname)
+                        if target.is_absolute() or ".." in target.parts:
+                            raise SystemExit(f"unsafe release archive link: {member.name}")
+            PY
+              tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$release_dir"
+              cd "$release_dir"
+              package_name="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["package_name"])')"
+              app_module="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["app_module"])')"
+              "$python_bin" -m venv .venv
+              .venv/bin/python -m pip install --upgrade pip wheel
+              # Chia 2.7.x requires the yanked zstd 1.5.7.3 wheel exactly.
+              .venv/bin/python -m pip install -c constraints.lock zstd==1.5.7.3
+              .venv/bin/python -m pip install -c constraints.lock -e ./protocol .
+              .venv/bin/python -m pip check
+              .venv/bin/python -m compileall -q "$package_name"
+              .venv/bin/python - <<PY
+            import importlib
+            module_name = "${app_module}".split(":")[0]
+            app = importlib.import_module(module_name).app
+            paths = app.openapi().get("paths", {})
+            assert "Solslot" in app.title, app.title
+            assert any("zkpassport/enrollments" in path for path in paths), paths.keys()
+            PY
+              touch .release-ready
+            fi
+
+            cd "$release_dir"
+            package_name="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["package_name"])')"
+            app_module="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["app_module"])')"
+            "$python_bin" -c 'import json, sys; data=json.load(open("release.json")); assert data["api_commit"] == sys.argv[1]; assert data["protocol_commit"] == sys.argv[2]' "$release_sha" "$protocol_ref"
+            if [ -n "$previous_target" ] && [ -f "$previous_target/release.json" ]; then
+              previous_app_module="$("$python_bin" -c 'import json, sys; print(json.load(open(sys.argv[1]))["app_module"])' "$previous_target/release.json" 2>/dev/null || true)"
+              if [ "$previous_app_module" != "$app_module" ]; then
+                previous_target=""
+              fi
+            fi
+            printf '%s\n' "$previous_target" \
+              | sudo tee "$transaction_file" >/dev/null
+            sudo chmod 0600 "$transaction_file"
+            sudo ln -sfn "$release_dir" "$release_root/current"
+            sudo tee /etc/systemd/system/"$systemd_service" >/dev/null <<EOF
+            [Unit]
+            Description=Solslot API Production
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            User=$systemd_user
+            Group=$systemd_user
+            WorkingDirectory=$release_root/current
+            EnvironmentFile=$env_file
+            Environment=PYTHONUNBUFFERED=1
+            Environment=SOLSLOT_RUNTIME_ENVIRONMENT=production
+            Environment=SOLSLOT_NETWORK=testnet11
+            Environment=SOLSLOT_EIP712_CHAIN_ID=11155111
+            Environment=SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID=11155111
+            Environment=SOLSLOT_API_DOCS_ENABLED=false
+            Environment=SOLSLOT_ALPHA_WRITES_ENABLED=false
+            Environment=SOLSLOT_MINTING_ENABLED=false
+            Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
+            Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
+            Environment=SOLSLOT_VAULT_SESSION_COOKIE_SECURE=true
+            Environment=SOLSLOT_SECURITY_HEADERS_ENABLED=true
+            Environment=SOLSLOT_HSTS_ENABLED=true
+            Environment="SOLSLOT_TRUSTED_PROXY_CIDRS=$trusted_proxy_cidrs"
+            Environment=SOLSLOT_CORS_ORIGINS=https://solslot.com
+            Environment=SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304
+            Environment=SOLSLOT_REQUEST_TIMEOUT_SECONDS=30
+            Environment=SOLSLOT_CHALLENGE_STORE_PATH=$state_dir/challenges_v2.db
+            Environment=SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH=$state_dir/zkpassport_v2.db
+            Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry_v2.db
+            Environment=SOLSLOT_ADMIN_DB_PATH=$state_dir/admin_desk_v2.db
+            Environment=SOLSLOT_DEPLOYMENT_MANIFEST_PATH=$state_dir/deployment_manifest_v2.json
+            Environment=SOLSLOT_BOOTSTRAP_MANIFEST_PATH=$state_dir/bootstrap_manifest_v2.json
+            ExecStart=
+            ExecStart=$release_root/current/.venv/bin/uvicorn $app_module --host 127.0.0.1 --port $app_port --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-keep-alive 5 --timeout-graceful-shutdown 30 --limit-concurrency 100 --backlog 256 --no-server-header
+            NoNewPrivileges=true
+            PrivateTmp=true
+            ProtectHome=true
+            ProtectSystem=strict
+            ProtectKernelModules=true
+            ProtectKernelTunables=true
+            ProtectControlGroups=true
+            RestrictRealtime=true
+            RestrictSUIDSGID=true
+            LockPersonality=true
+            UMask=0077
+            ReadWritePaths=$shared_root
+            Restart=on-failure
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            sudo systemctl daemon-reload
+            sudo systemctl enable "$systemd_service"
+
+            wait_for_health() {
+              local attempt
+              for attempt in $(seq 1 30); do
+                if curl -fsS "http://127.0.0.1:$app_port/health" >/dev/null; then
+                  return 0
+                fi
+                if ! sudo systemctl is-active --quiet "$systemd_service"; then
+                  echo "Coordinator service stopped before becoming healthy." >&2
+                  return 1
+                fi
+                sleep 1
+              done
+              echo "Coordinator health check timed out after 30 seconds." >&2
+              return 1
+            }
+
+            require_http_code() {
+              local expected="$1"
+              local url="$2"
+              shift 2
+              local actual
+              actual="$(curl -sS -o /dev/null -w '%{http_code}' "$@" "$url")" || return 1
+              if [ "$actual" != "$expected" ]; then
+                echo "Expected HTTP $expected from $url, received $actual." >&2
+                return 1
+              fi
+            }
+
+            verify_release() {
+              local cors_headers
+              local main_pid
+
+              wait_for_health || return 1
+              curl -fsS "http://127.0.0.1:$app_port/release" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ inputs.release_sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"' \
+                || return 1
+              curl -fsS "http://127.0.0.1:$app_port/protocol" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None' \
+                || return 1
+              require_http_code 404 "http://127.0.0.1:$app_port/openapi.json" \
+                || return 1
+              require_http_code 404 \
+                "http://127.0.0.1:$app_port/zkpassport/validator" \
+                || return 1
+              require_http_code 404 \
+                "http://127.0.0.1:$app_port/v1/zkpassport/sign" \
+                -H 'Content-Type: application/json' -d '{}' \
+                || return 1
+              require_http_code 503 \
+                "http://127.0.0.1:$app_port/auth/challenge" \
+                -H 'Content-Type: application/json' \
+                -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
+                || return 1
+
+              cors_headers="$(mktemp)" || return 1
+              require_http_code 400 \
+                "http://127.0.0.1:$app_port/auth/challenge" \
+                -D "$cors_headers" \
+                -X OPTIONS \
+                -H 'Origin: http://localhost:4200' \
+                -H 'Access-Control-Request-Method: POST' \
+                || { rm -f "$cors_headers"; return 1; }
+              if grep -qi '^access-control-allow-origin:' "$cors_headers"; then
+                echo "Blocked localhost origin received a CORS allow-origin header." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              if grep -qi '^access-control-allow-credentials:' "$cors_headers"; then
+                echo "Blocked localhost origin received a credentials header." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              rm -f "$cors_headers"
+
+              cors_headers="$(mktemp)" || return 1
+              require_http_code 200 \
+                "http://127.0.0.1:$app_port/auth/challenge" \
+                -D "$cors_headers" \
+                -X OPTIONS \
+                -H 'Origin: https://solslot.com' \
+                -H 'Access-Control-Request-Method: POST' \
+                || { rm -f "$cors_headers"; return 1; }
+              if ! grep -qi \
+                '^access-control-allow-origin: https://solslot\.com' \
+                "$cors_headers"; then
+                echo "Production origin did not receive its exact CORS header." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              if grep -qi '^access-control-allow-credentials:' "$cors_headers"; then
+                echo "Production CORS unexpectedly permits credentials." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              rm -f "$cors_headers"
+
+              sudo systemctl show "$systemd_service" --property=ExecStart --value \
+                | grep -q 'solslot_api.app:app' \
+                || return 1
+              if sudo find "$release_dir" -xdev -type f \
+                -iname '*.seed' -print -quit | grep -q .; then
+                echo "Validator seed file exists in the coordinator release." >&2
+                return 1
+              fi
+              if sudo find "$shared_root" -xdev -type f \
+                \( -iname '*.seed' -o -iname '*.seed.hex' \) \
+                -print -quit | grep -q .; then
+                echo "Validator seed material exists on the coordinator." >&2
+                return 1
+              fi
+              if sudo test -e /etc/solslot-validator/private/validator.seed; then
+                echo "Validator host material exists on the coordinator." >&2
+                return 1
+              fi
+              main_pid="$(sudo systemctl show "$systemd_service" --property=MainPID --value)"
+              if ! [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Coordinator service has no live main process." >&2
+                return 1
+              fi
+              if sudo grep -zEq '^SOLSLOT_VALIDATOR_SEED_(FILE|HEX)=' \
+                "/proc/$main_pid/environ"; then
+                echo "Coordinator process received validator seed configuration." >&2
+                return 1
+              fi
+              ss -ltn | grep -Eq "127\\.0\\.0\\.1:$app_port[[:space:]]" \
+                || return 1
+              if ss -ltn | grep -Eq \
+                "(0\\.0\\.0\\.0|\\[::\\]):$app_port[[:space:]]"; then
+                echo "Coordinator port is listening on a public address." >&2
+                return 1
+              fi
+            }
+
+            if ! sudo systemctl restart "$systemd_service" || ! verify_release; then
+              echo "New release failed local verification; restoring previous release." >&2
+              sudo systemctl stop "$systemd_service" || true
+              if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
+                sudo ln -sfn "$previous_target" "$release_root/current"
+                sudo systemctl restart "$systemd_service" || true
+              fi
+              sudo rm -f "$transaction_file"
+              exit 1
+            fi
+            touch "$release_dir/.release-local-verified"
+
+            find "$release_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+              | sort -rn \
+              | awk 'NR>5 {print $2}' \
+              | xargs -r rm -rf
+
+      - name: Verify public production API
+        run: |
+          set -euo pipefail
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
+            | python -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ inputs.release_sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/protocol" \
+            | python -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None'
+          headers="$(mktemp)"
+          curl -fsS -D "$headers" -o /dev/null "${{ env.PUBLIC_BASE_URL }}/health"
+          grep -qi '^strict-transport-security: .*max-age=31536000' "$headers"
+          grep -qi '^x-content-type-options: nosniff' "$headers"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/openapi.json")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/zkpassport/validator")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' -d '{}' \
+            "${{ env.PUBLIC_BASE_URL }}/v1/zkpassport/sign")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
+            "${{ env.PUBLIC_BASE_URL }}/auth/challenge")" = "503"
+
+          cors_headers="$(mktemp)"
+          test "$(curl -sS -D "$cors_headers" -o /dev/null -w '%{http_code}' \
+            -X OPTIONS \
+            -H 'Origin: http://localhost:4200' \
+            -H 'Access-Control-Request-Method: POST' \
+            "${{ env.PUBLIC_BASE_URL }}/auth/challenge")" = "400"
+          ! grep -qi '^access-control-allow-origin:' "$cors_headers"
+          ! grep -qi '^access-control-allow-credentials:' "$cors_headers"
+          rm -f "$cors_headers"
+
+          if [ -n "${{ env.LEGACY_API_HOST }}" ]; then
+            if curl -sS --connect-timeout 3 -o /dev/null \
+              "http://${{ env.LEGACY_API_HOST }}:5001/"; then
+              echo "Retired API port 5001 is publicly reachable." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Finalize successful deployment transaction
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            protocol_ref="${{ env.PROTOCOL_REF }}"
+            release_id="${{ inputs.release_sha }}-${protocol_ref:0:12}"
+            release_dir="${{ env.RELEASE_ROOT }}/releases/$release_id"
+            transaction_file="${{ env.SHARED_ROOT }}/deployments/deploy-${{ inputs.release_sha }}.previous"
+            test "$(readlink -f '${{ env.RELEASE_ROOT }}/current')" = "$release_dir"
+            test -f "$release_dir/.release-local-verified"
+            touch "$release_dir/.release-verified"
+            sudo rm -f "$transaction_file"
+
+      - name: Restore previous release after failed public verification
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            release_root="${{ env.RELEASE_ROOT }}"
+            transaction_file="${{ env.SHARED_ROOT }}/deployments/deploy-${{ inputs.release_sha }}.previous"
+            if ! sudo test -f "$transaction_file"; then
+              echo "No active deployment transaction requires restoration."
+              exit 0
+            fi
+            previous_target="$(sudo cat "$transaction_file")"
+            case "$previous_target" in
+              "$release_root"/releases/*) ;;
+              *)
+                echo "Deployment transaction has no valid previous release." >&2
+                exit 1
+                ;;
+            esac
+            test -d "$previous_target"
+            test -f "$previous_target/.release-verified"
+            sudo ln -sfn "$previous_target" "$release_root/current"
+            sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}"
+            for attempt in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" >/dev/null; then
+                sudo rm -f "$transaction_file"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Previous release did not recover within 30 seconds." >&2
+            exit 1
+
+      - name: Print production API diagnostics on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set +e
+            echo "user=$(id -un) home=$HOME"
+            ps aux | grep -E 'uvicorn|solslot|solslot_api' | grep -v grep
+            sudo systemctl status "${{ env.SYSTEMD_SERVICE }}" --no-pager
+            sudo journalctl -u "${{ env.SYSTEMD_SERVICE }}" -n 120 --no-pager
+            curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" || true
+
+  rollback:
+    if: ${{ (github.event.inputs.diagnostics_only != 'true') && (github.event.inputs.rollback_sha != '' && github.event.inputs.rollback_sha != null) }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Roll back production API
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          ROLLBACK_RELEASE_ID: ${{ github.event.inputs.rollback_sha }}
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          envs: ROLLBACK_RELEASE_ID
+          script: |
+            set -euo pipefail
+            release_root="${{ env.RELEASE_ROOT }}"
+            rollback_id="$ROLLBACK_RELEASE_ID"
+            if [[ ! "$rollback_id" =~ ^[0-9a-f]{40}-[0-9a-f]{12}$ ]]; then
+              echo "Rollback requires a V2 release ID: <api-sha>-<protocol-prefix>." >&2
+              exit 1
+            fi
+            release_dir="$release_root/releases/$rollback_id"
+            test -d "$release_dir" || (echo "No release directory exists for $rollback_id" && exit 1)
+            test -f "$release_dir/.release-ready" || (echo "Release $rollback_id is incomplete" && exit 1)
+            test -f "$release_dir/.release-verified" || (echo "Release $rollback_id never passed runtime verification" && exit 1)
+
+            "$release_dir/.venv/bin/python" -c '
+            import json, pathlib, sys
+            release_id = sys.argv[1]
+            api_id, protocol_prefix = release_id.split("-", 1)
+            data = json.loads(pathlib.Path(sys.argv[2]).read_text())
+            assert data["schemaVersion"] == 2
+            assert data["protocolVersion"] == "solslot-v2"
+            assert data["api_commit"] == api_id
+            assert data["protocol_commit"].startswith(protocol_prefix)
+            assert data["package_name"] == "solslot_api"
+            assert data["app_module"] == "solslot_api.app:app"
+            ' "$rollback_id" "$release_dir/release.json"
+
+            previous_target="$(readlink -f "$release_root/current" || true)"
+            case "$previous_target" in
+              "$release_root"/releases/*) ;;
+              *)
+                echo "Current release is not a canonical release target." >&2
+                exit 1
+                ;;
+            esac
+            test -f "$previous_target/.release-verified" || (echo "Current release has no public verification marker" && exit 1)
+            transaction_dir="${{ env.SHARED_ROOT }}/deployments"
+            transaction_file="$transaction_dir/rollback-${{ github.run_id }}.previous"
+            sudo mkdir -p "$transaction_dir"
+            sudo chmod 0700 "$transaction_dir"
+            printf '%s\n' "$previous_target" \
+              | sudo tee "$transaction_file" >/dev/null
+            sudo chmod 0600 "$transaction_file"
+
+            sudo ln -sfn "$release_dir" "$release_root/current"
+            wait_for_rollback_health() {
+              local attempt
+              for attempt in $(seq 1 30); do
+                if curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" >/dev/null; then
+                  return 0
+                fi
+                if ! sudo systemctl is-active --quiet "${{ env.SYSTEMD_SERVICE }}"; then
+                  echo "Rollback service stopped before becoming healthy." >&2
+                  return 1
+                fi
+                sleep 1
+              done
+              echo "Rollback health check timed out after 30 seconds." >&2
+              return 1
+            }
+
+            require_rollback_http_code() {
+              local expected="$1"
+              local url="$2"
+              shift 2
+              local actual
+              actual="$(curl -sS -o /dev/null -w '%{http_code}' "$@" "$url")" || return 1
+              if [ "$actual" != "$expected" ]; then
+                echo "Expected HTTP $expected from $url, received $actual." >&2
+                return 1
+              fi
+            }
+
+            verify_rollback() {
+              local cors_headers
+              wait_for_rollback_health || return 1
+              curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/release" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; rollback_id=sys.argv[1]; api_sha, protocol_prefix=rollback_id.split("-", 1); assert data["available"] is True; assert release["apiCommit"] == api_sha; assert release["protocolCommit"].startswith(protocol_prefix)' "$rollback_id" \
+                || return 1
+              require_rollback_http_code 404 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" \
+                || return 1
+              require_rollback_http_code 404 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/zkpassport/validator" \
+                || return 1
+              require_rollback_http_code 404 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/v1/zkpassport/sign" \
+                -H 'Content-Type: application/json' -d '{}' \
+                || return 1
+              require_rollback_http_code 503 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/auth/challenge" \
+                -H 'Content-Type: application/json' \
+                -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
+                || return 1
+              cors_headers="$(mktemp)" || return 1
+              require_rollback_http_code 400 \
+                "http://127.0.0.1:${{ env.APP_PORT }}/auth/challenge" \
+                -D "$cors_headers" \
+                -X OPTIONS \
+                -H 'Origin: http://localhost:4200' \
+                -H 'Access-Control-Request-Method: POST' \
+                || { rm -f "$cors_headers"; return 1; }
+              if grep -qi '^access-control-allow-origin:' "$cors_headers" \
+                || grep -qi '^access-control-allow-credentials:' "$cors_headers"; then
+                echo "Blocked localhost origin received CORS authorization." >&2
+                rm -f "$cors_headers"
+                return 1
+              fi
+              rm -f "$cors_headers"
+              ss -ltn | grep -Eq \
+                "127\\.0\\.0\\.1:${{ env.APP_PORT }}[[:space:]]" \
+                || return 1
+              if ss -ltn | grep -Eq \
+                "(0\\.0\\.0\\.0|\\[::\\]):${{ env.APP_PORT }}[[:space:]]"; then
+                echo "Rollback target is listening on a public address." >&2
+                return 1
+              fi
+            }
+
+            if ! sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}" || ! verify_rollback; then
+              echo "Rollback target failed verification; restoring the prior release." >&2
+              if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
+                sudo ln -sfn "$previous_target" "$release_root/current"
+                sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}" || true
+              fi
+              sudo rm -f "$transaction_file"
+              exit 1
+            fi
+
+      - name: Verify public rollback
+        env:
+          ROLLBACK_RELEASE_ID: ${{ github.event.inputs.rollback_sha }}
+        run: |
+          set -euo pipefail
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/health"
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/release" \
+            | python -c 'import json, os, sys; data=json.load(sys.stdin); release=data["release"]; api_sha, protocol_prefix=os.environ["ROLLBACK_RELEASE_ID"].split("-", 1); assert data["available"] is True; assert release["apiCommit"] == api_sha; assert release["protocolCommit"].startswith(protocol_prefix)'
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/openapi.json")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "${{ env.PUBLIC_BASE_URL }}/zkpassport/validator")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' -d '{}' \
+            "${{ env.PUBLIC_BASE_URL }}/v1/zkpassport/sign")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"address":"0x1111111111111111111111111111111111111111","auth_type":"evm"}' \
+            "${{ env.PUBLIC_BASE_URL }}/auth/challenge")" = "503"
+
+      - name: Finalize successful rollback transaction
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            sudo rm -f "${{ env.SHARED_ROOT }}/deployments/rollback-${{ github.run_id }}.previous"
+
+      - name: Restore pre-rollback release after failed public verification
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          script: |
+            set -euo pipefail
+            release_root="${{ env.RELEASE_ROOT }}"
+            transaction_file="${{ env.SHARED_ROOT }}/deployments/rollback-${{ github.run_id }}.previous"
+            if ! sudo test -f "$transaction_file"; then
+              echo "No active rollback transaction requires restoration."
+              exit 0
+            fi
+            previous_target="$(sudo cat "$transaction_file")"
+            case "$previous_target" in
+              "$release_root"/releases/*) ;;
+              *)
+                echo "Rollback transaction has no valid previous release." >&2
+                exit 1
+                ;;
+            esac
+            test -d "$previous_target"
+            test -f "$previous_target/.release-verified"
+            sudo ln -sfn "$previous_target" "$release_root/current"
+            sudo systemctl restart "${{ env.SYSTEMD_SERVICE }}"
+            for attempt in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" >/dev/null; then
+                sudo rm -f "$transaction_file"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Pre-rollback release did not recover within 30 seconds." >&2
+            exit 1
+
+  runtime-diagnostics:
+    if: ${{ github.event.inputs.diagnostics_only == 'true' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Inspect live production API
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 5m
+          script: |
+            set +e
+            echo "hostname=$(hostname) expected=${{ env.EXPECTED_HOSTNAME }}"
+            echo "user=$(id -un) home=$HOME"
+            echo "current=$(readlink -f '${{ env.RELEASE_ROOT }}/current')"
+            sudo systemctl status "${{ env.SYSTEMD_SERVICE }}" --no-pager
+            ps -eo pid,user,lstart,cmd | grep -E 'uvicorn .*solslot_api' | grep -v grep
+            echo "--- recent API journal ---"
+            sudo journalctl -u "${{ env.SYSTEMD_SERVICE }}" -n 300 --no-pager
+            echo "--- local health ---"
+            curl -fsS "http://127.0.0.1:${{ env.APP_PORT }}/health" || true
+            echo
+            echo "--- local OpenAPI status (must be 404) ---"
+            curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" || true
+            echo "--- vault registry candidates ---"
+            sudo find /opt/solslot /opt/solslot-api-production -type f -name 'vault_registry.db' -print0 2>/dev/null \
+              | while IFS= read -r -d '' db; do
+                  sudo DB_PATH="$db" python3 - <<'PY'
+            import os
+            import sqlite3
+
+            path = os.environ["DB_PATH"]
+            try:
+                connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                count = connection.execute("SELECT count(*) FROM vaults").fetchone()[0]
+                connection.close()
+                print(f"{path} vaults={count}")
+            except Exception as exc:
+                print(f"{path} unreadable={exc}")
+            PY
+                done
+            echo "--- shared state ---"
+            sudo find "${{ env.SHARED_ROOT }}/state" -maxdepth 1 -type f -printf '%f bytes=%s modified=%TY-%Tm-%TdT%TH:%TM:%TS\n' 2>/dev/null \
+              | sort
