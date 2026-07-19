@@ -84,7 +84,15 @@ if [ ! -f "$release_dir/.release-ready" ]; then
   python_bin="$(command -v python3.12 || command -v python3.11)"
   "$python_bin" -m venv "$release_dir/.venv"
   "$release_dir/.venv/bin/python" -m pip install --upgrade pip wheel
-  "$release_dir/.venv/bin/python" -m pip install -e "$release_dir/protocol" "$release_dir"
+  # Chia 2.7.x requires the yanked zstd 1.5.7.3 wheel exactly.
+  "$release_dir/.venv/bin/python" -m pip install \
+    -c "$release_dir/constraints.lock" \
+    zstd==1.5.7.3
+  "$release_dir/.venv/bin/python" -m pip install \
+    -c "$release_dir/constraints.lock" \
+    -e "$release_dir/protocol" \
+    "$release_dir"
+  "$release_dir/.venv/bin/python" -m pip check
   "$release_dir/.venv/bin/python" -m py_compile \
     "$release_dir/solslot_api/validator_app.py" \
     "$release_dir/solslot_api/validator_service.py"

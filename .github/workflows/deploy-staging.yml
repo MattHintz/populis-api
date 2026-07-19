@@ -89,7 +89,10 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel
-          python -m pip install -e protocol -e '.[dev]'
+          # Chia 2.7.x requires the yanked zstd 1.5.7.3 wheel exactly.
+          python -m pip install -c constraints.lock zstd==1.5.7.3
+          python -m pip install -c constraints.lock -e protocol -e '.[dev]'
+          PYTHON=python bash scripts/check_dependency_audit.sh
           python -m compileall -q "$APP_PACKAGE"
           python - <<'PY'
           import importlib
@@ -110,6 +113,7 @@ jobs:
         run: >-
           python scripts/check_secrets.py --paths
           "$APP_PACKAGE" tests scripts ops config .github pyproject.toml
+          constraints.lock
 
       - name: Write release metadata
         shell: bash
@@ -169,6 +173,7 @@ jobs:
               config \
               ops \
               scripts \
+              constraints.lock \
               pyproject.toml \
               README.md \
               release.json \
@@ -351,7 +356,10 @@ jobs:
               app_module="$("$python_bin" -c 'import json; print(json.load(open("release.json"))["app_module"])')"
               "$python_bin" -m venv .venv
               .venv/bin/python -m pip install --upgrade pip wheel
-              .venv/bin/python -m pip install -e ./protocol .
+              # Chia 2.7.x requires the yanked zstd 1.5.7.3 wheel exactly.
+              .venv/bin/python -m pip install -c constraints.lock zstd==1.5.7.3
+              .venv/bin/python -m pip install -c constraints.lock -e ./protocol .
+              .venv/bin/python -m pip check
               .venv/bin/python -m compileall -q "$package_name"
               .venv/bin/python - <<PY
             import importlib
