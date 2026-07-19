@@ -594,6 +594,8 @@ jobs:
               if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
                 sudo ln -sfn "$previous_target" "$release_root/current"
                 sudo systemctl restart "$systemd_service" || true
+              else
+                sudo rm -f "$release_root/current"
               fi
               sudo rm -f "$transaction_file"
               exit 1
