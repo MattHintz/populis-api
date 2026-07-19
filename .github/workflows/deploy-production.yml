@@ -296,7 +296,10 @@ jobs:
               echo "Coordinator environment contains validator seed configuration." >&2
               exit 1
             fi
-            previous_target="$(readlink -f "$release_root/current" || true)"
+            previous_target=""
+            if [ -L "$release_root/current" ]; then
+              previous_target="$(readlink -f "$release_root/current")"
+            fi
             previous_release_body="$(mktemp)"
             previous_public_release_body="$(mktemp)"
             if [ -n "$previous_target" ] \
