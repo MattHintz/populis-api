@@ -182,6 +182,15 @@ def admin_authorization_header() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def issue_bootstrap_handoff_cookie(client: TestClient) -> None:
+    challenge = client.post(
+        "/admin/bootstrap/challenge",
+        headers={"Authorization": "Bearer bootstrap-secret"},
+    )
+    assert challenge.status_code == 200, challenge.text
+    assert client.cookies.get(BOOTSTRAP_COOKIE_NAME)
+
+
 def admin_login_body(client: TestClient, owner: str) -> dict[str, str]:
     challenge = client.post(
         "/admin/auth/challenge",
@@ -859,13 +868,27 @@ def test_recovery_anchor_create_coin_preview_openapi_schema_pins_preview_handoff
     assert "future_spend" not in response_schema["properties"]
 
 
-def test_recovery_anchor_verify_accepts_untrusted_artifacts_without_auth(
+def test_recovery_anchor_verify_requires_handoff_auth(
     client: TestClient,
 ) -> None:
     payload = recovery_verify_payload()
     client.cookies.clear()
 
     resp = client.post("/admin/bootstrap/recovery-anchor/verify", json=payload)
+
+    assert resp.status_code == 401
+
+
+def test_recovery_anchor_verify_accepts_untrusted_artifacts_with_handoff_auth(
+    client: TestClient,
+) -> None:
+    payload = recovery_verify_payload()
+    issue_bootstrap_handoff_cookie(client)
+
+    resp = client.post(
+        "/admin/bootstrap/recovery-anchor/verify",
+        json=payload,
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -893,8 +916,12 @@ def test_recovery_anchor_verify_returns_false_for_tampered_admin_records(
     payload["admin_records"]["admin_records"][0]["leaves"][0]["evm_address"] = (
         "0x" + "ee" * 20
     )
+    issue_bootstrap_handoff_cookie(client)
 
-    resp = client.post("/admin/bootstrap/recovery-anchor/verify", json=payload)
+    resp = client.post(
+        "/admin/bootstrap/recovery-anchor/verify",
+        json=payload,
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -910,6 +937,7 @@ def test_recovery_anchor_verify_does_not_require_server_lock_or_files(
     bootstrap_env,
 ) -> None:
     assert not bootstrap_env.exists()
+    issue_bootstrap_handoff_cookie(client)
 
     resp = client.post(
         "/admin/bootstrap/recovery-anchor/verify",
@@ -921,6 +949,34 @@ def test_recovery_anchor_verify_does_not_require_server_lock_or_files(
     assert not bootstrap_env.exists()
     assert not bootstrap_env.with_name("admin_records_v2.json").exists()
     assert not bootstrap_env.with_name("portal_runtime_config_v2.json").exists()
+
+
+def test_recovery_anchor_verify_runs_verification_off_event_loop(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    async def record_threadpool_call(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(
+        admin_bootstrap,
+        "run_in_threadpool",
+        record_threadpool_call,
+        raising=False,
+    )
+    issue_bootstrap_handoff_cookie(client)
+
+    resp = client.post(
+        "/admin/bootstrap/recovery-anchor/verify",
+        json=recovery_verify_payload(),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["verified"] is True
+    assert calls
 
 
 def test_recovery_anchor_verify_openapi_schema_pins_verifier_boundary(
@@ -938,6 +994,9 @@ def test_recovery_anchor_verify_openapi_schema_pins_verifier_boundary(
     )
 
     assert "security" not in operation
+    assert ("authorization", "header") in {
+        (param["name"], param["in"]) for param in operation.get("parameters", [])
+    }
     assert set(request_schema["required"]) == {
         "bootstrap_recovery_anchor",
         "bootstrap_manifest",

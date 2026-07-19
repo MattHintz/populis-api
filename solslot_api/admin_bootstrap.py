@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal, Optional
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict
+from starlette.concurrency import run_in_threadpool
 
 from .admin import require_admin_token
 from .admin_auth import require_admin_jwt
@@ -533,25 +534,35 @@ async def bootstrap_recovery_anchor_create_coin_preview(
     )
 
 
+def _verify_bootstrap_recovery_anchor_payload(
+    body: BootstrapRecoveryAnchorVerifyRequest,
+):
+    return verify_bootstrap_recovery_artifacts(
+        bootstrap_recovery_anchor=body.bootstrap_recovery_anchor.model_dump(),
+        bootstrap_manifest=body.bootstrap_manifest.model_dump(),
+        portal_runtime_config=body.portal_runtime_config.model_dump(),
+        admin_records=body.admin_records,
+        deployment_manifest=body.deployment_manifest,
+        live_admin_authority_v2=(
+            body.live_admin_authority_v2.model_dump()
+            if body.live_admin_authority_v2 is not None
+            else None
+        ),
+    )
+
+
 @router.post(
     "/recovery-anchor/verify",
     response_model=BootstrapRecoveryAnchorVerifyResponse,
 )
 async def bootstrap_recovery_anchor_verify(
     body: BootstrapRecoveryAnchorVerifyRequest,
+    _auth: Annotated[Any, Depends(require_recovery_anchor_handoff_auth)],
 ) -> BootstrapRecoveryAnchorVerifyResponse:
     try:
-        verification = verify_bootstrap_recovery_artifacts(
-            bootstrap_recovery_anchor=body.bootstrap_recovery_anchor.model_dump(),
-            bootstrap_manifest=body.bootstrap_manifest.model_dump(),
-            portal_runtime_config=body.portal_runtime_config.model_dump(),
-            admin_records=body.admin_records,
-            deployment_manifest=body.deployment_manifest,
-            live_admin_authority_v2=(
-                body.live_admin_authority_v2.model_dump()
-                if body.live_admin_authority_v2 is not None
-                else None
-            ),
+        verification = await run_in_threadpool(
+            _verify_bootstrap_recovery_anchor_payload,
+            body,
         )
     except BootstrapManifestError as e:
         return BootstrapRecoveryAnchorVerifyResponse(
