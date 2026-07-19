@@ -46,6 +46,19 @@ def _same_hex(left: object, right: object) -> bool:
     return isinstance(left, str) and isinstance(right, str) and left.lower() == right.lower()
 
 
+def _require_configured_evm_binding(
+    configured: str | None,
+    signed: object,
+    label: str,
+) -> None:
+    if configured is None:
+        raise PublicArtifactError(
+            f"configured {label} is required to verify signed artifact"
+        )
+    if not _same_hex(configured, signed):
+        raise PublicArtifactError(f"configured {label} does not match signed artifact")
+
+
 def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> None:
     if payload.get("network") != settings.network:
         raise PublicArtifactError("public artifact network does not match this API")
@@ -81,10 +94,20 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
             bridge.get("policyHash"),
             "bridge policy",
         ),
+    )
+    for configured, signed, label in configured_bindings:
+        if configured is not None and not _same_hex(configured, signed):
+            raise PublicArtifactError(f"configured {label} does not match signed artifact")
+    evm_bindings = (
         (
             settings.zkpassport_forwarder_address,
             addresses.get("forwarder"),
             "forwarder address",
+        ),
+        (
+            settings.zkpassport_verifier_adapter_address,
+            addresses.get("verifierAdapter"),
+            "verifier adapter address",
         ),
         (
             settings.zkpassport_emitter_address,
@@ -92,9 +115,8 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
             "attestation emitter address",
         ),
     )
-    for configured, signed, label in configured_bindings:
-        if configured is not None and not _same_hex(configured, signed):
-            raise PublicArtifactError(f"configured {label} does not match signed artifact")
+    for configured, signed, label in evm_bindings:
+        _require_configured_evm_binding(configured, signed, label)
 
     if validators.get("threshold") != settings.zkpassport_validator_threshold:
         raise PublicArtifactError("validator threshold does not match signed artifact")

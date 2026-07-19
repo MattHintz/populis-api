@@ -90,6 +90,9 @@ def _settings(tmp_path, artifact: dict, **updates) -> Settings:
         ],
         "zkpassport_bridge_policy_hash": artifact["bridgePolicy"]["policyHash"],
         "zkpassport_forwarder_address": artifact["evmAddresses"]["forwarder"],
+        "zkpassport_verifier_adapter_address": artifact["evmAddresses"][
+            "verifierAdapter"
+        ],
         "zkpassport_emitter_address": artifact["evmAddresses"][
             "attestationEmitter"
         ],
@@ -151,6 +154,22 @@ def test_rejects_runtime_coordinate_and_release_commit_drift(tmp_path) -> None:
     wrong_pool = _settings(tmp_path, artifact, pool_launcher_id="0x" + "fe" * 32)
     with pytest.raises(PublicArtifactError, match="pool launcher"):
         load_signed_public_artifact(wrong_pool)
+
+    missing_forwarder = _settings(
+        tmp_path,
+        artifact,
+        zkpassport_forwarder_address=None,
+    )
+    with pytest.raises(PublicArtifactError, match="forwarder address"):
+        load_signed_public_artifact(missing_forwarder)
+
+    wrong_verifier_adapter = _settings(
+        tmp_path,
+        artifact,
+        zkpassport_verifier_adapter_address="0x" + "fd" * 20,
+    )
+    with pytest.raises(PublicArtifactError, match="verifier adapter address"):
+        load_signed_public_artifact(wrong_verifier_adapter)
 
     release_path = tmp_path / "release.json"
     release_path.write_text(

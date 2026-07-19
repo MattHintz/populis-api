@@ -288,6 +288,7 @@ class Settings(BaseSettings):
         "zkpassport_relayer_private_key_hex",
         "zkpassport_bridge_policy_hash",
         "zkpassport_forwarder_address",
+        "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
         mode="before",
@@ -514,6 +515,7 @@ class Settings(BaseSettings):
     zkpassport_evm_chain_id: int = 11155111
     # Fresh V2 addresses are intentionally unset until the EVM ceremony.
     zkpassport_forwarder_address: Optional[str] = None
+    zkpassport_verifier_adapter_address: Optional[str] = None
     zkpassport_emitter_address: Optional[str] = None
     zkpassport_evm_min_confirmations: int = Field(12, ge=1)
 
