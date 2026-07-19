@@ -18,6 +18,7 @@ Pass 2 audit (CANON_SOLSLOT_API_AUDIT_2026_04_26 Pass 2) findings covered:
   - POP-CANON-009 / Documentation drift — faucet_max_spend_mojos enforced via select_coin max_amount
   - POP-CANON-010 / LD-2                — coinset query pagination via start_height (limit unsupported upstream)
   - POP-CANON-011 / SN-3                — pool launcher comes only from signed V2 artifact
+  - V7 / 2026-07 audit                  — Chia BLS vault registration dedup mirrors EVM
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from chia_rs import AugSchemeMPL
 from eth_account import Account
 
 from solslot_api.challenges import (
@@ -39,6 +41,7 @@ from solslot_api.evm_auth import (
     REGISTER_PRIMARY_TYPE,
     REGISTER_TYPES,
     recover_evm_signer,
+    registration_bls_signing_digest,
     registration_typed_data,
 )
 
@@ -526,6 +529,32 @@ class TestVaultRegistrationSafetyFalsifiers:
         )
         return acct, store, body
 
+    def _signed_chia_request(self):
+        from solslot_api.app import RegisterChiaVaultRequest
+
+        owner_sk = AugSchemeMPL.key_gen(b"\x77" * 32)
+        pubkey = "0x" + bytes(owner_sk.get_g1()).hex()
+        store = ChallengeStore(ttl_seconds=300, max_pending=10, per_ip_per_minute=10)
+        ch = store.issue(
+            pubkey,
+            "chia_bls",
+            pool_launcher_id_hex="0x" + "00" * 32,
+            chia_network="testnet11",
+        )
+        digest = registration_bls_signing_digest(
+            ch.nonce,
+            ch.pool_launcher_id_hex,
+            ch.auth_type,
+            ch.chia_network,
+        )
+        signature = AugSchemeMPL.sign(owner_sk, digest)
+        body = RegisterChiaVaultRequest(
+            bls_pubkey=pubkey,
+            nonce=ch.nonce,
+            signature="0x" + bytes(signature).hex(),
+        )
+        return owner_sk, store, body
+
     @pytest.mark.asyncio
     async def test_rejected_push_does_not_persist_registry_record(self, monkeypatch):
         from fastapi import HTTPException
@@ -592,6 +621,40 @@ class TestVaultRegistrationSafetyFalsifiers:
             )
 
         assert exc_info.value.status_code == 409
+        coinset.push_tx.assert_not_called()
+        registry.record.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_chia_registration_rejected_before_coinset(
+        self, monkeypatch
+    ):
+        from fastapi import HTTPException
+        from solslot_api.app import register_chia_vault
+
+        _owner_sk, store, body = self._signed_chia_request()
+        monkeypatch.setattr(
+            "solslot_api.app._require_vault_protocol_ready",
+            lambda _settings: "0x" + "00" * 32,
+        )
+        faucet = self._faucet()
+        coinset = MagicMock()
+        coinset.get_coin_records_by_puzzle_hash = AsyncMock(return_value=[])
+        coinset.push_tx = AsyncMock(return_value={"success": True})
+        registry = MagicMock()
+        registry.get_by_bls = MagicMock(return_value=object())
+
+        with pytest.raises(HTTPException) as exc_info:
+            await register_chia_vault(
+                body,
+                self._settings(),
+                coinset,
+                faucet,
+                store,
+                registry,
+            )
+
+        assert exc_info.value.status_code == 409
+        coinset.get_coin_records_by_puzzle_hash.assert_not_called()
         coinset.push_tx.assert_not_called()
         registry.record.assert_not_called()
 
@@ -1110,6 +1173,50 @@ class TestVaultRegistryPersistence:
                 pushed_at=rec_a.pushed_at,
             )
             reg.record(rec_a)
+            with pytest.raises(sqlite3.IntegrityError):
+                reg.record(rec_b)
+        finally:
+            reg.close()
+
+    def test_bls_pubkey_lookup_and_uniqueness_enforced_by_index(self, tmp_path):
+        """Chia BLS vaults get the same one-owner-one-vault invariant as
+        EVM vaults: lookup by owner pubkey is indexed, and a second
+        launcher claiming the same BLS key is rejected by SQLite.
+        """
+        import sqlite3
+
+        from chia_rs.sized_bytes import bytes32
+
+        from solslot_api.state import VaultRecord, VaultRegistry
+
+        pubkey = bytes([0x07] * 48)
+        reg = VaultRegistry.open(":memory:")
+        try:
+            rec_a = VaultRecord(
+                launcher_id=bytes32(bytes([0xA1] * 32)),
+                full_puzhash=bytes32(bytes([0xA2] * 32)),
+                p2_vault_puzhash=bytes32(bytes([0xA3] * 32)),
+                auth_type=1,  # AUTH_TYPE_BLS
+                owner_pubkey=pubkey,
+                owner_evm_address=None,
+                spend_bundle_id="0x" + "a4" * 32,
+                pushed_at=1.0,
+            )
+            rec_b = VaultRecord(
+                launcher_id=bytes32(bytes([0xB1] * 32)),
+                full_puzhash=rec_a.full_puzhash,
+                p2_vault_puzhash=rec_a.p2_vault_puzhash,
+                auth_type=rec_a.auth_type,
+                owner_pubkey=pubkey,
+                owner_evm_address=None,
+                spend_bundle_id=rec_a.spend_bundle_id,
+                pushed_at=rec_a.pushed_at,
+            )
+
+            reg.record(rec_a)
+            loaded = reg.get_by_bls(pubkey)
+            assert loaded is not None
+            assert loaded.launcher_id == rec_a.launcher_id
             with pytest.raises(sqlite3.IntegrityError):
                 reg.record(rec_b)
         finally:

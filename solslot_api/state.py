@@ -69,12 +69,12 @@ class VaultRecord:
 
 
 class VaultRegistry:
-    """Registry keyed by launcher_id with a unique secondary index on EVM address.
+    """Registry keyed by launcher_id with unique owner secondary indexes.
 
     The registry's full life cycle:
         1. ``open(path)`` to acquire a SQLite-backed store.
         2. ``record(rec)`` to insert / overwrite (idempotent).
-        3. ``get(launcher_id)`` / ``get_by_evm(addr)`` for read paths.
+        3. ``get(launcher_id)`` / owner lookups for read paths.
         4. ``remove(launcher_id)`` for explicit deregistration.
         5. ``close()`` from the FastAPI lifespan teardown.
 
@@ -106,6 +106,10 @@ class VaultRegistry:
 
     def get_by_evm(self, address: str) -> Optional[VaultRecord]:
         s = self._store.get_by_evm(address)
+        return VaultRecord.from_stored(s) if s else None
+
+    def get_by_bls(self, pubkey: bytes) -> Optional[VaultRecord]:
+        s = self._store.get_by_bls(bytes(pubkey))
         return VaultRecord.from_stored(s) if s else None
 
     def remove(self, launcher_id: bytes32) -> bool:

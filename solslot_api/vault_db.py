@@ -15,7 +15,7 @@ Why SQLite + WAL instead of a JSON file:
     10 000 registered vaults a single update touches ≈ 4 KB of disk;
     the equivalent JSON-file approach rewrites the entire file
     (potentially megabytes) on every change.
-  * **Indexed reverse lookup**: ``by_evm`` is a real B-tree index;
+  * **Indexed reverse lookup**: owner identities are real B-tree indexes;
     lookup is O(log N) regardless of registry size.  A JSON dict needs
     a parallel reverse index that the application has to keep in sync,
     introducing a class of consistency bugs we sidestep entirely.
@@ -55,7 +55,9 @@ logger = logging.getLogger(__name__)
 
 
 # Bumping this triggers ``_migrate`` on next ``VaultStore`` open.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+AUTH_TYPE_BLS = 1
 
 
 @dataclass(frozen=True)
@@ -192,6 +194,16 @@ class VaultStore:
                 WHERE owner_evm_address IS NOT NULL
         """)
 
+    def _migrate_to_v2(self, cur: sqlite3.Cursor) -> None:
+        """Add Chia BLS owner uniqueness for one-vault-per-owner parity."""
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX idx_vaults_bls_owner_pubkey
+                ON vaults (owner_pubkey)
+                WHERE auth_type = 1
+            """
+        )
+
     # ── transaction helper ─────────────────────────────────────────
 
     @contextmanager
@@ -222,10 +234,10 @@ class VaultStore:
 
         Uses ``INSERT ... ON CONFLICT(launcher_id) DO UPDATE`` so callers
         don't need to know whether a record already exists.  The unique
-        constraint on ``owner_evm_address`` means re-using an EVM
-        address with a *different* launcher_id will fail loudly — that
-        situation is a programming error (one EVM key cannot own two
-        vaults at the same launcher_id key).
+        constraints on owner identities mean re-using an EVM address or
+        Chia BLS pubkey with a *different* launcher_id will fail loudly —
+        that situation is a programming error (one owner key cannot own
+        two vaults under different launcher IDs).
         """
         with self._lock, self._txn() as cur:
             cur.execute(
@@ -274,6 +286,19 @@ class VaultStore:
             row = self._conn.execute(
                 "SELECT * FROM vaults WHERE owner_evm_address = ? COLLATE NOCASE",
                 (address,),
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
+    def get_by_bls(self, pubkey: bytes) -> Optional[StoredVault]:
+        """Return the BLS-owned row for ``pubkey`` or None.
+
+        Hits the ``idx_vaults_bls_owner_pubkey`` partial index, matching
+        the EVM registration invariant for Chia vault owners.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM vaults WHERE auth_type = ? AND owner_pubkey = ?",
+                (AUTH_TYPE_BLS, bytes(pubkey)),
             ).fetchone()
         return _row_to_record(row) if row else None
 

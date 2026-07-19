@@ -856,6 +856,9 @@ async def register_chia_vault(
     if not AugSchemeMPL.verify(pk, signing_digest, sig):
         raise HTTPException(status_code=400, detail="BLS signature does not verify")
 
+    if registry.get_by_bls(pk_bytes) is not None:
+        raise HTTPException(status_code=409, detail="BLS pubkey is already registered.")
+
     coins = await coinset.get_coin_records_by_puzzle_hash(
         "0x" + faucet.address_puzzle_hash.hex(), include_spent=False
     )
