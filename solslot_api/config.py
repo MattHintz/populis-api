@@ -31,6 +31,9 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_VAULT_SESSION_JWT_SECRET",
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
+        "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY",
+        "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN",
+        "SOLSLOT_COLLECTION_MALWARE_SCAN_TOKEN",
     }
 )
 
@@ -86,9 +89,36 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
         )
+    if settings.collection_minting_enabled and not settings.collection_metadata_enabled:
+        raise RuntimeError(
+            "SOLSLOT_COLLECTION_MINTING_ENABLED requires "
+            "SOLSLOT_COLLECTION_METADATA_ENABLED."
+        )
+    if settings.collection_minting_enabled and not settings.minting_enabled:
+        raise RuntimeError(
+            "SOLSLOT_COLLECTION_MINTING_ENABLED requires SOLSLOT_MINTING_ENABLED."
+        )
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
+    if settings.collection_metadata_enabled:
+        required_collection_settings = {
+            "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
+            "SOLSLOT_COLLECTION_S3_ACCESS_KEY_ID": settings.collection_s3_access_key_id,
+            "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY": settings.collection_s3_secret_access_key,
+            "SOLSLOT_COLLECTION_S3_PUBLIC_BASE_URL": settings.collection_s3_public_base_url,
+            "SOLSLOT_COLLECTION_IPFS_API_URL": settings.collection_ipfs_api_url,
+            "SOLSLOT_COLLECTION_IPFS_PINNING_SERVICE_URL": settings.collection_ipfs_pinning_service_url,
+            "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN": settings.collection_ipfs_pinning_token,
+            "SOLSLOT_COLLECTION_IPFS_GATEWAY_URL": settings.collection_ipfs_gateway_url,
+            "SOLSLOT_COLLECTION_MALWARE_SCAN_URL": settings.collection_malware_scan_url,
+        }
+        missing = [name for name, value in required_collection_settings.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "Collection metadata is enabled without verified media services: "
+                + ", ".join(missing)
+            )
     proxy_cidrs = settings.trusted_proxy_cidr_list()
     if not proxy_cidrs:
         raise RuntimeError(
@@ -291,6 +321,16 @@ class Settings(BaseSettings):
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
+        "collection_s3_endpoint_url",
+        "collection_s3_access_key_id",
+        "collection_s3_secret_access_key",
+        "collection_s3_public_base_url",
+        "collection_ipfs_api_url",
+        "collection_ipfs_pinning_service_url",
+        "collection_ipfs_pinning_token",
+        "collection_ipfs_gateway_url",
+        "collection_malware_scan_url",
+        "collection_malware_scan_token",
         mode="before",
     )
     @classmethod
@@ -371,7 +411,7 @@ class Settings(BaseSettings):
     genesis_output_dir: str = "./state/genesis_ceremonies"
     genesis_audit_approval_path: str = "./state/genesis_audit_approval_v2.json"
     genesis_evm_deployment_path: str = "./state/genesis_evm_deployment_v2.json"
-    genesis_invitation_ttl_seconds: int = Field(1800, ge=1800, le=1800)
+    genesis_invitation_ttl_seconds: int = Field(172800, ge=1800, le=172800)
     genesis_plan_ttl_seconds: int = Field(3600, ge=900, le=7200)
     genesis_sepolia_confirmations: int = Field(12, ge=12, le=12)
     genesis_chia_confirmations: int = Field(3, ge=3, le=3)
@@ -630,6 +670,41 @@ class Settings(BaseSettings):
     # property metadata).  Distinct from the vault registry path so the
     # operator can back them up independently.
     admin_db_path: str = "./state/admin_desk_v2.db"
+
+    # ── Chain-verifiable collection minting ──────────────────────────────
+    # Metadata authoring and proposal publication are independently gated.
+    # Both default off so an API upgrade cannot expose an unfinished desk.
+    collection_metadata_enabled: bool = False
+    collection_minting_enabled: bool = False
+
+    # Authenticated S3-compatible staging store. Objects are never considered
+    # investor-ready until the API has fetched and verified their bytes.
+    collection_s3_endpoint_url: Optional[str] = None
+    collection_s3_region: str = "us-east-1"
+    collection_s3_bucket: str = "solslot-collections"
+    collection_s3_access_key_id: Optional[str] = None
+    collection_s3_secret_access_key: Optional[str] = None
+    collection_s3_public_base_url: Optional[str] = None
+    collection_s3_presign_ttl_seconds: int = Field(900, ge=60, le=3600)
+    collection_asset_max_bytes: int = Field(
+        100 * 1024 * 1024, ge=1, le=250 * 1024 * 1024
+    )
+    collection_asset_verification_timeout_seconds: float = Field(
+        30.0, gt=0, le=120.0
+    )
+
+    # Bytes first enter an IPFS node/API, then the provider-neutral Pinning
+    # Service API records the returned CID. Gateway re-fetch verifies that
+    # the pinned object still hashes to the declared SHA-256.
+    collection_ipfs_api_url: Optional[str] = None
+    collection_ipfs_pinning_service_url: Optional[str] = None
+    collection_ipfs_pinning_token: Optional[str] = None
+    collection_ipfs_gateway_url: Optional[str] = None
+
+    # Scanner must return {"status":"CLEAN"}. No scanner means no publish;
+    # there is deliberately no production fail-open mode.
+    collection_malware_scan_url: Optional[str] = None
+    collection_malware_scan_token: Optional[str] = None
 
     # ── CORS ──────────────────────────────────────────────────────────────
     # Same-origin deployments need no CORS entries. Local development opts

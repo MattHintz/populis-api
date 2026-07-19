@@ -34,6 +34,13 @@ from starlette.concurrency import run_in_threadpool
 from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
 from .coinset_client import CoinsetClient
+from .collection_store import (
+    CollectionConflict,
+    CollectionForbidden,
+    CollectionInvalidState,
+    CollectionNotFound,
+    get_collection_store,
+)
 from .credential_auth import require_minting_writes
 from .mint_chain_validation import validate_execute_bundle, validate_publish_bundle
 from .mint_publish_validation import PublishProposalMetadata
@@ -392,6 +399,82 @@ async def _require_coin_ancestry(
     )
 
 
+def _validate_collection_publish_context(
+    *,
+    settings: Settings,
+    metadata: PublishProposalMetadata,
+    claims: AdminClaims,
+    canonical: Any,
+    proposal_id: str,
+) -> tuple[Any, str] | None:
+    """Bind an extended MINT bill to the sealed API workspace.
+
+    The spend bundle remains authoritative, but publication cannot substitute
+    a different dossier root, anchor, allocation row, or collection owner.
+    """
+    has_commitment = bool(metadata.metadata_root and metadata.metadata_anchor_id)
+    if settings.collection_minting_enabled and not has_commitment:
+        raise HTTPException(
+            status_code=400,
+            detail="collection minting requires metadata_root and metadata_anchor_id",
+        )
+    if not has_commitment:
+        return None
+    if not settings.collection_metadata_enabled or not settings.collection_minting_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="chain-verifiable collection minting is disabled",
+        )
+    collection_store = get_collection_store(settings)
+    try:
+        collection = collection_store.get(metadata.collection_id)
+    except CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if collection["ownerSubject"] != claims.sub.lower():
+        raise HTTPException(status_code=403, detail="only the collection owner may publish")
+    if collection["state"] not in ("SEALED", "PUBLISHED"):
+        raise HTTPException(status_code=409, detail="collection must be sealed before mint publication")
+    if str(collection["metadataRoot"]).lower() != str(metadata.metadata_root).lower():
+        raise HTTPException(status_code=409, detail="MINT metadata root does not match the sealed dossier")
+    expected_anchor = collection["metadataAnchorId"] or (
+        "0x" + canonical.deed_launcher_id.hex()
+    )
+    if expected_anchor.lower() != str(metadata.metadata_anchor_id).lower():
+        raise HTTPException(status_code=409, detail="MINT metadata anchor does not match the collection")
+    deed = next(
+        (
+            item
+            for item in collection["deeds"]
+            if item["deedId"].casefold() == metadata.property_id.casefold()
+        ),
+        None,
+    )
+    if deed is None:
+        raise HTTPException(status_code=409, detail="property id is not in the sealed deed allocation")
+    if deed["proposalId"] not in (None, proposal_id):
+        raise HTTPException(status_code=409, detail="deed allocation row already has a proposal")
+    if int(deed["sharePpm"]) != metadata.share_ppm:
+        raise HTTPException(status_code=409, detail="MINT share_ppm differs from the sealed allocation")
+    if int(deed["parValueMojos"]) != metadata.par_value_mojos:
+        raise HTTPException(status_code=409, detail="MINT par value differs from the sealed allocation")
+    offering = collection["dossier"]["offering"]
+    if str(offering["assetClass"]).upper() != metadata.asset_class_name.upper():
+        raise HTTPException(status_code=409, detail="MINT asset class differs from the sealed dossier")
+    if int(offering["royaltyBps"]) != metadata.royalty_bps:
+        raise HTTPException(status_code=409, detail="MINT royalty differs from the sealed dossier")
+    if str(offering["royaltyPuzhash"]).lower() != metadata.royalty_puzhash.lower():
+        raise HTTPException(status_code=409, detail="MINT royalty payee differs from the sealed dossier")
+    if int(offering["governanceQuorum"]) != metadata.quorum_threshold:
+        raise HTTPException(status_code=409, detail="MINT quorum differs from the sealed dossier")
+    try:
+        jurisdiction = bytes.fromhex(metadata.jurisdiction.removeprefix("0x")).decode("utf-8")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="MINT jurisdiction is not valid UTF-8") from exc
+    if str(offering["jurisdiction"]) != jurisdiction:
+        raise HTTPException(status_code=409, detail="MINT jurisdiction differs from the sealed dossier")
+    return collection_store, deed["deedId"]
+
+
 async def _publish_mint_bundle(
     *,
     proposal_id: str,
@@ -478,6 +561,14 @@ async def _publish_mint_bundle(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    collection_context = _validate_collection_publish_context(
+        settings=settings,
+        metadata=body.proposal_metadata,
+        claims=claims,
+        canonical=canonical,
+        proposal_id=proposal_id,
+    )
+
     registry_id = "0x" + canonical.property_registry_coin_id.hex()
     try:
         registry_record = await coinset.get_coin_record_by_name(registry_id)
@@ -531,6 +622,26 @@ async def _publish_mint_bundle(
             "proposal": _to_response(proposal),
         }
 
+    persisted_metadata = dict(proposal.off_chain_metadata or {})
+    persisted_metadata["publish_context"] = {
+        "property_registry_puzzle_hash": "0x"
+        + canonical.property_registry_puzzle_hash.hex(),
+        "property_registry_coin_id": "0x" + canonical.property_registry_coin_id.hex(),
+        "owner_member_hash": body.proposal_metadata.owner_member_hash.lower(),
+        "gov_member_hash": body.proposal_metadata.gov_member_hash.lower(),
+        "proposal_data_hash": "0x" + canonical.proposal_data_hash.hex(),
+        **(
+            {
+                "metadata_root": str(body.proposal_metadata.metadata_root).lower(),
+                "metadata_anchor_id": str(
+                    body.proposal_metadata.metadata_anchor_id
+                ).lower(),
+            }
+            if body.proposal_metadata.metadata_root
+            and body.proposal_metadata.metadata_anchor_id
+            else {}
+        ),
+    }
     try:
         published = store.set_published(
             proposal_id,
@@ -550,9 +661,43 @@ async def _publish_mint_bundle(
             deed_launcher_id=bytes(canonical.deed_launcher_id),
             published_bundle_id=bundle_id,
             deadline=canonical.voting_deadline,
+            off_chain_metadata=persisted_metadata,
         )
     except (InvalidTransition, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    collection_record = None
+    if collection_context is not None:
+        collection_store, deed_id = collection_context
+        try:
+            collection_record = collection_store.record_proposal_publication(
+                body.proposal_metadata.collection_id,
+                deed_id,
+                actor_subject=claims.sub,
+                proposal_id=proposal_id,
+                proposal_hash=bytes(canonical.proposal_hash),
+                proposal_launcher_id=bytes(canonical.proposal_singleton_launcher_id),
+                deed_launcher_id=bytes(canonical.deed_launcher_id),
+                output_coin_id=bytes(canonical.deed_launcher_id),
+                publish_bundle_id=bundle_id,
+            )
+        except (
+            CollectionConflict,
+            CollectionForbidden,
+            CollectionInvalidState,
+            CollectionNotFound,
+            ValueError,
+        ) as exc:
+            logger.exception(
+                "Mint %s reached the mempool but collection persistence failed",
+                proposal_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Mint was accepted by the network but collection recording failed; "
+                    f"reconcile proposal {proposal_id}: {exc}"
+                ),
+            ) from exc
     logger.info("Canonical mint proposal %s submitted as %s", proposal_id, bundle_id)
     return {
         "pushed": True,
@@ -560,6 +705,7 @@ async def _publish_mint_bundle(
         "spend_bundle_id": bundle_id,
         "proposal_id": proposal_id,
         "proposal": _to_response(published),
+        "collection": collection_record,
     }
 
 
@@ -567,6 +713,7 @@ async def _execute_mint_bundle(
     *,
     proposal_id: str,
     body: ExecuteMintBundleRequest,
+    claims: AdminClaims,
     settings: Settings,
     store: MintProposalStore,
     coinset: Optional[CoinsetClient],
@@ -624,6 +771,26 @@ async def _execute_mint_bundle(
         )
     except (InvalidTransition, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    collection_record = None
+    if settings.collection_metadata_enabled:
+        try:
+            collection_record = get_collection_store(settings).record_proposal_execution(
+                proposal_id,
+                execute_bundle_id=bundle_id,
+                actor_subject=claims.sub,
+            )
+        except (CollectionConflict, ValueError) as exc:
+            logger.exception(
+                "Mint %s reached the mempool but collection execution persistence failed",
+                proposal_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Mint execution was accepted by the network but collection recording "
+                    f"failed; reconcile proposal {proposal_id}: {exc}"
+                ),
+            ) from exc
     logger.info("Canonical mint execution %s submitted as %s", proposal_id, bundle_id)
     return {
         "pushed": True,
@@ -631,6 +798,7 @@ async def _execute_mint_bundle(
         "spend_bundle_id": bundle_id,
         "proposal_id": proposal_id,
         "proposal": _to_response(executed),
+        "collection": collection_record,
     }
 
 
@@ -666,6 +834,7 @@ async def publish_mint_proposal(
 async def execute_mint_proposal(
     proposal_id: str,
     body: ExecuteMintBundleRequest,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
     coinset: Annotated[Optional[CoinsetClient], Depends(_get_coinset_dep)],
@@ -674,6 +843,7 @@ async def execute_mint_proposal(
     return await _execute_mint_bundle(
         proposal_id=proposal_id,
         body=body,
+        claims=claims,
         settings=settings,
         store=store,
         coinset=coinset,
@@ -722,6 +892,7 @@ async def committee_propose_mint(
 )
 async def committee_execute_mint(
     body: ExecuteMintBundleRequest,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
     coinset: Annotated[Optional[CoinsetClient], Depends(_get_coinset_dep)],
@@ -732,6 +903,7 @@ async def committee_execute_mint(
     return await _execute_mint_bundle(
         proposal_id=body.proposal_id,
         body=body,
+        claims=claims,
         settings=settings,
         store=store,
         coinset=coinset,

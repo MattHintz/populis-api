@@ -666,6 +666,7 @@ class MintProposalStore:
         deed_launcher_id: bytes,
         published_bundle_id: str,
         deadline: int,
+        off_chain_metadata: Optional[dict[str, Any]] = None,
     ) -> StoredMintProposal:
         """DRAFT → PROPOSED.
 
@@ -700,25 +701,29 @@ class MintProposalStore:
         if deadline <= 0:
             raise ValueError("deadline must be positive")
 
+        updates: list[tuple[str, Any]] = [
+            ("smart_deed_inner_puzhash", smart_deed_inner_puzhash),
+            ("eve_inner_puzhash",        eve_inner_puzhash),
+            ("deed_full_puzhash",        deed_full_puzhash),
+            ("proposal_hash",            proposal_hash),
+            ("proposal_tracker_coin_id", proposal_tracker_coin_id),
+            ("sgt_lock_coin_id",         sgt_lock_coin_id),
+            ("proposal_singleton_launcher_id", proposal_singleton_launcher_id),
+            ("property_registry_coin_id", property_registry_coin_id),
+            ("property_registry_puzzle_hash", property_registry_puzzle_hash),
+            ("deed_launcher_id", deed_launcher_id),
+            ("published_bundle_id", published_bundle_id),
+            ("deadline", deadline),
+            ("published_at", int(time.time())),
+        ]
+        if off_chain_metadata is not None:
+            updates.append(("off_chain_metadata", json.dumps(off_chain_metadata)))
+
         try:
             return self._transition(
                 proposal_id,
                 target_state="PROPOSED",
-                updates=[
-                    ("smart_deed_inner_puzhash", smart_deed_inner_puzhash),
-                    ("eve_inner_puzhash",        eve_inner_puzhash),
-                    ("deed_full_puzhash",        deed_full_puzhash),
-                    ("proposal_hash",            proposal_hash),
-                    ("proposal_tracker_coin_id", proposal_tracker_coin_id),
-                    ("sgt_lock_coin_id",         sgt_lock_coin_id),
-                    ("proposal_singleton_launcher_id", proposal_singleton_launcher_id),
-                    ("property_registry_coin_id", property_registry_coin_id),
-                    ("property_registry_puzzle_hash", property_registry_puzzle_hash),
-                    ("deed_launcher_id", deed_launcher_id),
-                    ("published_bundle_id",      published_bundle_id),
-                    ("deadline",                 deadline),
-                    ("published_at",             int(time.time())),
-                ],
+                updates=updates,
             )
         except sqlite3.IntegrityError as e:
             if "proposal_hash" in str(e):

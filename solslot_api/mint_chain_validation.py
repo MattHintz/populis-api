@@ -168,6 +168,16 @@ def validate_publish_bundle(
         p2_pool_mod_hash=_artifact_bytes32(puzzle_hashes, "p2PoolModHash"),
         p2_vault_mod_hash=bytes32(load_puzzle("p2_vault.clsp").get_tree_hash()),
         property_registry_puzzle_hash=registry_ph,
+        metadata_root=(
+            bytes32(values["metadata_root"])
+            if "metadata_root" in values
+            else None
+        ),
+        metadata_anchor_id=(
+            bytes32(values["metadata_anchor_id"])
+            if "metadata_anchor_id" in values
+            else None
+        ),
     )
 
     launcher_solution = list(_program(launcher_spend.solution).as_iter())

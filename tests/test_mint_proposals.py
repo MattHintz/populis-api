@@ -153,6 +153,24 @@ class TestCreate:
         # Re-fetched record carries the same metadata after JSON round-trip.
         assert store.get(rec.id).off_chain_metadata == meta
 
+    def test_publish_can_persist_shared_execution_context(self, store):
+        rec = store.create(**_new_args(suffix=7))
+        metadata = {
+            "source": "collection-workspace",
+            "publish_context": {
+                "property_registry_puzzle_hash": "0x" + "11" * 32,
+                "metadata_root": "0x" + "12" * 32,
+                "metadata_anchor_id": "0x" + "13" * 32,
+            },
+        }
+        published = store.set_published(
+            rec.id,
+            **_publish_args(suffix=7),
+            off_chain_metadata=metadata,
+        )
+        assert published.off_chain_metadata == metadata
+        assert store.get(rec.id).off_chain_metadata == metadata
+
 
 # ── validation errors ───────────────────────────────────────────────────────
 class TestCreateValidation:

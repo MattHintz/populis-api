@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from chia.types.blockchain_format.program import Program
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import Settings
 
@@ -26,6 +26,14 @@ class PublishProposalMetadata(BaseModel):
     owner_member_hash: str = Field(..., description="0x-prefixed bytes32")
     gov_member_hash: str = Field(..., description="0x-prefixed bytes32")
     voting_deadline: int = Field(..., gt=0)
+    metadata_root: str | None = Field(None, description="0x-prefixed dossier SHA-256")
+    metadata_anchor_id: str | None = Field(None, description="0x-prefixed first deed launcher id")
+
+    @model_validator(mode="after")
+    def validate_metadata_commitment_pair(self) -> "PublishProposalMetadata":
+        if bool(self.metadata_root) != bool(self.metadata_anchor_id):
+            raise ValueError("metadata_root and metadata_anchor_id must be supplied together")
+        return self
 
 
 def build_protocol_publish_context(settings: Settings) -> dict[str, str]:
@@ -65,9 +73,13 @@ def metadata_bytes(metadata: PublishProposalMetadata) -> dict[str, bytes | int]:
         "royalty_puzhash",
         "owner_member_hash",
         "gov_member_hash",
+        "metadata_root",
+        "metadata_anchor_id",
     }
     converted: dict[str, bytes | int] = {}
     for key, value in data.items():
+        if value is None:
+            continue
         if key in bytes32_fields:
             converted[key] = _require_bytes32(str(value), key)
         elif key == "jurisdiction":

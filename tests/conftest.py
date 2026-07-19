@@ -97,6 +97,11 @@ def _admin_state_reset():
         reset_credential_ledgers_for_tests()
     except ImportError:
         pass
+    try:
+        from solslot_api.collection_store import reset_collection_store_for_tests
+        reset_collection_store_for_tests()
+    except ImportError:
+        pass
 
     yield
 
@@ -113,5 +118,10 @@ def _admin_state_reset():
     try:
         from solslot_api.credential_ledger import reset_credential_ledgers_for_tests
         reset_credential_ledgers_for_tests()
+    except ImportError:
+        pass
+    try:
+        from solslot_api.collection_store import reset_collection_store_for_tests
+        reset_collection_store_for_tests()
     except ImportError:
         pass
