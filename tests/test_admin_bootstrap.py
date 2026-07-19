@@ -582,7 +582,7 @@ def test_bootstrap_finalize_openapi_schema_pins_public_artifacts(
     }.issubset(set(recovery_anchor_schema["required"]))
 
 
-def test_recovery_anchor_publish_intent_accepts_bootstrap_cookie_after_lock(
+def test_recovery_anchor_publish_intent_rejects_bootstrap_cookie_after_lock(
     client: TestClient,
     bootstrap_env,
 ) -> None:
@@ -597,6 +597,10 @@ def test_recovery_anchor_publish_intent_accepts_bootstrap_cookie_after_lock(
     assert client.cookies.get(BOOTSTRAP_COOKIE_NAME)
 
     cookie_auth = client.get("/admin/bootstrap/recovery-anchor/publish-intent")
+    admin_jwt = client.get(
+        "/admin/bootstrap/recovery-anchor/publish-intent",
+        headers=admin_authorization_header(),
+    )
     static_token = client.get(
         "/admin/bootstrap/recovery-anchor/publish-intent",
         headers={"Authorization": "Bearer bootstrap-secret"},
@@ -604,9 +608,11 @@ def test_recovery_anchor_publish_intent_accepts_bootstrap_cookie_after_lock(
     client.cookies.clear()
     missing = client.get("/admin/bootstrap/recovery-anchor/publish-intent")
 
-    assert cookie_auth.status_code == 200
-    assert cookie_auth.json()["tag_memo_utf8"] == BOOTSTRAP_RECOVERY_ANCHOR_TAG
-    assert missing.status_code == 401
+    assert cookie_auth.status_code == 410
+    assert "locked" in cookie_auth.json()["detail"]
+    assert admin_jwt.status_code == 200
+    assert admin_jwt.json()["tag_memo_utf8"] == BOOTSTRAP_RECOVERY_ANCHOR_TAG
+    assert missing.status_code == 410
     assert static_token.status_code == 403
 
 
@@ -630,15 +636,19 @@ def test_recovery_anchor_publish_intent_rejects_missing_anchor_after_lock(
     client: TestClient,
     bootstrap_env,
 ) -> None:
+    write_deployment_manifest(bootstrap_env)
     challenge = client.post(
         "/admin/bootstrap/challenge",
         headers={"Authorization": "Bearer bootstrap-secret"},
     )
     assert challenge.status_code == 200
-    bootstrap_env.write_text('{"locked": true}', encoding="utf-8")
+    finalized = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert finalized.status_code == 200
+    bootstrap_env.with_name("bootstrap_recovery_anchor_v2.json").unlink()
 
     resp = client.get(
         "/admin/bootstrap/recovery-anchor/publish-intent",
+        headers=admin_authorization_header(),
     )
 
     assert resp.status_code == 409
@@ -730,7 +740,7 @@ def test_recovery_anchor_publish_intent_openapi_schema_pins_json_safe_handoff(
     assert "marker_puzzle_hash" not in schema["properties"]
 
 
-def test_recovery_anchor_create_coin_preview_accepts_bootstrap_cookie_after_lock(
+def test_recovery_anchor_create_coin_preview_rejects_bootstrap_cookie_after_lock(
     client: TestClient,
     bootstrap_env,
 ) -> None:
@@ -748,6 +758,11 @@ def test_recovery_anchor_create_coin_preview_accepts_bootstrap_cookie_after_lock
         "/admin/bootstrap/recovery-anchor/create-coin-preview",
         json={"marker_puzzle_hash": H("ef")},
     )
+    admin_jwt = client.post(
+        "/admin/bootstrap/recovery-anchor/create-coin-preview",
+        json={"marker_puzzle_hash": H("ef")},
+        headers=admin_authorization_header(),
+    )
     static_token = client.post(
         "/admin/bootstrap/recovery-anchor/create-coin-preview",
         json={"marker_puzzle_hash": H("ef")},
@@ -759,9 +774,11 @@ def test_recovery_anchor_create_coin_preview_accepts_bootstrap_cookie_after_lock
         json={"marker_puzzle_hash": H("ef")},
     )
 
-    assert cookie_auth.status_code == 200
-    assert cookie_auth.json()["condition_opcode"] == 51
-    assert missing.status_code == 401
+    assert cookie_auth.status_code == 410
+    assert "locked" in cookie_auth.json()["detail"]
+    assert admin_jwt.status_code == 200
+    assert admin_jwt.json()["condition_opcode"] == 51
+    assert missing.status_code == 410
     assert static_token.status_code == 403
 
 
@@ -949,6 +966,31 @@ def test_recovery_anchor_verify_does_not_require_server_lock_or_files(
     assert not bootstrap_env.exists()
     assert not bootstrap_env.with_name("admin_records_v2.json").exists()
     assert not bootstrap_env.with_name("portal_runtime_config_v2.json").exists()
+
+
+def test_recovery_anchor_verify_rejects_bootstrap_cookie_after_lock(
+    client: TestClient,
+    bootstrap_env,
+) -> None:
+    write_deployment_manifest(bootstrap_env)
+    issue_bootstrap_handoff_cookie(client)
+    finalized = client.post("/admin/bootstrap/finalize", json=finalize_payload())
+    assert finalized.status_code == 200
+
+    cookie_auth = client.post(
+        "/admin/bootstrap/recovery-anchor/verify",
+        json=recovery_verify_payload(),
+    )
+    admin_jwt = client.post(
+        "/admin/bootstrap/recovery-anchor/verify",
+        json=recovery_verify_payload(),
+        headers=admin_authorization_header(),
+    )
+
+    assert cookie_auth.status_code == 410
+    assert "locked" in cookie_auth.json()["detail"]
+    assert admin_jwt.status_code == 200
+    assert admin_jwt.json()["verified"] is True
 
 
 def test_recovery_anchor_verify_runs_verification_off_event_loop(

@@ -306,6 +306,11 @@ def require_recovery_anchor_handoff_auth(
 ) -> Any:
     if authorization:
         return require_admin_jwt(settings, authorization)
+    if bootstrap_locked(settings):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Bootstrapper is locked because bootstrap_manifest_v2.json already exists.",
+        )
     token = request.cookies.get(BOOTSTRAP_COOKIE_NAME)
     if not token:
         raise HTTPException(
