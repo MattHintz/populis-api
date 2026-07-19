@@ -32,6 +32,7 @@ def build_protocol_publish_context(settings: Settings) -> dict[str, str]:
     field_to_env = [
         ("protocol_did_singleton_struct_hex", "SOLSLOT_PROTOCOL_DID_SINGLETON_STRUCT_HEX"),
         ("protocol_did_puzhash", "SOLSLOT_PROTOCOL_DID_PUZHASH"),
+        ("pool_launcher_id", "SOLSLOT_POOL_LAUNCHER_ID"),
         ("p2_pool_mod_hash", "SOLSLOT_P2_POOL_MOD_HASH"),
         ("p2_vault_mod_hash", "SOLSLOT_P2_VAULT_MOD_HASH"),
     ]
@@ -46,6 +47,7 @@ def build_protocol_publish_context(settings: Settings) -> dict[str, str]:
         "protocol_did_singleton_struct_hex",
     )
     _require_bytes32(context["protocol_did_puzhash"], "protocol_did_puzhash")
+    _require_bytes32(context["pool_launcher_id"], "pool_launcher_id")
     _require_bytes32(context["p2_pool_mod_hash"], "p2_pool_mod_hash")
     _require_bytes32(context["p2_vault_mod_hash"], "p2_vault_mod_hash")
     return context

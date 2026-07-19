@@ -15,6 +15,7 @@ def _settings(**updates: object) -> Settings:
         "runtime_environment": "test",
         "protocol_did_singleton_struct_hex": "0x01",
         "protocol_did_puzhash": "0x" + "11" * 32,
+        "pool_launcher_id": "0x" + "44" * 32,
         "p2_pool_mod_hash": "0x" + "22" * 32,
         "p2_vault_mod_hash": "0x" + "33" * 32,
     }
@@ -53,6 +54,7 @@ def test_publish_context_normalizes_canonical_coordinates() -> None:
     context = build_protocol_publish_context(settings)
     assert context["protocol_did_singleton_struct_hex"] == "0x01"
     assert context["protocol_did_puzhash"] == "0x" + "aa" * 32
+    assert context["pool_launcher_id"] == "0x" + "44" * 32
 
 
 @pytest.mark.parametrize(
@@ -60,6 +62,7 @@ def test_publish_context_normalizes_canonical_coordinates() -> None:
     [
         "protocol_did_singleton_struct_hex",
         "protocol_did_puzhash",
+        "pool_launcher_id",
         "p2_pool_mod_hash",
         "p2_vault_mod_hash",
     ],

@@ -163,6 +163,8 @@ def validate_publish_bundle(
         protocol_did_puzhash=_artifact_bytes32(puzzle_hashes, "didFullPuzzleHash"),
         protocol_did_inner_puzhash=did_inner_hash,
         governance_singleton_struct=governance_struct,
+        pool_singleton_launcher_id=_artifact_bytes32(launcher_ids, "pool"),
+        pool_singleton_launcher_puzzle_hash=bytes32(SINGLETON_LAUNCHER_HASH),
         p2_pool_mod_hash=_artifact_bytes32(puzzle_hashes, "p2PoolModHash"),
         p2_vault_mod_hash=bytes32(load_puzzle("p2_vault.clsp").get_tree_hash()),
         property_registry_puzzle_hash=registry_ph,
