@@ -29,6 +29,7 @@ from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
@@ -842,7 +843,10 @@ async def cast_committee_vote(
         )
 
     try:
-        bundle = SpendBundle.from_json_dict(body.spend_bundle)
+        bundle = await run_in_threadpool(
+            SpendBundle.from_json_dict,
+            body.spend_bundle,
+        )
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(
             status_code=400,

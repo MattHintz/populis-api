@@ -733,6 +733,31 @@ class TestCommitteeVote:
         assert "coin_spends" in forwarded
         assert "aggregated_signature" in forwarded
 
+    def test_parses_spend_bundle_off_event_loop(self, app, client, monkeypatch):
+        calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+        async def record_threadpool_parse(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(
+            mint_endpoints,
+            "run_in_threadpool",
+            record_threadpool_parse,
+            raising=False,
+        )
+        self._override_coinset(app, success=True, status_str="SUCCESS")
+        bundle_json = self._valid_bundle_json()
+
+        resp = client.post(
+            "/admin/committee/vote",
+            json={"spend_bundle": bundle_json},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert calls
+        assert calls[0][1] == (bundle_json,)
+
     def test_rejected_by_mempool_surfaces_status(self, app, client):
         # POP-CANON-004 contract: mempool rejection MUST be surfaced to the
         # caller (not silently logged), so the portal can render the error.
