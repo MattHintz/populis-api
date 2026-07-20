@@ -98,6 +98,27 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "SOLSLOT_COLLECTION_MINTING_ENABLED requires SOLSLOT_MINTING_ENABLED."
         )
+    if settings.kos_mint_execute_signer_enabled:
+        if not settings.alpha_writes_enabled or not settings.minting_enabled:
+            raise RuntimeError(
+                "SOLSLOT_KOS_MINT_EXECUTE_SIGNER_ENABLED requires alpha writes and minting."
+            )
+        if settings.network != "testnet11":
+            raise RuntimeError("KoS MINT execute signing is restricted to testnet11.")
+        if not settings.kos_mint_execute_signer_url:
+            raise RuntimeError("KoS MINT execute signing requires a signer URL.")
+        if not settings.kos_mint_execute_signer_url.startswith("https://"):
+            raise RuntimeError("KoS MINT execute signer URL must use HTTPS.")
+        if not all(
+            (
+                settings.kos_mint_execute_signer_mtls_ca_path,
+                settings.kos_mint_execute_signer_mtls_cert_path,
+                settings.kos_mint_execute_signer_mtls_key_path,
+            )
+        ):
+            raise RuntimeError(
+                "KoS MINT execute signing requires CA, client certificate, and client key paths."
+            )
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
@@ -315,6 +336,10 @@ class Settings(BaseSettings):
         "zkpassport_validator_mtls_ca_path",
         "zkpassport_validator_mtls_cert_path",
         "zkpassport_validator_mtls_key_path",
+        "kos_mint_execute_signer_url",
+        "kos_mint_execute_signer_mtls_ca_path",
+        "kos_mint_execute_signer_mtls_cert_path",
+        "kos_mint_execute_signer_mtls_key_path",
         "zkpassport_relayer_private_key_hex",
         "zkpassport_bridge_policy_hash",
         "zkpassport_forwarder_address",
@@ -364,6 +389,15 @@ class Settings(BaseSettings):
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
+    # KoS is an isolated, optional co-signer for the one MINT EXECUTE
+    # condition emitted by governance. The coordinator never receives a KoS
+    # private key; it calls a separately deployed signer over mutual TLS.
+    kos_mint_execute_signer_enabled: bool = False
+    kos_mint_execute_signer_url: Optional[str] = None
+    kos_mint_execute_signer_mtls_ca_path: Optional[str] = None
+    kos_mint_execute_signer_mtls_cert_path: Optional[str] = None
+    kos_mint_execute_signer_mtls_key_path: Optional[str] = None
+    kos_mint_execute_signer_timeout_seconds: float = Field(8.0, gt=0, le=30)
     # One-shot testnet ceremony mode is the only state in which protocol
     # writes may run before a chain-bound admin authority exists. It requires
     # the bootstrap token, disables minting, and refuses all CORS origins.

@@ -7,7 +7,7 @@ from solslot_puzzles.property_metadata import build_metadata_memos
 from solslot_api.metadata_chain_indexer import MetadataChainIndexer
 from solslot_api.property_metadata import PropertyDossierV1
 
-from test_collection_store import verified_store
+from tests.test_collection_store import verified_store
 
 
 class FakeCoinset:

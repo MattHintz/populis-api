@@ -30,6 +30,7 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from chia_rs import AugSchemeMPL, SpendBundle
 
 from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
@@ -42,7 +43,14 @@ from .collection_store import (
     get_collection_store,
 )
 from .credential_auth import require_minting_writes
-from .mint_chain_validation import validate_execute_bundle, validate_publish_bundle
+from .kos_mint_execute_signer import (
+    KosMintExecuteSignerError,
+    request_kos_mint_execute_signature,
+)
+from .mint_chain_validation import (
+    validate_kos_mint_execute_bundle,
+    validate_publish_bundle,
+)
 from .mint_publish_validation import PublishProposalMetadata
 from .mint_proposals import (
     DuplicateProperty,
@@ -725,17 +733,17 @@ async def _execute_mint_bundle(
     proposal = store.get(proposal_id)
     if proposal is None:
         raise HTTPException(status_code=404, detail=f"Unknown proposal id {proposal_id!r}")
+    if proposal.state == "EXECUTED":
+        # The client bundle intentionally lacks the isolated co-signature, so
+        # it cannot reproduce the final bundle id locally. Never ask KoS to
+        # sign a proposal that has already been submitted; chain/index state
+        # is the authoritative execution record.
+        raise HTTPException(
+            status_code=409,
+            detail="MINT proposal is already executed; inspect its recorded chain bundle.",
+        )
 
     bundle = _parse_spend_bundle(body.spend_bundle)
-    bundle_id = "0x" + bytes(bundle.name()).hex()
-    if proposal.state == "EXECUTED" and proposal.executed_bundle_id == bundle_id:
-        return {
-            "pushed": True,
-            "status": "ALREADY_RECORDED",
-            "spend_bundle_id": bundle_id,
-            "proposal_id": proposal_id,
-            "proposal": _to_response(proposal),
-        }
     if proposal.state not in {"PROPOSED", "VOTING", "PASSED"}:
         raise HTTPException(
             status_code=409,
@@ -744,9 +752,33 @@ async def _execute_mint_bundle(
 
     artifact = _load_mint_artifact(settings)
     try:
-        validate_execute_bundle(bundle=bundle, proposal=proposal, artifact=artifact)
+        execution = validate_kos_mint_execute_bundle(
+            bundle=bundle,
+            proposal=proposal,
+            artifact=artifact,
+            network=settings.network,
+        )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        kos_signature, kos_request_hash = await request_kos_mint_execute_signature(
+            settings=settings,
+            execution=execution,
+            artifact_hash=str(artifact["artifactHash"]),
+            proposal_id=proposal_id,
+        )
+    except KosMintExecuteSignerError as exc:
+        logger.warning("KoS MINT co-sign unavailable for proposal %s", proposal_id)
+        raise HTTPException(
+            status_code=503,
+            detail="MINT execution co-signer is unavailable; no bundle was submitted.",
+        ) from exc
+    bundle = SpendBundle(
+        bundle.coin_spends,
+        AugSchemeMPL.aggregate([bundle.aggregated_signature, kos_signature]),
+    )
+    bundle_id = "0x" + bytes(bundle.name()).hex()
 
     try:
         push_result = await coinset.push_tx(bundle.to_json_dict())
@@ -791,7 +823,12 @@ async def _execute_mint_bundle(
                     f"failed; reconcile proposal {proposal_id}: {exc}"
                 ),
             ) from exc
-    logger.info("Canonical mint execution %s submitted as %s", proposal_id, bundle_id)
+    logger.info(
+        "Canonical mint execution %s submitted as %s with KoS request %s",
+        proposal_id,
+        bundle_id,
+        kos_request_hash,
+    )
     return {
         "pushed": True,
         "status": chain_status,

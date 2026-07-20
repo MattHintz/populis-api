@@ -11,6 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from chia.consensus.condition_tools import (
+    conditions_dict_for_solution,
+    pkm_pairs_for_conditions_dict,
+)
 from chia.types.blockchain_format.program import Program
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
@@ -40,6 +44,23 @@ class CanonicalPublish:
     property_registry_coin_id: bytes32
     property_registry_puzzle_hash: bytes32
     voting_deadline: int
+
+
+@dataclass(frozen=True)
+class CanonicalKosMintExecution:
+    """The one MINT execution a KoS signer may attest to.
+
+    This deliberately carries no generic coin-spend or arbitrary-message
+    signing capability. The values are re-derived from the canonical bundle
+    and signed genesis artifact before the coordinator contacts the isolated
+    signer.
+    """
+
+    governance_coin_id: bytes32
+    proposal_hash: bytes32
+    cosigner_pubkey: bytes
+    visible_message: bytes
+    signing_message: bytes
 
 
 def validate_publish_bundle(
@@ -353,6 +374,86 @@ def validate_execute_bundle(
         raise ValueError("deed launcher does not create the committed one-mojo deed singleton")
 
 
+def validate_kos_mint_execute_bundle(
+    *,
+    bundle: SpendBundle,
+    proposal: StoredMintProposal,
+    artifact: dict[str, Any],
+    network: str,
+) -> CanonicalKosMintExecution:
+    """Re-derive the sole KoS MINT-execution signing request.
+
+    The protocol itself enforces the resulting ``AGG_SIG_ME`` condition. This
+    validator prevents the coordinator from asking its isolated signer to
+    attest to a different singleton, stale coin, proposal, or network.
+    Existing wallet signatures are intentionally not trusted here: consensus
+    still verifies the aggregate after the returned signature is attached.
+    """
+    from chia.types.blockchain_format.program import INFINITE_COST
+    from solslot_puzzles.protocol_deployment import singleton_struct
+    from solslot_puzzles.sgt_driver import (
+        kos_mint_execute_message,
+        kos_mint_execute_signing_message,
+    )
+
+    from .faucet import AGG_SIG_ME_DATA
+
+    validate_execute_bundle(bundle=bundle, proposal=proposal, artifact=artifact)
+    if artifact.get("network") != network:
+        raise ValueError("signed artifact network does not match KoS signer network")
+    additional_data = AGG_SIG_ME_DATA.get(network)
+    if additional_data is None:
+        raise ValueError("KoS MINT execute signer does not support this network")
+
+    launchers = _artifact_mapping(artifact, "launcherIds")
+    governance = _artifact_mapping(artifact, "governanceStruct")
+    governance_launcher_id = _artifact_bytes32(launchers, "governance")
+    cosigner_pubkey = _artifact_bytes(governance, "mintExecuteCosignerPubkey", 48)
+    if proposal.proposal_hash is None:
+        raise ValueError("proposal lacks a canonical governance proposal hash")
+    proposal_hash = bytes32(proposal.proposal_hash)
+    governance_spend = _single_spend_for_launcher(bundle, governance_launcher_id)
+    governance_coin_id = bytes32(governance_spend.coin.name())
+    governance_struct = singleton_struct(governance_launcher_id)
+    visible_message = kos_mint_execute_message(
+        governance_singleton_struct=governance_struct,
+        governance_coin_id=governance_coin_id,
+        proposal_hash=proposal_hash,
+    )
+    signing_message = kos_mint_execute_signing_message(
+        governance_singleton_struct=governance_struct,
+        governance_coin_id=governance_coin_id,
+        proposal_hash=proposal_hash,
+        agg_sig_me_additional_data=bytes32(additional_data),
+    )
+
+    conditions = conditions_dict_for_solution(
+        _program(governance_spend.puzzle_reveal),
+        _program(governance_spend.solution),
+        INFINITE_COST,
+    )
+    matches = [
+        message
+        for pubkey, message in pkm_pairs_for_conditions_dict(
+            conditions,
+            governance_spend.coin,
+            additional_data,
+        )
+        if bytes(pubkey) == cosigner_pubkey
+    ]
+    if matches != [signing_message]:
+        raise ValueError(
+            "governance MINT spend does not emit the exact KoS co-signature condition"
+        )
+    return CanonicalKosMintExecution(
+        governance_coin_id=governance_coin_id,
+        proposal_hash=proposal_hash,
+        cosigner_pubkey=cosigner_pubkey,
+        visible_message=visible_message,
+        signing_message=signing_message,
+    )
+
+
 def _validate_reveals_match_coins(bundle: SpendBundle) -> None:
     seen: set[bytes] = set()
     for coin_spend in bundle.coin_spends:
@@ -460,12 +561,27 @@ def _artifact_bytes32(mapping: dict[str, Any], key: str) -> bytes32:
         raise ValueError(f"signed artifact coordinate {key} is not bytes32") from exc
 
 
+def _artifact_bytes(mapping: dict[str, Any], key: str, size: int) -> bytes:
+    raw = mapping.get(key)
+    if not isinstance(raw, str):
+        raise ValueError(f"signed artifact coordinate {key} is missing")
+    try:
+        value = bytes.fromhex(raw.removeprefix("0x"))
+    except ValueError as exc:
+        raise ValueError(f"signed artifact coordinate {key} is not hex") from exc
+    if len(value) != size:
+        raise ValueError(f"signed artifact coordinate {key} is not {size} bytes")
+    return value
+
+
 def _program(value: Any) -> Program:
     return Program.from_bytes(bytes(value))
 
 
 __all__ = [
     "CanonicalPublish",
+    "CanonicalKosMintExecution",
     "validate_publish_bundle",
     "validate_execute_bundle",
+    "validate_kos_mint_execute_bundle",
 ]

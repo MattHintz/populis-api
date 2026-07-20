@@ -73,6 +73,7 @@ uvicorn port directly.
 - [Security model](SECURITY.md)
 - [Admin authority](ADMIN_README.md)
 - [Clean genesis ceremony](GENESIS_README.md)
+- [KoS MINT execute signer](docs/KOS_MINT_EXECUTE_SIGNER.md)
 - [Staging deployment](docs/STAGING_BACKEND_DEPLOY.md)
 - [zkPassport to Chia stamp](docs/ZKPASSPORT_CHIA_VAULT_ATTESTATION.md)
 

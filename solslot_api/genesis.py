@@ -122,6 +122,10 @@ class PlanRequest(ApiModel):
     funding_coin_ids: FundingCoinIds = Field(alias="fundingCoinIds")
     faucet_puzzle_hash: str = Field(alias="faucetPuzzleHash")
     governance_bls_pubkey: str = Field(alias="governanceBlsPubkey")
+    # A dedicated public key for the MINT-only KoS co-sign condition. It is
+    # sealed into the governance puzzle and signed ceremony artifact; the
+    # private key is never submitted to this API.
+    kos_mint_execute_pubkey: str = Field(alias="kosMintExecutePubkey")
     validator_pubkeys: list[str] = Field(alias="validatorPubkeys", min_length=3, max_length=3)
     trusted_treasury_reserve_puzzle_hash: str = Field(
         alias="trustedTreasuryReservePuzzleHash"

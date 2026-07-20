@@ -110,6 +110,7 @@ def _plan_body() -> dict:
         for index in (21, 22, 23)
     ]
     governance = bytes(AugSchemeMPL.key_gen(b"g" * 32).get_g1()).hex()
+    kos_mint_execute = bytes(AugSchemeMPL.key_gen(b"k" * 32).get_g1()).hex()
     return {
         "evmAddresses": {
             "forwarder": "0x" + "a1" * 20,
@@ -122,6 +123,7 @@ def _plan_body() -> dict:
         },
         "faucetPuzzleHash": "0x" + "31" * 32,
         "governanceBlsPubkey": "0x" + governance,
+        "kosMintExecutePubkey": "0x" + kos_mint_execute,
         "validatorPubkeys": ["0x" + value for value in validators],
         "trustedTreasuryReservePuzzleHash": "0x" + "41" * 32,
         "trustedProtocolTreasuryPuzzleHash": "0x" + "42" * 32,
