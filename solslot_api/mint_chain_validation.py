@@ -37,6 +37,7 @@ class CanonicalPublish:
     eve_inner_puzhash: bytes32
     deed_full_puzhash: bytes32
     proposal_hash: bytes32
+    proposal_data_hash: bytes32
     proposal_singleton_launcher_id: bytes32
     deed_launcher_id: bytes32
     proposal_tracker_coin_id: bytes32
@@ -80,8 +81,12 @@ def validate_publish_bundle(
         genesis_challenge_for_network,
     )
     from solslot_puzzles.mint_publish_driver import (
+        PrimaryPurchaseMintConfig,
         build_mint_publish_artifacts,
         deed_launcher_puzzle_hash,
+    )
+    from solslot_puzzles.primary_purchase_v2_driver import (
+        PRIMARY_PURCHASE_PROVIDER_ID,
     )
     from solslot_puzzles.property_registry_driver import canonicalise_property_id
     from solslot_puzzles.protocol_deployment import (
@@ -166,6 +171,34 @@ def validate_publish_bundle(
         raise ValueError("signed artifact DID inner puzzle hash is inconsistent")
 
     funding_coin_id = bytes32(funding_spend.coin.name())
+    primary_purchase = None
+    if "primary_purchase_usd_amount_minor" in values:
+        validator_set = _artifact_mapping(artifact, "validatorSet")
+        if int(validator_set.get("threshold", 0)) != 2:
+            raise ValueError("signed artifact primary purchase threshold must be two")
+        raw_pubkeys = validator_set.get("pubkeys")
+        if not isinstance(raw_pubkeys, list) or len(raw_pubkeys) != 3:
+            raise ValueError("signed artifact must contain three primary purchase validators")
+        validator_pubkeys: list[bytes] = []
+        for value in raw_pubkeys:
+            normalized = str(value).removeprefix("0x")
+            try:
+                pubkey = bytes.fromhex(normalized)
+            except ValueError as exc:
+                raise ValueError("signed artifact contains an invalid validator pubkey") from exc
+            if len(pubkey) != 48:
+                raise ValueError("signed artifact validator pubkeys must be 48 bytes")
+            validator_pubkeys.append(pubkey)
+        primary_purchase = PrimaryPurchaseMintConfig(
+            network=str(artifact.get("network", "")),
+            usd_amount_minor=int(values["primary_purchase_usd_amount_minor"]),
+            protocol_treasury_puzhash=_artifact_bytes32(
+                puzzle_hashes,
+                "protocolTreasuryPuzzleHash",
+            ),
+            validator_pubkeys=tuple(validator_pubkeys),
+            provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+        )
     artifacts = build_mint_publish_artifacts(
         property_id_canon=property_id,
         collection_id_canon=collection_id,
@@ -199,6 +232,7 @@ def validate_publish_bundle(
             if "metadata_anchor_id" in values
             else None
         ),
+        primary_purchase=primary_purchase,
     )
 
     launcher_solution = list(_program(launcher_spend.solution).as_iter())
@@ -265,6 +299,7 @@ def validate_publish_bundle(
         eve_inner_puzhash=artifacts.eve_inner_puzhash,
         deed_full_puzhash=artifacts.deed_full_puzhash,
         proposal_hash=artifacts.proposal_hash,
+        proposal_data_hash=artifacts.proposal_data_hash,
         proposal_singleton_launcher_id=artifacts.proposal_singleton_launcher_id,
         deed_launcher_id=artifacts.deed_launcher_id,
         proposal_tracker_coin_id=tracker_child_id,

@@ -11,12 +11,17 @@ from pydantic import BaseModel, ConfigDict
 
 from .release_metadata import load_release_metadata
 from .validator_ledger import ValidatorLedger
-from .validator_quorum import ValidatorClaim, ValidatorSignatureResponse
+from .validator_quorum import (
+    PrimaryPurchaseClaim,
+    ValidatorClaim,
+    ValidatorSignatureResponse,
+)
 from .validator_service import (
     ValidatorEvidenceError,
     load_validator_artifact,
     load_validator_private_key,
     sign_validator_claim,
+    sign_primary_purchase_claim,
 )
 from .validator_settings import ValidatorSettings, get_validator_settings
 
@@ -25,6 +30,13 @@ class ValidatorSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim: ValidatorClaim
+    claimHash: str
+
+
+class PrimaryPurchaseSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: PrimaryPurchaseClaim
     claimHash: str
 
 
@@ -141,6 +153,36 @@ def create_validator_app(
             signature=signature,
         )
 
+    @application.post(
+        "/v1/primary-purchase/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_primary_purchase(
+        request: PrimaryPurchaseSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_primary_purchase_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
     return application
 
 
@@ -149,6 +191,7 @@ app = create_validator_app()
 
 __all__ = [
     "ValidatorHealthResponse",
+    "PrimaryPurchaseSignRequest",
     "ValidatorSignRequest",
     "app",
     "create_validator_app",

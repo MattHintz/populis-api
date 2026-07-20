@@ -9,8 +9,10 @@ from chia_rs import AugSchemeMPL, G1Element
 from solslot_api import validator_quorum
 from solslot_api.config import Settings
 from solslot_api.validator_quorum import (
+    PrimaryPurchaseClaim,
     ValidatorClaim,
     ValidatorQuorumError,
+    collect_primary_purchase_quorum,
     collect_validator_quorum,
     probe_validator_health,
 )
@@ -66,6 +68,29 @@ def _claim(keys) -> ValidatorClaim:
         bridge_amount=1,
         bridge_coin_id="0x" + "0f" * 32,
         validator_message="0x" + "10" * 32,
+    )
+
+
+def _primary_claim() -> PrimaryPurchaseClaim:
+    owner_key = AugSchemeMPL.key_gen(b"o" * 32).get_g1()
+    return PrimaryPurchaseClaim(
+        network="testnet11",
+        genesis_artifact_hash="0x" + "21" * 32,
+        purchase_artifact={
+            "purchaseId": "0x" + "22" * 32,
+            "artifactHash": "0x" + "23" * 32,
+        },
+        buyer_offer="offer1test-primary-purchase",
+        deed_coin_id="0x" + "24" * 32,
+        deed_puzzle_hash="0x" + "25" * 32,
+        smart_deed_inner_hash="0x" + "26" * 32,
+        protocol_puzzle_hash="0x" + "27" * 32,
+        credential_vault_coin_id="0x" + "28" * 32,
+        credential_identity_root="0x" + "29" * 32,
+        credential_policy_version=2,
+        credential_bridge_policy_hash="0x" + "2a" * 32,
+        credential_owner_auth_type=1,
+        credential_owner_key="0x" + bytes(owner_key).hex(),
     )
 
 
@@ -147,6 +172,42 @@ async def test_any_two_independent_signers_reach_quorum():
     public_keys = [G1Element.from_bytes(bytes(keys[index].get_g1())) for index in (0, 2)]
     assert AugSchemeMPL.aggregate_verify(
         public_keys,
+        [claim.signature_message(), claim.signature_message()],
+        result.aggregated_signature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_primary_purchase_collects_two_signers_for_deed_coin_message():
+    keys = _keys()
+    claim = _primary_claim()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        assert request.url.path == "/v1/primary-purchase/sign"
+        body = json.loads(request.content)
+        assert body["claim"] == claim.model_dump(mode="json")
+        signature = AugSchemeMPL.sign(keys[index], claim.signature_message())
+        return httpx.Response(
+            200,
+            json={
+                "claimHash": claim.canonical_hash(),
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "signature": "0x" + bytes(signature).hex(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await collect_primary_purchase_quorum(
+            _settings(keys),
+            claim,
+            client=client,
+        )
+
+    assert result.signer_indices == (0, 1)
+    assert AugSchemeMPL.aggregate_verify(
+        [keys[0].get_g1(), keys[1].get_g1()],
         [claim.signature_message(), claim.signature_message()],
         result.aggregated_signature,
     )

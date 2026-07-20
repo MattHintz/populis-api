@@ -346,6 +346,7 @@ class Settings(BaseSettings):
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
+        "payment_oracle_rounds_path",
         "collection_s3_endpoint_url",
         "collection_s3_access_key_id",
         "collection_s3_secret_access_key",
@@ -583,6 +584,19 @@ class Settings(BaseSettings):
     # wallets, portals, and auditors can recompute artifact hashes without
     # holding any service credential.
     protocol_artifact_api_token: Optional[str] = None
+    # H-system generated oracle snapshots for XCH/CAT purchase offers.
+    # The browser never supplies prices. Each strict CLVM round in this file
+    # must carry a 2-of-3 BLS authorization from this dedicated roster.
+    payment_oracle_rounds_path: Optional[str] = None
+    payment_oracle_operator_pubkeys: list[str] = Field(default_factory=list)
+    payment_oracle_allowed_cat_asset_ids: list[str] = Field(
+        default_factory=list
+    )
+    # Coordinator-owned purchase ledger and allowlisted six-decimal EVM
+    # stablecoin contracts. The map uses decimal chain IDs as keys and
+    # 0x-prefixed 20-byte token addresses as values.
+    payment_purchase_db_path: str = "./state/payment_purchases_v2.db"
+    payment_evm_usdc_tokens: dict[str, str] = Field(default_factory=dict)
     # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
     zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
     # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).

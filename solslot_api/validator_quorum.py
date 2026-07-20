@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 from chia_rs import AugSchemeMPL, G1Element, G2Element
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from solslot_puzzles.zkpassport_bridge_driver import require_genesis_validator_set
 
@@ -117,6 +117,89 @@ class ValidatorClaim(BaseModel):
         return (
             bytes.fromhex(self.validator_message[2:])
             + bytes.fromhex(self.bridge_coin_id[2:])
+            + additional_data
+        )
+
+
+class PrimaryPurchaseClaim(BaseModel):
+    """Public evidence for one governed native SmartDeed delivery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: str
+    genesis_artifact_hash: str
+    purchase_artifact: dict[str, Any]
+    buyer_offer: str = Field(..., min_length=16, max_length=2_000_000)
+    deed_coin_id: str
+    deed_puzzle_hash: str
+    smart_deed_inner_hash: str
+    protocol_puzzle_hash: str
+    credential_vault_coin_id: str
+    credential_identity_root: str
+    credential_policy_version: int = Field(..., ge=2)
+    credential_bridge_policy_hash: str
+    credential_owner_auth_type: int
+    credential_owner_key: str
+
+    @field_validator(
+        "genesis_artifact_hash",
+        "deed_coin_id",
+        "deed_puzzle_hash",
+        "smart_deed_inner_hash",
+        "protocol_puzzle_hash",
+        "credential_vault_coin_id",
+        "credential_identity_root",
+        "credential_bridge_policy_hash",
+    )
+    @classmethod
+    def _purchase_hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_credential_owner(self) -> "PrimaryPurchaseClaim":
+        expected_size = {1: 48, 3: 33}.get(self.credential_owner_auth_type)
+        if expected_size is None:
+            raise ValueError("credential owner auth type must be BLS or secp256k1")
+        normalized = _hex(
+            self.credential_owner_key,
+            expected_size,
+            "credential_owner_key",
+        )
+        object.__setattr__(self, "credential_owner_key", normalized)
+        if self.credential_owner_auth_type == 1:
+            G1Element.from_bytes(bytes.fromhex(normalized[2:]))
+        return self
+
+    def canonical_hash(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return "0x" + hashlib.sha256(encoded).hexdigest()
+
+    def purchase_id(self) -> str:
+        value = self.purchase_artifact.get("purchaseId")
+        if not isinstance(value, str):
+            raise ValidatorQuorumError("purchase artifact has no purchase ID")
+        return _hex(value, 32, "purchaseId")
+
+    def purchase_artifact_hash(self) -> str:
+        value = self.purchase_artifact.get("artifactHash")
+        if not isinstance(value, str):
+            raise ValidatorQuorumError("purchase artifact has no artifact hash")
+        return _hex(value, 32, "artifactHash")
+
+    def signature_message(self) -> bytes:
+        additional_data = AGG_SIG_ME_DATA.get(self.network)
+        if additional_data is None:
+            raise ValidatorQuorumError(
+                f"unsupported Chia network: {self.network}"
+            )
+        return (
+            bytes.fromhex(self.purchase_artifact_hash()[2:])
+            + bytes.fromhex(self.deed_coin_id[2:])
             + additional_data
         )
 
@@ -380,12 +463,104 @@ async def collect_validator_quorum(
     )
 
 
+async def collect_primary_purchase_quorum(
+    settings: Settings,
+    claim: PrimaryPurchaseClaim,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ValidatorQuorumResult:
+    """Collect the configured quorum for one already wallet-signed offer."""
+
+    pubkeys = configured_validator_pubkeys(settings)
+    claim_hash = claim.canonical_hash()
+    message = claim.signature_message()
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_signature(
+        index: int,
+        url: str,
+    ) -> tuple[int, G2Element] | None:
+        try:
+            response = await client.post(
+                url.rstrip("/") + "/v1/primary-purchase/sign",
+                json={
+                    "claim": claim.model_dump(mode="json"),
+                    "claimHash": claim_hash,
+                },
+            )
+            response.raise_for_status()
+            parsed = ValidatorSignatureResponse.model_validate(
+                response.json()
+            )
+            if parsed.claimHash.lower() != claim_hash:
+                raise ValueError("claim hash mismatch")
+            if parsed.signerIndex != index:
+                raise ValueError("signer index mismatch")
+            configured_pubkey = pubkeys[index]
+            if bytes.fromhex(
+                parsed.validatorPubkey.removeprefix("0x")
+            ) != configured_pubkey:
+                raise ValueError("validator public key mismatch")
+            signature = G2Element.from_bytes(
+                bytes.fromhex(parsed.signature.removeprefix("0x"))
+            )
+            if not AugSchemeMPL.verify(
+                G1Element.from_bytes(configured_pubkey),
+                message,
+                signature,
+            ):
+                raise ValueError("invalid validator signature")
+            return index, signature
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "primary purchase signer %s rejected or unavailable: %s",
+                index,
+                exc,
+            )
+            return None
+
+    try:
+        responses = await asyncio.gather(
+            *(
+                request_signature(index, url)
+                for index, url in enumerate(
+                    settings.zkpassport_validator_urls
+                )
+            )
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    valid = sorted(
+        (item for item in responses if item is not None),
+        key=lambda item: item[0],
+    )
+    threshold = settings.zkpassport_validator_threshold
+    if len(valid) < threshold:
+        raise ValidatorQuorumError(
+            "primary purchase validator quorum unavailable: "
+            f"received {len(valid)} of {threshold} required signatures"
+        )
+    selected = valid[:threshold]
+    return ValidatorQuorumResult(
+        signer_indices=tuple(index for index, _ in selected),
+        aggregated_signature=AugSchemeMPL.aggregate(
+            [signature for _, signature in selected]
+        ),
+        claim_hash=claim_hash,
+    )
+
+
 __all__ = [
     "ValidatorClaim",
+    "PrimaryPurchaseClaim",
     "ValidatorHealthResponse",
     "ValidatorQuorumError",
     "ValidatorQuorumResult",
     "collect_validator_quorum",
+    "collect_primary_purchase_quorum",
     "configured_bridge_policy_hash",
     "configured_validator_pubkeys",
     "probe_validator_health",

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -45,25 +45,41 @@ class ValidatorLedger:
                 raise RuntimeError(
                     f"Validator ledger schema {version} is newer than supported {SCHEMA_VERSION}."
                 )
-            if version == SCHEMA_VERSION:
-                return
-            self._conn.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE signatures (
-                    claim_hash TEXT PRIMARY KEY,
-                    canonical_claim TEXT NOT NULL,
-                    scoped_nullifier TEXT NOT NULL UNIQUE,
-                    bridge_coin_id TEXT NOT NULL UNIQUE,
-                    vault_action TEXT NOT NULL UNIQUE,
-                    evm_transaction_hash TEXT NOT NULL UNIQUE,
-                    signature TEXT NOT NULL,
-                    signed_at INTEGER NOT NULL
-                );
-                PRAGMA user_version = 1;
-                COMMIT;
-                """
-            )
+            if version < 1:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE signatures (
+                        claim_hash TEXT PRIMARY KEY,
+                        canonical_claim TEXT NOT NULL,
+                        scoped_nullifier TEXT NOT NULL UNIQUE,
+                        bridge_coin_id TEXT NOT NULL UNIQUE,
+                        vault_action TEXT NOT NULL UNIQUE,
+                        evm_transaction_hash TEXT NOT NULL UNIQUE,
+                        signature TEXT NOT NULL,
+                        signed_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 1;
+                    COMMIT;
+                    """
+                )
+                version = 1
+            if version < 2:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE primary_purchase_signatures (
+                        claim_hash TEXT PRIMARY KEY,
+                        canonical_claim TEXT NOT NULL,
+                        purchase_id TEXT NOT NULL UNIQUE,
+                        deed_coin_id TEXT NOT NULL UNIQUE,
+                        signature TEXT NOT NULL,
+                        signed_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 2;
+                    COMMIT;
+                    """
+                )
 
     def record_or_recover(
         self,
@@ -123,6 +139,62 @@ class ValidatorLedger:
         with self._lock:
             row = self._conn.execute("PRAGMA quick_check").fetchone()
         return bool(row and row[0] == "ok")
+
+    def record_primary_purchase_or_recover(
+        self,
+        *,
+        claim_hash: str,
+        canonical_claim: str,
+        purchase_id: str,
+        deed_coin_id: str,
+        signature: str,
+    ) -> str:
+        """Record one deed authorization or recover an exact retry."""
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT canonical_claim, signature
+                    FROM primary_purchase_signatures
+                    WHERE claim_hash = ?
+                    """,
+                    (claim_hash,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["canonical_claim"] != canonical_claim:
+                        raise ValidatorLedgerConflict(
+                            "Purchase claim hash collides with different evidence."
+                        )
+                    self._conn.execute("COMMIT")
+                    return str(existing["signature"])
+                self._conn.execute(
+                    """
+                    INSERT INTO primary_purchase_signatures(
+                        claim_hash, canonical_claim, purchase_id,
+                        deed_coin_id, signature, signed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_hash,
+                        canonical_claim,
+                        purchase_id,
+                        deed_coin_id,
+                        signature,
+                        int(time.time()),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return signature
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Purchase or SmartDeed coin was already authorized."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         with self._lock:

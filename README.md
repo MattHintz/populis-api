@@ -26,6 +26,34 @@ The V2 cutover is intentionally breaking:
 - zkPassport validator signing is internal. There is no public signing route.
 - Offer artifacts require a current, server-confirmed Chia credential receipt.
 
+## Protocol Payment Configuration
+
+The coordinator is authoritative for protocol pricing and fulfillment terms.
+Clients select a published deed and rail; they do not submit a price, launcher,
+share allocation, or delivery address.
+
+- `SOLSLOT_PAYMENT_ORACLE_ROUNDS_PATH` points to strict canonical XCH/CAT
+  rounds. Native prices are accepted only with a live 2-of-3 BLS authorization
+  from `SOLSLOT_PAYMENT_ORACLE_OPERATOR_PUBKEYS`.
+- `SOLSLOT_PAYMENT_ORACLE_ALLOWED_CAT_ASSET_IDS` is the explicit native CAT
+  allowlist.
+- `SOLSLOT_PAYMENT_EVM_USDC_TOKENS` maps an EVM chain ID to its reviewed
+  six-decimal test stablecoin contract.
+- `SOLSLOT_PAYMENT_PURCHASE_DB_PATH` is the coordinator-owned SQLite-WAL
+  purchase and replay ledger.
+- `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase
+  construction and finalization.
+
+Native XCH and CAT purchases are completed as standard atomic Chia offer files.
+The sealed USD target raise and deed share determine the exact integer USD
+minor-unit price; the H-system oracle round converts that price to XCH mojos or
+CAT base units. The offer requests those exact units and delivers exactly one
+governed SmartDeed to the canonical vault puzzle hash in one atomic settlement.
+Native offers do not pass through Samuel, Key of Solomon, or the EVM escrow.
+EVM and Stripe use escrow-backed fulfillment, but must bind the same purchase
+ID, artifact hash, deed launcher, vault launcher, destination, quantity, and
+expiry.
+
 ## Local Verification
 
 Create an isolated environment and pin the exact protocol checkout:
