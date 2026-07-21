@@ -638,6 +638,9 @@ class Settings(BaseSettings):
     payment_omnichain_preflight_evidence_path: Optional[str] = None
     payment_omnichain_evidence_path: Optional[str] = None
     payment_omnichain_activation_evidence_path: Optional[str] = None
+    payment_omnichain_governance_evidence_path: Optional[str] = None
+    payment_omnichain_samuel_evidence_path: Optional[str] = None
+    payment_omnichain_ownership_intent_evidence_path: Optional[str] = None
     payment_omnichain_source_sha: Optional[str] = None
     payment_omnichain_gateway_profile: Optional[str] = Field(
         None, min_length=1, max_length=32

@@ -37,12 +37,17 @@ share allocation, or delivery address.
   from `SOLSLOT_PAYMENT_ORACLE_OPERATOR_PUBKEYS`.
 - `SOLSLOT_PAYMENT_ORACLE_ALLOWED_CAT_ASSET_IDS` is the explicit native CAT
   allowlist.
-- `SOLSLOT_PAYMENT_EVM_USDC_TOKENS` maps an EVM chain ID to its reviewed
-  six-decimal test stablecoin contract.
+- `SOLSLOT_PAYMENT_EVM_USDC_TOKENS` must contain exactly one binding when the
+  omnichain rail is enabled. Alpha binds Base Sepolia chain `84532` to Circle
+  USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` and accepts no USDT.
 - `SOLSLOT_PAYMENT_OMNICHAIN_ENABLED` remains false until the separately
   deployed CCIP/Warp rail is approved. Enabling it also requires
+  `SOLSLOT_PAYMENT_OMNICHAIN_PREFLIGHT_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA`, and
   `SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE`; the API verifies the evidence
   hashes, source SHA, chain, token, gateway profile, runtime-code descriptors,
