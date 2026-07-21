@@ -289,7 +289,7 @@ def _configure_external_quote(
             "emergencyDelay": "604800",
             "payoutAddress": "0x" + "14" * 20,
             "governance": "0x" + "15" * 20,
-            "ownershipAccepted": True,
+            "ownershipAccepted": False,
         },
         "deploymentTransactions": {
             "spoke": {"hash": "0x" + "21" * 32, "blockNumber": 1},
@@ -310,10 +310,38 @@ def _configure_external_quote(
         evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     evidence["artifactHash"] = "0x" + hashlib.sha256(canonical).hexdigest()
-    path = tmp_path / "omnichain-evidence.json"
-    path.write_text(json.dumps(evidence), encoding="utf-8")
+    deployment_path = tmp_path / "omnichain-deployment-evidence.json"
+    deployment_path.write_text(json.dumps(evidence), encoding="utf-8")
+    activation = {
+        "schemaVersion": 1,
+        "kind": "ccip-warp-escrow-activation",
+        "deploymentArtifactHash": evidence["artifactHash"],
+        "sourceSha": evidence["sourceSha"],
+        "network": evidence["network"],
+        "chainId": evidence["chainId"],
+        "gatewayProfile": "bse",
+        "contracts": {
+            name: evidence["contracts"][name] for name in ("gateway", "spoke")
+        },
+        "runtimeCodeHashes": {
+            name: evidence["runtimeCodeHashes"][name] for name in ("gateway", "spoke")
+        },
+        "governance": evidence["configuration"]["governance"],
+        "observedOwners": {
+            name: evidence["configuration"]["governance"] for name in ("gateway", "spoke")
+        },
+        "ownershipAccepted": True,
+        "activatedAt": "2026-07-20T00:00:01.000Z",
+    }
+    activation_canonical = json.dumps(
+        activation, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    activation["artifactHash"] = "0x" + hashlib.sha256(activation_canonical).hexdigest()
+    activation_path = tmp_path / "omnichain-activation-evidence.json"
+    activation_path.write_text(json.dumps(activation), encoding="utf-8")
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "true")
-    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH", str(path))
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH", str(deployment_path))
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH", str(activation_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA", "a" * 40)
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE", "bse")
     monkeypatch.setenv(
@@ -363,9 +391,30 @@ def test_evm_offer_requires_reviewed_omnichain_evidence(monkeypatch, tmp_path):
     assert "Omnichain payments are disabled" in response.text
 
 
+def test_evm_offer_requires_omnichain_activation_evidence(monkeypatch, tmp_path):
+    _configure_external_quote(monkeypatch, tmp_path)
+    monkeypatch.delenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH")
+    get_settings.cache_clear()
+    now = int(time.time())
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(
+                rail="base_usdc",
+                purchase_intent_id="pi_omnichain_no_activation",
+                expires_at=now + 900,
+                authorization_nonce="0x" + "16" * 32,
+                authorization_expires_at=now + 1200,
+                payment_terms={"currency": "USDC", "quantity": 1, "chain_id": 84532},
+            ),
+        )
+    assert response.status_code == 503
+    assert "activation evidence is not configured" in response.text
+
+
 def test_evm_offer_rejects_tampered_omnichain_evidence(monkeypatch, tmp_path):
     _configure_external_quote(monkeypatch, tmp_path)
-    path = tmp_path / "omnichain-evidence.json"
+    path = tmp_path / "omnichain-deployment-evidence.json"
     evidence = json.loads(path.read_text(encoding="utf-8"))
     evidence["sourceSha"] = "b" * 40
     path.write_text(json.dumps(evidence), encoding="utf-8")

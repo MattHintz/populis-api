@@ -601,6 +601,7 @@ class Settings(BaseSettings):
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False
     payment_omnichain_evidence_path: Optional[str] = None
+    payment_omnichain_activation_evidence_path: Optional[str] = None
     payment_omnichain_source_sha: Optional[str] = None
     payment_omnichain_gateway_profile: Optional[str] = Field(
         None, min_length=1, max_length=32

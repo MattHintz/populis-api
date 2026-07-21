@@ -53,6 +53,28 @@ def _require_hash(value: object, label: str) -> str:
     return value.lower()
 
 
+def _load_evidence(path_value: str | None, label: str) -> dict[str, Any]:
+    if not path_value:
+        raise OmnichainEvidenceError(f"Omnichain {label} evidence is not configured")
+    path = Path(path_value)
+    if not path.is_file() or path.is_symlink():
+        raise OmnichainEvidenceError(f"Omnichain {label} evidence is unavailable")
+    try:
+        if path.stat().st_size <= 0 or path.stat().st_size > MAX_EVIDENCE_BYTES:
+            raise OmnichainEvidenceError(f"Omnichain {label} evidence size is invalid")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OmnichainEvidenceError(f"Omnichain {label} evidence is invalid") from exc
+    if not isinstance(raw, Mapping):
+        raise OmnichainEvidenceError(f"Omnichain {label} evidence must be an object")
+    evidence = dict(raw)
+    declared_hash = _require_hash(evidence.pop("artifactHash", None), f"{label}.artifactHash")
+    if declared_hash != _canonical_hash(evidence):
+        raise OmnichainEvidenceError(f"Omnichain {label} evidence hash mismatches")
+    evidence["artifactHash"] = declared_hash
+    return evidence
+
+
 def load_omnichain_evidence(
     settings: Settings,
     *,
@@ -64,30 +86,12 @@ def load_omnichain_evidence(
 
     if not settings.payment_omnichain_enabled:
         raise OmnichainEvidenceError("Omnichain payments are disabled")
-    path_value = settings.payment_omnichain_evidence_path
     source_sha = (settings.payment_omnichain_source_sha or "").lower()
     expected_profile = settings.payment_omnichain_gateway_profile
-    if not path_value or not _GIT_SHA_RE.fullmatch(source_sha) or not expected_profile:
+    if not _GIT_SHA_RE.fullmatch(source_sha) or not expected_profile:
         raise OmnichainEvidenceError("Omnichain deployment evidence is not configured")
-    if gateway_profile != expected_profile:
-        raise OmnichainEvidenceError("Omnichain gateway profile is not enabled")
-
-    path = Path(path_value)
-    if not path.is_file() or path.is_symlink():
-        raise OmnichainEvidenceError("Omnichain deployment evidence is unavailable")
-    try:
-        if path.stat().st_size <= 0 or path.stat().st_size > MAX_EVIDENCE_BYTES:
-            raise OmnichainEvidenceError("Omnichain deployment evidence size is invalid")
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise OmnichainEvidenceError("Omnichain deployment evidence is invalid") from exc
-    if not isinstance(raw, Mapping):
-        raise OmnichainEvidenceError("Omnichain deployment evidence must be an object")
-
-    evidence = dict(raw)
-    declared_hash = _require_hash(evidence.pop("artifactHash", None), "artifactHash")
-    if declared_hash != _canonical_hash(evidence):
-        raise OmnichainEvidenceError("Omnichain deployment evidence hash mismatches")
+    evidence = _load_evidence(settings.payment_omnichain_evidence_path, "deployment")
+    declared_hash = str(evidence["artifactHash"])
     if evidence.get("schemaVersion") != 1 or evidence.get("rail") != "ccip-warp-escrow":
         raise OmnichainEvidenceError("Omnichain deployment evidence schema is unsupported")
     if evidence.get("protocolVersion") != "solslot-v2":
@@ -113,7 +117,43 @@ def load_omnichain_evidence(
     for name in ("ccipRouter", "gateway", "spoke", "usdc", "usdt"):
         _require_address(contracts.get(name), name)
         _require_hash(code_hashes.get(name), f"runtimeCodeHashes.{name}")
-    if configuration.get("ownershipAccepted") is not True:
+    activation = _load_evidence(
+        settings.payment_omnichain_activation_evidence_path, "activation"
+    )
+    if (
+        activation.get("schemaVersion") != 1
+        or activation.get("kind") != "ccip-warp-escrow-activation"
+        or activation.get("deploymentArtifactHash") != declared_hash
+        or activation.get("sourceSha") != source_sha
+        or activation.get("network") != evidence.get("network")
+        or activation.get("chainId") != chain_id
+        or activation.get("gatewayProfile") != expected_profile
+        or activation.get("ownershipAccepted") is not True
+    ):
+        raise OmnichainEvidenceError("Omnichain activation evidence mismatches")
+    if gateway_profile != expected_profile:
+        raise OmnichainEvidenceError("Omnichain gateway profile is not enabled")
+    activation_contracts = activation.get("contracts")
+    activation_hashes = activation.get("runtimeCodeHashes")
+    if not isinstance(activation_contracts, Mapping) or not isinstance(activation_hashes, Mapping):
+        raise OmnichainEvidenceError("Omnichain activation evidence contracts are invalid")
+    for name in ("gateway", "spoke"):
+        if _require_address(activation_contracts.get(name), f"activation.{name}") != _require_address(
+            contracts.get(name), name
+        ) or _require_hash(activation_hashes.get(name), f"activation.runtimeCodeHashes.{name}") != _require_hash(
+            code_hashes.get(name), f"runtimeCodeHashes.{name}"
+        ):
+            raise OmnichainEvidenceError("Omnichain activation evidence contract mismatches")
+    if _require_address(activation.get("governance"), "activation.governance") != _require_address(
+        configuration.get("governance"), "configuration.governance"
+    ):
+        raise OmnichainEvidenceError("Omnichain activation evidence governance mismatches")
+    owners = activation.get("observedOwners")
+    if not isinstance(owners, Mapping) or any(
+        _require_address(owners.get(name), f"activation.observedOwners.{name}")
+        != _require_address(configuration.get("governance"), "configuration.governance")
+        for name in ("gateway", "spoke")
+    ):
         raise OmnichainEvidenceError("Omnichain governance ownership is not accepted")
 
     return OmnichainEvidence(
