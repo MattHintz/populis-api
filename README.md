@@ -26,6 +26,48 @@ The V2 cutover is intentionally breaking:
 - zkPassport validator signing is internal. There is no public signing route.
 - Offer artifacts require a current, server-confirmed Chia credential receipt.
 
+## Protocol Payment Configuration
+
+The coordinator is authoritative for protocol pricing and fulfillment terms.
+Clients select a published deed and rail; they do not submit a price, launcher,
+share allocation, or delivery address.
+
+- `SOLSLOT_PAYMENT_ORACLE_ROUNDS_PATH` points to strict canonical XCH/CAT
+  rounds. Native prices are accepted only with a live 2-of-3 BLS authorization
+  from `SOLSLOT_PAYMENT_ORACLE_OPERATOR_PUBKEYS`.
+- `SOLSLOT_PAYMENT_ORACLE_ALLOWED_CAT_ASSET_IDS` is the explicit native CAT
+  allowlist.
+- `SOLSLOT_PAYMENT_EVM_USDC_TOKENS` must contain exactly one binding when the
+  omnichain rail is enabled. Alpha binds Base Sepolia chain `84532` to Circle
+  USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` and accepts no USDT.
+- `SOLSLOT_PAYMENT_OMNICHAIN_ENABLED` remains false until the separately
+  deployed CCIP/Warp rail is approved. Enabling it also requires
+  `SOLSLOT_PAYMENT_OMNICHAIN_PREFLIGHT_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA`, and
+  `SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE`; the API verifies the evidence
+  hashes, source SHA, chain, token, gateway profile, runtime-code descriptors,
+  and a post-handoff governance-ownership attestation before it quotes or
+  finalizes an EVM buy.
+- `SOLSLOT_PAYMENT_PURCHASE_DB_PATH` is the coordinator-owned SQLite-WAL
+  purchase and replay ledger.
+- `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase
+  construction and finalization.
+
+Native XCH and CAT purchases are completed as standard atomic Chia offer files.
+The sealed USD target raise and deed share determine the exact integer USD
+minor-unit price; the H-system oracle round converts that price to XCH mojos or
+CAT base units. The offer requests those exact units and delivers exactly one
+governed SmartDeed to the canonical vault puzzle hash in one atomic settlement.
+Native offers do not pass through Samuel, Key of Solomon, or the EVM escrow.
+EVM and Stripe use escrow-backed fulfillment, but must bind the same purchase
+ID, artifact hash, deed launcher, vault launcher, destination, quantity, and
+expiry.
+
 ## Local Verification
 
 Create an isolated environment and pin the exact protocol checkout:
@@ -73,6 +115,7 @@ uvicorn port directly.
 - [Security model](SECURITY.md)
 - [Admin authority](ADMIN_README.md)
 - [Clean genesis ceremony](GENESIS_README.md)
+- [KoS MINT execute signer](docs/KOS_MINT_EXECUTE_SIGNER.md)
 - [Staging deployment](docs/STAGING_BACKEND_DEPLOY.md)
 - [zkPassport to Chia stamp](docs/ZKPASSPORT_CHIA_VAULT_ATTESTATION.md)
 

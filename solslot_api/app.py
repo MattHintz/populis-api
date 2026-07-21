@@ -51,6 +51,7 @@ except ModuleNotFoundError as e:
 from .mint_endpoints import router as mint_endpoints_router
 from .collection_endpoints import router as collection_endpoints_router
 from .protocol_artifacts import router as protocol_artifacts_router
+from .native_purchases import router as native_purchases_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
@@ -299,6 +300,7 @@ if admin_roster_update_router is not None:
 app.include_router(mint_endpoints_router)
 app.include_router(collection_endpoints_router)
 app.include_router(protocol_artifacts_router)
+app.include_router(native_purchases_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)

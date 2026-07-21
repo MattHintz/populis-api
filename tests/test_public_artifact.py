@@ -25,7 +25,7 @@ from tests.test_genesis_api import _plan_body
 SOURCE_SHAS = {
     name: f"{index:x}" * 40
     for index, name in enumerate(
-        ("protocol", "evm", "api", "customerWeb", "adminPortal"), start=1
+        ("protocol", "evm", "api", "legacyBackend", "customerWeb", "adminPortal"), start=1
     )
 }
 

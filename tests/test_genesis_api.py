@@ -50,7 +50,7 @@ def _headers() -> dict[str, str]:
 
 def _create_and_enroll(client: TestClient) -> tuple[str, list]:
     commits = {name: f"{index:x}" * 40 for index, name in enumerate(
-        ("protocol", "evm", "api", "customerWeb", "adminPortal"), start=1
+        ("protocol", "evm", "api", "legacyBackend", "customerWeb", "adminPortal"), start=1
     )}
     response = client.post(
         "/admin/genesis/drafts",
@@ -110,6 +110,7 @@ def _plan_body() -> dict:
         for index in (21, 22, 23)
     ]
     governance = bytes(AugSchemeMPL.key_gen(b"g" * 32).get_g1()).hex()
+    kos_mint_execute = bytes(AugSchemeMPL.key_gen(b"k" * 32).get_g1()).hex()
     return {
         "evmAddresses": {
             "forwarder": "0x" + "a1" * 20,
@@ -122,6 +123,7 @@ def _plan_body() -> dict:
         },
         "faucetPuzzleHash": "0x" + "31" * 32,
         "governanceBlsPubkey": "0x" + governance,
+        "kosMintExecutePubkey": "0x" + kos_mint_execute,
         "validatorPubkeys": ["0x" + value for value in validators],
         "trustedTreasuryReservePuzzleHash": "0x" + "41" * 32,
         "trustedProtocolTreasuryPuzzleHash": "0x" + "42" * 32,
@@ -258,8 +260,9 @@ def test_operator_routes_require_ceremony_token(tmp_path) -> None:
                 "protocol": "1" * 40,
                 "evm": "2" * 40,
                 "api": "3" * 40,
-                "customerWeb": "4" * 40,
-                "adminPortal": "5" * 40,
+                "legacyBackend": "4" * 40,
+                "customerWeb": "5" * 40,
+                "adminPortal": "6" * 40,
             }
         },
     )
@@ -275,8 +278,9 @@ def test_draft_rejects_unknown_review_class(tmp_path) -> None:
                 "protocol": "1" * 40,
                 "evm": "2" * 40,
                 "api": "3" * 40,
-                "customerWeb": "4" * 40,
-                "adminPortal": "5" * 40,
+                "legacyBackend": "4" * 40,
+                "customerWeb": "5" * 40,
+                "adminPortal": "6" * 40,
             },
             "reviewClass": "self-approved-mainnet",
         },

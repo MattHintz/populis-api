@@ -28,6 +28,11 @@ class PublishProposalMetadata(BaseModel):
     voting_deadline: int = Field(..., gt=0)
     metadata_root: str | None = Field(None, description="0x-prefixed dossier SHA-256")
     metadata_anchor_id: str | None = Field(None, description="0x-prefixed first deed launcher id")
+    primary_purchase_usd_amount_minor: int | None = Field(
+        None,
+        gt=0,
+        description="Sealed per-deed USD price in minor units for the V2 primary offer",
+    )
 
     @model_validator(mode="after")
     def validate_metadata_commitment_pair(self) -> "PublishProposalMetadata":

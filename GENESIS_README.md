@@ -73,6 +73,7 @@ The signed public bundle must include:
 - `sgtGenesisCoinId` and `sgtTailHash`
 - pool V3 and SmartDeed V2 versions
 - governance singleton struct
+- immutable MINT-only KoS co-signer public key (never its private key)
 - protocol DID singleton material and the empty property-registry authority
 - bridge policy and fresh EVM contract addresses
 - admin authority and vault-version-registry state

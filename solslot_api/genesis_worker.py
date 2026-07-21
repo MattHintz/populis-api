@@ -99,6 +99,9 @@ def _build_plan(
         governance_bls_pubkey=_hex_bytes(
             body["governanceBlsPubkey"], 48, "governanceBlsPubkey"
         ),
+        kos_mint_execute_pubkey=_hex_bytes(
+            body["kosMintExecutePubkey"], 48, "kosMintExecutePubkey"
+        ),
         admin_compressed_pubkeys=_admin_pubkeys(ceremony),
         validator_pubkeys=[
             _hex_bytes(value, 48, "validatorPubkey")

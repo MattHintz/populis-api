@@ -84,8 +84,9 @@ def _fixture(tmp_path):
                 "protocol": "1" * 40,
                 "evm": "2" * 40,
                 "api": "3" * 40,
-                "customerWeb": "4" * 40,
-                "adminPortal": "5" * 40,
+                "legacyBackend": "4" * 40,
+                "customerWeb": "5" * 40,
+                "adminPortal": "6" * 40,
             }
         }
     }

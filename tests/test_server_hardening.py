@@ -80,6 +80,18 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
 
 
+def test_omnichain_enablement_requires_reviewed_evidence_at_startup() -> None:
+    with pytest.raises(RuntimeError, match="requires valid reviewed"):
+        validate_server_hardening_at_startup(
+            _staging(
+                payment_omnichain_enabled=True,
+                payment_evm_usdc_tokens={"84532": "0x" + "ab" * 20},
+                payment_omnichain_source_sha="a" * 40,
+                payment_omnichain_gateway_profile="bse",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -233,6 +245,67 @@ def test_minting_cannot_be_enabled_while_alpha_writes_are_locked() -> None:
         validate_server_hardening_at_startup(
             _staging(minting_enabled=True, alpha_writes_enabled=False)
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"alpha_writes_enabled": False, "minting_enabled": False},
+            "requires alpha writes and minting",
+        ),
+        (
+            {
+                "alpha_writes_enabled": True,
+                "minting_enabled": True,
+                "network": "mainnet",
+            },
+            "restricted to testnet11",
+        ),
+        (
+            {"alpha_writes_enabled": True, "minting_enabled": True},
+            "requires a signer URL",
+        ),
+        (
+            {
+                "alpha_writes_enabled": True,
+                "minting_enabled": True,
+                "kos_mint_execute_signer_url": "http://kos.internal",
+            },
+            "must use HTTPS",
+        ),
+        (
+            {
+                "alpha_writes_enabled": True,
+                "minting_enabled": True,
+                "kos_mint_execute_signer_url": "https://kos.internal",
+            },
+            "requires CA, client certificate, and client key paths",
+        ),
+    ],
+)
+def test_kos_mint_execute_signer_fails_closed_without_testnet_mtls(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        validate_server_hardening_at_startup(
+            _staging(kos_mint_execute_signer_enabled=True, **overrides)
+        )
+
+
+def test_kos_mint_execute_signer_accepts_the_complete_testnet_posture() -> None:
+    validate_server_hardening_at_startup(
+        _staging(
+            alpha_writes_enabled=True,
+            minting_enabled=True,
+            zkpassport_validator_threshold=2,
+            kos_mint_execute_signer_enabled=True,
+            kos_mint_execute_signer_url="https://kos.testnet.internal",
+            kos_mint_execute_signer_mtls_ca_path="/run/secrets/kos-ca.pem",
+            kos_mint_execute_signer_mtls_cert_path="/run/secrets/api-kos-cert.pem",
+            kos_mint_execute_signer_mtls_key_path="/run/secrets/api-kos-key.pem",
+        )
+    )
 
 
 @pytest.mark.asyncio

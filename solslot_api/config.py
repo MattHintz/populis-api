@@ -98,6 +98,62 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "SOLSLOT_COLLECTION_MINTING_ENABLED requires SOLSLOT_MINTING_ENABLED."
         )
+    if settings.kos_mint_execute_signer_enabled:
+        if not settings.alpha_writes_enabled or not settings.minting_enabled:
+            raise RuntimeError(
+                "SOLSLOT_KOS_MINT_EXECUTE_SIGNER_ENABLED requires alpha writes and minting."
+            )
+        if settings.network != "testnet11":
+            raise RuntimeError("KoS MINT execute signing is restricted to testnet11.")
+        if not settings.kos_mint_execute_signer_url:
+            raise RuntimeError("KoS MINT execute signing requires a signer URL.")
+        if not settings.kos_mint_execute_signer_url.startswith("https://"):
+            raise RuntimeError("KoS MINT execute signer URL must use HTTPS.")
+        if not all(
+            (
+                settings.kos_mint_execute_signer_mtls_ca_path,
+                settings.kos_mint_execute_signer_mtls_cert_path,
+                settings.kos_mint_execute_signer_mtls_key_path,
+            )
+        ):
+            raise RuntimeError(
+                "KoS MINT execute signing requires CA, client certificate, and client key paths."
+            )
+
+    if settings.payment_omnichain_enabled:
+        if len(settings.payment_evm_usdc_tokens) != 1:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires exactly one "
+                "SOLSLOT_PAYMENT_EVM_USDC_TOKENS chain binding."
+            )
+        chain_id_raw, token_address = next(
+            iter(settings.payment_evm_usdc_tokens.items())
+        )
+        try:
+            chain_id = int(chain_id_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_EVM_USDC_TOKENS must use a decimal chain ID."
+            ) from exc
+        from .omnichain_evidence import (
+            OmnichainEvidenceError,
+            load_omnichain_evidence,
+        )
+
+        try:
+            load_omnichain_evidence(
+                settings,
+                chain_id=chain_id,
+                token_address=token_address,
+                gateway_profile=str(
+                    settings.payment_omnichain_gateway_profile or ""
+                ),
+            )
+        except OmnichainEvidenceError as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires valid reviewed "
+                f"preflight, deployment, and activation evidence: {exc}"
+            ) from exc
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
@@ -315,12 +371,17 @@ class Settings(BaseSettings):
         "zkpassport_validator_mtls_ca_path",
         "zkpassport_validator_mtls_cert_path",
         "zkpassport_validator_mtls_key_path",
+        "kos_mint_execute_signer_url",
+        "kos_mint_execute_signer_mtls_ca_path",
+        "kos_mint_execute_signer_mtls_cert_path",
+        "kos_mint_execute_signer_mtls_key_path",
         "zkpassport_relayer_private_key_hex",
         "zkpassport_bridge_policy_hash",
         "zkpassport_forwarder_address",
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
+        "payment_oracle_rounds_path",
         "collection_s3_endpoint_url",
         "collection_s3_access_key_id",
         "collection_s3_secret_access_key",
@@ -364,6 +425,15 @@ class Settings(BaseSettings):
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
+    # KoS is an isolated, optional co-signer for the one MINT EXECUTE
+    # condition emitted by governance. The coordinator never receives a KoS
+    # private key; it calls a separately deployed signer over mutual TLS.
+    kos_mint_execute_signer_enabled: bool = False
+    kos_mint_execute_signer_url: Optional[str] = None
+    kos_mint_execute_signer_mtls_ca_path: Optional[str] = None
+    kos_mint_execute_signer_mtls_cert_path: Optional[str] = None
+    kos_mint_execute_signer_mtls_key_path: Optional[str] = None
+    kos_mint_execute_signer_timeout_seconds: float = Field(8.0, gt=0, le=30)
     # One-shot testnet ceremony mode is the only state in which protocol
     # writes may run before a chain-bound admin authority exists. It requires
     # the bootstrap token, disables minting, and refuses all CORS origins.
@@ -549,6 +619,32 @@ class Settings(BaseSettings):
     # wallets, portals, and auditors can recompute artifact hashes without
     # holding any service credential.
     protocol_artifact_api_token: Optional[str] = None
+    # H-system generated oracle snapshots for XCH/CAT purchase offers.
+    # The browser never supplies prices. Each strict CLVM round in this file
+    # must carry a 2-of-3 BLS authorization from this dedicated roster.
+    payment_oracle_rounds_path: Optional[str] = None
+    payment_oracle_operator_pubkeys: list[str] = Field(default_factory=list)
+    payment_oracle_allowed_cat_asset_ids: list[str] = Field(
+        default_factory=list
+    )
+    # Coordinator-owned purchase ledger and allowlisted six-decimal EVM
+    # stablecoin contracts. The map uses decimal chain IDs as keys and
+    # 0x-prefixed 20-byte token addresses as values.
+    payment_purchase_db_path: str = "./state/payment_purchases_v2.db"
+    payment_evm_usdc_tokens: dict[str, str] = Field(default_factory=dict)
+    # External CCIP/Warp escrow is separately deployed from the ceremony EVM
+    # bridge. Token allowlisting alone must never activate this rail.
+    payment_omnichain_enabled: bool = False
+    payment_omnichain_preflight_evidence_path: Optional[str] = None
+    payment_omnichain_evidence_path: Optional[str] = None
+    payment_omnichain_activation_evidence_path: Optional[str] = None
+    payment_omnichain_governance_evidence_path: Optional[str] = None
+    payment_omnichain_samuel_evidence_path: Optional[str] = None
+    payment_omnichain_ownership_intent_evidence_path: Optional[str] = None
+    payment_omnichain_source_sha: Optional[str] = None
+    payment_omnichain_gateway_profile: Optional[str] = Field(
+        None, min_length=1, max_length=32
+    )
     # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
     zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
     # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).
