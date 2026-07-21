@@ -41,6 +41,7 @@ REQUIRED_SOURCE_SHAS = (
     "protocol",
     "evm",
     "api",
+    "legacyBackend",
     "customerWeb",
     "adminPortal",
 )
@@ -69,7 +70,7 @@ class DraftRequest(ApiModel):
     @classmethod
     def validate_source_shas(cls, value: dict[str, str]) -> dict[str, str]:
         if set(value) != set(REQUIRED_SOURCE_SHAS):
-            raise ValueError("sourceShas must contain all five frozen release commits")
+            raise ValueError("sourceShas must contain all six frozen release commits")
         normalized: dict[str, str] = {}
         for key in REQUIRED_SOURCE_SHAS:
             sha = value[key].lower()

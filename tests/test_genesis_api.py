@@ -50,7 +50,7 @@ def _headers() -> dict[str, str]:
 
 def _create_and_enroll(client: TestClient) -> tuple[str, list]:
     commits = {name: f"{index:x}" * 40 for index, name in enumerate(
-        ("protocol", "evm", "api", "customerWeb", "adminPortal"), start=1
+        ("protocol", "evm", "api", "legacyBackend", "customerWeb", "adminPortal"), start=1
     )}
     response = client.post(
         "/admin/genesis/drafts",
@@ -260,8 +260,9 @@ def test_operator_routes_require_ceremony_token(tmp_path) -> None:
                 "protocol": "1" * 40,
                 "evm": "2" * 40,
                 "api": "3" * 40,
-                "customerWeb": "4" * 40,
-                "adminPortal": "5" * 40,
+                "legacyBackend": "4" * 40,
+                "customerWeb": "5" * 40,
+                "adminPortal": "6" * 40,
             }
         },
     )
@@ -277,8 +278,9 @@ def test_draft_rejects_unknown_review_class(tmp_path) -> None:
                 "protocol": "1" * 40,
                 "evm": "2" * 40,
                 "api": "3" * 40,
-                "customerWeb": "4" * 40,
-                "adminPortal": "5" * 40,
+                "legacyBackend": "4" * 40,
+                "customerWeb": "5" * 40,
+                "adminPortal": "6" * 40,
             },
             "reviewClass": "self-approved-mainnet",
         },
