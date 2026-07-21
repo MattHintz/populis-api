@@ -53,6 +53,30 @@ def _require_hash(value: object, label: str) -> str:
     return value.lower()
 
 
+def _require_selector(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.isdigit() or int(value) <= 0:
+        raise OmnichainEvidenceError(f"Omnichain evidence {label} is invalid")
+    return value
+
+
+def _require_mapping(value: object, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OmnichainEvidenceError(f"Omnichain evidence {label} is invalid")
+    return value
+
+
+def _preflight_runtime_hash(
+    hashes: Mapping[str, Any], address: str, label: str
+) -> str:
+    normalized = _require_address(address, label)
+    for candidate, code_hash in hashes.items():
+        if _require_address(candidate, f"preflight.runtimeCodeHashes.{label}") == normalized:
+            return _require_hash(code_hash, f"preflight.runtimeCodeHashes.{label}")
+    raise OmnichainEvidenceError(
+        f"Omnichain preflight evidence is missing {label} runtime code"
+    )
+
+
 def _load_evidence(path_value: str | None, label: str) -> dict[str, Any]:
     if not path_value:
         raise OmnichainEvidenceError(f"Omnichain {label} evidence is not configured")
@@ -117,6 +141,64 @@ def load_omnichain_evidence(
     for name in ("ccipRouter", "gateway", "spoke", "usdc", "usdt"):
         _require_address(contracts.get(name), name)
         _require_hash(code_hashes.get(name), f"runtimeCodeHashes.{name}")
+    preflight = _load_evidence(
+        settings.payment_omnichain_preflight_evidence_path, "preflight"
+    )
+    if (
+        preflight.get("schemaVersion") != 1
+        or preflight.get("kind")
+        != "solslot-omnichain-testnet-deployment-preflight"
+        or preflight.get("sourceSha") != source_sha
+        or preflight.get("network") != evidence.get("network")
+        or preflight.get("chainId") != chain_id
+        or _require_selector(preflight.get("chainSelector"), "preflight.chainSelector")
+        != _require_selector(evidence.get("chainSelector"), "chainSelector")
+        or evidence.get("preflightArtifactHash") != preflight.get("artifactHash")
+    ):
+        raise OmnichainEvidenceError("Omnichain preflight evidence mismatches")
+    preflight_settings = _require_mapping(
+        preflight.get("settings"), "preflight.settings"
+    )
+    preflight_inspection = _require_mapping(
+        preflight.get("inspection"), "preflight.inspection"
+    )
+    preflight_decimals = _require_mapping(
+        preflight_inspection.get("tokenDecimals"), "preflight.tokenDecimals"
+    )
+    preflight_hashes = _require_mapping(
+        preflight_inspection.get("runtimeCodeHashes"),
+        "preflight.runtimeCodeHashes",
+    )
+    expected_preflight_addresses = {
+        "ccipRouter": contracts.get("ccipRouter"),
+        "payout": configuration.get("payoutAddress"),
+        "governance": configuration.get("governance"),
+        "usdc": contracts.get("usdc"),
+        "usdt": contracts.get("usdt"),
+    }
+    for name, address in expected_preflight_addresses.items():
+        if _require_address(preflight_settings.get(name), f"preflight.{name}") != _require_address(
+            address, name
+        ):
+            raise OmnichainEvidenceError(
+                "Omnichain preflight evidence contracts mismatch"
+            )
+    if (
+        preflight_settings.get("callbackGas") != configuration.get("callbackGas")
+        or preflight_settings.get("emergencyDelay")
+        != configuration.get("emergencyDelay")
+        or preflight_settings.get("confirmations") != evidence.get("confirmations")
+        or preflight_decimals.get("usdc") != 6
+        or preflight_decimals.get("usdt") != 6
+    ):
+        raise OmnichainEvidenceError("Omnichain preflight evidence settings mismatch")
+    for name in ("ccipRouter", "usdc", "usdt"):
+        if _preflight_runtime_hash(
+            preflight_hashes, str(contracts.get(name)), name
+        ) != _require_hash(code_hashes.get(name), f"runtimeCodeHashes.{name}"):
+            raise OmnichainEvidenceError(
+                "Omnichain preflight evidence runtime code mismatches"
+            )
     activation = _load_evidence(
         settings.payment_omnichain_activation_evidence_path, "activation"
     )

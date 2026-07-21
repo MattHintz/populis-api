@@ -152,7 +152,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         except OmnichainEvidenceError as exc:
             raise RuntimeError(
                 "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires valid reviewed "
-                f"deployment and activation evidence: {exc}"
+                f"preflight, deployment, and activation evidence: {exc}"
             ) from exc
 
     if settings.runtime_environment not in {"staging", "production"}:
@@ -635,6 +635,7 @@ class Settings(BaseSettings):
     # External CCIP/Warp escrow is separately deployed from the ceremony EVM
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False
+    payment_omnichain_preflight_evidence_path: Optional[str] = None
     payment_omnichain_evidence_path: Optional[str] = None
     payment_omnichain_activation_evidence_path: Optional[str] = None
     payment_omnichain_source_sha: Optional[str] = None

@@ -267,6 +267,16 @@ def _configure_external_quote(
     target_raise_minor: str = "5000000",
 ) -> None:
     monkeypatch.setenv("SOLSLOT_COLLECTION_METADATA_ENABLED", "true")
+    runtime_code_hashes = {
+        name: "0x" + value * 32
+        for name, value in {
+            "ccipRouter": "31",
+            "gateway": "32",
+            "spoke": "33",
+            "usdc": "34",
+            "usdt": "35",
+        }.items()
+    }
     evidence = {
         "schemaVersion": 1,
         "protocolVersion": "solslot-v2",
@@ -294,18 +304,53 @@ def _configure_external_quote(
         "deploymentTransactions": {
             "spoke": {"hash": "0x" + "21" * 32, "blockNumber": 1},
         },
-        "runtimeCodeHashes": {
-            name: "0x" + value * 32
-            for name, value in {
-                "ccipRouter": "31",
-                "gateway": "32",
-                "spoke": "33",
-                "usdc": "34",
-                "usdt": "35",
-            }.items()
-        },
+        "runtimeCodeHashes": runtime_code_hashes,
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
+    preflight = {
+        "schemaVersion": 1,
+        "kind": "solslot-omnichain-testnet-deployment-preflight",
+        "sourceSha": evidence["sourceSha"],
+        "network": evidence["network"],
+        "chainId": evidence["chainId"],
+        "chainSelector": evidence["chainSelector"],
+        "hubName": "baseSepolia",
+        "hubChainSelector": evidence["chainSelector"],
+        "deploymentMode": "new_gateway_and_spoke",
+        "settings": {
+            "ccipRouter": evidence["contracts"]["ccipRouter"],
+            "payout": evidence["configuration"]["payoutAddress"],
+            "governance": evidence["configuration"]["governance"],
+            "usdc": evidence["contracts"]["usdc"],
+            "usdt": evidence["contracts"]["usdt"],
+            "warpPortal": "0x" + "16" * 20,
+            "callbackGas": evidence["configuration"]["callbackGas"],
+            "emergencyDelay": evidence["configuration"]["emergencyDelay"],
+            "confirmations": evidence["confirmations"],
+        },
+        "inspection": {
+            "tokenDecimals": {"usdc": 6, "usdt": 6},
+            "runtimeCodeHashes": {
+                evidence["contracts"]["ccipRouter"]: runtime_code_hashes[
+                    "ccipRouter"
+                ],
+                evidence["contracts"]["usdc"]: runtime_code_hashes["usdc"],
+                evidence["contracts"]["usdt"]: runtime_code_hashes["usdt"],
+                evidence["configuration"]["governance"]: "0x" + "36" * 32,
+                "0x" + "16" * 20: "0x" + "37" * 32,
+            },
+        },
+        "checkedAt": "2026-07-20T00:00:00.000Z",
+    }
+    preflight_canonical = json.dumps(
+        preflight, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    preflight["artifactHash"] = "0x" + hashlib.sha256(
+        preflight_canonical
+    ).hexdigest()
+    preflight_path = tmp_path / "omnichain-preflight-evidence.json"
+    preflight_path.write_text(json.dumps(preflight), encoding="utf-8")
+    evidence["preflightArtifactHash"] = preflight["artifactHash"]
     canonical = json.dumps(
         evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
@@ -340,6 +385,7 @@ def _configure_external_quote(
     activation_path = tmp_path / "omnichain-activation-evidence.json"
     activation_path.write_text(json.dumps(activation), encoding="utf-8")
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "true")
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_PREFLIGHT_EVIDENCE_PATH", str(preflight_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH", str(deployment_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH", str(activation_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA", "a" * 40)
@@ -396,6 +442,36 @@ def test_evm_offer_requires_omnichain_activation_evidence(monkeypatch, tmp_path)
     monkeypatch.delenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH")
     get_settings.cache_clear()
     with pytest.raises(RuntimeError, match="activation evidence is not configured"):
+        validate_server_hardening_at_startup(get_settings())
+
+
+def test_evm_offer_requires_omnichain_preflight_evidence(monkeypatch, tmp_path):
+    _configure_external_quote(monkeypatch, tmp_path)
+    monkeypatch.delenv("SOLSLOT_PAYMENT_OMNICHAIN_PREFLIGHT_EVIDENCE_PATH")
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="preflight evidence is not configured"):
+        validate_server_hardening_at_startup(get_settings())
+
+
+def test_evm_offer_rejects_preflight_with_changed_token_parameters(
+    monkeypatch, tmp_path
+):
+    _configure_external_quote(monkeypatch, tmp_path)
+    path = tmp_path / "omnichain-preflight-evidence.json"
+    preflight = json.loads(path.read_text(encoding="utf-8"))
+    preflight["inspection"]["tokenDecimals"]["usdc"] = 18
+    preflight_without_hash = dict(preflight)
+    preflight_without_hash.pop("artifactHash")
+    canonical = json.dumps(
+        preflight_without_hash,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    preflight["artifactHash"] = "0x" + hashlib.sha256(canonical).hexdigest()
+    path.write_text(json.dumps(preflight), encoding="utf-8")
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="preflight evidence mismatches"):
         validate_server_hardening_at_startup(get_settings())
 
 
