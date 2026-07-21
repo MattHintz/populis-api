@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 
 import pytest
@@ -260,11 +261,61 @@ def _configure_native_quote(
 
 def _configure_external_quote(
     monkeypatch,
+    tmp_path,
     *,
     offering_currency: str = "USD",
     target_raise_minor: str = "5000000",
 ) -> None:
     monkeypatch.setenv("SOLSLOT_COLLECTION_METADATA_ENABLED", "true")
+    evidence = {
+        "schemaVersion": 1,
+        "protocolVersion": "solslot-v2",
+        "rail": "ccip-warp-escrow",
+        "sourceSha": "a" * 40,
+        "network": "baseSepolia",
+        "chainId": 84532,
+        "chainSelector": "10344971235874465080",
+        "confirmations": 12,
+        "contracts": {
+            "ccipRouter": "0x" + "11" * 20,
+            "gateway": "0x" + "12" * 20,
+            "spoke": "0x" + "13" * 20,
+            "usdc": "0x" + "ab" * 20,
+            "usdt": "0x" + "ac" * 20,
+        },
+        "configuration": {
+            "hubChainSelector": "10344971235874465080",
+            "callbackGas": "500000",
+            "emergencyDelay": "604800",
+            "payoutAddress": "0x" + "14" * 20,
+            "governance": "0x" + "15" * 20,
+            "ownershipAccepted": True,
+        },
+        "deploymentTransactions": {
+            "spoke": {"hash": "0x" + "21" * 32, "blockNumber": 1},
+        },
+        "runtimeCodeHashes": {
+            name: "0x" + value * 32
+            for name, value in {
+                "ccipRouter": "31",
+                "gateway": "32",
+                "spoke": "33",
+                "usdc": "34",
+                "usdt": "35",
+            }.items()
+        },
+        "createdAt": "2026-07-20T00:00:00.000Z",
+    }
+    canonical = json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    evidence["artifactHash"] = "0x" + hashlib.sha256(canonical).hexdigest()
+    path = tmp_path / "omnichain-evidence.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "true")
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH", str(path))
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA", "a" * 40)
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE", "bse")
     monkeypatch.setenv(
         "SOLSLOT_PAYMENT_EVM_USDC_TOKENS",
         json.dumps(
@@ -289,6 +340,51 @@ def _configure_external_quote(
         lambda _settings: Store(),
     )
     get_settings.cache_clear()
+
+
+def test_evm_offer_requires_reviewed_omnichain_evidence(monkeypatch, tmp_path):
+    _configure_external_quote(monkeypatch, tmp_path)
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "false")
+    get_settings.cache_clear()
+    now = int(time.time())
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(
+                rail="base_usdc",
+                purchase_intent_id="pi_omnichain_disabled",
+                expires_at=now + 900,
+                authorization_nonce="0x" + "18" * 32,
+                authorization_expires_at=now + 1200,
+                payment_terms={"currency": "USDC", "quantity": 1, "chain_id": 84532},
+            ),
+        )
+    assert response.status_code == 503
+    assert "Omnichain payments are disabled" in response.text
+
+
+def test_evm_offer_rejects_tampered_omnichain_evidence(monkeypatch, tmp_path):
+    _configure_external_quote(monkeypatch, tmp_path)
+    path = tmp_path / "omnichain-evidence.json"
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    evidence["sourceSha"] = "b" * 40
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    get_settings.cache_clear()
+    now = int(time.time())
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(
+                rail="base_usdc",
+                purchase_intent_id="pi_omnichain_tampered",
+                expires_at=now + 900,
+                authorization_nonce="0x" + "17" * 32,
+                authorization_expires_at=now + 1200,
+                payment_terms={"currency": "USDC", "quantity": 1, "chain_id": 84532},
+            ),
+        )
+    assert response.status_code == 503
+    assert "evidence hash mismatches" in response.text
 
 
 def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
@@ -366,8 +462,9 @@ def test_builds_native_xch_offer_from_server_authorized_quote(
 
 def test_quote_price_uses_target_raise_share_not_chia_par_value(
     monkeypatch,
+    tmp_path,
 ):
-    _configure_external_quote(monkeypatch)
+    _configure_external_quote(monkeypatch, tmp_path)
     now = int(time.time())
     with TestClient(app) as client:
         built = client.post(
@@ -404,12 +501,14 @@ def test_quote_price_uses_target_raise_share_not_chia_par_value(
 )
 def test_quote_rejects_ambiguous_sealed_usd_price(
     monkeypatch,
+    tmp_path,
     currency,
     target_raise,
     message,
 ):
     _configure_external_quote(
         monkeypatch,
+        tmp_path,
         offering_currency=currency,
         target_raise_minor=target_raise,
     )
@@ -457,7 +556,7 @@ def test_verify_rejects_tampered_or_expired_artifact(monkeypatch, tmp_path):
 
 def test_evm_finalization_waits_for_authenticated_relay_message(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
-    _configure_external_quote(monkeypatch)
+    _configure_external_quote(monkeypatch, tmp_path)
     now = int(time.time())
     with TestClient(app) as client:
         built = client.post(
@@ -499,7 +598,7 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
     monkeypatch,
     tmp_path,
 ):
-    _configure_external_quote(monkeypatch)
+    _configure_external_quote(monkeypatch, tmp_path)
     now = int(time.time())
     with TestClient(app) as client:
         built_response = client.post(
@@ -565,6 +664,27 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         assert finalized.status_code == 200, finalized.text
         assert finalized.json()["verified"] is True
 
+        monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "false")
+        get_settings.cache_clear()
+        disabled = client.post(
+            "/protocol/purchase-finalizations/verify",
+            json={
+                "artifact": built["artifact"],
+                "artifact_hash": built["artifact_hash"],
+                "rail": "base_usdc",
+                "purchase_intent_id": "pi_bridge_bound",
+                "payment_evidence": {
+                    "tx_hash": "0x" + "ab" * 32,
+                    "global_payment_id": message["globalPaymentId"],
+                },
+            },
+        )
+        assert disabled.status_code == 200, disabled.text
+        assert disabled.json()["verified"] is False
+        assert "external_escrow_evidence_unavailable" in disabled.json()["reasons"]
+
+        monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "true")
+        get_settings.cache_clear()
         replay = client.post(
             "/protocol/external-payments/verify",
             json={
@@ -578,7 +698,7 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
 
 def test_finalization_accepts_stripe_checkout_or_payment_intent_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
-    _configure_external_quote(monkeypatch)
+    _configure_external_quote(monkeypatch, tmp_path)
     now = int(time.time())
     with TestClient(app) as client:
         built = client.post(

@@ -47,6 +47,7 @@ from .payment_purchase_store import (
     PaymentPurchaseNotFound,
     get_payment_purchase_store,
 )
+from .omnichain_evidence import OmnichainEvidenceError, load_omnichain_evidence
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
@@ -324,11 +325,33 @@ async def build_protocol_offer_artifact(
             detail="The requested genesis artifact is not the active signed artifact.",
         )
     try:
+        if body.rail in {"base_usdc", "evm_usdc"}:
+            chain_id = body.payment_terms.chain_id
+            if chain_id is None and body.rail == "base_usdc":
+                chain_id = 84532
+            token_address = (
+                settings.payment_evm_usdc_tokens.get(str(chain_id))
+                if chain_id is not None
+                else None
+            )
+            if token_address is None:
+                raise OmnichainEvidenceError("EVM chain is not enabled for protocol purchases")
+            load_omnichain_evidence(
+                settings,
+                chain_id=chain_id,
+                token_address=token_address,
+                gateway_profile=str(settings.payment_omnichain_gateway_profile or ""),
+            )
         canonical_payment = _build_canonical_payment_artifact(
             body,
             settings,
             vault_launcher_id=vault_launcher_id,
         )
+    except OmnichainEvidenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except (PaymentArtifactError, PaymentQuoteError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -467,11 +490,28 @@ async def verify_purchase_finalization(
             message = stored.external_message
             if message is None:
                 reasons.append("external_message_not_verified")
-            elif (
-                body.payment_evidence.get("global_payment_id")
-                != message.get("globalPaymentId")
-            ):
-                reasons.append("external_global_payment_mismatch")
+            else:
+                token_address = settings.payment_evm_usdc_tokens.get(
+                    str(canonical.rail_chain_id)
+                )
+                gateway_profile = message.get("gatewayProfile")
+                if token_address is None or not isinstance(gateway_profile, str):
+                    reasons.append("external_escrow_evidence_unavailable")
+                else:
+                    try:
+                        load_omnichain_evidence(
+                            settings,
+                            chain_id=canonical.rail_chain_id,
+                            token_address=token_address,
+                            gateway_profile=gateway_profile,
+                        )
+                    except OmnichainEvidenceError:
+                        reasons.append("external_escrow_evidence_unavailable")
+                if (
+                    body.payment_evidence.get("global_payment_id")
+                    != message.get("globalPaymentId")
+                ):
+                    reasons.append("external_global_payment_mismatch")
     return VerifyPurchaseFinalizationResponse(
         verified=not reasons,
         artifact_hash=content_hash(body.artifact),
@@ -550,6 +590,24 @@ async def verify_external_escrow(
     except PaymentArtifactError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    token_address = settings.payment_evm_usdc_tokens.get(str(canonical.rail_chain_id))
+    if token_address is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="EVM chain is not enabled for protocol purchases",
+        )
+    try:
+        load_omnichain_evidence(
+            settings,
+            chain_id=canonical.rail_chain_id,
+            token_address=token_address,
+            gateway_profile=normalized["gatewayProfile"],
+        )
+    except OmnichainEvidenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
     expected = {

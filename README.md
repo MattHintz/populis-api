@@ -39,6 +39,13 @@ share allocation, or delivery address.
   allowlist.
 - `SOLSLOT_PAYMENT_EVM_USDC_TOKENS` maps an EVM chain ID to its reviewed
   six-decimal test stablecoin contract.
+- `SOLSLOT_PAYMENT_OMNICHAIN_ENABLED` remains false until the separately
+  deployed CCIP/Warp rail is approved. Enabling it also requires
+  `SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA`, and
+  `SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE`; the API verifies the evidence
+  hash, source SHA, chain, token, gateway profile, runtime-code descriptors,
+  and accepted governance ownership before it quotes or finalizes an EVM buy.
 - `SOLSLOT_PAYMENT_PURCHASE_DB_PATH` is the coordinator-owned SQLite-WAL
   purchase and replay ledger.
 - `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase

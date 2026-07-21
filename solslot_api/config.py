@@ -597,6 +597,14 @@ class Settings(BaseSettings):
     # 0x-prefixed 20-byte token addresses as values.
     payment_purchase_db_path: str = "./state/payment_purchases_v2.db"
     payment_evm_usdc_tokens: dict[str, str] = Field(default_factory=dict)
+    # External CCIP/Warp escrow is separately deployed from the ceremony EVM
+    # bridge. Token allowlisting alone must never activate this rail.
+    payment_omnichain_enabled: bool = False
+    payment_omnichain_evidence_path: Optional[str] = None
+    payment_omnichain_source_sha: Optional[str] = None
+    payment_omnichain_gateway_profile: Optional[str] = Field(
+        None, min_length=1, max_length=32
+    )
     # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
     zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
     # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).
