@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from solslot_api.app import app
-from solslot_api.config import get_settings
+from solslot_api.config import get_settings, validate_server_hardening_at_startup
 from solslot_api.payment_quotes import SNAPSHOT_SCHEMA
 from solslot_puzzles.payment_artifacts_v2 import (
     OracleObservationV1,
@@ -395,21 +395,8 @@ def test_evm_offer_requires_omnichain_activation_evidence(monkeypatch, tmp_path)
     _configure_external_quote(monkeypatch, tmp_path)
     monkeypatch.delenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH")
     get_settings.cache_clear()
-    now = int(time.time())
-    with TestClient(app) as client:
-        response = client.post(
-            "/protocol/offer-artifacts",
-            json=_request(
-                rail="base_usdc",
-                purchase_intent_id="pi_omnichain_no_activation",
-                expires_at=now + 900,
-                authorization_nonce="0x" + "16" * 32,
-                authorization_expires_at=now + 1200,
-                payment_terms={"currency": "USDC", "quantity": 1, "chain_id": 84532},
-            ),
-        )
-    assert response.status_code == 503
-    assert "activation evidence is not configured" in response.text
+    with pytest.raises(RuntimeError, match="activation evidence is not configured"):
+        validate_server_hardening_at_startup(get_settings())
 
 
 def test_evm_offer_rejects_tampered_omnichain_evidence(monkeypatch, tmp_path):
@@ -419,21 +406,8 @@ def test_evm_offer_rejects_tampered_omnichain_evidence(monkeypatch, tmp_path):
     evidence["sourceSha"] = "b" * 40
     path.write_text(json.dumps(evidence), encoding="utf-8")
     get_settings.cache_clear()
-    now = int(time.time())
-    with TestClient(app) as client:
-        response = client.post(
-            "/protocol/offer-artifacts",
-            json=_request(
-                rail="base_usdc",
-                purchase_intent_id="pi_omnichain_tampered",
-                expires_at=now + 900,
-                authorization_nonce="0x" + "17" * 32,
-                authorization_expires_at=now + 1200,
-                payment_terms={"currency": "USDC", "quantity": 1, "chain_id": 84532},
-            ),
-        )
-    assert response.status_code == 503
-    assert "evidence hash mismatches" in response.text
+    with pytest.raises(RuntimeError, match="deployment evidence hash mismatches"):
+        validate_server_hardening_at_startup(get_settings())
 
 
 def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):

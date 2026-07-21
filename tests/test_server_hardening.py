@@ -80,6 +80,18 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
 
 
+def test_omnichain_enablement_requires_reviewed_evidence_at_startup() -> None:
+    with pytest.raises(RuntimeError, match="requires valid reviewed"):
+        validate_server_hardening_at_startup(
+            _staging(
+                payment_omnichain_enabled=True,
+                payment_evm_usdc_tokens={"84532": "0x" + "ab" * 20},
+                payment_omnichain_source_sha="a" * 40,
+                payment_omnichain_gateway_profile="bse",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

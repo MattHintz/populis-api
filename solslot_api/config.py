@@ -120,6 +120,41 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "KoS MINT execute signing requires CA, client certificate, and client key paths."
             )
 
+    if settings.payment_omnichain_enabled:
+        if len(settings.payment_evm_usdc_tokens) != 1:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires exactly one "
+                "SOLSLOT_PAYMENT_EVM_USDC_TOKENS chain binding."
+            )
+        chain_id_raw, token_address = next(
+            iter(settings.payment_evm_usdc_tokens.items())
+        )
+        try:
+            chain_id = int(chain_id_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_EVM_USDC_TOKENS must use a decimal chain ID."
+            ) from exc
+        from .omnichain_evidence import (
+            OmnichainEvidenceError,
+            load_omnichain_evidence,
+        )
+
+        try:
+            load_omnichain_evidence(
+                settings,
+                chain_id=chain_id,
+                token_address=token_address,
+                gateway_profile=str(
+                    settings.payment_omnichain_gateway_profile or ""
+                ),
+            )
+        except OmnichainEvidenceError as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires valid reviewed "
+                f"deployment and activation evidence: {exc}"
+            ) from exc
+
     if settings.runtime_environment not in {"staging", "production"}:
         return
     if settings.collection_metadata_enabled:
