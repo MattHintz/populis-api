@@ -7,6 +7,7 @@ import time
 import pytest
 from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
+from eth_utils import keccak
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -284,12 +285,12 @@ def _configure_external_quote(
             "gateway": "32",
             "spoke": "33",
             "usdc": "34",
-            "governanceSafe": "35",
+            "governanceRootSafe": "35",
             "governanceTimelock": "36",
         }.items()
     }
     evidence = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "protocolVersion": "solslot-v2",
         "rail": "ccip-warp-escrow",
         "sourceSha": "a" * 40,
@@ -310,7 +311,7 @@ def _configure_external_quote(
             "callbackGas": "500000",
             "emergencyDelay": "604800",
             "payoutAddress": "0x" + "14" * 20,
-            "governanceSafe": "0x" + "14" * 20,
+            "governanceRootSafe": "0x" + "14" * 20,
             "governanceTimelock": "0x" + "15" * 20,
             "ownershipAccepted": False,
         },
@@ -333,30 +334,85 @@ def _configure_external_quote(
         "runtimeCodeHashes": runtime_code_hashes,
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
+    owner_safe = "0x" + "41" * 20
+    coadmin_safe = "0x" + "42" * 20
+    owner_address = "0x" + "51" * 20
+    coadmin_addresses = ["0x" + value * 20 for value in ("52", "53")]
+    guardian_address = "0x" + "54" * 20
+    bls_guardian_pubkey = "0x" + "81" * 48
     governance = {
-        "schemaVersion": 1,
-        "kind": "solslot-alpha-safe-timelock-deployment",
+        "schemaVersion": 2,
+        "kind": "solslot-alpha-owner-required-governance-deployment",
+        "authorityRule": "slot0_and_one_of_slot1_slot2",
         "sourceSha": evidence["sourceSha"],
         "network": "baseSepolia",
         "chainId": 84532,
         "rosterArtifactHash": "0x" + "41" * 32,
-        "safe": {
-            "address": evidence["configuration"]["governanceSafe"],
-            "owners": ["0x" + value * 20 for value in ("51", "52", "53")],
-            "threshold": 2,
+        "administrators": [
+            {"slot": 1, "address": owner_address},
+            {"slot": 2, "address": coadmin_addresses[0]},
+            {"slot": 3, "address": coadmin_addresses[1]},
+        ],
+        "safes": {
+            "ownerIdentity": {
+                "address": owner_safe,
+                "owners": [owner_address],
+                "threshold": 1,
+                "guard": "0x" + "46" * 20,
+            },
+            "coadmin": {
+                "address": coadmin_safe,
+                "owners": coadmin_addresses,
+                "threshold": 1,
+                "guard": "0x" + "4a" * 20,
+            },
+            "root": {
+                "address": evidence["configuration"]["governanceRootSafe"],
+                "owners": [owner_safe, coadmin_safe],
+                "threshold": 2,
+                "guard": "0x" + "4b" * 20,
+            },
         },
         "timelock": {
             "address": evidence["configuration"]["governanceTimelock"],
             "minimumDelaySeconds": "86400",
-            "proposer": evidence["configuration"]["governanceSafe"],
-            "executor": evidence["configuration"]["governanceSafe"],
+            "proposer": evidence["configuration"]["governanceRootSafe"],
+            "executor": evidence["configuration"]["governanceRootSafe"],
+            "canceller": evidence["configuration"]["governanceRootSafe"],
             "externalAdmin": "0x" + "00" * 20,
         },
-        "payoutAddress": evidence["configuration"]["governanceSafe"],
+        "payoutAddress": evidence["configuration"]["governanceRootSafe"],
+        "recovery": {
+            "address": "0x" + "45" * 20,
+            "ownerGuard": "0x" + "46" * 20,
+            "secp256k1Guardian": guardian_address,
+            "blsGuardianPubkey": bls_guardian_pubkey,
+            "blsGuardianCommitment": "0x" + keccak(
+                bytes.fromhex(bls_guardian_pubkey[2:])
+            ).hex(),
+            "coadmins": coadmin_addresses,
+            "delaySeconds": "604800",
+            "replacementAcceptanceRequired": True,
+        },
+        "safeInfrastructure": {
+            "safeVersion": "1.4.1",
+            "compatibilityFallbackHandler": "0x" + "48" * 20,
+            "signMessageLibrary": "0x" + "49" * 20,
+            "ownerSetup": "0x" + "47" * 20,
+        },
         "deploymentTransactions": {},
         "runtimeCodeHashes": {
-            "safe": runtime_code_hashes["governanceSafe"],
+            "ownerIdentitySafe": "0x" + "61" * 32,
+            "coadminSafe": "0x" + "62" * 32,
+            "rootSafe": runtime_code_hashes["governanceRootSafe"],
             "timelock": runtime_code_hashes["governanceTimelock"],
+            "recovery": "0x" + "63" * 32,
+            "ownerGuard": "0x" + "64" * 32,
+            "coadminGuard": "0x" + "68" * 32,
+            "rootGuard": "0x" + "69" * 32,
+            "ownerSetup": "0x" + "65" * 32,
+            "compatibilityFallbackHandler": "0x" + "66" * 32,
+            "signMessageLibrary": "0x" + "67" * 32,
         },
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
@@ -397,7 +453,7 @@ def _configure_external_quote(
     samuel_path.write_text(json.dumps(samuel), encoding="utf-8")
     evidence["samuelCoordinateArtifactHash"] = samuel["artifactHash"]
     preflight = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "kind": "solslot-omnichain-testnet-deployment-preflight",
         "sourceSha": evidence["sourceSha"],
         "network": evidence["network"],
@@ -414,7 +470,7 @@ def _configure_external_quote(
             "ccipRouter": evidence["contracts"]["ccipRouter"],
             "payout": evidence["configuration"]["payoutAddress"],
             "governance": evidence["configuration"]["governanceTimelock"],
-            "safe": evidence["configuration"]["governanceSafe"],
+            "rootSafe": evidence["configuration"]["governanceRootSafe"],
             "usdc": evidence["contracts"]["usdc"],
             "warpPortal": "0x" + "16" * 20,
             "callbackGas": evidence["configuration"]["callbackGas"],
@@ -428,8 +484,8 @@ def _configure_external_quote(
                     "ccipRouter"
                 ],
                 evidence["contracts"]["usdc"]: runtime_code_hashes["usdc"],
-                evidence["configuration"]["governanceSafe"]: runtime_code_hashes[
-                    "governanceSafe"
+                evidence["configuration"]["governanceRootSafe"]: runtime_code_hashes[
+                    "governanceRootSafe"
                 ],
                 evidence["configuration"]["governanceTimelock"]: runtime_code_hashes[
                     "governanceTimelock"
@@ -455,12 +511,12 @@ def _configure_external_quote(
     deployment_path = tmp_path / "omnichain-deployment-evidence.json"
     deployment_path.write_text(json.dumps(evidence), encoding="utf-8")
     ownership_intent = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "solslot-omnichain-ownership-activation-intent",
         "deploymentArtifactHash": evidence["artifactHash"],
         "network": evidence["network"],
         "chainId": evidence["chainId"],
-        "safe": evidence["configuration"]["governanceSafe"],
+        "rootSafe": evidence["configuration"]["governanceRootSafe"],
         "timelock": evidence["configuration"]["governanceTimelock"],
         "operationId": "0x" + "44" * 32,
         "minimumDelaySeconds": "86400",
@@ -481,7 +537,7 @@ def _configure_external_quote(
     ownership_path = tmp_path / "omnichain-ownership-intent.json"
     ownership_path.write_text(json.dumps(ownership_intent), encoding="utf-8")
     activation = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "kind": "ccip-warp-escrow-activation",
         "deploymentArtifactHash": evidence["artifactHash"],
         "ownershipOperationArtifactHash": ownership_intent["artifactHash"],
@@ -496,7 +552,7 @@ def _configure_external_quote(
             name: evidence["runtimeCodeHashes"][name] for name in ("gateway", "spoke")
         },
         "governance": evidence["configuration"]["governanceTimelock"],
-        "governanceSafe": evidence["configuration"]["governanceSafe"],
+        "governanceRootSafe": evidence["configuration"]["governanceRootSafe"],
         "observedOwners": {
             name: evidence["configuration"]["governanceTimelock"]
             for name in ("gateway", "spoke")
@@ -653,10 +709,25 @@ def _reseal_evidence(path, mutate):
         ),
         (
             "omnichain-governance-evidence.json",
-            lambda value: value["safe"]["owners"].__setitem__(
-                2, value["safe"]["owners"][0]
+            lambda value: value["safes"]["coadmin"]["owners"].__setitem__(
+                1, value["safes"]["coadmin"]["owners"][0]
             ),
             "governance evidence mismatches",
+        ),
+        (
+            "omnichain-governance-evidence.json",
+            lambda value: value.update(
+                schemaVersion=1,
+                kind="solslot-alpha-safe-timelock-deployment",
+            ),
+            "governance evidence mismatches",
+        ),
+        (
+            "omnichain-governance-evidence.json",
+            lambda value: value["recovery"].update(
+                blsGuardianPubkey="0x" + "00" * 48
+            ),
+            "BLS recovery key is invalid",
         ),
         (
             "omnichain-governance-evidence.json",
