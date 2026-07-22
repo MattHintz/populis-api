@@ -12,7 +12,7 @@ from typing import Annotated, Iterator, Literal, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field, model_validator
 
-from .admin_auth import require_admin_jwt
+from .admin_operations import require_admin_operation
 from .config import Settings, get_settings
 from .credential_auth import require_minting_writes
 
@@ -210,7 +210,14 @@ def response_or_404(call):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("", status_code=201, dependencies=[Depends(require_admin_jwt), Depends(require_minting_writes)])
+@router.post(
+    "",
+    status_code=201,
+    dependencies=[
+        Depends(require_admin_operation("presale.create")),
+        Depends(require_minting_writes),
+    ],
+)
 def create_presale(terms: PresaleTermsRequest, store: Annotated[PresaleStore, Depends(get_presale_store)]) -> dict:
     return response_or_404(lambda: store.create(terms))
 
@@ -268,6 +275,12 @@ def ingest_voucher_refund_evidence(
     return response_or_404(lambda: store.refund(terms_hash, serial, chain_evidence_id))
 
 
-@router.post("/{terms_hash}/launch", dependencies=[Depends(require_admin_jwt), Depends(require_minting_writes)])
+@router.post(
+    "/{terms_hash}/launch",
+    dependencies=[
+        Depends(require_admin_operation("presale.launch")),
+        Depends(require_minting_writes),
+    ],
+)
 def launch_presale(terms_hash: str, request: LaunchRequest, store: Annotated[PresaleStore, Depends(get_presale_store)]) -> dict:
     return response_or_404(lambda: store.launch(terms_hash, request))

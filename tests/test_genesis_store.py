@@ -93,7 +93,7 @@ def test_roster_cannot_freeze_early_or_reuse_wallet(tmp_path) -> None:
         )
 
 
-def test_exactly_two_plan_signatures_unlock_broadcast(tmp_path) -> None:
+def test_owner_plus_one_plan_signatures_unlock_broadcast(tmp_path) -> None:
     store = _planned_store(tmp_path)
     one = store.add_plan_signature(
         CEREMONY,
@@ -129,6 +129,27 @@ def test_exactly_two_plan_signatures_unlock_broadcast(tmp_path) -> None:
         now=133,
     )
     assert broadcast["state"] == "broadcast"
+
+
+def test_two_coadmins_cannot_approve_plan_without_owner(tmp_path) -> None:
+    store = _planned_store(tmp_path)
+    for slot in (2, 3):
+        result = store.add_plan_signature(
+            CEREMONY,
+            slot=slot,
+            plan_hash=PLAN,
+            compressed_pubkey="0x" + f"{slot:02x}" * 33,
+            signature="0x" + f"{slot:02x}" * 65,
+            now=130 + slot,
+        )
+    assert result["state"] == "planned"
+    with pytest.raises(GenesisConflict, match="expected plan_approved"):
+        store.mark_broadcast(
+            CEREMONY,
+            spend_bundle_id="0x" + "55" * 32,
+            response={"success": True},
+            now=140,
+        )
 
 
 def test_expired_plan_and_mutated_hash_fail_closed(tmp_path) -> None:
@@ -197,3 +218,41 @@ def test_artifact_requires_two_roster_signatures_before_lock(tmp_path) -> None:
         now=172,
     )
     assert store.mark_locked(CEREMONY, now=173)["state"] == "locked"
+
+
+def test_two_coadmins_cannot_sign_artifact_without_owner(tmp_path) -> None:
+    store = _planned_store(tmp_path)
+    for slot in (1, 2):
+        store.add_plan_signature(
+            CEREMONY,
+            slot=slot,
+            plan_hash=PLAN,
+            compressed_pubkey="0x" + f"{slot:02x}" * 33,
+            signature="0x" + f"{slot:02x}" * 65,
+            now=130 + slot,
+        )
+    store.mark_broadcast(
+        CEREMONY,
+        spend_bundle_id="0x" + "55" * 32,
+        response={"success": True},
+        now=140,
+    )
+    store.mark_confirmed(CEREMONY, confirmed_block_index=500, now=150)
+    store.set_artifact(
+        CEREMONY,
+        artifact={"artifactHash": ARTIFACT},
+        artifact_hash=ARTIFACT,
+        now=160,
+    )
+    for slot in (2, 3):
+        result = store.add_artifact_signature(
+            CEREMONY,
+            slot=slot,
+            artifact_hash=ARTIFACT,
+            compressed_pubkey="0x" + f"{slot:02x}" * 33,
+            signature="0x" + f"{slot:02x}" * 65,
+            now=170 + slot,
+        )
+    assert result["state"] == "artifact_pending"
+    with pytest.raises(GenesisConflict, match="expected artifact_signed"):
+        store.mark_locked(CEREMONY, now=180)

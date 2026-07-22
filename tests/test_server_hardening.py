@@ -56,6 +56,7 @@ def _staging(**overrides: object) -> Settings:
         "trusted_proxy_cidrs": "203.0.113.0/24,2001:db8:1234::/48",
         "cors_origins": "https://staging.solslot.com",
         "alpha_writes_enabled": False,
+        "admin_operation_approvals_enabled": True,
         "vault_session_jwt_secret": "v" * 32,
         "minting_enabled": False,
         "zkpassport_validator_urls": [
@@ -78,6 +79,13 @@ def _staging(**overrides: object) -> Settings:
 
 def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
+
+
+def test_staging_rejects_disabled_owner_plus_one_approvals() -> None:
+    with pytest.raises(RuntimeError, match="ADMIN_OPERATION_APPROVALS_ENABLED"):
+        validate_server_hardening_at_startup(
+            _staging(admin_operation_approvals_enabled=False)
+        )
 
 
 def test_omnichain_enablement_requires_reviewed_evidence_at_startup() -> None:

@@ -36,6 +36,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 from .admin_auth import AdminClaims, require_admin_jwt
+from .admin_operations import require_admin_operation
 from .config import Settings, get_settings
 from .coinset_client import CoinsetClient
 from .collection_store import (
@@ -289,7 +290,10 @@ async def get_mint_proposal(
 @router.post(
     "/admin/mint/{proposal_id}/cancel",
     response_model=dict[str, Any],
-    dependencies=[Depends(require_admin_jwt), Depends(require_mint_writes)],
+    dependencies=[
+        Depends(require_admin_operation("mint.cancel")),
+        Depends(require_mint_writes),
+    ],
 )
 async def cancel_mint_proposal(
     proposal_id: str,
@@ -877,7 +881,10 @@ async def _execute_mint_bundle(
 @router.post(
     "/admin/mint/{proposal_id}/publish",
     response_model=dict[str, Any],
-    dependencies=[Depends(require_admin_jwt), Depends(require_mint_writes)],
+    dependencies=[
+        Depends(require_admin_operation("mint.publish")),
+        Depends(require_mint_writes),
+    ],
 )
 async def publish_mint_proposal(
     proposal_id: str,
@@ -901,7 +908,10 @@ async def publish_mint_proposal(
 @router.post(
     "/admin/mint/{proposal_id}/execute",
     response_model=dict[str, Any],
-    dependencies=[Depends(require_admin_jwt), Depends(require_mint_writes)],
+    dependencies=[
+        Depends(require_admin_operation("mint.execute")),
+        Depends(require_mint_writes),
+    ],
 )
 async def execute_mint_proposal(
     proposal_id: str,
@@ -935,7 +945,10 @@ async def execute_mint_proposal(
 @router.post(
     "/admin/committee/propose",
     response_model=dict[str, Any],
-    dependencies=[Depends(require_admin_jwt), Depends(require_mint_writes)],
+    dependencies=[
+        Depends(require_admin_operation("mint.publish")),
+        Depends(require_mint_writes),
+    ],
 )
 async def committee_propose_mint(
     body: PublishMintBundleRequest,
@@ -960,7 +973,10 @@ async def committee_propose_mint(
 @router.post(
     "/admin/committee/execute",
     response_model=dict[str, Any],
-    dependencies=[Depends(require_admin_jwt), Depends(require_mint_writes)],
+    dependencies=[
+        Depends(require_admin_operation("mint.execute")),
+        Depends(require_mint_writes),
+    ],
 )
 async def committee_execute_mint(
     body: ExecuteMintBundleRequest,

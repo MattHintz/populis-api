@@ -17,6 +17,18 @@ Administrator login is EIP-712 `SolslotAdminLogin`, domain
 issue time, auth type, and scope. The server recovers the signer and checks a
 hash-verified V2 records file. JWT membership is rechecked on every request.
 
+The JWT identifies an administrator; it does not authorize a consequential
+mutation. Sealing, amendments, mint publication/execution/cancellation,
+presale creation/launch, and bridge replenishment require an
+`AdminOperationEnvelopeV1` signed by permanent slot 0 and either slot 1 or slot
+2. The envelope binds the authority launcher, network, operation, exact HTTP
+request hash, resource revision, random nonce, and expiry. The approved request
+is single-use, and the executing JWT subject must be one of its signers.
+
+Draft edits, uploads, comments, and deterministic previews remain collaborative
+JWT operations. Public SGT votes carry their own on-chain authority and do not
+require an administrator envelope.
+
 Bootstrap cookies, ceremony bearer tokens, browser state, and unverified
 environment lists cannot authorize the desk.
 
@@ -49,8 +61,9 @@ approved proposal, bypass committee signatures, or substitute coordinates.
 
 ## Route Families
 
-- `/admin/auth/*`: challenge, login, refresh, and public authority snapshot.
-- `/admin/mint/*`: chain-admin-authenticated proposal lifecycle.
+- `/admin/auth/*`: challenge, login, refresh, authority snapshot, and
+  owner-plus-one operation preparation/signing.
+- `/admin/mint/*`: collaborative drafts plus owner-plus-one lifecycle actions.
 - `/admin/committee/*`: committee reads and signed votes.
 - `/admin/bootstrap/*`: run-once ceremony session and lock.
 - `/admin/zkpassport/bridge-pool/top-up`: chain-admin-authenticated bridge
@@ -63,6 +76,7 @@ authority launcher, admin subject, and write-gate state before any mutation.
 Buttons stay disabled when coordinates are missing, the ceremony is unlocked,
 the API release differs from the signed bundle, or minting is off.
 
-Every transaction preview identifies what will be signed, which chain receives
-it, and the resulting launcher or coin. Success appears only after the
-authoritative chain confirms the expected state.
+Every transaction preview identifies the exact request hash, authority,
+network, revision, nonce, expiry, and current signer slots, as well as which
+chain receives the action and the resulting launcher or coin. Success appears
+only after owner-plus-one approval and authoritative chain confirmation.

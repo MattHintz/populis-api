@@ -158,6 +158,10 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
+    if not settings.admin_operation_approvals_enabled:
+        raise RuntimeError(
+            "SOLSLOT_ADMIN_OPERATION_APPROVALS_ENABLED must be true in staging/production."
+        )
     if settings.collection_metadata_enabled:
         required_collection_settings = {
             "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
@@ -749,6 +753,11 @@ class Settings(BaseSettings):
     # generated; that's fine for local dev but means tokens don't survive
     # restart.  In production, set this explicitly.
     admin_jwt_secret: str = ""
+
+    # Consequential post-genesis mutations require a persistent operation
+    # envelope signed by slot 0 and one of slots 1/2. This may be disabled
+    # only in explicit development/test fixtures.
+    admin_operation_approvals_enabled: bool = True
 
     # Lifetime (seconds) of an admin JWT.  Default 15 minutes.  Refresh via
     # /admin/auth/refresh while the session is active.

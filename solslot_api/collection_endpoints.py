@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .admin_auth import AdminClaims, require_admin_jwt
+from .admin_operations import require_admin_operation
 from .collection_media import (
     CollectionMediaPipeline,
     MediaPipelineUnavailable,
@@ -248,7 +249,10 @@ async def collection_readiness(
 
 @router.post(
     "/admin/collections/{collection_id}/seal",
-    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+    dependencies=[
+        Depends(require_admin_operation("collection.seal")),
+        Depends(require_collection_metadata),
+    ],
 )
 async def seal_collection(
     collection_id: str,
@@ -406,7 +410,10 @@ async def resolve_collection_comment(
 
 @router.post(
     "/admin/collections/{collection_id}/amendments",
-    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+    dependencies=[
+        Depends(require_admin_operation("collection.amend")),
+        Depends(require_collection_metadata),
+    ],
 )
 async def append_collection_amendment(
     collection_id: str,

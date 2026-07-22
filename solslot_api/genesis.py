@@ -677,8 +677,10 @@ def _internal_review_approval(
         record.get("plan_signatures") or [], key=lambda item: int(item.get("slot", 0))
     )
     signer_slots = [int(item.get("slot", 0)) for item in plan_signatures]
-    if len(set(signer_slots)) < 2:
-        raise GenesisConflict("internal testnet review requires two administrator signatures")
+    if 1 not in signer_slots or not set(signer_slots).intersection({2, 3}):
+        raise GenesisConflict(
+            "internal testnet review requires slot 1 and one coadministrator signature"
+        )
     if len(validator_health) != 3:
         raise GenesisConflict("internal testnet review requires three live validators")
     if any(item.artifactReady for item in validator_health):
@@ -808,7 +810,7 @@ async def preflight(
     try:
         record = store.get(ceremony_id.lower())
         if record["state"] != "plan_approved":
-            raise GenesisConflict("two administrator plan signatures are required")
+            raise GenesisConflict("slot 1 and one coadministrator plan signature are required")
         plan, bundle, approval, validator_health = await _prepare_bundle(settings, record)
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
@@ -843,7 +845,7 @@ async def broadcast(
     try:
         record = store.get(ceremony_id.lower())
         if record["state"] != "plan_approved":
-            raise GenesisConflict("two administrator plan signatures are required")
+            raise GenesisConflict("slot 1 and one coadministrator plan signature are required")
         plan, bundle, approval, validator_health = await _prepare_bundle(settings, record)
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
@@ -1042,7 +1044,7 @@ async def finalize(
     try:
         record = store.get(ceremony_id.lower())
         if record["state"] != "artifact_signed":
-            raise GenesisConflict("two artifact signatures are required")
+            raise GenesisConflict("slot 1 and one coadministrator artifact signature are required")
         artifact = dict(record["artifact"])
         artifact["signatures"] = [
             {

@@ -187,7 +187,8 @@ Enrollment discovers confirmed unspent coins at the active bridge policy
 hash. Static parent-ID configuration is not used. Public enrollment cannot
 create coins or spend the faucet. Replenishment is a deliberate post-genesis
 admin action through `/admin/zkpassport/bridge-pool/top-up` using a current
-chain-bound admin JWT.
+chain-bound admin JWT plus a single-use slot-0-and-one-coadmin operation
+approval.
 
 ## Rollback
 
