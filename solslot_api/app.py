@@ -52,6 +52,9 @@ from .mint_endpoints import router as mint_endpoints_router
 from .collection_endpoints import router as collection_endpoints_router
 from .protocol_artifacts import router as protocol_artifacts_router
 from .native_purchases import router as native_purchases_router
+from .presale_endpoints import router as presale_router
+from .alpha_observability import router as alpha_observability_router
+from .alpha_metrics import router as alpha_metrics_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
@@ -301,6 +304,9 @@ app.include_router(mint_endpoints_router)
 app.include_router(collection_endpoints_router)
 app.include_router(protocol_artifacts_router)
 app.include_router(native_purchases_router)
+app.include_router(presale_router)
+app.include_router(alpha_observability_router)
+app.include_router(alpha_metrics_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)

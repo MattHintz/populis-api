@@ -31,6 +31,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_VAULT_SESSION_JWT_SECRET",
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
+        "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN",
         "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY",
         "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN",
         "SOLSLOT_COLLECTION_MALWARE_SCAN_TOKEN",
@@ -635,6 +636,7 @@ class Settings(BaseSettings):
     # External CCIP/Warp escrow is separately deployed from the ceremony EVM
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False
+    payment_omnichain_ingest_token: Optional[str] = None
     payment_omnichain_preflight_evidence_path: Optional[str] = None
     payment_omnichain_evidence_path: Optional[str] = None
     payment_omnichain_activation_evidence_path: Optional[str] = None
