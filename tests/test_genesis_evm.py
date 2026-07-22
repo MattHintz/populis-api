@@ -83,10 +83,13 @@ def _fixture(tmp_path):
             "sourceShas": {
                 "protocol": "1" * 40,
                 "evm": "2" * 40,
-                "api": "3" * 40,
-                "legacyBackend": "4" * 40,
-                "customerWeb": "5" * 40,
-                "adminPortal": "6" * 40,
+                "omnichain": "3" * 40,
+                "api": "4" * 40,
+                "legacyBackend": "5" * 40,
+                "keyOfSolomon": "6" * 40,
+                "samuel": "7" * 40,
+                "customerWeb": "8" * 40,
+                "adminPortal": "9" * 40,
             }
         }
     }

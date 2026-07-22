@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Primary purchase artifacts are introduced by the coordinated alpha rail
   # release. Keep CI reproducible without advancing staging/production pins.
-  PROTOCOL_REF: dc61cdc1f77dd4e118905414ebb02aa052475192
+  PROTOCOL_REF: 0efeb6e8db9840042d371e1e9f28971b591b0972
 
 jobs:
   verify:

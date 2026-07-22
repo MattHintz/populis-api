@@ -65,8 +65,10 @@ Never rename an older file into one of these paths.
 The signed public bundle must include:
 
 - `schemaVersion: 2`
+- `sourceManifestVersion: 3`
 - `protocolVersion: "solslot-v2"`
-- protocol, API, EVM, customer-web, and admin-portal commit SHAs
+- exact protocol, EVM, Omnichain, API, legacy Stripe adapter, Key of Solomon,
+  Samuel, customer-web, and admin-portal commit SHAs
 - build timestamp and artifact hash
 - explicit `reviewClass`, `testOnly`, and `auditStatus` markers
 - all puzzle module hashes and singleton launcher IDs
