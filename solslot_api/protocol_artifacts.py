@@ -58,7 +58,6 @@ from .public_artifact import (
 router = APIRouter(prefix="/protocol", tags=["protocol-artifacts"])
 
 ProtocolRail = Literal[
-    "chia",
     "chia_xch",
     "chia_cat",
     "base_usdc",
@@ -110,6 +109,8 @@ class ProtocolPaymentTerms(BaseModel):
 
 
 class BuildProtocolOfferArtifactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     protocol_version: Literal["solslot-v2"]
     network: Literal["testnet11"]
     genesis_artifact_hash: str = Field(..., min_length=66, max_length=66)
@@ -125,7 +126,6 @@ class BuildProtocolOfferArtifactRequest(BaseModel):
     identity_attest_root: str = Field(..., min_length=66, max_length=66)
     expires_at: int = Field(..., gt=0, description="Unix seconds")
     payment_terms: ProtocolPaymentTerms
-    raw_offer: Optional[str] = Field(None, max_length=2_000_000)
     zk_passport_required: bool = True
     current_state: PurchaseIntentState = "created"
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -146,13 +146,6 @@ class BuildProtocolOfferArtifactRequest(BaseModel):
     def require_zkpassport(self):
         if self.zk_passport_required is not True:
             raise ValueError("zk_passport_required must be true for Sols Lot protocol purchases")
-        if self.rail == "chia":
-            if self.deed_launcher_id is None:
-                raise ValueError("deed_launcher_id is required")
-            if self.share_ppm is None:
-                raise ValueError("share_ppm is required")
-            if self.payment_terms.amount is None:
-                raise ValueError("payment_terms.amount is required")
         return self
 
 
@@ -369,48 +362,34 @@ async def build_protocol_offer_artifact(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     artifact_hash = content_hash(artifact)
-    purchase_artifact = (
-        canonical_payment[0] if canonical_payment is not None else None
-    )
-    oracle_authorization = (
-        canonical_payment[1] if canonical_payment is not None else None
-    )
-    if purchase_artifact is not None:
-        try:
-            stored = get_payment_purchase_store(
-                settings.payment_purchase_db_path
-            ).save(
-                purchase_intent_id=body.purchase_intent_id,
-                rail=body.rail,
-                offer_artifact_hash=artifact_hash,
-                offer_artifact=artifact,
-                purchase_artifact=purchase_artifact,
-                created_at=int(time.time()),
-            )
-        except PaymentPurchaseConflict as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(exc),
-            ) from exc
-        artifact = stored.offer_artifact
-        artifact_hash = stored.offer_artifact_hash
-        purchase_artifact = stored.purchase_artifact
-        oracle_authorization = artifact.get("oracleAuthorization")
+    purchase_artifact, oracle_authorization = canonical_payment
+    try:
+        stored = get_payment_purchase_store(
+            settings.payment_purchase_db_path
+        ).save(
+            purchase_intent_id=body.purchase_intent_id,
+            rail=body.rail,
+            offer_artifact_hash=artifact_hash,
+            offer_artifact=artifact,
+            purchase_artifact=purchase_artifact,
+            created_at=int(time.time()),
+        )
+    except PaymentPurchaseConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    artifact = stored.offer_artifact
+    artifact_hash = stored.offer_artifact_hash
+    purchase_artifact = stored.purchase_artifact
+    oracle_authorization = artifact.get("oracleAuthorization")
     return ProtocolOfferArtifactResponse(
         artifact=artifact,
         artifact_hash=artifact_hash,
         protocol=_protocol_object_from_artifact(artifact, artifact_hash),
         purchase_artifact=purchase_artifact,
-        purchase_artifact_hash=(
-            purchase_artifact["artifactHash"]
-            if purchase_artifact is not None
-            else None
-        ),
-        purchase_id=(
-            purchase_artifact["purchaseId"]
-            if purchase_artifact is not None
-            else None
-        ),
+        purchase_artifact_hash=purchase_artifact["artifactHash"],
+        purchase_id=purchase_artifact["purchaseId"],
         oracle_authorization=oracle_authorization,
     )
 
@@ -665,7 +644,7 @@ def _build_canonical_payment_artifact(
     settings: Settings,
     *,
     vault_launcher_id: str,
-) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     now = int(time.time())
     canonical_rails = {
         "chia_xch",
@@ -675,11 +654,7 @@ def _build_canonical_payment_artifact(
         "stripe",
     }
     if body.rail not in canonical_rails:
-        return None
-    if body.raw_offer is not None:
-        raise PaymentArtifactError(
-            "canonical quote creation cannot reuse a legacy raw offer"
-        )
+        raise PaymentArtifactError("unsupported protocol payment rail")
     if not settings.collection_metadata_enabled:
         raise PaymentArtifactError(
             "protocol purchases require the collection metadata workspace"
@@ -923,9 +898,7 @@ def _build_artifact(
     *,
     receipt: dict[str, Any],
     genesis_artifact: Mapping[str, Any],
-    canonical_payment: (
-        tuple[dict[str, Any], dict[str, Any] | None] | None
-    ),
+    canonical_payment: tuple[dict[str, Any], dict[str, Any] | None],
 ) -> dict[str, Any]:
     launchers = _mapping(genesis_artifact.get("launcherIds"))
     protocol = {
@@ -941,29 +914,23 @@ def _build_artifact(
         "currentState": body.current_state,
         "expiresAt": body.expires_at,
     }
-    if body.raw_offer:
-        protocol["rawOffer"] = body.raw_offer
-    if canonical_payment is not None:
-        purchase_artifact, _oracle_authorization = canonical_payment
-        protocol["deedLauncherId"] = purchase_artifact["deedLauncherId"]
-        protocol["collectionWorkspaceId"] = body.collection_id
-        protocol["collectionId"] = purchase_artifact["collectionId"]
-        protocol["sharePpm"] = purchase_artifact["sharePpm"]
-        protocol["purchaseArtifactHash"] = purchase_artifact["artifactHash"]
-        protocol["purchaseId"] = purchase_artifact["purchaseId"]
-    payment_terms = body.payment_terms.model_dump(exclude_none=True)
-    if canonical_payment is not None:
-        purchase_artifact, _oracle_authorization = canonical_payment
-        payment_terms = {
-            "currency": (
-                "XCH" if body.rail == "chia_xch" else body.payment_terms.currency
-            ),
-            "amount": purchase_artifact["railAmount"],
-            "quantity": 1,
-            "usd_amount_minor": purchase_artifact["usdAmountMinor"],
-            "asset_id": purchase_artifact["railAssetId"],
-            "asset_decimals": purchase_artifact["railAssetDecimals"],
-        }
+    purchase_artifact, _oracle_authorization = canonical_payment
+    protocol["deedLauncherId"] = purchase_artifact["deedLauncherId"]
+    protocol["collectionWorkspaceId"] = body.collection_id
+    protocol["collectionId"] = purchase_artifact["collectionId"]
+    protocol["sharePpm"] = purchase_artifact["sharePpm"]
+    protocol["purchaseArtifactHash"] = purchase_artifact["artifactHash"]
+    protocol["purchaseId"] = purchase_artifact["purchaseId"]
+    payment_terms = {
+        "currency": (
+            "XCH" if body.rail == "chia_xch" else body.payment_terms.currency
+        ),
+        "amount": purchase_artifact["railAmount"],
+        "quantity": 1,
+        "usd_amount_minor": purchase_artifact["usdAmountMinor"],
+        "asset_id": purchase_artifact["railAssetId"],
+        "asset_decimals": purchase_artifact["railAssetDecimals"],
+    }
     artifact: dict[str, Any] = {
         "schemaVersion": 2,
         "protocolVersion": "solslot-v2",
@@ -977,11 +944,10 @@ def _build_artifact(
         "metadata": body.metadata,
         "issuedAt": int(time.time()),
     }
-    if canonical_payment is not None:
-        purchase_artifact, oracle_authorization = canonical_payment
-        artifact["purchaseArtifactV2"] = purchase_artifact
-        if oracle_authorization is not None:
-            artifact["oracleAuthorization"] = oracle_authorization
+    purchase_artifact, oracle_authorization = canonical_payment
+    artifact["purchaseArtifactV2"] = purchase_artifact
+    if oracle_authorization is not None:
+        artifact["oracleAuthorization"] = oracle_authorization
     artifact["poolLauncherId"] = launchers["pool"]
     artifact["protocolConfigLauncherId"] = launchers["protocolConfig"]
     artifact["vaultVersionRegistryLauncherId"] = launchers["vaultVersionRegistry"]
@@ -1219,7 +1185,7 @@ def _payment_evidence_rejection_reasons(
         _assert_public_artifact(evidence, "purchase_finalization_evidence")
     except ValueError as e:
         return [str(e)]
-    if rail in {"chia", "chia_xch", "chia_cat"}:
+    if rail in {"chia_xch", "chia_cat"}:
         if not any(evidence.get(k) for k in ("spend_bundle_id", "accepted_offer_id", "coin_spend_id")):
             return ["chia_evidence_missing"]
     elif rail in {"base_usdc", "evm_usdc"}:

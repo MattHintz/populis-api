@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,7 @@ from solslot_api.native_purchases import (
     PrepareNativePurchaseRequest,
     complete_native_purchase,
     prepare_native_purchase,
+    _proposal_rejection_reasons,
 )
 from solslot_api.payment_purchase_store import StoredPaymentPurchase
 from solslot_api.validator_quorum import ValidatorQuorumResult
@@ -95,6 +97,7 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         ),
         uint64(1),
     )
+
     artifact = PurchaseArtifactV2(
         network="testnet11",
         collection_id=_b32(10),
@@ -182,6 +185,41 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         ),
         payment_coin,
     )
+
+
+def test_purchase_terms_must_match_the_governed_proposal() -> None:
+    payment_key = AugSchemeMPL.key_gen(b"q" * 32)
+    validator_keys = tuple(
+        AugSchemeMPL.key_gen(bytes([seed]) * 32) for seed in (41, 42, 43)
+    )
+    context, _coin = _context(payment_key, validator_keys)
+    deed = {"deedId": "US-TX-AUSTIN-001"}
+    proposal = SimpleNamespace(
+        deed_launcher_id=bytes(context.purchase.deed_launcher_id),
+        collection_id="SOL-LOT-AUSTIN-ALPHA",
+        property_id=deed["deedId"],
+        share_ppm=context.purchase.share_ppm,
+    )
+    from solslot_puzzles.property_registry_driver import canonicalise_property_id
+
+    purchase = replace(
+        context.purchase,
+        collection_id=bytes32(
+            canonicalise_property_id(proposal.collection_id)
+        ),
+    )
+    assert _proposal_rejection_reasons(proposal, deed, purchase) == []
+
+    proposal.deed_launcher_id = bytes(_b32(91))
+    proposal.property_id = "US-TX-AUSTIN-002"
+    proposal.share_ppm += 1
+    proposal.collection_id = "SOL-LOT-OTHER"
+    assert _proposal_rejection_reasons(proposal, deed, purchase) == [
+        "deed launcher",
+        "collection",
+        "deed identifier",
+        "share allocation",
+    ]
 
 
 @pytest.mark.asyncio

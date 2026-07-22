@@ -41,6 +41,7 @@ from solslot_puzzles.primary_purchase_v2_driver import (
     prepare_chia_buyer_offer,
     validate_chia_buyer_offer,
 )
+from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.protocol_deployment import singleton_struct
 
 from .collection_store import CollectionNotFound, get_collection_store
@@ -407,6 +408,7 @@ async def _load_context(
     proposal = get_mint_proposal_store(settings).get(str(deed["proposalId"]))
     if (
         proposal is None
+        or proposal.state not in {"EXECUTED", "MINTED"}
         or proposal.executed_bundle_id is None
         or proposal.smart_deed_inner_puzhash is None
         or deed.get("confirmationHeight") is None
@@ -415,6 +417,19 @@ async def _load_context(
         raise HTTPException(
             status_code=409,
             detail="Purchase SmartDeed is not executed and chain-confirmed.",
+        )
+    proposal_mismatches = _proposal_rejection_reasons(
+        proposal,
+        deed,
+        purchase,
+    )
+    if proposal_mismatches:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Purchase SmartDeed no longer matches its governed proposal: "
+                + ", ".join(proposal_mismatches)
+            ),
         )
     try:
         genesis = load_signed_public_artifact(settings)
@@ -501,6 +516,29 @@ async def _load_context(
         credential_owner_auth_type=vault_record.auth_type,
         credential_owner_key=bytes(vault_record.owner_pubkey),
     )
+
+
+def _proposal_rejection_reasons(
+    proposal: Any,
+    deed: Mapping[str, Any],
+    purchase: PurchaseArtifactV2,
+) -> list[str]:
+    reasons: list[str] = []
+    if proposal.deed_launcher_id != bytes(purchase.deed_launcher_id):
+        reasons.append("deed launcher")
+    try:
+        proposal_collection_id = bytes32(
+            canonicalise_property_id(proposal.collection_id)
+        )
+    except (TypeError, ValueError):
+        proposal_collection_id = bytes32.zeros
+    if proposal_collection_id != purchase.collection_id:
+        reasons.append("collection")
+    if proposal.property_id.casefold() != str(deed.get("deedId") or "").casefold():
+        reasons.append("deed identifier")
+    if proposal.share_ppm != purchase.share_ppm:
+        reasons.append("share allocation")
+    return reasons
 
 
 async def _select_payment_coin(

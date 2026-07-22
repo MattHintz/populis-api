@@ -66,6 +66,18 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
         "SOLSLOT_PAYMENT_PURCHASE_DB_PATH",
         str(tmp_path / "payment-purchases.db"),
     )
+    monkeypatch.setenv("SOLSLOT_COLLECTION_METADATA_ENABLED", "true")
+
+    class Store:
+        @staticmethod
+        def get(collection_id):
+            assert collection_id == "SOL-LOT-AUSTIN-ALPHA"
+            return _published_collection()
+
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts.get_collection_store",
+        lambda _settings: Store(),
+    )
 
     def confirmed_enrollment(_settings, vault_launcher_id):
         assert vault_launcher_id == VAULT_ID
@@ -120,7 +132,7 @@ def _request(**overrides):
         "genesis_artifact_hash": "0x" + "d1" * 32,
         "instance_id": "solslot-staging",
         "purchase_intent_id": "pi_test_001",
-        "rail": "chia",
+        "rail": "stripe",
         "deed_launcher_id": "0x" + "11" * 32,
         "property_id": "US-TX-AUSTIN-001",
         "collection_id": "SOL-LOT-AUSTIN-ALPHA",
@@ -129,11 +141,9 @@ def _request(**overrides):
         "current_vault_coin_id": "0x" + "88" * 32,
         "identity_attest_root": IDENTITY_ROOT,
         "expires_at": int(time.time()) + 3600,
-        "payment_terms": {
-            "currency": "wUSDC",
-            "amount": 125_000,
-            "quantity": 1,
-        },
+        "payment_terms": {"currency": "USD", "quantity": 1},
+        "authorization_nonce": "0x" + "14" * 32,
+        "authorization_expires_at": int(time.time()) + 7200,
     }
     base.update(overrides)
     return base
@@ -752,6 +762,22 @@ def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
         assert verified.json()["valid"] is True
 
 
+@pytest.mark.parametrize(
+    "legacy_field",
+    (
+        {"rail": "chia"},
+        {"raw_offer": "offer1retired"},
+    ),
+)
+def test_rejects_legacy_static_chia_offer_inputs(legacy_field):
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(**legacy_field),
+        )
+    assert response.status_code == 422
+
+
 def test_builds_native_xch_offer_from_server_authorized_quote(
     monkeypatch,
     tmp_path,
@@ -875,10 +901,11 @@ def test_quote_rejects_ambiguous_sealed_usd_price(
 def test_verify_rejects_tampered_or_expired_artifact(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
     get_settings.cache_clear()
+    now = int(time.time())
     with TestClient(app) as client:
         built = client.post(
             "/protocol/offer-artifacts",
-            json=_request(expires_at=int(time.time()) - 1),
+            json=_request(expires_at=now + 60),
         ).json()
         artifact = built["artifact"]
         artifact["protocol"]["sharePpm"] = 50_000
@@ -887,7 +914,7 @@ def test_verify_rejects_tampered_or_expired_artifact(monkeypatch, tmp_path):
             json={
                 "artifact": artifact,
                 "artifact_hash": built["artifact_hash"],
-                "now": int(time.time()),
+                "now": now + 61,
             },
         )
         assert verified.status_code == 200, verified.text
