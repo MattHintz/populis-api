@@ -15,6 +15,9 @@ from .validator_quorum import (
     PrimaryPurchaseClaim,
     ValidatorClaim,
     ValidatorSignatureResponse,
+    VoucherIssuanceClaim,
+    VoucherSeriesPhaseClaim,
+    VoucherTransitionClaim,
 )
 from .validator_service import (
     ValidatorEvidenceError,
@@ -22,6 +25,9 @@ from .validator_service import (
     load_validator_private_key,
     sign_validator_claim,
     sign_primary_purchase_claim,
+    sign_voucher_issuance_claim,
+    sign_voucher_series_phase_claim,
+    sign_voucher_transition_claim,
 )
 from .validator_settings import ValidatorSettings, get_validator_settings
 
@@ -37,6 +43,27 @@ class PrimaryPurchaseSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim: PrimaryPurchaseClaim
+    claimHash: str
+
+
+class VoucherIssuanceSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: VoucherIssuanceClaim
+    claimHash: str
+
+
+class VoucherTransitionSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: VoucherTransitionClaim
+    claimHash: str
+
+
+class VoucherSeriesPhaseSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: VoucherSeriesPhaseClaim
     claimHash: str
 
 
@@ -183,6 +210,96 @@ def create_validator_app(
             signature=signature,
         )
 
+    @application.post(
+        "/v1/voucher-issuance/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_voucher_issuance(
+        request: VoucherIssuanceSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_voucher_issuance_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/voucher-series-phase/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_voucher_series_phase(
+        request: VoucherSeriesPhaseSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_voucher_series_phase_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/voucher-transition/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_voucher_transition(
+        request: VoucherTransitionSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_voucher_transition_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
     return application
 
 
@@ -192,6 +309,9 @@ app = create_validator_app()
 __all__ = [
     "ValidatorHealthResponse",
     "PrimaryPurchaseSignRequest",
+    "VoucherIssuanceSignRequest",
+    "VoucherSeriesPhaseSignRequest",
+    "VoucherTransitionSignRequest",
     "ValidatorSignRequest",
     "app",
     "create_validator_app",

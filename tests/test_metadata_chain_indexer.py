@@ -69,7 +69,9 @@ def _published_store():
         output_coin_id=anchor_id,
         publish_bundle_id="0xbundle",
     )
-    dossier = PropertyDossierV1.model_validate(store.get("HARBOR-17")["dossier"])
+    dossier = PropertyDossierV1.model_validate(
+        store.public_collection("HARBOR-17")["dossier"]
+    )
     return store, anchor_id, dossier
 
 

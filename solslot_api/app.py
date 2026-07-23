@@ -54,6 +54,8 @@ from .collection_endpoints import router as collection_endpoints_router
 from .protocol_artifacts import router as protocol_artifacts_router
 from .native_purchases import router as native_purchases_router
 from .presale_endpoints import router as presale_router
+from .presale_endpoints import get_presale_store
+from .payment_purchase_store import get_payment_purchase_store
 from .alpha_observability import router as alpha_observability_router
 from .alpha_metrics import router as alpha_metrics_router
 from .zkpassport_relay import router as zkpassport_relay_router
@@ -234,6 +236,31 @@ async def lifespan(app: FastAPI):
             app.state.faucet.address_hex,
         )
 
+    app.state.voucher_issuance_worker = None
+    if settings.voucher_issuance_worker_enabled:
+        if app.state.faucet is None:
+            raise RuntimeError(
+                "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED requires a faucet key."
+            )
+        from .voucher_issuance_worker import (
+            VoucherIssuanceWorker,
+            VoucherIssuanceWorkerConfig,
+        )
+
+        voucher_worker = VoucherIssuanceWorker(
+            settings=settings,
+            faucet=app.state.faucet,
+            coinset=app.state.coinset,
+            presales=get_presale_store(settings),
+            purchases=get_payment_purchase_store(settings.payment_purchase_db_path),
+            config=VoucherIssuanceWorkerConfig(
+                enabled=True,
+                interval_seconds=settings.voucher_issuance_interval_seconds,
+            ),
+        )
+        await voucher_worker.start()
+        app.state.voucher_issuance_worker = voucher_worker
+
     # POP-CANON-008: faucet UTXO consolidation worker.  Opt-in via
     # SOLSLOT_FAUCET_CONSOLIDATION_ENABLED=true.  Started here so the
     # task is owned by the FastAPI event loop and properly cancelled on
@@ -263,6 +290,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if app.state.voucher_issuance_worker is not None:
+            await app.state.voucher_issuance_worker.stop()
         if app.state.faucet_worker is not None:
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()

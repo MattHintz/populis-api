@@ -48,6 +48,10 @@ class ValidatorSettings(BaseSettings):
     evm_forwarder_address: str
     evm_verifier_adapter_address: str
     evm_attestation_emitter_address: str
+    base_sepolia_rpc_url: str = ""
+    base_sepolia_spoke_address: str = ""
+    base_sepolia_usdc_address: str = ""
+    base_sepolia_min_confirmations: int = Field(12, ge=12, le=100)
 
     @field_validator("bridge_policy_hash")
     @classmethod
@@ -85,6 +89,16 @@ class ValidatorSettings(BaseSettings):
             raise ValueError("coinset_base_url must use HTTPS")
         if not self.evm_rpc_url.startswith("https://"):
             raise ValueError("evm_rpc_url must use HTTPS")
+        if self.base_sepolia_rpc_url and not self.base_sepolia_rpc_url.startswith(
+            "https://"
+        ):
+            raise ValueError("base_sepolia_rpc_url must use HTTPS")
+        for value, label in (
+            (self.base_sepolia_spoke_address, "base_sepolia_spoke_address"),
+            (self.base_sepolia_usdc_address, "base_sepolia_usdc_address"),
+        ):
+            if value and not _ADDRESS_RE.fullmatch(value):
+                raise ValueError(f"{label} must be a 20-byte EVM address")
         return self
 
 

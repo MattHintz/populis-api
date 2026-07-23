@@ -64,6 +64,7 @@ from .mint_proposals import (
     StoredMintProposal,
 )
 from .public_artifact import PublicArtifactError, load_signed_public_artifact
+from solslot_puzzles.real_estate_profiles import ASSET_CLASS_CODES
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 
 logger = logging.getLogger(__name__)
@@ -421,6 +422,7 @@ def _validate_collection_publish_context(
     claims: AdminClaims,
     canonical: Any,
     proposal_id: str,
+    artifact: dict[str, Any],
 ) -> tuple[Any, str] | None:
     """Bind an extended MINT bill to the sealed API workspace.
 
@@ -477,16 +479,19 @@ def _validate_collection_publish_context(
     if not isinstance(target_raise, str) or not target_raise.isdecimal() or int(target_raise) <= 0:
         raise HTTPException(status_code=409, detail="sealed collection has no valid USD target raise")
     numerator = int(target_raise) * int(deed["sharePpm"])
-    expected_usd_amount, remainder = divmod(numerator, 1_000_000)
+    base_usd_amount, remainder = divmod(numerator, 1_000_000)
     if remainder:
         raise HTTPException(
             status_code=409,
             detail="sealed deed allocation produces fractional USD minor units",
         )
+    fee_bps = int(offering.get("royaltyBps") or 0)
+    technology_fee = (base_usd_amount * fee_bps + 9_999) // 10_000
+    expected_usd_amount = base_usd_amount + technology_fee
     if metadata.primary_purchase_usd_amount_minor != expected_usd_amount:
         raise HTTPException(
             status_code=409,
-            detail="primary purchase USD amount does not match the sealed deed allocation",
+            detail="primary purchase USD amount does not match the sealed base price plus technology fee",
         )
     if deed["proposalId"] not in (None, proposal_id):
         raise HTTPException(status_code=409, detail="deed allocation row already has a proposal")
@@ -499,8 +504,18 @@ def _validate_collection_publish_context(
         raise HTTPException(status_code=409, detail="MINT asset class differs from the sealed dossier")
     if int(offering["royaltyBps"]) != metadata.royalty_bps:
         raise HTTPException(status_code=409, detail="MINT royalty differs from the sealed dossier")
+    if metadata.royalty_bps > 1_000:
+        raise HTTPException(status_code=409, detail="primary technology fee exceeds 1000 bps")
     if str(offering["royaltyPuzhash"]).lower() != metadata.royalty_puzhash.lower():
         raise HTTPException(status_code=409, detail="MINT royalty payee differs from the sealed dossier")
+    puzzle_hashes = artifact.get("puzzleHashes")
+    trusted_treasury = (
+        puzzle_hashes.get("protocolTreasuryPuzzleHash")
+        if isinstance(puzzle_hashes, dict)
+        else None
+    )
+    if not isinstance(trusted_treasury, str) or metadata.royalty_puzhash.lower() != trusted_treasury.lower():
+        raise HTTPException(status_code=409, detail="technology fee destination is not the trusted protocol treasury")
     if int(offering["governanceQuorum"]) != metadata.quorum_threshold:
         raise HTTPException(status_code=409, detail="MINT quorum differs from the sealed dossier")
     try:
@@ -539,8 +554,11 @@ async def _publish_mint_bundle(
                 metadata.collection_id_canon, "collection_id_canon"
             ):
                 raise ValueError("collection_id does not reproduce collection_id_canon")
-            if metadata.asset_class_name.upper() != "RWA-RE-RES" or metadata.asset_class != 1:
+            expected_class = ASSET_CLASS_CODES.get(metadata.asset_class_name.upper())
+            if expected_class is None or metadata.asset_class != int(expected_class):
                 raise ValueError("asset_class_name does not match the alpha asset class code")
+            if metadata.royalty_bps > 1_000:
+                raise ValueError("primary technology fee cannot exceed 1000 bps")
             jurisdiction = bytes.fromhex(
                 metadata.jurisdiction.removeprefix("0x")
             ).decode("utf-8")
@@ -604,6 +622,7 @@ async def _publish_mint_bundle(
         claims=claims,
         canonical=canonical,
         proposal_id=proposal_id,
+        artifact=artifact,
     )
 
     registry_id = "0x" + canonical.property_registry_coin_id.hex()

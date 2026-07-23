@@ -24,6 +24,12 @@ def dossier_payload() -> dict:
         "revision": 1,
         "title": "17 Harbor Street",
         "summary": "Two-unit residential property with a documented renovation plan.",
+        "classification": {
+            "assetClass": "RWA-RE-RES",
+            "propertySubtype": "duplex",
+            "projectStage": "stabilized",
+            "programOverlays": [],
+        },
         "property": {
             "address": {
                 "line1": "17 Harbor Street",
@@ -120,6 +126,20 @@ def dossier_payload() -> dict:
                 "url": "https://assets.example/harbor-17/appraisal.pdf",
             }
         ],
+        "diligence": [
+            {"key": key, "value": "Reviewed", "evidenceAssetIds": []}
+            for key in (
+                "building-details",
+                "comparable-sales",
+                "debt",
+                "insurance",
+                "occupancy",
+                "operating-history",
+                "property-condition",
+                "title",
+                "valuation",
+            )
+        ],
         "deedAllocation": [
             {"deedId": "HARBOR-17-A", "sharePpm": 600000, "parValueMojos": "150000000000"},
             {"deedId": "HARBOR-17-B", "sharePpm": 400000, "parValueMojos": "100000000000"},
@@ -140,6 +160,13 @@ def verified_store() -> tuple[CollectionStore, dict]:
         draft=PropertyDossierDraftV1.model_validate(dossier_payload()),
         expected_revision=1,
         actor_subject="0xreviewer",
+        submit_for_review=True,
+    )
+    store.submit_review(
+        "HARBOR-17",
+        reviewer_subject="0xreviewer",
+        decision="APPROVED",
+        note="Current revision reviewed.",
     )
     for asset_id, kind, digest, mime, size, url, cid in (
         (
@@ -398,6 +425,44 @@ def test_public_verification_requires_chain_reconstruction() -> None:
     )
     assert store.public_collection("17-harbor-street")["verification"]["verified"] is True
 
+    store.declare_asset(
+        "HARBOR-17",
+        asset_id="unredacted-title",
+        kind="DOCUMENT",
+        visibility="PRIVATE",
+        expected_sha256="67" * 32,
+        expected_mime_type="application/pdf",
+        expected_byte_size=300,
+        actor_subject="0xowner",
+    )
+    store.mark_asset_uploaded(
+        "HARBOR-17",
+        "unredacted-title",
+        object_key="private/collections/HARBOR-17/unredacted-title.pdf",
+        actor_subject="0xowner",
+    )
+    store.mark_asset_verified(
+        "HARBOR-17",
+        "unredacted-title",
+        actual_sha256="67" * 32,
+        actual_mime_type="application/pdf",
+        actual_byte_size=300,
+        malware_status="CLEAN",
+        verified_https_url=None,
+        ipfs_cid=None,
+        availability_status="PRIVATE",
+        actor_subject="0xowner",
+    )
+    private = store.authorize_private_asset_download(
+        "HARBOR-17", "unredacted-title", actor_subject="0xreviewer"
+    )
+    assert private["visibility"] == "PRIVATE"
+    assert all(
+        asset["assetId"] != "unredacted-title"
+        for asset in store.public_collection("17-harbor-street")["assets"]
+    )
+    assert store.audit_events("HARBOR-17")[-1]["action"] == "PRIVATE_DOCUMENT_ACCESSED"
+
     # Every canonical media descriptor matters. A failed hero must remove the
     # public verified state even when the referenced document remains healthy.
     store.mark_asset_failed(
@@ -409,4 +474,92 @@ def test_public_verification_requires_chain_reconstruction() -> None:
     verification = store.public_collection("17-harbor-street")["verification"]
     assert verification["mediaVerified"] is False
     assert verification["verified"] is False
+    store.close()
+
+
+def test_private_document_descriptor_stays_out_of_canonical_and_public_metadata() -> None:
+    store, collection = verified_store()
+    payload = dossier_payload()
+    payload["revision"] = collection["revision"]
+    payload["privateDocuments"] = [
+        {
+            "assetId": "unredacted-title",
+            "title": "Unredacted title report",
+            "category": "title",
+            "sha256": "68" * 32,
+            "mimeType": "application/pdf",
+            "byteSize": 300,
+        }
+    ]
+    reviewed = store.update_draft(
+        "HARBOR-17",
+        draft=PropertyDossierDraftV1.model_validate(payload),
+        expected_revision=collection["revision"],
+        actor_subject="0xowner",
+        submit_for_review=True,
+    )
+    store.submit_review(
+        "HARBOR-17",
+        reviewer_subject="0xreviewer",
+        decision="APPROVED",
+        note="Private original and redacted public evidence reviewed.",
+    )
+    store.declare_asset(
+        "HARBOR-17",
+        asset_id="unredacted-title",
+        kind="DOCUMENT",
+        visibility="PRIVATE",
+        expected_sha256="68" * 32,
+        expected_mime_type="application/pdf",
+        expected_byte_size=300,
+        actor_subject="0xowner",
+    )
+    store.mark_asset_uploaded(
+        "HARBOR-17",
+        "unredacted-title",
+        object_key="private/collections/HARBOR-17/unredacted-title.pdf",
+        actor_subject="0xowner",
+    )
+    store.mark_asset_verified(
+        "HARBOR-17",
+        "unredacted-title",
+        actual_sha256="68" * 32,
+        actual_mime_type="application/pdf",
+        actual_byte_size=300,
+        malware_status="CLEAN",
+        verified_https_url=None,
+        ipfs_cid=None,
+        availability_status="PRIVATE",
+        actor_subject="0xowner",
+    )
+    sealed = store.seal(
+        "HARBOR-17",
+        expected_revision=reviewed["revision"],
+        actor_subject="0xowner",
+    )
+    store.record_proposal_publication(
+        "HARBOR-17",
+        "HARBOR-17-A",
+        actor_subject="0xowner",
+        proposal_id="proposal-private-boundary",
+        proposal_hash=b"\x69" * 32,
+        proposal_launcher_id=b"\x6a" * 32,
+        deed_launcher_id=b"\x6b" * 32,
+        output_coin_id=b"\x6b" * 32,
+        publish_bundle_id="0x" + "6c" * 32,
+    )
+
+    admin = store.get("HARBOR-17")
+    public = store.public_collection("HARBOR-17")
+    issuance = public["metadataVersions"][0]["canonicalMetadata"]
+
+    assert admin["dossier"]["privateDocuments"][0]["assetId"] == (
+        "unredacted-title"
+    )
+    assert "privateDocuments" not in public["dossier"]
+    assert "privateDocuments" not in issuance
+    assert all(
+        asset["assetId"] != "unredacted-title" for asset in public["assets"]
+    )
+    assert sealed["metadataRoot"] == public["metadataRoot"]
     store.close()

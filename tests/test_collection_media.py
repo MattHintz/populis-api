@@ -115,3 +115,42 @@ async def test_verify_rejects_altered_bytes_before_pinning() -> None:
             asset_name="hero",
         )
     assert called_hosts == ["s3.example.test"]
+
+
+@pytest.mark.asyncio
+async def test_private_document_is_scanned_but_never_pinned_or_published() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, str(request.url)))
+        if request.method == "GET" and request.url.host == "s3.example.test":
+            return httpx.Response(200, content=PNG_BYTES)
+        if request.url.host == "scanner.example.test":
+            return httpx.Response(200, json={"status": "CLEAN"})
+        raise AssertionError(f"private verification called public service {request.url}")
+
+    pipeline = CollectionMediaPipeline(
+        _settings(), transport=httpx.MockTransport(handler)
+    )
+    digest = hashlib.sha256(PNG_BYTES).hexdigest()
+    verified = await pipeline.verify_private_document(
+        object_key="private/collections/HARBOR-17/title.png",
+        expected_sha256=digest,
+        expected_mime_type="image/png",
+        expected_byte_size=len(PNG_BYTES),
+    )
+    assert verified.availability_status == "PRIVATE"
+    assert {httpx.URL(url).host for _method, url in requests} == {
+        "s3.example.test",
+        "scanner.example.test",
+    }
+
+
+def test_private_presign_uses_segregated_prefix() -> None:
+    upload = CollectionMediaPipeline(_settings()).presign_upload(
+        collection_id="HARBOR-17",
+        asset_id="unredacted-title",
+        filename="title.pdf",
+        private=True,
+    )
+    assert upload["objectKey"] == "private/collections/HARBOR-17/unredacted-title.pdf"

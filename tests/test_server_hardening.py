@@ -93,9 +93,26 @@ def test_omnichain_enablement_requires_reviewed_evidence_at_startup() -> None:
         validate_server_hardening_at_startup(
             _staging(
                 payment_omnichain_enabled=True,
+                payment_omnichain_ingest_token="test-only-relayer-token-value-32",
                 payment_evm_usdc_tokens={"84532": "0x" + "ab" * 20},
                 payment_omnichain_source_sha="a" * 40,
                 payment_omnichain_gateway_profile="bse",
+                payment_omnichain_rpc_url="https://base-sepolia.example.invalid",
+            )
+        )
+
+
+@pytest.mark.parametrize("rpc_url", [None, "", "http://base-sepolia.example.invalid"])
+def test_omnichain_enablement_requires_https_rpc(rpc_url: str | None) -> None:
+    with pytest.raises(RuntimeError, match="requires an HTTPS.*RPC_URL"):
+        validate_server_hardening_at_startup(
+            _staging(
+                payment_omnichain_enabled=True,
+                payment_omnichain_ingest_token="test-only-relayer-token-value-32",
+                payment_evm_usdc_tokens={"84532": "0x" + "ab" * 20},
+                payment_omnichain_source_sha="a" * 40,
+                payment_omnichain_gateway_profile="bse",
+                payment_omnichain_rpc_url=rpc_url,
             )
         )
 

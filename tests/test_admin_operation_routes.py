@@ -15,6 +15,7 @@ EXPECTED_OWNER_PLUS_ONE = {
     "/admin/committee/propose": "mint.publish",
     "/admin/committee/execute": "mint.execute",
     "/presales": "presale.create",
+    "/presales/{terms_hash}/cancel": "presale.cancel",
     "/presales/{terms_hash}/launch": "presale.launch",
 }
 

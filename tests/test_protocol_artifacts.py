@@ -427,14 +427,17 @@ def _configure_external_quote(
     evidence["governanceArtifactHash"] = governance["artifactHash"]
 
     samuel = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "solslot-samuel-testnet-coordinates",
         "sourceSha": "b" * 40,
+        "protocolSourceSha": "c" * 40,
         "validatorRosterArtifactHash": "0x" + "42" * 32,
         "testnet11": {
             "portalLauncherId": "0x" + "61" * 32,
             "bridgingPuzzleHash": "0x" + "62" * 32,
             "returnPuzzleHash": "0x" + "63" * 32,
+            "resultAuthorizationModHash": "0x" + "64" * 32,
+            "voucherBurnInnerHash": "0x" + "65" * 32,
         },
         "baseSepolia": {
             "chainId": 84532,
@@ -473,6 +476,13 @@ def _configure_external_quote(
             "rootSafe": evidence["configuration"]["governanceRootSafe"],
             "usdc": evidence["contracts"]["usdc"],
             "warpPortal": "0x" + "16" * 20,
+            "protocolSourceSha": samuel["protocolSourceSha"],
+            "voucherResultAuthorizationMod": samuel["testnet11"][
+                "resultAuthorizationModHash"
+            ],
+            "voucherBurnInner": samuel["testnet11"][
+                "voucherBurnInnerHash"
+            ],
             "callbackGas": evidence["configuration"]["callbackGas"],
             "emergencyDelay": evidence["configuration"]["emergencyDelay"],
             "confirmations": evidence["confirmations"],
@@ -567,6 +577,14 @@ def _configure_external_quote(
     activation_path = tmp_path / "omnichain-activation-evidence.json"
     activation_path.write_text(json.dumps(activation), encoding="utf-8")
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "true")
+    monkeypatch.setenv(
+        "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN",
+        "test-omnichain-callback-token-32-characters",
+    )
+    monkeypatch.setenv(
+        "SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL",
+        "https://base-sepolia.example.invalid",
+    )
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_PREFLIGHT_EVIDENCE_PATH", str(preflight_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH", str(deployment_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH", str(activation_path))
@@ -705,6 +723,11 @@ def _reseal_evidence(path, mutate):
         (
             "omnichain-samuel-evidence.json",
             lambda value: value["baseSepolia"].update(chainId=8453),
+            "Samuel evidence mismatches",
+        ),
+        (
+            "omnichain-samuel-evidence.json",
+            lambda value: value.update(schemaVersion=1),
             "Samuel evidence mismatches",
         ),
         (
@@ -1062,6 +1085,9 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         message = {
             "gatewayProfile": "bse",
             "globalPaymentId": "0x" + "90" * 32,
+            "localPaymentId": "0x" + "91" * 32,
+            "depositor": "0x" + "80" * 20,
+            "settlementToken": "0x" + "ab" * 20,
             "purchaseId": purchase["purchaseId"],
             "artifactHash": purchase["artifactHash"],
             "amount": purchase["railAmount"],
@@ -1072,34 +1098,93 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
             "destinationPuzzle": purchase["vaultP2PuzzleHash"],
             "quoteExpiresAt": purchase["quoteExpiresAt"],
         }
+        source = {
+            "chainId": 84532,
+            "spoke": "0x" + "13" * 20,
+            "transactionHash": "0x" + "92" * 32,
+            "blockNumber": 100,
+            "blockHash": "0x" + "93" * 32,
+            "blockTimestamp": now,
+            "logIndex": 2,
+            "confirmations": 12,
+        }
+        headers = {
+            "Authorization": "Bearer test-omnichain-callback-token-32-characters"
+        }
+        unauthorized = client.post(
+            "/protocol/purchase-intents/escrow-webhook",
+            json={"escrowMessage": message, "source": source},
+        )
+        assert unauthorized.status_code == 401
+
+        wrong_spoke = client.post(
+            "/protocol/purchase-intents/escrow-webhook",
+            json={
+                "escrowMessage": message,
+                "source": {**source, "spoke": "0x" + "ff" * 20},
+            },
+            headers=headers,
+        )
+        assert wrong_spoke.status_code == 409
+        assert "provenance" in wrong_spoke.text
+
+        underconfirmed = client.post(
+            "/protocol/purchase-intents/escrow-webhook",
+            json={
+                "escrowMessage": message,
+                "source": {**source, "confirmations": 11},
+            },
+            headers=headers,
+        )
+        assert underconfirmed.status_code == 422
+
         tampered = client.post(
             "/protocol/external-payments/verify",
-            json={**message, "amount": message["amount"] - 1},
+            json={
+                "escrowMessage": {**message, "amount": message["amount"] - 1},
+                "source": source,
+            },
+            headers=headers,
         )
         assert tampered.status_code == 409
         assert "amount" in tampered.text
 
         redirected_vault = client.post(
             "/protocol/external-payments/verify",
-            json={**message, "vaultLauncherId": "0x" + "99" * 32},
+            json={
+                "escrowMessage": {
+                    **message,
+                    "vaultLauncherId": "0x" + "99" * 32,
+                },
+                "source": source,
+            },
+            headers=headers,
         )
         assert redirected_vault.status_code == 409
         assert "vaultLauncherId" in redirected_vault.text
 
         redirected_destination = client.post(
             "/protocol/external-payments/verify",
-            json={**message, "destinationPuzzle": "0x" + "98" * 32},
+            json={
+                "escrowMessage": {
+                    **message,
+                    "destinationPuzzle": "0x" + "98" * 32,
+                },
+                "source": source,
+            },
+            headers=headers,
         )
         assert redirected_destination.status_code == 409
         assert "destinationPuzzle" in redirected_destination.text
 
         verified = client.post(
-            "/protocol/external-payments/verify",
-            json=message,
+            "/protocol/purchase-intents/escrow-webhook",
+            json={"escrowMessage": message, "source": source},
+            headers=headers,
         )
         assert verified.status_code == 200, verified.text
-        assert verified.json()["verified"] is True
-        assert verified.json()["fulfillment"]["purchaseId"] == (
+        assert verified.json()["escrow"]["verified"] is True
+        assert verified.json()["verification"]["fulfillment"]["purchaseId"] == (
             purchase["purchaseId"]
         )
         built = built_response.json()
@@ -1143,9 +1228,13 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         replay = client.post(
             "/protocol/external-payments/verify",
             json={
-                **message,
-                "globalPaymentId": "0x" + "91" * 32,
+                "escrowMessage": {
+                    **message,
+                    "globalPaymentId": "0x" + "94" * 32,
+                },
+                "source": {**source, "transactionHash": "0x" + "95" * 32},
             },
+            headers=headers,
         )
         assert replay.status_code == 409
         assert "another external payment" in replay.text

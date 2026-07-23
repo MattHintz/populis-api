@@ -26,9 +26,9 @@ from chia_rs.sized_bytes import bytes32
 
 from .mint_proposals import StoredMintProposal
 from .mint_publish_validation import PublishProposalMetadata, metadata_bytes
+from solslot_puzzles.real_estate_profiles import ASSET_CLASS_CODES
 
-
-ALPHA_ASSET_CLASS_CODES = {"RWA-RE-RES": 1}
+ALPHA_ASSET_CLASS_CODES = {name: int(code) for name, code in ASSET_CLASS_CODES.items()}
 
 
 @dataclass(frozen=True)

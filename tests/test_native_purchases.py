@@ -43,7 +43,7 @@ from solslot_puzzles.payment_artifacts_v2 import PaymentRail, PurchaseArtifactV2
 from solslot_puzzles.primary_purchase_v2_driver import (
     PRIMARY_PURCHASE_PROVIDER_ID,
     PrimaryMintTermsV2,
-    make_mint_offer_v2_inner,
+    make_mint_offer_v4_inner,
 )
 from solslot_puzzles.protocol_deployment import singleton_struct
 from solslot_puzzles.vault_driver import puzzle_for_p2_vault
@@ -139,7 +139,7 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         validator_pubkeys=tuple(bytes(key.get_g1()) for key in validator_keys),
         provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
     )
-    deed_puzzle = SINGLETON_MOD.curry(deed_struct, make_mint_offer_v2_inner(terms))
+    deed_puzzle = SINGLETON_MOD.curry(deed_struct, make_mint_offer_v4_inner(terms))
     deed_coin = Coin(
         artifact.deed_launcher_id,
         deed_puzzle.get_tree_hash(),

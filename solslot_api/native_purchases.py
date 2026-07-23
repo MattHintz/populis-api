@@ -36,8 +36,8 @@ from solslot_puzzles.payment_artifacts_v2 import (
 from solslot_puzzles.primary_purchase_v2_driver import (
     PRIMARY_PURCHASE_PROVIDER_ID,
     PrimaryMintTermsV2,
-    build_chia_primary_offer,
-    make_mint_offer_v2_inner,
+    build_universal_primary_offer_v4,
+    make_mint_offer_v4_inner,
     prepare_chia_buyer_offer,
     validate_chia_buyer_offer,
 )
@@ -274,7 +274,7 @@ async def complete_native_purchase(
     )
     try:
         quorum = await collect_primary_purchase_quorum(settings, claim)
-        primary = build_chia_primary_offer(
+        primary = build_universal_primary_offer_v4(
             buyer_offer=buyer_offer,
             deed_coin=context.deed_coin,
             deed_singleton_struct=context.deed_struct,
@@ -316,6 +316,8 @@ async def _load_context(
     settings: Settings,
     coinset: Any,
     purchase_id: str,
+    *,
+    require_live: bool = True,
 ) -> NativePurchaseContext:
     normalized_purchase_id = "0x" + _hex_bytes(
         purchase_id,
@@ -327,7 +329,8 @@ async def _load_context(
             settings.payment_purchase_db_path
         ).get(normalized_purchase_id)
         purchase = purchase_artifact_from_json(stored.purchase_artifact)
-        purchase.assert_live(int(time.time()))
+        if require_live:
+            purchase.assert_live(int(time.time()))
     except (PaymentPurchaseNotFound, PaymentArtifactError, ValueError) as exc:
         raise HTTPException(
             status_code=409,
@@ -335,17 +338,21 @@ async def _load_context(
         ) from exc
     if purchase.rail not in (PaymentRail.CHIA_XCH, PaymentRail.CHIA_CAT):
         raise HTTPException(status_code=409, detail="Purchase is not XCH or CAT.")
-    reasons = _artifact_rejection_reasons(
-        stored.offer_artifact,
-        stored.offer_artifact_hash,
-        now=int(time.time()),
-        settings=settings,
-    )
-    if reasons:
-        raise HTTPException(
-            status_code=409,
-            detail="Purchase authorization is no longer current: " + ", ".join(reasons),
+    if require_live:
+        reasons = _artifact_rejection_reasons(
+            stored.offer_artifact,
+            stored.offer_artifact_hash,
+            now=int(time.time()),
+            settings=settings,
         )
+        if reasons:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Purchase authorization is no longer current: "
+                    + ", ".join(reasons)
+                ),
+            )
 
     from .zkpassport_enrollments import _sync_chia_stamp
 
@@ -360,14 +367,10 @@ async def _load_context(
             detail="The zkPassport vault credential is no longer current.",
         ) from exc
     receipt = enrollment.receipt
-    stored_receipt = stored.offer_artifact.get("vaultCredentialReceipt")
     if (
         enrollment.status != "chia_confirmed"
         or receipt is None
-        or not isinstance(stored_receipt, Mapping)
         or receipt.vaultLauncherId != _hex32(purchase.vault_launcher_id)
-        or receipt.chiaVaultCoinId != stored_receipt.get("chiaVaultCoinId")
-        or receipt.identityAttestRoot != stored_receipt.get("identityAttestRoot")
         or receipt.policyVersion != settings.zkpassport_policy_version
         or receipt.network != settings.network
         or receipt.bridgePolicyHash != settings.zkpassport_bridge_policy_hash
@@ -377,6 +380,17 @@ async def _load_context(
             status_code=409,
             detail="A current chain-confirmed zkPassport vault credential is required.",
         )
+    if require_live:
+        stored_receipt = stored.offer_artifact.get("vaultCredentialReceipt")
+        if (
+            not isinstance(stored_receipt, Mapping)
+            or receipt.chiaVaultCoinId != stored_receipt.get("chiaVaultCoinId")
+            or receipt.identityAttestRoot != stored_receipt.get("identityAttestRoot")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Purchase authorization is no longer current.",
+            )
     vault_record = get_registry().get(purchase.vault_launcher_id)
     if vault_record is None:
         raise HTTPException(
@@ -466,7 +480,7 @@ async def _load_context(
         )
         expected_puzzle = SINGLETON_MOD.curry(
             deed_struct,
-            make_mint_offer_v2_inner(terms),
+            make_mint_offer_v4_inner(terms),
         )
     except (KeyError, PublicArtifactError, TypeError, ValueError) as exc:
         raise HTTPException(
@@ -545,6 +559,8 @@ async def _select_payment_coin(
     coinset: Any,
     purchase: PurchaseArtifactV2,
     payment_public_key: bytes,
+    *,
+    minimum_amount: int | None = None,
 ) -> tuple[Coin, bytes, LineageProof | None] | None:
     from chia.wallet.cat_wallet.cat_utils import construct_cat_puzzle
     from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
@@ -562,13 +578,20 @@ async def _select_payment_coin(
         _hex32(puzzle.get_tree_hash()),
         include_spent=False,
     )
+    required_amount = (
+        purchase.rail_amount if minimum_amount is None else minimum_amount
+    )
+    if required_amount < purchase.rail_amount:
+        raise PaymentArtifactError(
+            "payment coin minimum cannot be below the authorized rail amount"
+        )
     candidates: list[tuple[Coin, Mapping[str, Any]]] = []
     for record in records:
         coin = _coin_from_record(record)
         if (
             coin is not None
             and _record_is_unspent_coin(record, coin)
-            and int(coin.amount) >= purchase.rail_amount
+            and int(coin.amount) >= required_amount
         ):
             candidates.append((coin, record))
     for coin, _record in sorted(candidates, key=lambda item: int(item[0].amount)):

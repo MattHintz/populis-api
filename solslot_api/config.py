@@ -86,6 +86,21 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "SOLSLOT_MINTING_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
         )
+    if settings.presale_enabled and not settings.alpha_writes_enabled:
+        raise RuntimeError(
+            "SOLSLOT_PRESALE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+    if settings.presale_enabled and not settings.collection_minting_enabled:
+        raise RuntimeError(
+            "SOLSLOT_PRESALE_ENABLED requires SOLSLOT_COLLECTION_MINTING_ENABLED."
+        )
+    if settings.voucher_issuance_worker_enabled and not settings.presale_enabled:
+        raise RuntimeError(
+            "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED requires "
+            "SOLSLOT_PRESALE_ENABLED."
+        )
+    if settings.voucher_issuance_worker_enabled and settings.network != "testnet11":
+        raise RuntimeError("RC20 voucher issuance is restricted to testnet11.")
     if settings.ceremony_mode_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
@@ -122,10 +137,26 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             )
 
     if settings.payment_omnichain_enabled:
+        if (
+            not settings.payment_omnichain_ingest_token
+            or len(settings.payment_omnichain_ingest_token) < 32
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires a dedicated "
+                "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN of at least 32 characters."
+            )
         if len(settings.payment_evm_usdc_tokens) != 1:
             raise RuntimeError(
                 "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires exactly one "
                 "SOLSLOT_PAYMENT_EVM_USDC_TOKENS chain binding."
+            )
+        if (
+            not settings.payment_omnichain_rpc_url
+            or not settings.payment_omnichain_rpc_url.startswith("https://")
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires an HTTPS "
+                "SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL."
             )
         chain_id_raw, token_address = next(
             iter(settings.payment_evm_usdc_tokens.items())
@@ -386,6 +417,8 @@ class Settings(BaseSettings):
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
+        "payment_omnichain_ingest_token",
+        "payment_omnichain_rpc_url",
         "payment_oracle_rounds_path",
         "collection_s3_endpoint_url",
         "collection_s3_access_key_id",
@@ -430,6 +463,12 @@ class Settings(BaseSettings):
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
+    presale_enabled: bool = False
+    # Automatic paid-reservation -> Chia voucher reconciliation. This is a
+    # separate opt-in because it spends faucet coins and requests validator
+    # quorum. Presale endpoints may be rehearsed while this remains disabled.
+    voucher_issuance_worker_enabled: bool = False
+    voucher_issuance_interval_seconds: float = Field(15.0, ge=5.0, le=300.0)
     # KoS is an isolated, optional co-signer for the one MINT EXECUTE
     # condition emitted by governance. The coordinator never receives a KoS
     # private key; it calls a separately deployed signer over mutual TLS.
@@ -641,6 +680,7 @@ class Settings(BaseSettings):
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False
     payment_omnichain_ingest_token: Optional[str] = None
+    payment_omnichain_rpc_url: Optional[str] = None
     payment_omnichain_preflight_evidence_path: Optional[str] = None
     payment_omnichain_evidence_path: Optional[str] = None
     payment_omnichain_activation_evidence_path: Optional[str] = None
@@ -799,6 +839,7 @@ class Settings(BaseSettings):
     collection_asset_verification_timeout_seconds: float = Field(
         30.0, gt=0, le=120.0
     )
+    collection_private_download_ttl_seconds: int = Field(300, ge=60, le=900)
 
     # Bytes first enter an IPFS node/API, then the provider-neutral Pinning
     # Service API records the returned CID. Gateway re-fetch verifies that

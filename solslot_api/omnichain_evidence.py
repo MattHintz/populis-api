@@ -31,8 +31,10 @@ class OmnichainEvidence:
     gateway_profile: str
     gateway_address: str
     spoke_address: str
+    confirmations: int
     governance_root_safe: str
     governance_timelock: str
+    return_puzzle_hash: str
 
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
@@ -136,6 +138,15 @@ def load_omnichain_evidence(
         raise OmnichainEvidenceError("Omnichain deployment evidence source SHA mismatches")
     if evidence.get("chainId") != chain_id:
         raise OmnichainEvidenceError("Omnichain deployment evidence chain mismatches")
+    confirmations = evidence.get("confirmations")
+    if (
+        not isinstance(confirmations, int)
+        or isinstance(confirmations, bool)
+        or confirmations < 12
+    ):
+        raise OmnichainEvidenceError(
+            "Omnichain deployment evidence confirmations are invalid"
+        )
     governance_artifact_hash = _require_hash(
         evidence.get("governanceArtifactHash"), "governanceArtifactHash"
     )
@@ -363,10 +374,13 @@ def load_omnichain_evidence(
     samuel_base = _require_mapping(samuel.get("baseSepolia"), "samuel.baseSepolia")
     validator_keys = samuel.get("validatorPublicKeys")
     if (
-        samuel.get("schemaVersion") != 1
+        samuel.get("schemaVersion") != 2
         or samuel.get("kind") != "solslot-samuel-testnet-coordinates"
         or samuel.get("artifactHash") != samuel_artifact_hash
         or not _GIT_SHA_RE.fullmatch(str(samuel.get("sourceSha", "")))
+        or not _GIT_SHA_RE.fullmatch(
+            str(samuel.get("protocolSourceSha", ""))
+        )
         or samuel.get("threshold") != 2
         or not isinstance(validator_keys, list)
         or len(validator_keys) != 3
@@ -375,7 +389,13 @@ def load_omnichain_evidence(
         or samuel_base.get("chainId") != 84532
     ):
         raise OmnichainEvidenceError("Omnichain Samuel evidence mismatches")
-    for name in ("portalLauncherId", "bridgingPuzzleHash", "returnPuzzleHash"):
+    for name in (
+        "portalLauncherId",
+        "bridgingPuzzleHash",
+        "returnPuzzleHash",
+        "resultAuthorizationModHash",
+        "voucherBurnInnerHash",
+    ):
         _require_hash(samuel_testnet.get(name), f"samuel.testnet11.{name}")
     samuel_portal = _require_address(
         samuel_base.get("warpPortalAddress"), "samuel.baseSepolia.warpPortalAddress"
@@ -432,6 +452,24 @@ def load_omnichain_evidence(
         or preflight_decimals.get("usdc") != 6
         or _require_address(preflight_settings.get("warpPortal"), "preflight.warpPortal")
         != samuel_portal
+        or preflight_settings.get("protocolSourceSha")
+        != samuel.get("protocolSourceSha")
+        or _require_hash(
+            preflight_settings.get("voucherResultAuthorizationMod"),
+            "preflight.voucherResultAuthorizationMod",
+        )
+        != _require_hash(
+            samuel_testnet.get("resultAuthorizationModHash"),
+            "samuel.testnet11.resultAuthorizationModHash",
+        )
+        or _require_hash(
+            preflight_settings.get("voucherBurnInner"),
+            "preflight.voucherBurnInner",
+        )
+        != _require_hash(
+            samuel_testnet.get("voucherBurnInnerHash"),
+            "samuel.testnet11.voucherBurnInnerHash",
+        )
     ):
         raise OmnichainEvidenceError("Omnichain preflight evidence settings mismatch")
     for name in ("ccipRouter", "usdc"):
@@ -525,8 +563,13 @@ def load_omnichain_evidence(
         gateway_profile=gateway_profile,
         gateway_address=_require_address(contracts.get("gateway"), "gateway"),
         spoke_address=_require_address(contracts.get("spoke"), "spoke"),
+        confirmations=confirmations,
         governance_root_safe=governance_root_safe,
         governance_timelock=governance_timelock,
+        return_puzzle_hash=_require_hash(
+            samuel_testnet.get("returnPuzzleHash"),
+            "samuel.testnet11.returnPuzzleHash",
+        ),
     )
 
 
