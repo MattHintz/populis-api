@@ -42,6 +42,7 @@ from solslot_api.presale_endpoints import (
     VoucherIssuanceEvidenceRequest,
     VoucherSeriesPhaseChainEvidence,
     _authorize_native_voucher_request,
+    _public_presale,
     _verify_base_settlement_relay_evidence,
     _voucher_commitment,
 )
@@ -603,6 +604,28 @@ def create_series(
             "spendBundleId": hex32(128),
         },
     )
+
+
+def test_public_presale_redacts_vouchers_and_vault_view_is_scoped() -> None:
+    now = int(time.time())
+    current_terms = terms(now)
+    store = PresaleStore(":memory:")
+    create_series(store, current_terms)
+    ingest(store, current_terms)
+
+    full = store.get(str(current_terms["termsHash"]))
+    assert len(full["vouchers"]) == 1
+    assert "vouchers" not in _public_presale(full)
+
+    launcher_id = approved_vault().launcher_id
+    scoped = store.vouchers_for_vault(launcher_id)
+    assert len(scoped) == 1
+    assert scoped[0]["vaultLauncherId"] == launcher_id
+    assert scoped[0]["termsHash"] == current_terms["termsHash"]
+    assert scoped[0]["seriesState"] == "PRESALE"
+    assert scoped[0]["deedId"] == "deed-0"
+    assert "commitment" not in scoped[0]
+    assert store.vouchers_for_vault(hex32(255)) == []
 
 
 def confirm_issuance(

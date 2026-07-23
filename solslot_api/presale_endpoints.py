@@ -78,6 +78,7 @@ from solslot_puzzles.vault_driver import (
     puzzle_for_vault_inner,
 )
 
+from .admin_auth import require_admin_jwt
 from .admin_operations import require_admin_operation
 from .collection_store import CollectionStore, get_collection_store
 from .config import Settings, get_settings
@@ -718,6 +719,74 @@ class PresaleStore:
             "SELECT terms_hash FROM presale_series_v2 ORDER BY created_at DESC"
         ).fetchall()
         return [self.get(row["terms_hash"]) for row in rows]
+
+    def vouchers_for_vault(self, vault_launcher_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM voucher_records_v2
+            WHERE vault_launcher_id=?
+            ORDER BY created_at DESC, serial
+            """,
+            (vault_launcher_id.lower(),),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            series = self._get_series(row["terms_hash"])
+            voucher = self._render_voucher(row, series)
+            deed = next(
+                (
+                    item
+                    for item in series["terms"]["deeds"]
+                    if item["deedLauncherId"].lower()
+                    == voucher["deedLauncherId"].lower()
+                ),
+                None,
+            )
+            result.append(
+                {
+                    key: voucher[key]
+                    for key in (
+                        "serial",
+                        "deedLauncherId",
+                        "paymentRail",
+                        "paymentPrincipal",
+                        "basePriceMinor",
+                        "technologyFeeBps",
+                        "technologyFeeMinor",
+                        "grossPriceMinor",
+                        "originalPayer",
+                        "vaultLauncherId",
+                        "vaultP2PuzzleHash",
+                        "purchaseId",
+                        "globalPaymentId",
+                        "commitmentHash",
+                        "state",
+                        "paymentEvidenceId",
+                        "issuanceEvidenceId",
+                        "issuanceBundleId",
+                        "voucherLauncherId",
+                        "voucherOutputCoinId",
+                        "paymentCommitmentCoinId",
+                        "issuanceConfirmedHeight",
+                        "deliveryDeadline",
+                        "createdAt",
+                        "updatedAt",
+                    )
+                }
+                | {
+                    "termsHash": series["termsHash"],
+                    "seriesSingletonId": series["seriesSingletonId"],
+                    "seriesState": series["state"],
+                    "collectionId": series["collectionId"],
+                    "deedId": (
+                        deed["deedId"]
+                        if deed is not None
+                        else voucher["deedLauncherId"]
+                    ),
+                    "refundDeadline": series["terms"]["refundDeadline"],
+                }
+            )
+        return result
 
     def ingest_payment(
         self,
@@ -3701,6 +3770,12 @@ def response_or_404(call):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _public_presale(series: dict[str, Any]) -> dict[str, Any]:
+    public = dict(series)
+    public.pop("vouchers", None)
+    return public
+
+
 @router.get("/base-settlements/pending")
 def pending_base_settlements(
     store: Annotated[PresaleStore, Depends(get_presale_store)],
@@ -3886,7 +3961,37 @@ async def create_presale(
 def list_presales(
     store: Annotated[PresaleStore, Depends(get_presale_store)],
 ) -> list[dict[str, Any]]:
+    return [_public_presale(series) for series in store.list()]
+
+
+@router.get("/admin", dependencies=[Depends(require_admin_jwt)])
+def list_presales_for_admin(
+    store: Annotated[PresaleStore, Depends(get_presale_store)],
+) -> list[dict[str, Any]]:
     return store.list()
+
+
+@router.get("/admin/{identifier}", dependencies=[Depends(require_admin_jwt)])
+def get_presale_for_admin(
+    identifier: str,
+    store: Annotated[PresaleStore, Depends(get_presale_store)],
+) -> dict[str, Any]:
+    return response_or_404(lambda: store.get(identifier))
+
+
+@router.get("/vaults/{vault_launcher_id}/vouchers")
+def list_vault_presale_vouchers(
+    vault_launcher_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[PresaleStore, Depends(get_presale_store)],
+) -> list[dict[str, Any]]:
+    session = verify_vault_session(settings, request, vault_launcher_id)
+    approved = require_current_approved_vault(
+        settings,
+        session.vault_launcher_id,
+    )
+    return store.vouchers_for_vault(approved.launcher_id)
 
 
 @router.get("/{identifier}")
@@ -3894,7 +3999,7 @@ def get_presale(
     identifier: str,
     store: Annotated[PresaleStore, Depends(get_presale_store)],
 ) -> dict[str, Any]:
-    return response_or_404(lambda: store.get(identifier))
+    return response_or_404(lambda: _public_presale(store.get(identifier)))
 
 
 @router.post(
@@ -4216,7 +4321,10 @@ def ingest_voucher_issuance_evidence(
     )
 
 
-@router.get("/{terms_hash}/vouchers/{serial}")
+@router.get(
+    "/{terms_hash}/vouchers/{serial}",
+    dependencies=[Depends(require_admin_jwt)],
+)
 def get_voucher(
     terms_hash: str,
     serial: int,
