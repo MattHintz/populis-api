@@ -58,6 +58,12 @@ share allocation, or delivery address.
   flat 2-of-3 Safe, pre-RC19 rail schemas, guardian key reuse, incorrect Safe
   thresholds, missing seven-day recovery acceptance, and any payout or
   timelock role not bound to the root Safe.
+- The one-shot ownership handoff desk is separately gated by
+  `SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED`. It requires the
+  reviewed Safe-operation path and exact artifact hash. Administrators sign
+  the actual nested Safe messages in the portal; the API stores no EVM private
+  key and accepts a broadcast receipt only when the Root Safe destination and
+  calldata match the reconstructed sealed transaction.
 - `SOLSLOT_PAYMENT_PURCHASE_DB_PATH` is the coordinator-owned SQLite-WAL
   purchase and replay ledger.
 - `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase

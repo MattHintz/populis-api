@@ -216,6 +216,11 @@ jobs:
     if: ${{ github.event.inputs.rollback_sha == '' || github.event.inputs.rollback_sha == null }}
     runs-on: ubuntu-latest
     environment: staging
+    env:
+      OWNERSHIP_ACTIVATION_ENABLED: ${{ vars.SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED || 'false' }}
+      OWNERSHIP_SAFE_OPERATION_HASH: ${{ vars.SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_SAFE_OPERATION_HASH || '' }}
+      OWNERSHIP_RPC_URL: ${{ vars.SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL || '' }}
+      OWNERSHIP_SAFE_OPERATION_B64: ${{ secrets.SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_SAFE_OPERATION_B64 || '' }}
     steps:
       - name: Deploy release atomically
         uses: appleboy/ssh-action@v1.0.3
@@ -226,6 +231,7 @@ jobs:
           passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
           port: 22
           command_timeout: 15m
+          envs: OWNERSHIP_ACTIVATION_ENABLED,OWNERSHIP_SAFE_OPERATION_HASH,OWNERSHIP_RPC_URL,OWNERSHIP_SAFE_OPERATION_B64
           script: |
             set -euo pipefail
 
@@ -237,6 +243,8 @@ jobs:
             archive="/tmp/solslot-api-release-$release_sha.tgz"
             shared_root="${{ env.SHARED_ROOT }}"
             state_dir="$shared_root/state"
+            evidence_dir="$shared_root/evidence"
+            ownership_operation_file="$evidence_dir/ownership-safe-operation-v1.json"
             transaction_dir="$shared_root/deployments"
             transaction_file="$transaction_dir/deploy-$release_sha.previous"
             env_file="${{ env.ENV_FILE_PATH }}"
@@ -252,12 +260,12 @@ jobs:
             if ! id "$systemd_user" >/dev/null 2>&1; then
               sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin "$systemd_user"
             fi
-            sudo mkdir -p "$release_root/releases" "$state_dir" "$transaction_dir"
+            sudo mkdir -p "$release_root/releases" "$state_dir" "$evidence_dir" "$transaction_dir"
             test -f "$archive" || (echo "Missing release archive $archive" && exit 1)
             sudo test -f "$env_file" || (echo "Missing $env_file on staging host." && exit 1)
             sudo chown -R "$(id -un)":"$(id -gn)" "$release_root/releases"
             sudo chown -R "$systemd_user":"$systemd_user" "$shared_root"
-            sudo chmod 0700 "$shared_root" "$state_dir" "$transaction_dir"
+            sudo chmod 0700 "$shared_root" "$state_dir" "$evidence_dir" "$transaction_dir"
             sudo chmod 0600 "$env_file"
 
             python_bin="$(command -v python3.12 || command -v python3.11 || true)"
@@ -265,6 +273,47 @@ jobs:
               echo "Python 3.11+ is required on the staging host."
               exit 1
             fi
+
+            if [ "$OWNERSHIP_ACTIVATION_ENABLED" != "true" ] \
+              && [ "$OWNERSHIP_ACTIVATION_ENABLED" != "false" ]; then
+              echo "Ownership activation flag must be true or false." >&2
+              exit 1
+            fi
+            if [ "$OWNERSHIP_ACTIVATION_ENABLED" = "true" ]; then
+              test -n "$OWNERSHIP_SAFE_OPERATION_B64"
+              test -n "$OWNERSHIP_RPC_URL"
+              [[ "$OWNERSHIP_RPC_URL" =~ ^https://[A-Za-z0-9._:/-]+$ ]]
+              [[ "$OWNERSHIP_SAFE_OPERATION_HASH" =~ ^0x[0-9a-f]{64}$ ]]
+              ownership_temp="$(mktemp)"
+              trap 'rm -f "$ownership_temp"' EXIT
+              printf '%s' "$OWNERSHIP_SAFE_OPERATION_B64" | base64 --decode >"$ownership_temp"
+              "$python_bin" - "$ownership_temp" "$OWNERSHIP_SAFE_OPERATION_HASH" <<'PY'
+            import hashlib
+            import json
+            import sys
+
+            value = json.load(open(sys.argv[1], encoding="utf-8"))
+            declared = value.pop("artifactHash")
+            canonical = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            observed = "0x" + hashlib.sha256(canonical).hexdigest()
+            assert declared == sys.argv[2] == observed
+            assert value["kind"] == "solslot-safe-authority-operation"
+            assert value["network"] == "baseSepolia"
+            assert value["chainId"] == 84532
+            assert value["phase"] == "schedule"
+            PY
+              sudo install -o "$systemd_user" -g "$systemd_user" -m 0600 \
+                "$ownership_temp" "$ownership_operation_file"
+            else
+              OWNERSHIP_SAFE_OPERATION_HASH=""
+              OWNERSHIP_RPC_URL=""
+            fi
+
             "$python_bin" - <<'PY'
             import sys
             if sys.version_info < (3, 11):
@@ -422,6 +471,10 @@ jobs:
             Environment=SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH=$state_dir/zkpassport_v2.db
             Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry_v2.db
             Environment=SOLSLOT_ADMIN_DB_PATH=$state_dir/admin_desk_v2.db
+            Environment=SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED=$OWNERSHIP_ACTIVATION_ENABLED
+            Environment="SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_SAFE_OPERATION_PATH=$ownership_operation_file"
+            Environment="SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_SAFE_OPERATION_HASH=$OWNERSHIP_SAFE_OPERATION_HASH"
+            Environment="SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL=$OWNERSHIP_RPC_URL"
             Environment=SOLSLOT_DEPLOYMENT_MANIFEST_PATH=$state_dir/deployment_manifest_v2.json
             Environment=SOLSLOT_BOOTSTRAP_MANIFEST_PATH=$state_dir/bootstrap_manifest_v2.json
             ExecStart=
