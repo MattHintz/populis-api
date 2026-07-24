@@ -25,7 +25,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from web3 import Web3
 
-from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
 
@@ -679,7 +678,7 @@ def _verify_broadcast(
     package: Mapping[str, Any],
     approvals: Mapping[str, Mapping[str, Any]],
     transaction_hash: str,
-) -> tuple[int, int]:
+) -> tuple[int, int, str]:
     transaction_hash = _require_hash(transaction_hash, "transactionHash")
     expected = _build_exec_transaction(package, approvals)
     w3 = _web3(settings)
@@ -708,7 +707,11 @@ def _verify_broadcast(
         raise OwnershipActivationError(
             "ownership broadcast does not match the sealed Root Safe transaction"
         )
-    return block_number, max(0, latest_block - block_number + 1)
+    submitted_by = _require_address(
+        transaction.get("from"),
+        "broadcast transaction sender",
+    )
+    return block_number, max(0, latest_block - block_number + 1), submitted_by
 
 
 def _require_enabled(settings: Settings) -> None:
@@ -799,7 +802,6 @@ router = APIRouter(
 
 @router.get("")
 def get_ownership_activation(
-    _claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[
         OwnershipActivationStore, Depends(get_ownership_activation_store)
@@ -816,40 +818,30 @@ def get_ownership_activation(
 @router.post("/sign")
 def sign_ownership_activation(
     body: SignatureRequest,
-    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[
         OwnershipActivationStore, Depends(get_ownership_activation_store)
     ],
 ) -> dict[str, Any]:
     _require_enabled(settings)
-    if claims.auth_type != "evm":
-        raise HTTPException(
-            status_code=409,
-            detail="Safe ownership activation requires the enrolled EVM admin wallet",
-        )
     try:
         package = load_authority_operation(settings)
         chain = _chain_state(settings, package)
         if not chain.package_is_current:
             raise ValueError("ownership operation is already scheduled")
-        claimed_address = normalize_evm_address(claims.sub, "authenticated administrator")
-        matching = [
-            descriptor
-            for descriptor in package["authorityOperation"]["approvals"]
+        matching: list[tuple[Mapping[str, Any], Any]] = []
+        for descriptor in package["authorityOperation"]["approvals"]:
+            recovered = recover_evm_signer(descriptor["typedData"], body.signature)
             if any(
-                signer.lower() == claimed_address.lower()
+                signer.lower() == recovered.address.lower()
                 for signer in descriptor["allowedSigners"]
-            )
-        ]
+            ):
+                matching.append((descriptor, recovered))
         if len(matching) != 1:
             raise ValueError(
-                "authenticated administrator has no unique role in this Safe operation"
+                "SafeMessage signature does not match one unique authorized Safe role"
             )
-        descriptor = matching[0]
-        recovered = recover_evm_signer(descriptor["typedData"], body.signature)
-        if recovered.address.lower() != claimed_address.lower():
-            raise ValueError("SafeMessage signature does not match the admin session")
+        descriptor, recovered = matching[0]
         if "0x" + recovered.digest.hex() != descriptor["messageHash"]:
             raise ValueError("SafeMessage digest changed after package review")
         _normalize_signature(body.signature)
@@ -870,7 +862,6 @@ def sign_ownership_activation(
 @router.post("/broadcast")
 def record_ownership_activation_broadcast(
     body: BroadcastRequest,
-    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[
         OwnershipActivationStore, Depends(get_ownership_activation_store)
@@ -882,7 +873,7 @@ def record_ownership_activation_broadcast(
         approvals = store.approvals(package["artifactHash"])
         if any(role not in approvals for role in REQUIRED_ROLES):
             raise ValueError("both Safe administrator approvals are required")
-        block_number, confirmations = _verify_broadcast(
+        block_number, confirmations, submitted_by = _verify_broadcast(
             settings=settings,
             package=package,
             approvals=approvals,
@@ -894,7 +885,7 @@ def record_ownership_activation_broadcast(
         store.record_broadcast(
             package_hash=package["artifactHash"],
             transaction_hash=body.transaction_hash.lower(),
-            submitted_by=claims.sub,
+            submitted_by=submitted_by,
             block_number=block_number,
             confirmations=confirmations,
             minimum_confirmations=settings.payment_omnichain_ownership_min_confirmations,

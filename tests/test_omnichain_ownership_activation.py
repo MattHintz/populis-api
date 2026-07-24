@@ -8,7 +8,6 @@ from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from solslot_api.admin_auth import AdminClaims, require_admin_jwt
 from solslot_api.config import Settings, get_settings
 from solslot_api.omnichain_ownership_activation import (
     ChainState,
@@ -28,10 +27,6 @@ ROOT_SAFE = "0xb7e02C216A2B3aF0cC4Ad8808fA169f2F0B19724"
 TIMELOCK = "0x5eC98d5a9C24C2a80957AB04630812C36807aad3"
 OWNER_SAFE = "0x73a282e829dF5b7E12824a53F54c2FB6f07D13a5"
 COADMIN_SAFE = "0x428700faA2b6Ebc613435994C84dB27908964A88"
-
-
-def _claims(address: str) -> AdminClaims:
-    return AdminClaims(sub=address, auth_type="evm", iat=1, exp=2_000_000_000)
 
 
 def _safe_message(safe: str, message: str) -> dict:
@@ -140,12 +135,11 @@ def _scheduled_chain_state() -> ChainState:
     )
 
 
-def _test_app(settings: Settings, store: OwnershipActivationStore, claims) -> FastAPI:
+def _test_app(settings: Settings, store: OwnershipActivationStore) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_ownership_activation_store] = lambda: store
-    app.dependency_overrides[require_admin_jwt] = claims
     return app
 
 
@@ -170,8 +164,7 @@ def test_real_safe_signatures_are_the_only_approvals(
         admin_db_path=str(tmp_path / "admin.db"),
     )
     store = OwnershipActivationStore(settings.admin_db_path)
-    active_claims = {"value": _claims(owner.address)}
-    app = _test_app(settings, store, lambda: active_claims["value"])
+    app = _test_app(settings, store)
     client = TestClient(app)
     monkeypatch.setattr(
         "solslot_api.omnichain_ownership_activation._chain_state",
@@ -194,7 +187,6 @@ def test_real_safe_signatures_are_the_only_approvals(
     assert response.status_code == 200
     assert response.json()["state"] == "AWAITING_APPROVALS"
 
-    active_claims["value"] = _claims(coadmin.address)
     response = client.post(
         "/admin/omnichain/ownership-activation/sign",
         json={"signature": _signature(coadmin, descriptors["coadmin"]["typedData"])},
@@ -208,7 +200,7 @@ def test_real_safe_signatures_are_the_only_approvals(
     assert len(store.approvals(raw["artifactHash"])) == 2
 
 
-def test_signature_must_match_admin_session_and_safe_role(
+def test_signature_must_match_one_authorized_safe_role(
     tmp_path, monkeypatch
 ) -> None:
     owner = Account.create()
@@ -228,25 +220,26 @@ def test_signature_must_match_admin_session_and_safe_role(
         admin_db_path=str(tmp_path / "admin.db"),
     )
     store = OwnershipActivationStore(settings.admin_db_path)
-    app = _test_app(settings, store, lambda: _claims(owner.address))
+    app = _test_app(settings, store)
     client = TestClient(app)
     monkeypatch.setattr(
         "solslot_api.omnichain_ownership_activation._chain_state",
         lambda *_args, **_kwargs: _current_chain_state(),
     )
     package = load_authority_operation(settings)
-    coadmin_typed_data = next(
+    outsider = Account.create()
+    owner_typed_data = next(
         value["typedData"]
         for value in package["authorityOperation"]["approvals"]
-        if value["role"] == "coadmin"
+        if value["role"] == "owner_identity"
     )
 
     response = client.post(
         "/admin/omnichain/ownership-activation/sign",
-        json={"signature": _signature(coadmin, coadmin_typed_data)},
+        json={"signature": _signature(outsider, owner_typed_data)},
     )
     assert response.status_code == 409
-    assert "does not match the admin session" in response.json()["detail"]
+    assert "does not match one unique authorized Safe role" in response.json()["detail"]
     assert store.approvals(raw["artifactHash"]) == {}
 
 
@@ -288,11 +281,11 @@ def test_broadcast_receipt_is_recorded_only_after_timelock_schedule(
         signature=_signature(coadmin, descriptors["coadmin"]["typedData"]),
         now=2,
     )
-    app = _test_app(settings, store, lambda: _claims(owner.address))
+    app = _test_app(settings, store)
     client = TestClient(app)
     monkeypatch.setattr(
         "solslot_api.omnichain_ownership_activation._verify_broadcast",
-        lambda **_kwargs: (101, 12),
+        lambda **_kwargs: (101, 12, owner.address),
     )
     monkeypatch.setattr(
         "solslot_api.omnichain_ownership_activation._chain_state",
@@ -342,7 +335,6 @@ def test_package_hash_and_feature_flag_fail_closed(tmp_path) -> None:
     app = _test_app(
         disabled_settings,
         OwnershipActivationStore(disabled_settings.admin_db_path),
-        lambda: _claims(owner.address),
     )
     response = TestClient(app).get("/admin/omnichain/ownership-activation")
     assert response.status_code == 503
@@ -385,6 +377,7 @@ def test_broadcast_verifier_compares_exact_root_safe_calldata(
         @staticmethod
         def get_transaction(_transaction_hash):
             return {
+                "from": owner.address,
                 "to": package["rootSafe"],
                 "value": 0,
                 "input": expected["data"],
@@ -407,10 +400,11 @@ def test_broadcast_verifier_compares_exact_root_safe_calldata(
         package=package,
         approvals=approvals,
         transaction_hash="0x" + "99" * 32,
-    ) == (101, 12)
+    ) == (101, 12, owner.address)
 
     FakeEth.get_transaction = staticmethod(
         lambda _transaction_hash: {
+            "from": owner.address,
             "to": package["rootSafe"],
             "value": 0,
             "input": expected["data"][:-2]
