@@ -136,6 +136,32 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "KoS MINT execute signing requires CA, client certificate, and client key paths."
             )
 
+    if settings.payment_omnichain_ownership_activation_enabled:
+        if settings.network != "testnet11":
+            raise RuntimeError(
+                "Base Sepolia ownership activation is restricted to the Testnet11 alpha."
+            )
+        if (
+            not settings.payment_omnichain_rpc_url
+            or not settings.payment_omnichain_rpc_url.startswith("https://")
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED "
+                "requires an HTTPS SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL."
+            )
+        from .omnichain_ownership_activation import (
+            OwnershipActivationError,
+            load_authority_operation,
+        )
+
+        try:
+            load_authority_operation(settings)
+        except OwnershipActivationError as exc:
+            raise RuntimeError(
+                "Base Sepolia ownership activation requires the exact reviewed "
+                f"Safe operation package: {exc}"
+            ) from exc
+
     if settings.payment_omnichain_enabled:
         if (
             not settings.payment_omnichain_ingest_token
@@ -419,6 +445,8 @@ class Settings(BaseSettings):
         "protocol_artifact_api_token",
         "payment_omnichain_ingest_token",
         "payment_omnichain_rpc_url",
+        "payment_omnichain_ownership_safe_operation_path",
+        "payment_omnichain_ownership_safe_operation_hash",
         "payment_oracle_rounds_path",
         "collection_s3_endpoint_url",
         "collection_s3_access_key_id",
@@ -687,6 +715,13 @@ class Settings(BaseSettings):
     payment_omnichain_governance_evidence_path: Optional[str] = None
     payment_omnichain_samuel_evidence_path: Optional[str] = None
     payment_omnichain_ownership_intent_evidence_path: Optional[str] = None
+    # A separate, one-shot gate for transferring the Base Sepolia rail to the
+    # reviewed 2-of-3 Safe + timelock. Administrators sign the actual nested
+    # SafeMessage payload; no API-specific approval envelope is introduced.
+    payment_omnichain_ownership_activation_enabled: bool = False
+    payment_omnichain_ownership_safe_operation_path: Optional[str] = None
+    payment_omnichain_ownership_safe_operation_hash: Optional[str] = None
+    payment_omnichain_ownership_min_confirmations: int = Field(12, ge=12)
     payment_omnichain_source_sha: Optional[str] = None
     payment_omnichain_gateway_profile: Optional[str] = Field(
         None, min_length=1, max_length=32

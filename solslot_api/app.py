@@ -43,6 +43,9 @@ from .admin_auth import (
     validate_admin_config_at_startup,
 )
 from .admin_operations import router as admin_operations_router
+from .omnichain_ownership_activation import (
+    router as omnichain_ownership_activation_router,
+)
 try:
     from .admin_roster_update import router as admin_roster_update_router
 except ModuleNotFoundError as e:
@@ -329,6 +332,7 @@ app.include_router(genesis_router)
 # records committed by the current admin-authority singleton.
 app.include_router(admin_auth_router)
 app.include_router(admin_operations_router)
+app.include_router(omnichain_ownership_activation_router)
 if admin_roster_update_router is not None:
     app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
