@@ -606,6 +606,14 @@ def create_series(
     )
 
 
+def test_presale_store_creates_parent_directory(tmp_path: Path) -> None:
+    database_path = tmp_path / "fresh-state" / "presale.db"
+
+    store = PresaleStore(str(database_path))
+
+    assert database_path.is_file()
+
+
 def test_public_presale_redacts_vouchers_and_vault_view_is_scoped() -> None:
     now = int(time.time())
     current_terms = terms(now)

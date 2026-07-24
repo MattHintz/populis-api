@@ -405,8 +405,11 @@ class PresaleStore:
 
     def __init__(self, path: str) -> None:
         self._lock = threading.RLock()
+        db_path = Path(path)
+        if path != ":memory:":
+            db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
-            ":memory:" if path == ":memory:" else str(Path(path)),
+            ":memory:" if path == ":memory:" else str(db_path),
             check_same_thread=False,
             isolation_level=None,
         )
