@@ -7,6 +7,7 @@ import time
 import pytest
 from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
+from eth_abi import encode as abi_encode
 from eth_utils import keccak
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -290,7 +291,7 @@ def _configure_external_quote(
         }.items()
     }
     evidence = {
-        "schemaVersion": 3,
+        "schemaVersion": 5,
         "protocolVersion": "solslot-v2",
         "rail": "ccip-warp-escrow",
         "sourceSha": "a" * 40,
@@ -300,6 +301,7 @@ def _configure_external_quote(
         "confirmations": 12,
         "governanceArtifactHash": "0x" + "42" * 32,
         "samuelCoordinateArtifactHash": "0x" + "43" * 32,
+        "warpPortalArtifactHash": "0x" + "44" * 32,
         "contracts": {
             "ccipRouter": "0x" + "11" * 20,
             "gateway": "0x" + "12" * 20,
@@ -313,6 +315,8 @@ def _configure_external_quote(
             "payoutAddress": "0x" + "14" * 20,
             "governanceRootSafe": "0x" + "14" * 20,
             "governanceTimelock": "0x" + "15" * 20,
+            "samuelSourceSha": "b" * 40,
+            "predictedGatewayAddress": "0x" + "12" * 20,
             "ownershipAccepted": False,
         },
         "deploymentTransactions": {
@@ -426,8 +430,11 @@ def _configure_external_quote(
     governance_path.write_text(json.dumps(governance), encoding="utf-8")
     evidence["governanceArtifactHash"] = governance["artifactHash"]
 
+    validator_evm_addresses = [
+        "0x" + value * 20 for value in ("71", "72", "73")
+    ]
     samuel = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "kind": "solslot-samuel-testnet-coordinates",
         "sourceSha": "b" * 40,
         "protocolSourceSha": "c" * 40,
@@ -442,11 +449,17 @@ def _configure_external_quote(
         "baseSepolia": {
             "chainId": 84532,
             "warpPortalAddress": "0x" + "16" * 20,
+            "solomonGatewayAddress": evidence["contracts"]["gateway"],
         },
         "threshold": 2,
         "validatorPublicKeys": [
             "0x" + value * 48 for value in ("71", "72", "73")
         ],
+        "validatorEvmAddresses": validator_evm_addresses,
+        "returnRoute": {
+            "destinationChain": "bse",
+            "destinationAddress": evidence["contracts"]["gateway"],
+        },
     }
     samuel_canonical = json.dumps(
         samuel, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -455,8 +468,66 @@ def _configure_external_quote(
     samuel_path = tmp_path / "omnichain-samuel-evidence.json"
     samuel_path.write_text(json.dumps(samuel), encoding="utf-8")
     evidence["samuelCoordinateArtifactHash"] = samuel["artifactHash"]
+
+    warp_portal = {
+        "schemaVersion": 1,
+        "kind": "solslot-warp-base-sepolia-portal-deployment",
+        "sourceSha": evidence["sourceSha"],
+        "network": evidence["network"],
+        "chainId": evidence["chainId"],
+        "portal": {
+            "address": samuel["baseSepolia"]["warpPortalAddress"],
+            "owner": "0x" + "17" * 20,
+            "signers": validator_evm_addresses,
+            "signatureThreshold": 2,
+            "messageTollWei": "0",
+            "supportedChains": ["0x786368"],
+            "initializedAtomically": True,
+        },
+        "proxy": {
+            "implementation": "0x" + "18" * 20,
+            "admin": "0x" + "19" * 20,
+            "adminOwner": "0x" + "17" * 20,
+            "standard": "openzeppelin-transparent-proxy-5.0.2",
+        },
+        "deploymentTransactions": {
+            name: {
+                "hash": "0x" + value * 32,
+                "blockNumber": 1,
+                "from": "0x" + "20" * 20,
+                "dataHash": "0x" + value * 32,
+            }
+            for name, value in {
+                "validatorSafe": "81",
+                "portalImplementation": "82",
+                "portalProxy": "83",
+            }.items()
+        },
+        "runtimeCodeHashes": {
+            "safe": "0x" + "38" * 32,
+            "portal": "0x" + "37" * 32,
+            "implementation": "0x" + "39" * 32,
+            "proxyAdmin": "0x" + "3a" * 32,
+        },
+        "artifactRuntimeCodeHashes": {
+            "portal": "0x" + "39" * 32,
+            "transparentProxyTemplate": "0x" + "3b" * 32,
+            "proxyAdmin": "0x" + "3a" * 32,
+        },
+        "createdAt": "2026-07-20T00:00:00.000Z",
+    }
+    warp_canonical = json.dumps(
+        warp_portal, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    warp_portal["artifactHash"] = "0x" + hashlib.sha256(
+        warp_canonical
+    ).hexdigest()
+    warp_path = tmp_path / "omnichain-warp-portal-evidence.json"
+    warp_path.write_text(json.dumps(warp_portal), encoding="utf-8")
+    evidence["warpPortalArtifactHash"] = warp_portal["artifactHash"]
+
     preflight = {
-        "schemaVersion": 3,
+        "schemaVersion": 5,
         "kind": "solslot-omnichain-testnet-deployment-preflight",
         "sourceSha": evidence["sourceSha"],
         "network": evidence["network"],
@@ -469,6 +540,7 @@ def _configure_external_quote(
         "samuelCoordinateArtifactHash": evidence[
             "samuelCoordinateArtifactHash"
         ],
+        "warpPortalArtifactHash": evidence["warpPortalArtifactHash"],
         "settings": {
             "ccipRouter": evidence["contracts"]["ccipRouter"],
             "payout": evidence["configuration"]["payoutAddress"],
@@ -477,6 +549,8 @@ def _configure_external_quote(
             "usdc": evidence["contracts"]["usdc"],
             "warpPortal": "0x" + "16" * 20,
             "protocolSourceSha": samuel["protocolSourceSha"],
+            "samuelSourceSha": samuel["sourceSha"],
+            "predictedGatewayAddress": evidence["contracts"]["gateway"],
             "voucherResultAuthorizationMod": samuel["testnet11"][
                 "resultAuthorizationModHash"
             ],
@@ -520,6 +594,67 @@ def _configure_external_quote(
     evidence["artifactHash"] = "0x" + hashlib.sha256(canonical).hexdigest()
     deployment_path = tmp_path / "omnichain-deployment-evidence.json"
     deployment_path.write_text(json.dumps(evidence), encoding="utf-8")
+    ownership_targets = [
+        evidence["contracts"]["gateway"],
+        evidence["contracts"]["spoke"],
+    ]
+    ownership_values = [0, 0]
+    ownership_payloads = [keccak(text="acceptOwnership()")[:4]] * 2
+    ownership_predecessor = bytes(32)
+    ownership_salt = bytes.fromhex("44" * 32)
+    operation_id = "0x" + keccak(
+        abi_encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [
+                ownership_targets,
+                ownership_values,
+                ownership_payloads,
+                ownership_predecessor,
+                ownership_salt,
+            ],
+        )
+    ).hex()
+    schedule_data = "0x" + (
+        keccak(
+            text=(
+                "scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,"
+                "uint256)"
+            )
+        )[:4]
+        + abi_encode(
+            [
+                "address[]",
+                "uint256[]",
+                "bytes[]",
+                "bytes32",
+                "bytes32",
+                "uint256",
+            ],
+            [
+                ownership_targets,
+                ownership_values,
+                ownership_payloads,
+                ownership_predecessor,
+                ownership_salt,
+                86_400,
+            ],
+        )
+    ).hex()
+    execute_data = "0x" + (
+        keccak(
+            text="executeBatch(address[],uint256[],bytes[],bytes32,bytes32)"
+        )[:4]
+        + abi_encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [
+                ownership_targets,
+                ownership_values,
+                ownership_payloads,
+                ownership_predecessor,
+                ownership_salt,
+            ],
+        )
+    ).hex()
     ownership_intent = {
         "schemaVersion": 2,
         "kind": "solslot-omnichain-ownership-activation-intent",
@@ -528,11 +663,34 @@ def _configure_external_quote(
         "chainId": evidence["chainId"],
         "rootSafe": evidence["configuration"]["governanceRootSafe"],
         "timelock": evidence["configuration"]["governanceTimelock"],
-        "operationId": "0x" + "44" * 32,
+        "operationId": operation_id,
         "minimumDelaySeconds": "86400",
-        "scheduleTransaction": {},
-        "executeTransaction": {},
-        "targets": [evidence["contracts"]["gateway"], evidence["contracts"]["spoke"]],
+        "scheduleTransaction": {
+            "to": evidence["configuration"]["governanceTimelock"],
+            "value": "0",
+            "data": schedule_data,
+        },
+        "executeTransaction": {
+            "to": evidence["configuration"]["governanceTimelock"],
+            "value": "0",
+            "data": execute_data,
+        },
+        "targets": [
+            {
+                "label": name,
+                "address": evidence["contracts"][name],
+                "currentOwner": "0x" + "20" * 20,
+                "pendingOwner": evidence["configuration"]["governanceTimelock"],
+                "runtimeCodeHash": evidence["runtimeCodeHashes"][name],
+                "ownershipTransferTransactionHash": evidence[
+                    "deploymentTransactions"
+                ][f"{name}OwnershipTransfer"]["hash"],
+            }
+            for name in ("gateway", "spoke")
+        ],
+        "governanceArtifactHash": evidence["governanceArtifactHash"],
+        "preparationSourceSha": "d" * 40,
+        "preparationBlockNumber": 3,
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
     ownership_canonical = json.dumps(
@@ -590,6 +748,7 @@ def _configure_external_quote(
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH", str(activation_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH", str(governance_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH", str(samuel_path))
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_WARP_PORTAL_EVIDENCE_PATH", str(warp_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH", str(ownership_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA", "a" * 40)
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE", "bse")
@@ -691,6 +850,10 @@ def test_evm_offer_requires_omnichain_preflight_evidence(monkeypatch, tmp_path):
         ("SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH", "governance"),
         ("SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH", "samuel"),
         (
+            "SOLSLOT_PAYMENT_OMNICHAIN_WARP_PORTAL_EVIDENCE_PATH",
+            "warp_portal",
+        ),
+        (
             "SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH",
             "ownership_intent",
         ),
@@ -731,6 +894,25 @@ def _reseal_evidence(path, mutate):
             "Samuel evidence mismatches",
         ),
         (
+            "omnichain-samuel-evidence.json",
+            lambda value: value["validatorEvmAddresses"].__setitem__(
+                1, value["validatorEvmAddresses"][0]
+            ),
+            "validatorEvmAddresses is invalid",
+        ),
+        (
+            "omnichain-warp-portal-evidence.json",
+            lambda value: value["portal"].update(signatureThreshold=1),
+            "Warp portal evidence mismatches",
+        ),
+        (
+            "omnichain-warp-portal-evidence.json",
+            lambda value: value["runtimeCodeHashes"].update(
+                implementation="0x" + "99" * 32
+            ),
+            "Warp portal evidence mismatches",
+        ),
+        (
             "omnichain-governance-evidence.json",
             lambda value: value["safes"]["coadmin"]["owners"].__setitem__(
                 1, value["safes"]["coadmin"]["owners"][0]
@@ -769,6 +951,32 @@ def _reseal_evidence(path, mutate):
             lambda value: value.update(ownershipAccepted=False),
             "activation evidence mismatches",
         ),
+        (
+            "omnichain-ownership-intent.json",
+            lambda value: value["targets"][0].update(
+                address="0x" + "99" * 20
+            ),
+            "ownership intent targets mismatch",
+        ),
+        (
+            "omnichain-ownership-intent.json",
+            lambda value: value.update(operationId="0x" + "99" * 32),
+            "ownership intent operation ID mismatches",
+        ),
+        (
+            "omnichain-ownership-intent.json",
+            lambda value: value["scheduleTransaction"].update(
+                data=value["executeTransaction"]["data"]
+            ),
+            "scheduleTransaction.data is invalid",
+        ),
+        (
+            "omnichain-preflight-evidence.json",
+            lambda value: value.update(
+                warpPortalArtifactHash="0x" + "99" * 32
+            ),
+            "preflight evidence mismatches",
+        ),
     ),
 )
 def test_evm_offer_rejects_invalid_authority_and_route_evidence(
@@ -776,6 +984,20 @@ def test_evm_offer_rejects_invalid_authority_and_route_evidence(
 ):
     _configure_external_quote(monkeypatch, tmp_path)
     _reseal_evidence(tmp_path / filename, mutate)
+    if filename == "omnichain-ownership-intent.json":
+        ownership_intent = json.loads(
+            (tmp_path / filename).read_text(encoding="utf-8")
+        )
+        _reseal_evidence(
+            tmp_path / "omnichain-activation-evidence.json",
+            lambda value: value.update(
+                {
+                    "ownershipOperationArtifactHash": ownership_intent[
+                        "artifactHash"
+                    ]
+                }
+            ),
+        )
     get_settings.cache_clear()
     with pytest.raises(RuntimeError, match=message):
         validate_server_hardening_at_startup(get_settings())
@@ -807,7 +1029,7 @@ def test_evm_offer_rejects_legacy_omnichain_schema(monkeypatch, tmp_path):
     _configure_external_quote(monkeypatch, tmp_path)
     path = tmp_path / "omnichain-deployment-evidence.json"
     evidence = json.loads(path.read_text(encoding="utf-8"))
-    evidence["schemaVersion"] = 1
+    evidence["schemaVersion"] = 3
     evidence_without_hash = dict(evidence)
     evidence_without_hash.pop("artifactHash")
     canonical = json.dumps(

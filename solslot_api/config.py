@@ -210,7 +210,8 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         except OmnichainEvidenceError as exc:
             raise RuntimeError(
                 "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires valid reviewed "
-                f"preflight, deployment, and activation evidence: {exc}"
+                "preflight, deployment, Warp portal, Samuel, governance, "
+                f"ownership, and activation evidence: {exc}"
             ) from exc
 
     if settings.runtime_environment not in {"staging", "production"}:
@@ -714,6 +715,7 @@ class Settings(BaseSettings):
     payment_omnichain_activation_evidence_path: Optional[str] = None
     payment_omnichain_governance_evidence_path: Optional[str] = None
     payment_omnichain_samuel_evidence_path: Optional[str] = None
+    payment_omnichain_warp_portal_evidence_path: Optional[str] = None
     payment_omnichain_ownership_intent_evidence_path: Optional[str] = None
     # A separate, one-shot gate for transferring the Base Sepolia rail to the
     # reviewed 2-of-3 Safe + timelock. Administrators sign the actual nested
