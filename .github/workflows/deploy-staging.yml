@@ -250,6 +250,7 @@ jobs:
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             systemd_user="${{ env.SYSTEMD_USER }}"
+            chia_root="${{ vars.SOLSLOT_CHIA_ROOT || '' }}"
             app_port="${{ env.APP_PORT }}"
             trusted_proxy_cidrs="${{ env.CLOUDFLARE_PROXY_CIDRS }}"
             actual_hostname="$(hostname)"
@@ -437,7 +438,12 @@ jobs:
             printf '%s\n' "$previous_target" \
               | sudo tee "$transaction_file" >/dev/null
             sudo chmod 0600 "$transaction_file"
+            chia_root_args=()
+            if [ -n "$chia_root" ]; then
+              chia_root_args=(--chia-root "$chia_root")
+            fi
             sudo "$release_dir/scripts/configure_local_chia_provider.sh" \
+              "${chia_root_args[@]}" \
               --shared-root "$shared_root" \
               --env-file "$env_file" \
               --service "$systemd_service" \
@@ -1022,6 +1028,14 @@ jobs:
             echo
             echo "--- local OpenAPI status (must be 404) ---"
             curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" || true
+            echo "--- local Chia provider candidates ---"
+            sudo ss -ltnp | grep ':8555' || true
+            sudo systemctl list-units --type=service --all --no-pager \
+              | grep -Ei 'chia|full.?node' || true
+            sudo find /home /root /opt /mnt -maxdepth 8 -type f \
+              -path '*/config/config.yaml' -print 2>/dev/null \
+              | grep -E '/\.chia/|/chia/' \
+              | sort -u || true
             echo "--- vault registry candidates ---"
             sudo find /opt/solslot /opt/solslot-api-staging -type f -name 'vault_registry.db' -print0 2>/dev/null \
               | while IFS= read -r -d '' db; do
