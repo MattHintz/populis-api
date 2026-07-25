@@ -250,6 +250,8 @@ jobs:
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             systemd_user="${{ env.SYSTEMD_USER }}"
+            chia_tunnel_service="${{ vars.SOLSLOT_CHIA_TUNNEL_SERVICE || 'solslot-chia-rpc-tunnel.service' }}"
+            chia_primary_url="${{ vars.SOLSLOT_CHIA_PRIMARY_URL || 'https://127.0.0.1:18555' }}"
             app_port="${{ env.APP_PORT }}"
             trusted_proxy_cidrs="${{ env.CLOUDFLARE_PROXY_CIDRS }}"
             actual_hostname="$(hostname)"
@@ -396,12 +398,23 @@ jobs:
             printf '%s\n' "$previous_target" \
               | sudo tee "$transaction_file" >/dev/null
             sudo chmod 0600 "$transaction_file"
+            sudo systemctl is-active --quiet "$chia_tunnel_service" \
+              || { echo "Required Chia RPC tunnel is not active." >&2; exit 1; }
+            sudo "$release_dir/scripts/configure_local_chia_provider.sh" \
+              --shared-root "$shared_root" \
+              --env-file "$env_file" \
+              --service "$systemd_service" \
+              --service-user "$systemd_user" \
+              --network testnet11 \
+              --primary-url "$chia_primary_url" \
+              --existing-tls \
+              --no-restart
             sudo ln -sfn "$release_dir" "$release_root/current"
             sudo tee /etc/systemd/system/"$systemd_service" >/dev/null <<EOF
             [Unit]
             Description=Solslot API Production
-            After=network-online.target
-            Wants=network-online.target
+            After=network-online.target $chia_tunnel_service
+            Wants=network-online.target $chia_tunnel_service
 
             [Service]
             Type=simple
@@ -493,6 +506,9 @@ jobs:
                 || return 1
               curl -fsS "http://127.0.0.1:$app_port/protocol" \
                 | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None' \
+                || return 1
+              curl -fsS "http://127.0.0.1:$app_port/chia/provider-status" \
+                | "$release_dir/.venv/bin/python" -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["activeProvider"] == "local-full-node"; assert data["primaryRequired"] is True; assert data["fallbackActive"] is False' \
                 || return 1
               require_http_code 404 "http://127.0.0.1:$app_port/openapi.json" \
                 || return 1
@@ -615,6 +631,8 @@ jobs:
             | python -c 'import json, sys; data=json.load(sys.stdin); release=data["release"]; assert data["available"] is True; assert release["apiCommit"] == "${{ inputs.release_sha }}"; assert release["protocolCommit"] == "${{ env.PROTOCOL_REF }}"'
           curl -fsS "${{ env.PUBLIC_BASE_URL }}/protocol" \
             | python -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["eip712_domain"]["chainId"] == 11155111; assert data["faucet_address"] is None; assert data["faucet_balance_mojos"] is None; assert data["deployment_manifest"] is None'
+          curl -fsS "${{ env.PUBLIC_BASE_URL }}/chia/provider-status" \
+            | python -c 'import json, sys; data=json.load(sys.stdin); assert data["network"] == "testnet11"; assert data["activeProvider"] == "local-full-node"; assert data["primaryRequired"] is True; assert data["fallbackActive"] is False'
           headers="$(mktemp)"
           curl -fsS -D "$headers" -o /dev/null "${{ env.PUBLIC_BASE_URL }}/health"
           grep -qi '^strict-transport-security: .*max-age=31536000' "$headers"
