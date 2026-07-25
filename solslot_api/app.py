@@ -2,6 +2,7 @@
 
 Endpoints:
   GET  /health
+  GET  /chia/provider-status
   GET  /protocol
   POST /auth/challenge
   POST /vault/register/evm
@@ -31,6 +32,7 @@ from typing import Annotated, Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from chia_rs import AugSchemeMPL, G1Element, G2Element
@@ -61,6 +63,7 @@ from .presale_endpoints import get_presale_store
 from .payment_purchase_store import get_payment_purchase_store
 from .alpha_observability import router as alpha_observability_router
 from .alpha_metrics import router as alpha_metrics_router
+from .chia_proxy import router as chia_proxy_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
@@ -70,7 +73,11 @@ from .challenges import (
     get_store as get_challenge_store,
     preflight_challenge_storage,
 )
-from .coinset_client import CoinsetClient
+from .chia_provider import (
+    ChiaProvider,
+    ChiaProviderConfig,
+    create_chia_provider,
+)
 from .config import (
     Settings,
     get_settings,
@@ -215,7 +222,21 @@ async def lifespan(app: FastAPI):
     validate_admin_config_at_startup(settings)
 
     app.state.settings = settings
-    app.state.coinset = CoinsetClient(settings.coinset_base_url)
+    app.state.coinset = create_chia_provider(
+        ChiaProviderConfig(
+            network=settings.network,
+            primary_url=settings.chia_primary_url,
+            fallback_url=settings.effective_chia_fallback_url(),
+            timeout_seconds=settings.chia_rpc_timeout_seconds,
+            primary_retry_count=settings.chia_primary_retry_count,
+            recovery_probe_seconds=settings.chia_recovery_probe_seconds,
+            primary_required=settings.chia_primary_required,
+            primary_ca_cert_path=settings.chia_primary_ca_cert_path,
+            primary_client_cert_path=settings.chia_primary_client_cert_path,
+            primary_client_key_path=settings.chia_primary_client_key_path,
+        )
+    )
+    await app.state.coinset.start()
 
     if settings.faucet_master_sk_hex:
         app.state.faucet = Faucet.from_master_private_key_hex(
@@ -342,6 +363,7 @@ app.include_router(native_purchases_router)
 app.include_router(presale_router)
 app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)
+app.include_router(chia_proxy_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)
@@ -352,7 +374,7 @@ app.include_router(zkpassport_relay_router)
 
 # ─── Dependency injectors ───────────────────────────────────────────────
 
-async def get_coinset() -> CoinsetClient:
+async def get_coinset() -> ChiaProvider:
     # async to keep the dependency on the event loop thread (FastAPI dispatches
     # sync deps to a worker pool, which would touch chia_rs LazyNodes that were
     # bound to the lifespan thread → pyo3 panic).
@@ -535,7 +557,7 @@ class VaultStateResponse(BaseModel):
 @app.get("/health", response_model=HealthResponse)
 async def health(
     settings: Annotated[Settings, Depends(get_settings)],
-    coinset: Annotated[CoinsetClient, Depends(get_coinset)],
+    coinset: Annotated[ChiaProvider, Depends(get_coinset)],
 ) -> HealthResponse:
     release = load_release_metadata(settings.release_metadata_path)
     try:
@@ -549,7 +571,7 @@ async def health(
             protocol_commit=release.protocolCommit if release else None,
         )
     except Exception as e:
-        logger.warning("coinset unreachable: %s", e)
+        logger.warning("Chia providers unreachable: %s", e)
         return HealthResponse(
             ok=False,
             network=settings.network,
@@ -557,6 +579,17 @@ async def health(
             api_commit=release.apiCommit if release else None,
             protocol_commit=release.protocolCommit if release else None,
         )
+
+
+@app.get("/chia/provider-status")
+async def chia_provider_status(
+    coinset: Annotated[ChiaProvider, Depends(get_coinset)],
+) -> JSONResponse:
+    status = await coinset.refresh_status()
+    return JSONResponse(
+        status_code=503 if status["fallbackActive"] else 200,
+        content=status,
+    )
 
 
 @app.get("/release", response_model=ReleaseResponse)
@@ -721,7 +754,7 @@ async def request_challenge(
 async def register_evm_vault(
     body: RegisterEvmVaultRequest,
     settings: Annotated[Settings, Depends(get_settings)],
-    coinset: Annotated[CoinsetClient, Depends(get_coinset)],
+    coinset: Annotated[ChiaProvider, Depends(get_coinset)],
     faucet: Annotated[Faucet, Depends(get_faucet)],
     store: Annotated[ChallengeStore, Depends(get_challenge_store)],
     registry: Annotated[VaultRegistry, Depends(get_registry)],
@@ -857,7 +890,7 @@ async def register_evm_vault(
 async def register_chia_vault(
     body: RegisterChiaVaultRequest,
     settings: Annotated[Settings, Depends(get_settings)],
-    coinset: Annotated[CoinsetClient, Depends(get_coinset)],
+    coinset: Annotated[ChiaProvider, Depends(get_coinset)],
     faucet: Annotated[Faucet, Depends(get_faucet)],
     store: Annotated[ChallengeStore, Depends(get_challenge_store)],
     registry: Annotated[VaultRegistry, Depends(get_registry)],
@@ -979,7 +1012,7 @@ async def register_chia_vault(
 @app.get("/vault/{launcher_id}", response_model=VaultStateResponse)
 async def get_vault(
     launcher_id: str,
-    coinset: Annotated[CoinsetClient, Depends(get_coinset)],
+    coinset: Annotated[ChiaProvider, Depends(get_coinset)],
     registry: Annotated[VaultRegistry, Depends(get_registry)],
 ) -> VaultStateResponse:
     lid = _parse_bytes32(launcher_id, "launcher_id")
@@ -1131,7 +1164,9 @@ def _client_ip(request: Request, settings: Settings) -> str:
     return trusted_client_ip(request.scope, settings)
 
 
-async def _push_or_fail(coinset: CoinsetClient, spend_bundle: Any) -> tuple[bool, Optional[str]]:
+async def _push_or_fail(
+    coinset: ChiaProvider, spend_bundle: Any
+) -> tuple[bool, Optional[str]]:
     """Broadcast a spend bundle to coinset.org and surface the result.
 
     Returns:

@@ -82,6 +82,26 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    if settings.chia_primary_required and not settings.chia_primary_url:
+        raise RuntimeError(
+            "SOLSLOT_CHIA_PRIMARY_REQUIRED requires SOLSLOT_CHIA_PRIMARY_URL."
+        )
+    for label, url in (
+        ("SOLSLOT_CHIA_PRIMARY_URL", settings.chia_primary_url),
+        ("SOLSLOT_CHIA_FALLBACK_URL", settings.effective_chia_fallback_url()),
+    ):
+        if url and not url.startswith(("https://", "http://")):
+            raise RuntimeError(f"{label} must be an HTTP(S) URL.")
+    chia_mtls_paths = (
+        settings.chia_primary_ca_cert_path,
+        settings.chia_primary_client_cert_path,
+        settings.chia_primary_client_key_path,
+    )
+    if any(chia_mtls_paths) and not all(chia_mtls_paths):
+        raise RuntimeError(
+            "Chia primary mTLS requires CA, client certificate, and client key paths."
+        )
+
     if settings.minting_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_MINTING_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
@@ -216,6 +236,15 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
+    if settings.chia_primary_url:
+        if not settings.chia_primary_url.startswith("https://"):
+            raise RuntimeError(
+                "SOLSLOT_CHIA_PRIMARY_URL must use HTTPS in staging/production."
+            )
+        if not all(chia_mtls_paths):
+            raise RuntimeError(
+                "The staging/production Chia primary requires reviewed mTLS files."
+            )
     if not settings.admin_operation_approvals_enabled:
         raise RuntimeError(
             "SOLSLOT_ADMIN_OPERATION_APPROVALS_ENABLED must be true in staging/production."
@@ -459,6 +488,11 @@ class Settings(BaseSettings):
         "collection_ipfs_gateway_url",
         "collection_malware_scan_url",
         "collection_malware_scan_token",
+        "chia_primary_url",
+        "chia_fallback_url",
+        "chia_primary_ca_cert_path",
+        "chia_primary_client_cert_path",
+        "chia_primary_client_key_path",
         mode="before",
     )
     @classmethod
@@ -485,7 +519,22 @@ class Settings(BaseSettings):
 
     # ── Network ───────────────────────────────────────────────────────────
     network: Literal["testnet11", "mainnet"] = "testnet11"
+    # ``coinset_base_url`` remains as a compatibility input while callers
+    # migrate to the explicit fallback setting.
     coinset_base_url: str = "https://testnet11.api.coinset.org"
+    chia_primary_url: Optional[str] = None
+    chia_fallback_url: Optional[str] = None
+    chia_primary_required: bool = False
+    chia_primary_retry_count: int = Field(1, ge=0, le=3)
+    chia_recovery_probe_seconds: float = Field(30.0, ge=5.0, le=300.0)
+    chia_rpc_timeout_seconds: float = Field(20.0, gt=0, le=60.0)
+    chia_push_per_ip_per_minute: int = Field(6, ge=1, le=60)
+    chia_primary_ca_cert_path: Optional[str] = None
+    chia_primary_client_cert_path: Optional[str] = None
+    chia_primary_client_key_path: Optional[str] = None
+
+    def effective_chia_fallback_url(self) -> str:
+        return self.chia_fallback_url or self.coinset_base_url
 
     # High-risk protocol writes remain locked until the frozen V2 artifact
     # bundle has passed ceremony preflight. Read-only health, protocol, vault,

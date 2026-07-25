@@ -124,12 +124,32 @@ SOLSLOT_CORS_ORIGINS=https://staging.solslot.com
 SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304
 SOLSLOT_REQUEST_TIMEOUT_SECONDS=30
 SOLSLOT_CHALLENGE_STORE_PATH=/opt/solslot/api-staging/shared/state/challenges_v2.db
+SOLSLOT_CHIA_PRIMARY_URL=https://127.0.0.1:8555
+SOLSLOT_CHIA_FALLBACK_URL=https://testnet11.api.coinset.org
+SOLSLOT_CHIA_PRIMARY_REQUIRED=true
+SOLSLOT_CHIA_PRIMARY_CA_CERT_PATH=/opt/solslot/api-staging/shared/tls/chia/private_ca.crt
+SOLSLOT_CHIA_PRIMARY_CLIENT_CERT_PATH=/opt/solslot/api-staging/shared/tls/chia/solslot_api.crt
+SOLSLOT_CHIA_PRIMARY_CLIENT_KEY_PATH=/opt/solslot/api-staging/shared/tls/chia/solslot_api.key
 ```
 
 The challenge database is SQLite-WAL state shared by vault registration and
 admin-login namespaces. It makes issuance quotas and nonce consumption atomic
 across process restarts and future worker fan-out. Never place it inside a
 release directory or replace it during a code rollback.
+
+The staging coordinator and both browser applications use one Chia provider.
+Install its dedicated mTLS identity from the existing same-host full node:
+
+```bash
+sudo /opt/solslot/api-staging/current/scripts/configure_local_chia_provider.sh \
+  --chia-root /home/<node-user>/.chia/mainnet
+```
+
+The installer verifies Testnet11 and full synchronization before changing the
+shared environment. It does not alter ceremony, minting, purchase, or protocol
+write gates. `GET /protocol-api/chia/provider-status` returns HTTP 200 only
+while the local full node is active; Coinset fallback is explicit HTTP 503 so
+monitoring cannot silently treat degraded operation as healthy.
 
 The Cloudflare range pin is non-secret infrastructure configuration. Its
 versioned value lives in the staging workflow and is sourced from

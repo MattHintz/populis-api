@@ -9,6 +9,7 @@ API reference: https://docs.coinset.org
 from __future__ import annotations
 
 import logging
+import ssl
 from typing import Any, Optional
 
 import httpx
@@ -19,12 +20,21 @@ logger = logging.getLogger(__name__)
 class CoinsetClient:
     """Thin async wrapper around coinset.org's RPC surface."""
 
-    def __init__(self, base_url: str, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 20.0,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        provider_label: str = "coinset",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.provider_label = provider_label
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
             headers={"content-type": "application/json"},
+            verify=ssl_context if ssl_context is not None else True,
         )
 
     async def close(self) -> None:
@@ -36,6 +46,10 @@ class CoinsetClient:
         """Return `{ blockchain_state: {...}, success: true }`."""
         r = await self._post("/get_blockchain_state", {})
         return r
+
+    async def get_network_info(self) -> dict[str, Any]:
+        """Return the full node's configured network name and address prefix."""
+        return await self._post("/get_network_info", {})
 
     async def get_coin_record_by_name(self, coin_id: str) -> Optional[dict[str, Any]]:
         """Return a single CoinRecord or None when unconfirmed."""
@@ -96,6 +110,44 @@ class CoinsetClient:
             )
         return records
 
+    async def get_coin_records_by_puzzle_hashes(
+        self,
+        puzzle_hashes: list[str],
+        *,
+        include_spent: bool = False,
+        start_height: Optional[int] = None,
+        end_height: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        body: dict[str, Any] = {
+            "puzzle_hashes": [_hex0x(value) for value in puzzle_hashes],
+            "include_spent_coins": include_spent,
+        }
+        if start_height is not None:
+            body["start_height"] = start_height
+        if end_height is not None:
+            body["end_height"] = end_height
+        r = await self._post("/get_coin_records_by_puzzle_hashes", body)
+        return r.get("coin_records") or []
+
+    async def get_coin_records_by_hint(
+        self,
+        hint: str,
+        *,
+        include_spent: bool = False,
+        start_height: Optional[int] = None,
+        end_height: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        body: dict[str, Any] = {
+            "hint": _hex0x(hint),
+            "include_spent_coins": include_spent,
+        }
+        if start_height is not None:
+            body["start_height"] = start_height
+        if end_height is not None:
+            body["end_height"] = end_height
+        r = await self._post("/get_coin_records_by_hint", body)
+        return r.get("coin_records") or []
+
     async def get_coin_records_by_parent_ids(
         self, parent_ids: list[str], *, include_spent: bool = False
     ) -> list[dict[str, Any]]:
@@ -112,6 +164,20 @@ class CoinsetClient:
         body = {"coin_id": _hex0x(coin_id), "height": height}
         r = await self._post("/get_puzzle_and_solution", body)
         return r.get("coin_solution")
+
+    async def get_mempool_items_by_coin_name(
+        self, coin_id: str
+    ) -> list[dict[str, Any]]:
+        """Return mempool items spending one coin.
+
+        Chia's RPC accepts one ``coin_name`` per request. Callers checking a
+        multi-input bundle must issue one request for each removal.
+        """
+        r = await self._post(
+            "/get_mempool_items_by_coin_name",
+            {"coin_name": _hex0x(coin_id)},
+        )
+        return r.get("mempool_items") or []
 
     # ── Writes ───────────────────────────────────────────────────────────
 
@@ -134,13 +200,17 @@ class CoinsetClient:
         try:
             resp = await self._client.post(path, json=body)
         except httpx.HTTPError as e:
-            logger.exception("coinset HTTP error for %s: %s", path, e)
+            logger.exception("%s HTTP error for %s: %s", self.provider_label, path, e)
             raise
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             logger.warning(
-                "coinset %s returned %d: %s", path, resp.status_code, resp.text[:400]
+                "%s %s returned %d: %s",
+                self.provider_label,
+                path,
+                resp.status_code,
+                resp.text[:400],
             )
             raise
         return resp.json()

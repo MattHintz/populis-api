@@ -43,6 +43,10 @@ def _app(settings: Settings) -> FastAPI:
     async def challenge(body: ChallengeBody) -> dict[str, str]:
         return {"address": body.address}
 
+    @app.post("/chia/push_tx")
+    async def chia_push() -> dict[str, bool]:
+        return {"success": True}
+
     return app
 
 
@@ -79,6 +83,45 @@ def _staging(**overrides: object) -> Settings:
 
 def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
+
+
+def test_required_chia_primary_requires_a_url() -> None:
+    with pytest.raises(RuntimeError, match="CHIA_PRIMARY_REQUIRED"):
+        validate_server_hardening_at_startup(
+            _staging(chia_primary_required=True)
+        )
+
+
+def test_staging_chia_primary_requires_https_and_complete_mtls() -> None:
+    with pytest.raises(RuntimeError, match="must use HTTPS"):
+        validate_server_hardening_at_startup(
+            _staging(chia_primary_url="http://127.0.0.1:8555")
+        )
+
+    with pytest.raises(RuntimeError, match="requires reviewed mTLS"):
+        validate_server_hardening_at_startup(
+            _staging(chia_primary_url="https://127.0.0.1:8555")
+        )
+
+    validate_server_hardening_at_startup(
+        _staging(
+            chia_primary_url="https://127.0.0.1:8555",
+            chia_primary_required=True,
+            chia_primary_ca_cert_path="/run/secrets/chia-ca.crt",
+            chia_primary_client_cert_path="/run/secrets/chia-client.crt",
+            chia_primary_client_key_path="/run/secrets/chia-client.key",
+        )
+    )
+
+
+def test_chia_primary_rejects_partial_mtls_configuration() -> None:
+    with pytest.raises(RuntimeError, match="requires CA, client certificate"):
+        validate_server_hardening_at_startup(
+            _staging(
+                chia_primary_url="https://127.0.0.1:8555",
+                chia_primary_ca_cert_path="/run/secrets/chia-ca.crt",
+            )
+        )
 
 
 def test_staging_rejects_disabled_owner_plus_one_approvals() -> None:
@@ -381,6 +424,25 @@ async def test_challenge_limiter_ignores_spoofed_forwarding_headers() -> None:
 
     assert first.status_code == 200
     assert second.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_chia_push_limiter_bounds_public_transaction_relay() -> None:
+    settings = Settings(
+        runtime_environment="test",
+        chia_push_per_ip_per_minute=2,
+    )
+    transport = httpx.ASGITransport(app=_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="https://test") as client:
+        first = await client.post("/chia/push_tx", json={})
+        second = await client.post("/chia/push_tx", json={})
+        limited = await client.post("/chia/push_tx", json={})
+
+    assert first.status_code == second.status_code == 200
+    assert limited.status_code == 429
+    assert limited.json() == {
+        "detail": "Too many Chia transaction submissions. Try again later."
+    }
 
 
 def test_persistent_challenge_limiter_is_atomic_across_workers(tmp_path) -> None:

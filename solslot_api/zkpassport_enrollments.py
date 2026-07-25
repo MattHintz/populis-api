@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 from web3 import Web3
 
 from .config import Settings
-from .coinset_client import CoinsetClient
+from .chia_provider import ChiaProvider
 from .credential_auth import (
     OwnerAuth,
     OwnerChallengeRequest,
@@ -1480,27 +1480,25 @@ def _build_bls_chia_stamp(
 async def _push_chia_stamp_and_mark_pending(
     settings: Settings,
     *,
+    coinset: ChiaProvider,
     key: str,
     spend_bundle: SpendBundle,
     expected_vault_coin: Coin,
 ) -> SubmitChiaStampResponse:
     spend_bundle_id = _hex32(spend_bundle.name())
     expected_vault_coin_id = _hex32(expected_vault_coin.name())
-    coinset = CoinsetClient(settings.coinset_base_url)
     try:
         push_result = await coinset.push_tx(spend_bundle.to_json_dict())
     except Exception as exc:  # noqa: BLE001 - normalize provider failures for the portal
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Coinset could not submit the Chia vault stamp: {exc}",
+            detail=f"The Chia providers could not submit the vault stamp: {exc}",
         ) from exc
-    finally:
-        await coinset.close()
     push_status = str(push_result.get("status") or "").upper()
     if not push_result.get("success") and push_status not in {"SUCCESS", "PENDING"}:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Coinset rejected the Chia vault stamp: {push_result.get('error') or push_result}",
+            detail=f"The Chia network rejected the vault stamp: {push_result.get('error') or push_result}",
         )
 
     ledger = get_credential_ledger(settings)
@@ -1714,6 +1712,7 @@ async def submit_evm_chia_stamp(
         )
         return await _push_chia_stamp_and_mark_pending(
             settings,
+            coinset=request.app.state.coinset,
             key=key,
             spend_bundle=spend_bundle,
             expected_vault_coin=expected_vault_coin,
@@ -1900,6 +1899,7 @@ async def submit_evm_chia_stamp(
     )
     return await _push_chia_stamp_and_mark_pending(
         settings,
+        coinset=request.app.state.coinset,
         key=key,
         spend_bundle=spend_bundle,
         expected_vault_coin=expected_vault_coin,

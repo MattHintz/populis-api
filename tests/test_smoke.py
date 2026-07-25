@@ -121,6 +121,27 @@ def test_health(client: TestClient) -> None:
     assert body["network"] in ("testnet11", "mainnet")
 
 
+def test_chia_provider_status_reports_unconfigured_primary_as_degraded(
+    client: TestClient,
+) -> None:
+    response = client.get("/chia/provider-status")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "schemaVersion": 1,
+        "network": "testnet11",
+        "activeProvider": "coinset-fallback",
+        "primaryConfigured": False,
+        "primaryRequired": False,
+        "fallbackActive": True,
+        "primaryOrigin": None,
+        "fallbackOrigin": "https://testnet11.api.coinset.org",
+        "lastPrimaryFailureAt": None,
+        "lastPrimarySuccessAt": None,
+        "lastPrimaryError": "primary provider is not configured",
+    }
+
+
 def test_protocol(client: TestClient) -> None:
     r = client.get("/protocol")
     assert r.status_code == 200, r.text
