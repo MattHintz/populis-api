@@ -251,6 +251,8 @@ jobs:
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             systemd_user="${{ env.SYSTEMD_USER }}"
             chia_root="${{ vars.SOLSLOT_CHIA_ROOT || '' }}"
+            chia_bin="${{ vars.SOLSLOT_CHIA_BIN || '/home/hiram/.local/bin/chia' }}"
+            chia_service_user="${{ vars.SOLSLOT_CHIA_SERVICE_USER || 'hiram' }}"
             app_port="${{ env.APP_PORT }}"
             trusted_proxy_cidrs="${{ env.CLOUDFLARE_PROXY_CIDRS }}"
             actual_hostname="$(hostname)"
@@ -442,6 +444,10 @@ jobs:
             if [ -n "$chia_root" ]; then
               chia_root_args=(--chia-root "$chia_root")
             fi
+            sudo "$release_dir/scripts/configure_testnet11_full_node.sh" \
+              "${chia_root_args[@]}" \
+              --chia-bin "$chia_bin" \
+              --service-user "$chia_service_user"
             sudo "$release_dir/scripts/configure_local_chia_provider.sh" \
               "${chia_root_args[@]}" \
               --shared-root "$shared_root" \

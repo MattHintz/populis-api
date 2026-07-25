@@ -138,11 +138,14 @@ across process restarts and future worker fan-out. Never place it inside a
 release directory or replace it during a code rollback.
 
 The staging coordinator and both browser applications use one Chia provider.
-Install its dedicated mTLS identity from the existing same-host full node:
+The deployment preserves existing mainnet roots and maintains a separate
+Testnet11 service at `/opt/solslot/chia-testnet11`. Provision the node and its
+dedicated API mTLS identity with:
 
 ```bash
+sudo /opt/solslot/api-staging/current/scripts/configure_testnet11_full_node.sh
 sudo /opt/solslot/api-staging/current/scripts/configure_local_chia_provider.sh \
-  --chia-root /home/<node-user>/.chia/mainnet
+  --chia-root /opt/solslot/chia-testnet11
 ```
 
 The installer verifies Testnet11 and full synchronization before changing the
