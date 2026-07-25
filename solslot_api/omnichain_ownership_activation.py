@@ -27,6 +27,10 @@ from web3 import Web3
 
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
+from .timelock_operation import (
+    TimelockOperationError,
+    decode_ownership_schedule,
+)
 
 
 MAX_OPERATION_BYTES = 128 * 1024
@@ -487,6 +491,13 @@ def load_authority_operation(settings: Settings) -> dict[str, Any]:
     transaction_hash = _require_hash(
         authority.get("transactionHash"), "authorityOperation.transactionHash"
     )
+    try:
+        schedule = decode_ownership_schedule(
+            validated_transaction["data"],
+            expected_operation_id=package["operationId"],
+        )
+    except TimelockOperationError as exc:
+        raise OwnershipActivationError(str(exc)) from exc
     approvals_raw = authority.get("approvals")
     if not isinstance(approvals_raw, list) or len(approvals_raw) != 2:
         raise OwnershipActivationError("exactly two nested Safe approvals are required")
@@ -508,6 +519,12 @@ def load_authority_operation(settings: Settings) -> dict[str, Any]:
     authority["transactionData"] = transaction_data
     authority["transactionHash"] = transaction_hash
     authority["approvals"] = approvals
+    authority["review"] = {
+        "action": "acceptOwnership",
+        "targets": list(schedule.targets),
+        "delaySeconds": schedule.delay_seconds,
+        "operationId": schedule.operation_id,
+    }
     package["authorityOperation"] = authority
     return package
 
@@ -772,7 +789,7 @@ def _public_status(
     else:
         state = "AWAITING_APPROVALS"
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "state": state,
         "packageHash": package["artifactHash"],
         "sourceSha": package["sourceSha"],
@@ -783,6 +800,10 @@ def _public_status(
         "rootSafe": package["rootSafe"],
         "timelock": package["timelock"],
         "rootSafeTransactionHash": package["authorityOperation"]["transactionHash"],
+        "deploymentArtifactHash": package["deploymentArtifactHash"],
+        "ownershipIntentArtifactHash": package["ownershipIntentArtifactHash"],
+        "governanceArtifactHash": package["governanceArtifactHash"],
+        "review": package["authorityOperation"]["review"],
         "scheduledFor": chain.operation_timestamp or None,
         "approvals": approvals,
         "broadcastTransaction": (

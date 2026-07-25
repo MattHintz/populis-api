@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils import keccak
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -27,6 +29,45 @@ ROOT_SAFE = "0xb7e02C216A2B3aF0cC4Ad8808fA169f2F0B19724"
 TIMELOCK = "0x5eC98d5a9C24C2a80957AB04630812C36807aad3"
 OWNER_SAFE = "0x73a282e829dF5b7E12824a53F54c2FB6f07D13a5"
 COADMIN_SAFE = "0x428700faA2b6Ebc613435994C84dB27908964A88"
+GATEWAY = "0x4A467fd9137D8aC807E3CD7E109AB4d56f9Dfa9e"
+SPOKE = "0xbbEEa9bd3E8a8becdef7FC21503C295b32C62d3f"
+
+
+def _schedule_calldata(
+    *,
+    payloads: list[bytes] | None = None,
+) -> tuple[str, str]:
+    targets = [GATEWAY, SPOKE]
+    values = [0, 0]
+    actions = payloads or [keccak(text="acceptOwnership()")[:4]] * 2
+    predecessor = bytes(32)
+    salt = bytes.fromhex("44" * 32)
+    operation_id = "0x" + keccak(
+        abi_encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [targets, values, actions, predecessor, salt],
+        )
+    ).hex()
+    data = "0x" + (
+        keccak(
+            text=(
+                "scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,"
+                "uint256)"
+            )
+        )[:4]
+        + abi_encode(
+            [
+                "address[]",
+                "uint256[]",
+                "bytes[]",
+                "bytes32",
+                "bytes32",
+                "uint256",
+            ],
+            [targets, values, actions, predecessor, salt, 86_400],
+        )
+    ).hex()
+    return data, operation_id
 
 
 def _safe_message(safe: str, message: str) -> dict:
@@ -45,6 +86,7 @@ def _write_package(
     coadmin_addresses: list[str],
 ) -> dict:
     transaction_data = "0x1901" + "11" * 64
+    schedule_data, operation_id = _schedule_calldata()
     approvals = []
     for role, safe, allowed in (
         ("owner_identity", OWNER_SAFE, [owner_address]),
@@ -69,7 +111,7 @@ def _write_package(
         "sourceSha": "1" * 40,
         "network": "baseSepolia",
         "chainId": 84532,
-        "operationId": "0x" + "24" * 32,
+        "operationId": operation_id,
         "phase": "schedule",
         "rootSafe": ROOT_SAFE,
         "timelock": TIMELOCK,
@@ -83,7 +125,7 @@ def _write_package(
             "transaction": {
                 "to": TIMELOCK,
                 "value": "0",
-                "data": "0x8f2a0bb0" + "00" * 32,
+                "data": schedule_data,
                 "operation": 0,
                 "safeTxGas": "0",
                 "baseGas": "0",
@@ -179,6 +221,13 @@ def test_real_safe_signatures_are_the_only_approvals(
     assert response.status_code == 200
     assert response.json()["state"] == "AWAITING_APPROVALS"
     assert response.json()["broadcastTransaction"] is None
+    assert response.json()["schemaVersion"] == 2
+    assert response.json()["review"] == {
+        "action": "acceptOwnership",
+        "targets": [GATEWAY, SPOKE],
+        "delaySeconds": 86_400,
+        "operationId": raw["operationId"],
+    }
 
     response = client.post(
         "/admin/omnichain/ownership-activation/sign",
@@ -338,6 +387,37 @@ def test_package_hash_and_feature_flag_fail_closed(tmp_path) -> None:
     )
     response = TestClient(app).get("/admin/omnichain/ownership-activation")
     assert response.status_code == 503
+
+
+def test_package_rejects_non_ownership_timelock_actions(tmp_path) -> None:
+    owner = Account.create()
+    coadmin = Account.create()
+    package_path = tmp_path / "operation.json"
+    raw = _write_package(
+        package_path,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    altered_data, altered_operation_id = _schedule_calldata(
+        payloads=[bytes.fromhex("deadbeef"), bytes.fromhex("deadbeef")]
+    )
+    raw["operationId"] = altered_operation_id
+    raw["authorityOperation"]["transaction"]["data"] = altered_data
+    raw.pop("artifactHash")
+    raw["artifactHash"] = _canonical_hash(raw)
+    package_path.write_text(json.dumps(raw), encoding="utf-8")
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_safe_operation_path=str(package_path),
+        payment_omnichain_ownership_safe_operation_hash=raw["artifactHash"],
+    )
+
+    try:
+        load_authority_operation(settings)
+    except OwnershipActivationError as exc:
+        assert "schedule terms mismatch" in str(exc)
+    else:
+        raise AssertionError("non-ownership timelock actions were accepted")
 
 
 def test_broadcast_verifier_compares_exact_root_safe_calldata(

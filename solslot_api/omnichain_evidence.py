@@ -9,23 +9,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from eth_abi import decode as abi_decode
-from eth_abi import encode as abi_encode
 from eth_utils import keccak
 
 from .config import Settings
+from .timelock_operation import (
+    TimelockOperationError,
+    decode_ownership_schedule,
+    validate_ownership_execute,
+)
 
 
 MAX_EVIDENCE_BYTES = 128 * 1024
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_ZERO_BYTES32 = bytes(32)
-_ACCEPT_OWNERSHIP_CALLDATA = keccak(text="acceptOwnership()")[:4]
-_SCHEDULE_BATCH_SIGNATURE = (
-    "scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,uint256)"
-)
-_EXECUTE_BATCH_SIGNATURE = "executeBatch(address[],uint256[],bytes[],bytes32,bytes32)"
 
 
 class OmnichainEvidenceError(RuntimeError):
@@ -111,31 +108,6 @@ def _require_address_list(
     return normalized
 
 
-def _decode_call(
-    value: object,
-    *,
-    signature: str,
-    types: list[str],
-    label: str,
-) -> tuple[Any, ...]:
-    if (
-        not isinstance(value, str)
-        or not re.fullmatch(r"0x[0-9a-fA-F]+", value)
-        or len(value) % 2 != 0
-    ):
-        raise OmnichainEvidenceError(f"Omnichain evidence {label} is invalid")
-    raw = bytes.fromhex(value[2:])
-    selector = keccak(text=signature)[:4]
-    if len(raw) <= 4 or raw[:4] != selector:
-        raise OmnichainEvidenceError(f"Omnichain evidence {label} is invalid")
-    try:
-        return abi_decode(types, raw[4:])
-    except Exception as exc:
-        raise OmnichainEvidenceError(
-            f"Omnichain evidence {label} is invalid"
-        ) from exc
-
-
 def _validate_ownership_calldata(
     *,
     schedule_data: object,
@@ -143,68 +115,29 @@ def _validate_ownership_calldata(
     expected_targets: list[str],
     expected_operation_id: str,
 ) -> None:
-    batch_types = ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"]
-    schedule = _decode_call(
-        schedule_data,
-        signature=_SCHEDULE_BATCH_SIGNATURE,
-        types=[*batch_types, "uint256"],
-        label="ownershipIntent.scheduleTransaction.data",
-    )
-    execute = _decode_call(
-        execute_data,
-        signature=_EXECUTE_BATCH_SIGNATURE,
-        types=batch_types,
-        label="ownershipIntent.executeTransaction.data",
-    )
-    schedule_targets, values, payloads, predecessor, salt, delay = schedule
-    execute_targets, execute_values, execute_payloads, execute_predecessor, execute_salt = (
-        execute
-    )
-    normalized_schedule_targets = [
-        _require_address(target, "ownershipIntent.scheduleTransaction.target")
-        for target in schedule_targets
-    ]
-    normalized_execute_targets = [
-        _require_address(target, "ownershipIntent.executeTransaction.target")
-        for target in execute_targets
-    ]
-    expected_normalized = [
-        _require_address(target, "ownershipIntent.expectedTarget")
-        for target in expected_targets
-    ]
-    if (
-        normalized_schedule_targets != expected_normalized
-        or normalized_execute_targets != expected_normalized
-        or list(values) != [0, 0]
-        or list(execute_values) != [0, 0]
-        or list(payloads)
-        != [_ACCEPT_OWNERSHIP_CALLDATA, _ACCEPT_OWNERSHIP_CALLDATA]
-        or list(execute_payloads)
-        != [_ACCEPT_OWNERSHIP_CALLDATA, _ACCEPT_OWNERSHIP_CALLDATA]
-        or predecessor != _ZERO_BYTES32
-        or execute_predecessor != _ZERO_BYTES32
-        or salt != execute_salt
-        or delay != 86_400
-    ):
-        raise OmnichainEvidenceError(
-            "Omnichain ownership intent calldata mismatches"
+    try:
+        schedule = decode_ownership_schedule(
+            schedule_data,
+            expected_operation_id=expected_operation_id,
+            label="Omnichain evidence ownershipIntent.scheduleTransaction.data",
         )
-    computed_operation_id = "0x" + keccak(
-        abi_encode(
-            batch_types,
-            [
-                list(schedule_targets),
-                list(values),
-                list(payloads),
-                predecessor,
-                salt,
-            ],
+        normalized_expected = tuple(
+            _require_address(target, "ownershipIntent.expectedTarget")
+            for target in expected_targets
         )
-    ).hex()
-    if computed_operation_id != expected_operation_id:
-        raise OmnichainEvidenceError(
-            "Omnichain ownership intent operation ID mismatches"
+        if tuple(target.lower() for target in schedule.targets) != tuple(
+            target.lower() for target in normalized_expected
+        ):
+            raise OmnichainEvidenceError(
+                "Omnichain ownership intent calldata mismatches"
+            )
+        validate_ownership_execute(
+            execute_data,
+            schedule=schedule,
+            label="Omnichain evidence ownershipIntent.executeTransaction.data",
         )
+    except TimelockOperationError as exc:
+        raise OmnichainEvidenceError(str(exc)) from exc
 
 
 def _preflight_runtime_hash(
