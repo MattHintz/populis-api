@@ -1054,6 +1054,7 @@ jobs:
               ' "$config" | head -n 12
             done
             echo "--- Chia executables and Testnet11 databases ---"
+            df -hT /opt /home /mnt 2>/dev/null || true
             for user in hiram mrdennis; do
               id "$user" >/dev/null 2>&1 || continue
               echo "user=$user"
