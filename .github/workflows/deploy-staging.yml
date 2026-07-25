@@ -1032,10 +1032,21 @@ jobs:
             sudo ss -ltnp | grep ':8555' || true
             sudo systemctl list-units --type=service --all --no-pager \
               | grep -Ei 'chia|full.?node' || true
+            ps -eo user,pid,lstart,args \
+              | grep -E '[c]hia(_full_node| full_node| start| daemon)' || true
             sudo find /home /root /opt /mnt -maxdepth 8 -type f \
               -path '*/config/config.yaml' -print 2>/dev/null \
               | grep -E '/\.chia/|/chia/' \
               | sort -u || true
+            for config in /home/*/.chia/mainnet/config/config.yaml; do
+              sudo test -f "$config" || continue
+              echo "config=$config"
+              sudo awk '
+                /^[[:space:]]*selected_network:/ { print }
+                /^[[:space:]]*rpc_port:/ { print }
+                /^[[:space:]]*self_hostname:/ { print }
+              ' "$config" | head -n 12
+            done
             echo "--- vault registry candidates ---"
             sudo find /opt/solslot /opt/solslot-api-staging -type f -name 'vault_registry.db' -print0 2>/dev/null \
               | while IFS= read -r -d '' db; do
