@@ -124,7 +124,7 @@ SOLSLOT_CORS_ORIGINS=https://staging.solslot.com
 SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304
 SOLSLOT_REQUEST_TIMEOUT_SECONDS=30
 SOLSLOT_CHALLENGE_STORE_PATH=/opt/solslot/api-staging/shared/state/challenges_v2.db
-SOLSLOT_CHIA_PRIMARY_URL=https://127.0.0.1:8555
+SOLSLOT_CHIA_PRIMARY_URL=https://127.0.0.1:18555
 SOLSLOT_CHIA_FALLBACK_URL=https://testnet11.api.coinset.org
 SOLSLOT_CHIA_PRIMARY_REQUIRED=true
 SOLSLOT_CHIA_PRIMARY_CA_CERT_PATH=/opt/solslot/api-staging/shared/tls/chia/private_ca.crt
@@ -138,21 +138,35 @@ across process restarts and future worker fan-out. Never place it inside a
 release directory or replace it during a code rollback.
 
 The staging coordinator and both browser applications use one Chia provider.
-The deployment preserves existing mainnet roots and maintains a separate
-Testnet11 service at `/opt/solslot/chia-testnet11`. Provision the node and its
-dedicated API mTLS identity with:
+The authoritative Testnet11 full node runs on the validator host with its RPC
+bound to that host's loopback interface. The coordinator reaches it through
+`solslot-chia-rpc-tunnel.service`, using a restricted forwarding-only SSH key,
+an explicitly pinned SSH host key, and a dedicated Chia private-CA client
+certificate. Neither the RPC port nor its mTLS credentials are public.
+
+Provision the tunnel only after the forwarding key has been restricted on the
+node to `permitopen="127.0.0.1:18555"`:
 
 ```bash
-sudo /opt/solslot/api-staging/current/scripts/configure_testnet11_full_node.sh
+sudo /opt/solslot/api-staging/current/scripts/configure_chia_rpc_tunnel.sh \
+  --remote-host <pinned-node-hostname>
 sudo /opt/solslot/api-staging/current/scripts/configure_local_chia_provider.sh \
-  --chia-root /opt/solslot/chia-testnet11
+  --primary-url https://127.0.0.1:18555 \
+  --existing-tls
 ```
 
-The installer verifies Testnet11 and full synchronization before changing the
-shared environment. It does not alter ceremony, minting, purchase, or protocol
-write gates. `GET /protocol-api/chia/provider-status` returns HTTP 200 only
-while the local full node is active; Coinset fallback is explicit HTTP 503 so
-monitoring cannot silently treat degraded operation as healthy.
+The mTLS client private key is generated on the coordinator. Only its CSR is
+signed with the Testnet11 node's private CA; the node CA key never leaves the
+node and the API client key never leaves the coordinator. The provider
+installer verifies the certificate, Testnet11 identity, synchronization, and
+peak before changing the shared environment. It does not alter ceremony,
+minting, purchase, or protocol write gates.
+
+`GET /protocol-api/chia/provider-status` returns HTTP 200 only while the local
+full node tunnel is active; Coinset fallback is explicit HTTP 503 so monitoring
+cannot silently treat degraded operation as healthy. Deployment fails closed
+if the tunnel, enrolled mTLS files, network identity, or node synchronization
+is unavailable.
 
 The Cloudflare range pin is non-secret infrastructure configuration. Its
 versioned value lives in the staging workflow and is sourced from

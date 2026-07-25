@@ -43,6 +43,17 @@ def test_release_verification_is_explicitly_fail_closed() -> None:
     assert "Coordinator health check timed out after 30 seconds." in text
 
 
+def test_staging_uses_existing_private_chia_tunnel() -> None:
+    text = _workflow_text()
+
+    assert "solslot-chia-rpc-tunnel.service" in text
+    assert "https://127.0.0.1:18555" in text
+    assert 'systemctl is-active --quiet "$chia_tunnel_service"' in text
+    assert "--existing-tls" in text
+    assert "After=network-online.target $chia_tunnel_service" in text
+    assert "configure_testnet11_full_node.sh" not in text
+
+
 def test_deploy_and_rollback_are_two_phase_transactions() -> None:
     text = _workflow_text()
 

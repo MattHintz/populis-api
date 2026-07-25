@@ -250,9 +250,8 @@ jobs:
             env_file="${{ env.ENV_FILE_PATH }}"
             systemd_service="${{ env.SYSTEMD_SERVICE }}"
             systemd_user="${{ env.SYSTEMD_USER }}"
-            chia_root="${{ vars.SOLSLOT_CHIA_ROOT || '' }}"
-            chia_bin="${{ vars.SOLSLOT_CHIA_BIN || '/home/hiram/.local/bin/chia' }}"
-            chia_service_user="${{ vars.SOLSLOT_CHIA_SERVICE_USER || 'hiram' }}"
+            chia_tunnel_service="${{ vars.SOLSLOT_CHIA_TUNNEL_SERVICE || 'solslot-chia-rpc-tunnel.service' }}"
+            chia_primary_url="${{ vars.SOLSLOT_CHIA_PRIMARY_URL || 'https://127.0.0.1:18555' }}"
             app_port="${{ env.APP_PORT }}"
             trusted_proxy_cidrs="${{ env.CLOUDFLARE_PROXY_CIDRS }}"
             actual_hostname="$(hostname)"
@@ -440,28 +439,23 @@ jobs:
             printf '%s\n' "$previous_target" \
               | sudo tee "$transaction_file" >/dev/null
             sudo chmod 0600 "$transaction_file"
-            chia_root_args=()
-            if [ -n "$chia_root" ]; then
-              chia_root_args=(--chia-root "$chia_root")
-            fi
-            sudo "$release_dir/scripts/configure_testnet11_full_node.sh" \
-              "${chia_root_args[@]}" \
-              --chia-bin "$chia_bin" \
-              --service-user "$chia_service_user"
+            sudo systemctl is-active --quiet "$chia_tunnel_service" \
+              || { echo "Required Chia RPC tunnel is not active." >&2; exit 1; }
             sudo "$release_dir/scripts/configure_local_chia_provider.sh" \
-              "${chia_root_args[@]}" \
               --shared-root "$shared_root" \
               --env-file "$env_file" \
               --service "$systemd_service" \
               --service-user "$systemd_user" \
               --network testnet11 \
+              --primary-url "$chia_primary_url" \
+              --existing-tls \
               --no-restart
             sudo ln -sfn "$release_dir" "$release_root/current"
             sudo tee /etc/systemd/system/"$systemd_service" >/dev/null <<EOF
             [Unit]
             Description=Solslot API Staging
-            After=network-online.target
-            Wants=network-online.target
+            After=network-online.target $chia_tunnel_service
+            Wants=network-online.target $chia_tunnel_service
 
             [Service]
             Type=simple
@@ -1035,7 +1029,7 @@ jobs:
             echo "--- local OpenAPI status (must be 404) ---"
             curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${{ env.APP_PORT }}/openapi.json" || true
             echo "--- local Chia provider candidates ---"
-            sudo ss -ltnp | grep ':8555' || true
+            sudo ss -ltnp | grep -E ':(8555|18555)' || true
             sudo systemctl list-units --type=service --all --no-pager \
               | grep -Ei 'chia|full.?node' || true
             ps -eo user,pid,lstart,args \
