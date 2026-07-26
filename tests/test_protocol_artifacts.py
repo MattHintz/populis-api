@@ -7,6 +7,8 @@ import time
 import pytest
 from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
+from eth_abi import encode as abi_encode
+from eth_utils import keccak
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -66,6 +68,18 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
         "SOLSLOT_PAYMENT_PURCHASE_DB_PATH",
         str(tmp_path / "payment-purchases.db"),
     )
+    monkeypatch.setenv("SOLSLOT_COLLECTION_METADATA_ENABLED", "true")
+
+    class Store:
+        @staticmethod
+        def get(collection_id):
+            assert collection_id == "SOL-LOT-AUSTIN-ALPHA"
+            return _published_collection()
+
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts.get_collection_store",
+        lambda _settings: Store(),
+    )
 
     def confirmed_enrollment(_settings, vault_launcher_id):
         assert vault_launcher_id == VAULT_ID
@@ -120,7 +134,7 @@ def _request(**overrides):
         "genesis_artifact_hash": "0x" + "d1" * 32,
         "instance_id": "solslot-staging",
         "purchase_intent_id": "pi_test_001",
-        "rail": "chia",
+        "rail": "stripe",
         "deed_launcher_id": "0x" + "11" * 32,
         "property_id": "US-TX-AUSTIN-001",
         "collection_id": "SOL-LOT-AUSTIN-ALPHA",
@@ -129,11 +143,9 @@ def _request(**overrides):
         "current_vault_coin_id": "0x" + "88" * 32,
         "identity_attest_root": IDENTITY_ROOT,
         "expires_at": int(time.time()) + 3600,
-        "payment_terms": {
-            "currency": "wUSDC",
-            "amount": 125_000,
-            "quantity": 1,
-        },
+        "payment_terms": {"currency": "USD", "quantity": 1},
+        "authorization_nonce": "0x" + "14" * 32,
+        "authorization_expires_at": int(time.time()) + 7200,
     }
     base.update(overrides)
     return base
@@ -274,12 +286,12 @@ def _configure_external_quote(
             "gateway": "32",
             "spoke": "33",
             "usdc": "34",
-            "governanceSafe": "35",
+            "governanceRootSafe": "35",
             "governanceTimelock": "36",
         }.items()
     }
     evidence = {
-        "schemaVersion": 2,
+        "schemaVersion": 5,
         "protocolVersion": "solslot-v2",
         "rail": "ccip-warp-escrow",
         "sourceSha": "a" * 40,
@@ -289,6 +301,7 @@ def _configure_external_quote(
         "confirmations": 12,
         "governanceArtifactHash": "0x" + "42" * 32,
         "samuelCoordinateArtifactHash": "0x" + "43" * 32,
+        "warpPortalArtifactHash": "0x" + "44" * 32,
         "contracts": {
             "ccipRouter": "0x" + "11" * 20,
             "gateway": "0x" + "12" * 20,
@@ -300,8 +313,10 @@ def _configure_external_quote(
             "callbackGas": "500000",
             "emergencyDelay": "604800",
             "payoutAddress": "0x" + "14" * 20,
-            "governanceSafe": "0x" + "14" * 20,
+            "governanceRootSafe": "0x" + "14" * 20,
             "governanceTimelock": "0x" + "15" * 20,
+            "samuelSourceSha": "b" * 40,
+            "predictedGatewayAddress": "0x" + "12" * 20,
             "ownershipAccepted": False,
         },
         "deploymentTransactions": {
@@ -323,30 +338,85 @@ def _configure_external_quote(
         "runtimeCodeHashes": runtime_code_hashes,
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
+    owner_safe = "0x" + "41" * 20
+    coadmin_safe = "0x" + "42" * 20
+    owner_address = "0x" + "51" * 20
+    coadmin_addresses = ["0x" + value * 20 for value in ("52", "53")]
+    guardian_address = "0x" + "54" * 20
+    bls_guardian_pubkey = "0x" + "81" * 48
     governance = {
-        "schemaVersion": 1,
-        "kind": "solslot-alpha-safe-timelock-deployment",
+        "schemaVersion": 2,
+        "kind": "solslot-alpha-owner-required-governance-deployment",
+        "authorityRule": "slot0_and_one_of_slot1_slot2",
         "sourceSha": evidence["sourceSha"],
         "network": "baseSepolia",
         "chainId": 84532,
         "rosterArtifactHash": "0x" + "41" * 32,
-        "safe": {
-            "address": evidence["configuration"]["governanceSafe"],
-            "owners": ["0x" + value * 20 for value in ("51", "52", "53")],
-            "threshold": 2,
+        "administrators": [
+            {"slot": 1, "address": owner_address},
+            {"slot": 2, "address": coadmin_addresses[0]},
+            {"slot": 3, "address": coadmin_addresses[1]},
+        ],
+        "safes": {
+            "ownerIdentity": {
+                "address": owner_safe,
+                "owners": [owner_address],
+                "threshold": 1,
+                "guard": "0x" + "46" * 20,
+            },
+            "coadmin": {
+                "address": coadmin_safe,
+                "owners": coadmin_addresses,
+                "threshold": 1,
+                "guard": "0x" + "4a" * 20,
+            },
+            "root": {
+                "address": evidence["configuration"]["governanceRootSafe"],
+                "owners": [owner_safe, coadmin_safe],
+                "threshold": 2,
+                "guard": "0x" + "4b" * 20,
+            },
         },
         "timelock": {
             "address": evidence["configuration"]["governanceTimelock"],
             "minimumDelaySeconds": "86400",
-            "proposer": evidence["configuration"]["governanceSafe"],
-            "executor": evidence["configuration"]["governanceSafe"],
+            "proposer": evidence["configuration"]["governanceRootSafe"],
+            "executor": evidence["configuration"]["governanceRootSafe"],
+            "canceller": evidence["configuration"]["governanceRootSafe"],
             "externalAdmin": "0x" + "00" * 20,
         },
-        "payoutAddress": evidence["configuration"]["governanceSafe"],
+        "payoutAddress": evidence["configuration"]["governanceRootSafe"],
+        "recovery": {
+            "address": "0x" + "45" * 20,
+            "ownerGuard": "0x" + "46" * 20,
+            "secp256k1Guardian": guardian_address,
+            "blsGuardianPubkey": bls_guardian_pubkey,
+            "blsGuardianCommitment": "0x" + keccak(
+                bytes.fromhex(bls_guardian_pubkey[2:])
+            ).hex(),
+            "coadmins": coadmin_addresses,
+            "delaySeconds": "604800",
+            "replacementAcceptanceRequired": True,
+        },
+        "safeInfrastructure": {
+            "safeVersion": "1.4.1",
+            "compatibilityFallbackHandler": "0x" + "48" * 20,
+            "signMessageLibrary": "0x" + "49" * 20,
+            "ownerSetup": "0x" + "47" * 20,
+        },
         "deploymentTransactions": {},
         "runtimeCodeHashes": {
-            "safe": runtime_code_hashes["governanceSafe"],
+            "ownerIdentitySafe": "0x" + "61" * 32,
+            "coadminSafe": "0x" + "62" * 32,
+            "rootSafe": runtime_code_hashes["governanceRootSafe"],
             "timelock": runtime_code_hashes["governanceTimelock"],
+            "recovery": "0x" + "63" * 32,
+            "ownerGuard": "0x" + "64" * 32,
+            "coadminGuard": "0x" + "68" * 32,
+            "rootGuard": "0x" + "69" * 32,
+            "ownerSetup": "0x" + "65" * 32,
+            "compatibilityFallbackHandler": "0x" + "66" * 32,
+            "signMessageLibrary": "0x" + "67" * 32,
         },
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
@@ -360,24 +430,36 @@ def _configure_external_quote(
     governance_path.write_text(json.dumps(governance), encoding="utf-8")
     evidence["governanceArtifactHash"] = governance["artifactHash"]
 
+    validator_evm_addresses = [
+        "0x" + value * 20 for value in ("71", "72", "73")
+    ]
     samuel = {
-        "schemaVersion": 1,
+        "schemaVersion": 3,
         "kind": "solslot-samuel-testnet-coordinates",
         "sourceSha": "b" * 40,
+        "protocolSourceSha": "c" * 40,
         "validatorRosterArtifactHash": "0x" + "42" * 32,
         "testnet11": {
             "portalLauncherId": "0x" + "61" * 32,
             "bridgingPuzzleHash": "0x" + "62" * 32,
             "returnPuzzleHash": "0x" + "63" * 32,
+            "resultAuthorizationModHash": "0x" + "64" * 32,
+            "voucherBurnInnerHash": "0x" + "65" * 32,
         },
         "baseSepolia": {
             "chainId": 84532,
             "warpPortalAddress": "0x" + "16" * 20,
+            "solomonGatewayAddress": evidence["contracts"]["gateway"],
         },
         "threshold": 2,
         "validatorPublicKeys": [
             "0x" + value * 48 for value in ("71", "72", "73")
         ],
+        "validatorEvmAddresses": validator_evm_addresses,
+        "returnRoute": {
+            "destinationChain": "bse",
+            "destinationAddress": evidence["contracts"]["gateway"],
+        },
     }
     samuel_canonical = json.dumps(
         samuel, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -386,8 +468,66 @@ def _configure_external_quote(
     samuel_path = tmp_path / "omnichain-samuel-evidence.json"
     samuel_path.write_text(json.dumps(samuel), encoding="utf-8")
     evidence["samuelCoordinateArtifactHash"] = samuel["artifactHash"]
+
+    warp_portal = {
+        "schemaVersion": 1,
+        "kind": "solslot-warp-base-sepolia-portal-deployment",
+        "sourceSha": evidence["sourceSha"],
+        "network": evidence["network"],
+        "chainId": evidence["chainId"],
+        "portal": {
+            "address": samuel["baseSepolia"]["warpPortalAddress"],
+            "owner": "0x" + "17" * 20,
+            "signers": validator_evm_addresses,
+            "signatureThreshold": 2,
+            "messageTollWei": "0",
+            "supportedChains": ["0x786368"],
+            "initializedAtomically": True,
+        },
+        "proxy": {
+            "implementation": "0x" + "18" * 20,
+            "admin": "0x" + "19" * 20,
+            "adminOwner": "0x" + "17" * 20,
+            "standard": "openzeppelin-transparent-proxy-5.0.2",
+        },
+        "deploymentTransactions": {
+            name: {
+                "hash": "0x" + value * 32,
+                "blockNumber": 1,
+                "from": "0x" + "20" * 20,
+                "dataHash": "0x" + value * 32,
+            }
+            for name, value in {
+                "validatorSafe": "81",
+                "portalImplementation": "82",
+                "portalProxy": "83",
+            }.items()
+        },
+        "runtimeCodeHashes": {
+            "safe": "0x" + "38" * 32,
+            "portal": "0x" + "37" * 32,
+            "implementation": "0x" + "39" * 32,
+            "proxyAdmin": "0x" + "3a" * 32,
+        },
+        "artifactRuntimeCodeHashes": {
+            "portal": "0x" + "39" * 32,
+            "transparentProxyTemplate": "0x" + "3b" * 32,
+            "proxyAdmin": "0x" + "3a" * 32,
+        },
+        "createdAt": "2026-07-20T00:00:00.000Z",
+    }
+    warp_canonical = json.dumps(
+        warp_portal, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    warp_portal["artifactHash"] = "0x" + hashlib.sha256(
+        warp_canonical
+    ).hexdigest()
+    warp_path = tmp_path / "omnichain-warp-portal-evidence.json"
+    warp_path.write_text(json.dumps(warp_portal), encoding="utf-8")
+    evidence["warpPortalArtifactHash"] = warp_portal["artifactHash"]
+
     preflight = {
-        "schemaVersion": 2,
+        "schemaVersion": 5,
         "kind": "solslot-omnichain-testnet-deployment-preflight",
         "sourceSha": evidence["sourceSha"],
         "network": evidence["network"],
@@ -400,13 +540,23 @@ def _configure_external_quote(
         "samuelCoordinateArtifactHash": evidence[
             "samuelCoordinateArtifactHash"
         ],
+        "warpPortalArtifactHash": evidence["warpPortalArtifactHash"],
         "settings": {
             "ccipRouter": evidence["contracts"]["ccipRouter"],
             "payout": evidence["configuration"]["payoutAddress"],
             "governance": evidence["configuration"]["governanceTimelock"],
-            "safe": evidence["configuration"]["governanceSafe"],
+            "rootSafe": evidence["configuration"]["governanceRootSafe"],
             "usdc": evidence["contracts"]["usdc"],
             "warpPortal": "0x" + "16" * 20,
+            "protocolSourceSha": samuel["protocolSourceSha"],
+            "samuelSourceSha": samuel["sourceSha"],
+            "predictedGatewayAddress": evidence["contracts"]["gateway"],
+            "voucherResultAuthorizationMod": samuel["testnet11"][
+                "resultAuthorizationModHash"
+            ],
+            "voucherBurnInner": samuel["testnet11"][
+                "voucherBurnInnerHash"
+            ],
             "callbackGas": evidence["configuration"]["callbackGas"],
             "emergencyDelay": evidence["configuration"]["emergencyDelay"],
             "confirmations": evidence["confirmations"],
@@ -418,8 +568,8 @@ def _configure_external_quote(
                     "ccipRouter"
                 ],
                 evidence["contracts"]["usdc"]: runtime_code_hashes["usdc"],
-                evidence["configuration"]["governanceSafe"]: runtime_code_hashes[
-                    "governanceSafe"
+                evidence["configuration"]["governanceRootSafe"]: runtime_code_hashes[
+                    "governanceRootSafe"
                 ],
                 evidence["configuration"]["governanceTimelock"]: runtime_code_hashes[
                     "governanceTimelock"
@@ -444,19 +594,103 @@ def _configure_external_quote(
     evidence["artifactHash"] = "0x" + hashlib.sha256(canonical).hexdigest()
     deployment_path = tmp_path / "omnichain-deployment-evidence.json"
     deployment_path.write_text(json.dumps(evidence), encoding="utf-8")
+    ownership_targets = [
+        evidence["contracts"]["gateway"],
+        evidence["contracts"]["spoke"],
+    ]
+    ownership_values = [0, 0]
+    ownership_payloads = [keccak(text="acceptOwnership()")[:4]] * 2
+    ownership_predecessor = bytes(32)
+    ownership_salt = bytes.fromhex("44" * 32)
+    operation_id = "0x" + keccak(
+        abi_encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [
+                ownership_targets,
+                ownership_values,
+                ownership_payloads,
+                ownership_predecessor,
+                ownership_salt,
+            ],
+        )
+    ).hex()
+    schedule_data = "0x" + (
+        keccak(
+            text=(
+                "scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,"
+                "uint256)"
+            )
+        )[:4]
+        + abi_encode(
+            [
+                "address[]",
+                "uint256[]",
+                "bytes[]",
+                "bytes32",
+                "bytes32",
+                "uint256",
+            ],
+            [
+                ownership_targets,
+                ownership_values,
+                ownership_payloads,
+                ownership_predecessor,
+                ownership_salt,
+                86_400,
+            ],
+        )
+    ).hex()
+    execute_data = "0x" + (
+        keccak(
+            text="executeBatch(address[],uint256[],bytes[],bytes32,bytes32)"
+        )[:4]
+        + abi_encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [
+                ownership_targets,
+                ownership_values,
+                ownership_payloads,
+                ownership_predecessor,
+                ownership_salt,
+            ],
+        )
+    ).hex()
     ownership_intent = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "solslot-omnichain-ownership-activation-intent",
         "deploymentArtifactHash": evidence["artifactHash"],
         "network": evidence["network"],
         "chainId": evidence["chainId"],
-        "safe": evidence["configuration"]["governanceSafe"],
+        "rootSafe": evidence["configuration"]["governanceRootSafe"],
         "timelock": evidence["configuration"]["governanceTimelock"],
-        "operationId": "0x" + "44" * 32,
+        "operationId": operation_id,
         "minimumDelaySeconds": "86400",
-        "scheduleTransaction": {},
-        "executeTransaction": {},
-        "targets": [evidence["contracts"]["gateway"], evidence["contracts"]["spoke"]],
+        "scheduleTransaction": {
+            "to": evidence["configuration"]["governanceTimelock"],
+            "value": "0",
+            "data": schedule_data,
+        },
+        "executeTransaction": {
+            "to": evidence["configuration"]["governanceTimelock"],
+            "value": "0",
+            "data": execute_data,
+        },
+        "targets": [
+            {
+                "label": name,
+                "address": evidence["contracts"][name],
+                "currentOwner": "0x" + "20" * 20,
+                "pendingOwner": evidence["configuration"]["governanceTimelock"],
+                "runtimeCodeHash": evidence["runtimeCodeHashes"][name],
+                "ownershipTransferTransactionHash": evidence[
+                    "deploymentTransactions"
+                ][f"{name}OwnershipTransfer"]["hash"],
+            }
+            for name in ("gateway", "spoke")
+        ],
+        "governanceArtifactHash": evidence["governanceArtifactHash"],
+        "preparationSourceSha": "d" * 40,
+        "preparationBlockNumber": 3,
         "createdAt": "2026-07-20T00:00:00.000Z",
     }
     ownership_canonical = json.dumps(
@@ -471,7 +705,7 @@ def _configure_external_quote(
     ownership_path = tmp_path / "omnichain-ownership-intent.json"
     ownership_path.write_text(json.dumps(ownership_intent), encoding="utf-8")
     activation = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "kind": "ccip-warp-escrow-activation",
         "deploymentArtifactHash": evidence["artifactHash"],
         "ownershipOperationArtifactHash": ownership_intent["artifactHash"],
@@ -486,7 +720,7 @@ def _configure_external_quote(
             name: evidence["runtimeCodeHashes"][name] for name in ("gateway", "spoke")
         },
         "governance": evidence["configuration"]["governanceTimelock"],
-        "governanceSafe": evidence["configuration"]["governanceSafe"],
+        "governanceRootSafe": evidence["configuration"]["governanceRootSafe"],
         "observedOwners": {
             name: evidence["configuration"]["governanceTimelock"]
             for name in ("gateway", "spoke")
@@ -501,11 +735,20 @@ def _configure_external_quote(
     activation_path = tmp_path / "omnichain-activation-evidence.json"
     activation_path.write_text(json.dumps(activation), encoding="utf-8")
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "true")
+    monkeypatch.setenv(
+        "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN",
+        "test-omnichain-callback-token-32-characters",
+    )
+    monkeypatch.setenv(
+        "SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL",
+        "https://base-sepolia.example.invalid",
+    )
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_PREFLIGHT_EVIDENCE_PATH", str(preflight_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_EVIDENCE_PATH", str(deployment_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH", str(activation_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH", str(governance_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH", str(samuel_path))
+    monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_WARP_PORTAL_EVIDENCE_PATH", str(warp_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH", str(ownership_path))
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA", "a" * 40)
     monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE", "bse")
@@ -607,6 +850,10 @@ def test_evm_offer_requires_omnichain_preflight_evidence(monkeypatch, tmp_path):
         ("SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH", "governance"),
         ("SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH", "samuel"),
         (
+            "SOLSLOT_PAYMENT_OMNICHAIN_WARP_PORTAL_EVIDENCE_PATH",
+            "warp_portal",
+        ),
+        (
             "SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH",
             "ownership_intent",
         ),
@@ -642,11 +889,50 @@ def _reseal_evidence(path, mutate):
             "Samuel evidence mismatches",
         ),
         (
+            "omnichain-samuel-evidence.json",
+            lambda value: value.update(schemaVersion=1),
+            "Samuel evidence mismatches",
+        ),
+        (
+            "omnichain-samuel-evidence.json",
+            lambda value: value["validatorEvmAddresses"].__setitem__(
+                1, value["validatorEvmAddresses"][0]
+            ),
+            "validatorEvmAddresses is invalid",
+        ),
+        (
+            "omnichain-warp-portal-evidence.json",
+            lambda value: value["portal"].update(signatureThreshold=1),
+            "Warp portal evidence mismatches",
+        ),
+        (
+            "omnichain-warp-portal-evidence.json",
+            lambda value: value["runtimeCodeHashes"].update(
+                implementation="0x" + "99" * 32
+            ),
+            "Warp portal evidence mismatches",
+        ),
+        (
             "omnichain-governance-evidence.json",
-            lambda value: value["safe"]["owners"].__setitem__(
-                2, value["safe"]["owners"][0]
+            lambda value: value["safes"]["coadmin"]["owners"].__setitem__(
+                1, value["safes"]["coadmin"]["owners"][0]
             ),
             "governance evidence mismatches",
+        ),
+        (
+            "omnichain-governance-evidence.json",
+            lambda value: value.update(
+                schemaVersion=1,
+                kind="solslot-alpha-safe-timelock-deployment",
+            ),
+            "governance evidence mismatches",
+        ),
+        (
+            "omnichain-governance-evidence.json",
+            lambda value: value["recovery"].update(
+                blsGuardianPubkey="0x" + "00" * 48
+            ),
+            "BLS recovery key is invalid",
         ),
         (
             "omnichain-governance-evidence.json",
@@ -665,6 +951,32 @@ def _reseal_evidence(path, mutate):
             lambda value: value.update(ownershipAccepted=False),
             "activation evidence mismatches",
         ),
+        (
+            "omnichain-ownership-intent.json",
+            lambda value: value["targets"][0].update(
+                address="0x" + "99" * 20
+            ),
+            "ownership intent targets mismatch",
+        ),
+        (
+            "omnichain-ownership-intent.json",
+            lambda value: value.update(operationId="0x" + "99" * 32),
+            "ownership intent operation ID mismatches",
+        ),
+        (
+            "omnichain-ownership-intent.json",
+            lambda value: value["scheduleTransaction"].update(
+                data=value["executeTransaction"]["data"]
+            ),
+            "scheduleTransaction.data is invalid",
+        ),
+        (
+            "omnichain-preflight-evidence.json",
+            lambda value: value.update(
+                warpPortalArtifactHash="0x" + "99" * 32
+            ),
+            "preflight evidence mismatches",
+        ),
     ),
 )
 def test_evm_offer_rejects_invalid_authority_and_route_evidence(
@@ -672,6 +984,20 @@ def test_evm_offer_rejects_invalid_authority_and_route_evidence(
 ):
     _configure_external_quote(monkeypatch, tmp_path)
     _reseal_evidence(tmp_path / filename, mutate)
+    if filename == "omnichain-ownership-intent.json":
+        ownership_intent = json.loads(
+            (tmp_path / filename).read_text(encoding="utf-8")
+        )
+        _reseal_evidence(
+            tmp_path / "omnichain-activation-evidence.json",
+            lambda value: value.update(
+                {
+                    "ownershipOperationArtifactHash": ownership_intent[
+                        "artifactHash"
+                    ]
+                }
+            ),
+        )
     get_settings.cache_clear()
     with pytest.raises(RuntimeError, match=message):
         validate_server_hardening_at_startup(get_settings())
@@ -703,7 +1029,7 @@ def test_evm_offer_rejects_legacy_omnichain_schema(monkeypatch, tmp_path):
     _configure_external_quote(monkeypatch, tmp_path)
     path = tmp_path / "omnichain-deployment-evidence.json"
     evidence = json.loads(path.read_text(encoding="utf-8"))
-    evidence["schemaVersion"] = 1
+    evidence["schemaVersion"] = 3
     evidence_without_hash = dict(evidence)
     evidence_without_hash.pop("artifactHash")
     canonical = json.dumps(
@@ -750,6 +1076,22 @@ def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
         )
         assert verified.status_code == 200, verified.text
         assert verified.json()["valid"] is True
+
+
+@pytest.mark.parametrize(
+    "legacy_field",
+    (
+        {"rail": "chia"},
+        {"raw_offer": "offer1retired"},
+    ),
+)
+def test_rejects_legacy_static_chia_offer_inputs(legacy_field):
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(**legacy_field),
+        )
+    assert response.status_code == 422
 
 
 def test_builds_native_xch_offer_from_server_authorized_quote(
@@ -875,10 +1217,11 @@ def test_quote_rejects_ambiguous_sealed_usd_price(
 def test_verify_rejects_tampered_or_expired_artifact(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
     get_settings.cache_clear()
+    now = int(time.time())
     with TestClient(app) as client:
         built = client.post(
             "/protocol/offer-artifacts",
-            json=_request(expires_at=int(time.time()) - 1),
+            json=_request(expires_at=now + 60),
         ).json()
         artifact = built["artifact"]
         artifact["protocol"]["sharePpm"] = 50_000
@@ -887,7 +1230,7 @@ def test_verify_rejects_tampered_or_expired_artifact(monkeypatch, tmp_path):
             json={
                 "artifact": artifact,
                 "artifact_hash": built["artifact_hash"],
-                "now": int(time.time()),
+                "now": now + 61,
             },
         )
         assert verified.status_code == 200, verified.text
@@ -964,6 +1307,9 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         message = {
             "gatewayProfile": "bse",
             "globalPaymentId": "0x" + "90" * 32,
+            "localPaymentId": "0x" + "91" * 32,
+            "depositor": "0x" + "80" * 20,
+            "settlementToken": "0x" + "ab" * 20,
             "purchaseId": purchase["purchaseId"],
             "artifactHash": purchase["artifactHash"],
             "amount": purchase["railAmount"],
@@ -974,34 +1320,93 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
             "destinationPuzzle": purchase["vaultP2PuzzleHash"],
             "quoteExpiresAt": purchase["quoteExpiresAt"],
         }
+        source = {
+            "chainId": 84532,
+            "spoke": "0x" + "13" * 20,
+            "transactionHash": "0x" + "92" * 32,
+            "blockNumber": 100,
+            "blockHash": "0x" + "93" * 32,
+            "blockTimestamp": now,
+            "logIndex": 2,
+            "confirmations": 12,
+        }
+        headers = {
+            "Authorization": "Bearer test-omnichain-callback-token-32-characters"
+        }
+        unauthorized = client.post(
+            "/protocol/purchase-intents/escrow-webhook",
+            json={"escrowMessage": message, "source": source},
+        )
+        assert unauthorized.status_code == 401
+
+        wrong_spoke = client.post(
+            "/protocol/purchase-intents/escrow-webhook",
+            json={
+                "escrowMessage": message,
+                "source": {**source, "spoke": "0x" + "ff" * 20},
+            },
+            headers=headers,
+        )
+        assert wrong_spoke.status_code == 409
+        assert "provenance" in wrong_spoke.text
+
+        underconfirmed = client.post(
+            "/protocol/purchase-intents/escrow-webhook",
+            json={
+                "escrowMessage": message,
+                "source": {**source, "confirmations": 11},
+            },
+            headers=headers,
+        )
+        assert underconfirmed.status_code == 422
+
         tampered = client.post(
             "/protocol/external-payments/verify",
-            json={**message, "amount": message["amount"] - 1},
+            json={
+                "escrowMessage": {**message, "amount": message["amount"] - 1},
+                "source": source,
+            },
+            headers=headers,
         )
         assert tampered.status_code == 409
         assert "amount" in tampered.text
 
         redirected_vault = client.post(
             "/protocol/external-payments/verify",
-            json={**message, "vaultLauncherId": "0x" + "99" * 32},
+            json={
+                "escrowMessage": {
+                    **message,
+                    "vaultLauncherId": "0x" + "99" * 32,
+                },
+                "source": source,
+            },
+            headers=headers,
         )
         assert redirected_vault.status_code == 409
         assert "vaultLauncherId" in redirected_vault.text
 
         redirected_destination = client.post(
             "/protocol/external-payments/verify",
-            json={**message, "destinationPuzzle": "0x" + "98" * 32},
+            json={
+                "escrowMessage": {
+                    **message,
+                    "destinationPuzzle": "0x" + "98" * 32,
+                },
+                "source": source,
+            },
+            headers=headers,
         )
         assert redirected_destination.status_code == 409
         assert "destinationPuzzle" in redirected_destination.text
 
         verified = client.post(
-            "/protocol/external-payments/verify",
-            json=message,
+            "/protocol/purchase-intents/escrow-webhook",
+            json={"escrowMessage": message, "source": source},
+            headers=headers,
         )
         assert verified.status_code == 200, verified.text
-        assert verified.json()["verified"] is True
-        assert verified.json()["fulfillment"]["purchaseId"] == (
+        assert verified.json()["escrow"]["verified"] is True
+        assert verified.json()["verification"]["fulfillment"]["purchaseId"] == (
             purchase["purchaseId"]
         )
         built = built_response.json()
@@ -1045,9 +1450,13 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         replay = client.post(
             "/protocol/external-payments/verify",
             json={
-                **message,
-                "globalPaymentId": "0x" + "91" * 32,
+                "escrowMessage": {
+                    **message,
+                    "globalPaymentId": "0x" + "94" * 32,
+                },
+                "source": {**source, "transactionHash": "0x" + "95" * 32},
             },
+            headers=headers,
         )
         assert replay.status_code == 409
         assert "another external payment" in replay.text

@@ -53,12 +53,29 @@ class PaymentPurchaseStore:
                     offer_artifact_json TEXT NOT NULL,
                     purchase_artifact_json TEXT NOT NULL,
                     external_global_payment_id TEXT UNIQUE,
+                    external_transaction_hash TEXT,
                     external_message_json TEXT,
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS payment_purchases_expiry
                     ON payment_purchases(quote_expires_at);
                 """
+            )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(payment_purchases)"
+                ).fetchall()
+            }
+            if "external_transaction_hash" not in columns:
+                connection.execute(
+                    "ALTER TABLE payment_purchases "
+                    "ADD COLUMN external_transaction_hash TEXT"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "payment_purchases_external_transaction "
+                "ON payment_purchases(external_transaction_hash)"
             )
 
     @contextmanager
@@ -173,6 +190,8 @@ class PaymentPurchaseStore:
     ) -> StoredPaymentPurchase:
         message_json = _canonical_json(message)
         global_payment_id = _required_string(message, "globalPaymentId")
+        source = _required_mapping(message, "source")
+        transaction_hash = _required_string(source, "transactionHash")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -198,10 +217,16 @@ class PaymentPurchaseStore:
                     """
                     UPDATE payment_purchases
                     SET external_global_payment_id = ?,
+                        external_transaction_hash = ?,
                         external_message_json = ?
                     WHERE purchase_id = ?
                     """,
-                    (global_payment_id, message_json, purchase_id),
+                    (
+                        global_payment_id,
+                        transaction_hash,
+                        message_json,
+                        purchase_id,
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 connection.execute("ROLLBACK")
@@ -255,6 +280,13 @@ def _required_int(value: Mapping[str, Any], field: str) -> int:
     result = value.get(field)
     if not isinstance(result, int) or isinstance(result, bool):
         raise PaymentPurchaseConflict(f"{field} must be an integer")
+    return result
+
+
+def _required_mapping(value: Mapping[str, Any], field: str) -> Mapping[str, Any]:
+    result = value.get(field)
+    if not isinstance(result, Mapping):
+        raise PaymentPurchaseConflict(f"{field} must be an object")
     return result
 
 

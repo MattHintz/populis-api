@@ -6,7 +6,7 @@ import hmac
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -33,6 +33,15 @@ class VerifiedMedia:
     availability_status: str
 
 
+@dataclass(frozen=True)
+class VerifiedPrivateDocument:
+    sha256: str
+    mime_type: str
+    byte_size: int
+    malware_status: str
+    availability_status: Literal["PRIVATE"] = "PRIVATE"
+
+
 class CollectionMediaPipeline:
     def __init__(
         self,
@@ -49,6 +58,7 @@ class CollectionMediaPipeline:
         collection_id: str,
         asset_id: str,
         filename: str,
+        private: bool = False,
     ) -> dict[str, Any]:
         self._require_s3()
         extension = ""
@@ -57,7 +67,7 @@ class CollectionMediaPipeline:
             if candidate.isalnum() and len(candidate) <= 12:
                 extension = "." + candidate
         object_key = (
-            f"collections/{_safe_segment(collection_id)}/"
+            f"{'private/' if private else ''}collections/{_safe_segment(collection_id)}/"
             f"{_safe_segment(asset_id)}{extension}"
         )
         expires = self.settings.collection_s3_presign_ttl_seconds
@@ -121,6 +131,57 @@ class CollectionMediaPipeline:
             cid=cid,
             malware_status="CLEAN",
             availability_status="HEALTHY",
+        )
+
+    async def verify_private_document(
+        self,
+        *,
+        object_key: str,
+        expected_sha256: str,
+        expected_mime_type: str,
+        expected_byte_size: int,
+    ) -> VerifiedPrivateDocument:
+        """Verify a private original without publishing or pinning its bytes."""
+        self._require_private_services()
+        if not object_key.startswith("private/collections/"):
+            raise MediaVerificationError("private document is outside the private object prefix")
+        timeout = self.settings.collection_asset_verification_timeout_seconds
+        download_url = self._s3_signed_url("GET", object_key, 300)
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            transport=self.transport,
+        ) as client:
+            response = await client.get(download_url)
+            response.raise_for_status()
+            payload = response.content
+            if len(payload) > self.settings.collection_asset_max_bytes:
+                raise MediaVerificationError("uploaded object exceeds the configured size cap")
+            actual_sha256 = hashlib.sha256(payload).hexdigest()
+            actual_mime = _detect_mime(payload)
+            if len(payload) != expected_byte_size:
+                raise MediaVerificationError(
+                    f"byte-size mismatch: expected {expected_byte_size}, got {len(payload)}"
+                )
+            if actual_sha256 != expected_sha256.lower():
+                raise MediaVerificationError("SHA-256 mismatch")
+            if actual_mime != expected_mime_type.lower():
+                raise MediaVerificationError(
+                    f"MIME mismatch: declared {expected_mime_type}, detected {actual_mime}"
+                )
+            await self._scan(client, payload, actual_sha256, actual_mime)
+        return VerifiedPrivateDocument(
+            sha256=actual_sha256,
+            mime_type=actual_mime,
+            byte_size=len(payload),
+            malware_status="CLEAN",
+        )
+
+    def presign_private_download(self, *, object_key: str) -> str:
+        if not object_key.startswith("private/collections/"):
+            raise MediaVerificationError("private document is outside the private object prefix")
+        return self._s3_signed_url(
+            "GET", object_key, self.settings.collection_private_download_ttl_seconds
         )
 
     async def _scan(
@@ -309,6 +370,13 @@ class CollectionMediaPipeline:
                 "collection verification services are not configured: " + ", ".join(missing)
             )
 
+    def _require_private_services(self) -> None:
+        self._require_s3()
+        if not self.settings.collection_malware_scan_url:
+            raise MediaPipelineUnavailable(
+                "collection private-document scanner is not configured"
+            )
+
 
 def _signature_key(secret: str, date: str, region: str, service: str) -> bytes:
     date_key = hmac.new(("AWS4" + secret).encode(), date.encode(), hashlib.sha256).digest()
@@ -343,4 +411,5 @@ __all__ = [
     "MediaPipelineUnavailable",
     "MediaVerificationError",
     "VerifiedMedia",
+    "VerifiedPrivateDocument",
 ]

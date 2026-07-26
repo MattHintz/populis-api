@@ -12,8 +12,12 @@ from solslot_api.validator_quorum import (
     PrimaryPurchaseClaim,
     ValidatorClaim,
     ValidatorQuorumError,
+    VoucherSeriesPhaseClaim,
+    VoucherTransitionClaim,
     collect_primary_purchase_quorum,
     collect_validator_quorum,
+    collect_voucher_series_phase_quorum,
+    collect_voucher_transition_quorum,
     probe_validator_health,
 )
 from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
@@ -91,6 +95,54 @@ def _primary_claim() -> PrimaryPurchaseClaim:
         credential_bridge_policy_hash="0x" + "2a" * 32,
         credential_owner_auth_type=1,
         credential_owner_key="0x" + bytes(owner_key).hex(),
+    )
+
+
+def _voucher_transition_claim() -> VoucherTransitionClaim:
+    owner_key = AugSchemeMPL.key_gen(b"v" * 32).get_g1()
+    return VoucherTransitionClaim(
+        network="testnet11",
+        genesis_artifact_hash="0x" + "31" * 32,
+        series_terms={"seriesId": "0x" + "32" * 32},
+        voucher_commitment={"globalPaymentId": "0x" + "33" * 32},
+        purchase_artifact={"artifactHash": "0x" + "34" * 32},
+        series_coin_id="0x" + "35" * 32,
+        series_sold_count=1,
+        series_redeemed_count=0,
+        series_refunded_count=0,
+        series_phase=1,
+        series_launched_at=0,
+        voucher_launcher_id="0x" + "36" * 32,
+        voucher_coin_id="0x" + "37" * 32,
+        payment_coin_id="0x" + "38" * 32,
+        vault_launcher_id="0x" + "39" * 32,
+        vault_coin_id="0x" + "3a" * 32,
+        vault_identity_attest_root="0x" + "3b" * 32,
+        vault_owner_auth_type=1,
+        vault_owner_key="0x" + bytes(owner_key).hex(),
+        owner_authorization="0x" + "3c" * 96,
+        current_timestamp=1_800_000_000,
+        action=1,
+        validator_message="0x" + "3d" * 32,
+    )
+
+
+def _voucher_series_phase_claim() -> VoucherSeriesPhaseClaim:
+    return VoucherSeriesPhaseClaim(
+        network="testnet11",
+        genesis_artifact_hash="0x" + "41" * 32,
+        series_terms={"seriesId": "0x" + "42" * 32},
+        series_coin_id="0x" + "43" * 32,
+        series_sold_count=2,
+        series_redeemed_count=0,
+        series_refunded_count=0,
+        series_phase=1,
+        series_launched_at=0,
+        transition=2,
+        launch_anchor=1_800_000_000,
+        deed_launcher_ids=["0x" + "44" * 32, "0x" + "45" * 32],
+        governance_execution_ids=["0x" + "46" * 32, "0x" + "47" * 32],
+        validator_message="0x" + "48" * 32,
     )
 
 
@@ -211,6 +263,208 @@ async def test_primary_purchase_collects_two_signers_for_deed_coin_message():
         [claim.signature_message(), claim.signature_message()],
         result.aggregated_signature,
     )
+
+
+def test_voucher_transition_binds_three_distinct_coin_messages() -> None:
+    claim = _voucher_transition_claim()
+    messages = claim.signature_messages()
+
+    assert len(messages) == 3
+    assert len(set(messages)) == 3
+    assert bytes.fromhex(claim.series_coin_id[2:]) in messages[0]
+    assert bytes.fromhex(claim.voucher_coin_id[2:]) in messages[1]
+    assert bytes.fromhex(claim.payment_coin_id[2:]) in messages[2]
+
+
+def test_base_voucher_transition_uses_receipt_evidence_message() -> None:
+    payload = _voucher_transition_claim().model_dump(mode="json")
+    payload["voucher_commitment"] = {
+        **payload["voucher_commitment"],
+        "paymentRail": 1,
+    }
+    payload.update(
+        payment_evidence={"source": {"chainId": 84532}},
+        external_settlement_evidence_hash="0x" + "4a" * 32,
+        external_validator_message="0x" + "4b" * 32,
+    )
+    claim = VoucherTransitionClaim.model_validate(payload)
+    messages = claim.signature_messages()
+
+    assert len(messages) == 3
+    assert bytes.fromhex(claim.external_validator_message[2:]) in messages[2]
+    assert bytes.fromhex(claim.validator_message[2:]) not in messages[2]
+    assert bytes.fromhex(claim.payment_coin_id[2:]) in messages[2]
+
+    with pytest.raises(ValueError, match="authenticated settlement evidence"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "external_validator_message": None}
+        )
+
+
+def test_voucher_redemption_binds_the_governed_deed_without_owner_signature() -> None:
+    payload = _voucher_transition_claim().model_dump(mode="json")
+    payload.update(
+        action=3,
+        owner_authorization="",
+        deed_coin_id="0x" + "3e" * 32,
+        deed_puzzle_hash="0x" + "3f" * 32,
+        smart_deed_inner_hash="0x" + "40" * 32,
+        protocol_puzzle_hash="0x" + "41" * 32,
+        buyer_offer="offer1" + "42" * 16,
+    )
+    claim = VoucherTransitionClaim.model_validate(payload)
+    messages = claim.signature_messages()
+
+    assert len(messages) == 4
+    assert len(set(messages)) == 4
+    assert bytes.fromhex(claim.deed_coin_id[2:]) in messages[3]
+    assert bytes.fromhex(payload["purchase_artifact"]["artifactHash"][2:]) in messages[3]
+
+    with pytest.raises(ValueError, match="second owner signature"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "owner_authorization": "0x" + "43" * 96}
+        )
+    with pytest.raises(ValueError, match="exact deed evidence"):
+        VoucherTransitionClaim.model_validate({**payload, "buyer_offer": None})
+
+
+def test_expired_refund_forbids_owner_and_deed_evidence() -> None:
+    payload = _voucher_transition_claim().model_dump(mode="json")
+    payload.update(
+        action=2,
+        vault_coin_id=None,
+        vault_identity_attest_root=None,
+        vault_owner_auth_type=None,
+        vault_owner_key=None,
+        owner_authorization="",
+    )
+    claim = VoucherTransitionClaim.model_validate(payload)
+
+    assert len(claim.signature_messages()) == 3
+    assert claim.vault_coin_id is None
+    with pytest.raises(ValueError, match="current vault ownership evidence"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "vault_coin_id": "0x" + "44" * 32}
+        )
+    with pytest.raises(ValueError, match="owner signature"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "owner_authorization": "0x" + "45" * 96}
+        )
+    with pytest.raises(ValueError, match="cannot carry deed evidence"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "deed_coin_id": "0x" + "46" * 32}
+        )
+
+
+@pytest.mark.asyncio
+async def test_voucher_transition_collects_two_aggregate_signers() -> None:
+    keys = _keys()
+    claim = _voucher_transition_claim()
+    messages = claim.signature_messages()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        assert request.url.path == "/v1/voucher-transition/sign"
+        body = json.loads(request.content)
+        assert body["claim"] == claim.model_dump(mode="json")
+        signature = AugSchemeMPL.aggregate(
+            [AugSchemeMPL.sign(keys[index], message) for message in messages]
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claimHash": claim.canonical_hash(),
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "signature": "0x" + bytes(signature).hex(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await collect_voucher_transition_quorum(
+            _settings(keys),
+            claim,
+            client=client,
+        )
+
+    assert result.signer_indices == (0, 1)
+    assert AugSchemeMPL.aggregate_verify(
+        [keys[0].get_g1()] * 3 + [keys[1].get_g1()] * 3,
+        list(messages) + list(messages),
+        result.aggregated_signature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_voucher_transition_rejects_partial_protocol_signature() -> None:
+    keys = _keys()
+    claim = _voucher_transition_claim()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        signature = AugSchemeMPL.sign(keys[index], claim.signature_messages()[0])
+        return httpx.Response(
+            200,
+            json={
+                "claimHash": claim.canonical_hash(),
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "signature": "0x" + bytes(signature).hex(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValidatorQuorumError, match="received 0 of 2"):
+            await collect_voucher_transition_quorum(
+                _settings(keys),
+                claim,
+                client=client,
+            )
+
+
+@pytest.mark.asyncio
+async def test_series_phase_collects_two_independent_signers() -> None:
+    keys = _keys()
+    claim = _voucher_series_phase_claim()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        assert request.url.path == "/v1/voucher-series-phase/sign"
+        signature = AugSchemeMPL.sign(keys[index], claim.signature_message())
+        return httpx.Response(
+            200,
+            json={
+                "claimHash": claim.canonical_hash(),
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "signature": "0x" + bytes(signature).hex(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await collect_voucher_series_phase_quorum(
+            _settings(keys),
+            claim,
+            client=client,
+        )
+
+    assert result.signer_indices == (0, 1)
+    assert AugSchemeMPL.aggregate_verify(
+        [keys[0].get_g1(), keys[1].get_g1()],
+        [claim.signature_message(), claim.signature_message()],
+        result.aggregated_signature,
+    )
+
+
+def test_series_cancel_rejects_launch_evidence() -> None:
+    with pytest.raises(ValueError, match="cancellation cannot carry"):
+        VoucherSeriesPhaseClaim(
+            **{
+                **_voucher_series_phase_claim().model_dump(),
+                "transition": 3,
+                "launch_anchor": 0,
+            }
+        )
 
 
 @pytest.mark.asyncio

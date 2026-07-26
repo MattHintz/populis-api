@@ -1,13 +1,14 @@
 """Admin and public APIs for chain-verifiable property collections."""
 from __future__ import annotations
 
-from typing import Annotated, Any, Callable, Optional, TypeVar
+from typing import Annotated, Any, Callable, Literal, Optional, TypeVar
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .admin_auth import AdminClaims, require_admin_jwt
+from .admin_operations import require_admin_operation
 from .collection_media import (
     CollectionMediaPipeline,
     MediaPipelineUnavailable,
@@ -27,6 +28,14 @@ from .config import Settings, get_settings
 from .property_amendment_auth import verify_amendment_signature
 from .metadata_chain_indexer import MetadataChainIndexer, MetadataIndexError
 from .property_metadata import (
+    ASSET_CLASS_DILIGENCE_KEYS,
+    ASSET_CLASS_CODES,
+    COMMON_DILIGENCE_KEYS,
+    OVERLAY_DILIGENCE_KEYS,
+    PROJECT_STAGES,
+    PROPERTY_SUBTYPES,
+    PROGRAM_OVERLAYS,
+    STAGE_DILIGENCE_KEYS,
     PropertyAmendmentV1,
     PropertyDossierDraftV1,
     PropertyDossierV1,
@@ -59,11 +68,18 @@ class AssetUploadRequest(ApiModel):
     title: Optional[str] = Field(default=None, max_length=180)
     alt: Optional[str] = Field(default=None, max_length=240)
     category: Optional[str] = Field(default=None, max_length=80)
+    visibility: Literal["PUBLIC", "PRIVATE"] = "PUBLIC"
 
 
 class CommentRequest(ApiModel):
     section: str = Field(min_length=1, max_length=80)
     body: str = Field(min_length=1, max_length=4000)
+    blocking: bool = True
+
+
+class ReviewRequest(ApiModel):
+    decision: str = Field(pattern=r"^(APPROVED|CHANGES_REQUESTED)$")
+    note: Optional[str] = Field(default=None, max_length=4000)
 
 
 class AmendmentRequest(ApiModel):
@@ -158,6 +174,38 @@ async def collection_feature_status(
     }
 
 
+@router.get(
+    "/admin/collections/profiles",
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+)
+async def collection_profiles() -> dict[str, Any]:
+    return {
+        "assetClasses": [
+            {
+                "id": name,
+                "code": int(code),
+                "subtypes": sorted(PROPERTY_SUBTYPES[name]),
+            }
+            for name, code in ASSET_CLASS_CODES.items()
+        ],
+        "projectStages": sorted(PROJECT_STAGES),
+        "programOverlays": sorted(PROGRAM_OVERLAYS),
+        "diligence": {
+            "common": sorted(COMMON_DILIGENCE_KEYS),
+            "byAssetClass": {
+                key: sorted(values) for key, values in ASSET_CLASS_DILIGENCE_KEYS.items()
+            },
+            "byProjectStage": {
+                key: sorted(values) for key, values in STAGE_DILIGENCE_KEYS.items()
+            },
+            "byProgramOverlay": {
+                key: sorted(values) for key, values in OVERLAY_DILIGENCE_KEYS.items()
+            },
+        },
+        "legalRight": "future-sale-or-refinance-proceeds",
+    }
+
+
 @router.post(
     "/admin/collections",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
@@ -235,6 +283,28 @@ async def update_collection(
     return _with_etag(response, payload)
 
 
+@router.post(
+    "/admin/collections/{collection_id}/reviews",
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+)
+async def review_collection(
+    collection_id: str,
+    body: ReviewRequest,
+    response: Response,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+) -> dict[str, Any]:
+    payload = _store_call(
+        lambda: store.submit_review(
+            collection_id,
+            reviewer_subject=claims.sub,
+            decision=body.decision,
+            note=body.note,
+        )
+    )
+    return _with_etag(response, payload)
+
+
 @router.get(
     "/admin/collections/{collection_id}/readiness",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
@@ -248,7 +318,10 @@ async def collection_readiness(
 
 @router.post(
     "/admin/collections/{collection_id}/seal",
-    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+    dependencies=[
+        Depends(require_admin_operation("collection.seal")),
+        Depends(require_collection_metadata),
+    ],
 )
 async def seal_collection(
     collection_id: str,
@@ -293,6 +366,7 @@ async def presign_collection_asset(
             title=body.title,
             alt_text=body.alt,
             category=body.category,
+            visibility=body.visibility,
         )
     )
     pipeline = CollectionMediaPipeline(settings)
@@ -301,6 +375,7 @@ async def presign_collection_asset(
             collection_id=collection_id,
             asset_id=body.asset_id,
             filename=body.filename,
+            private=body.visibility == "PRIVATE",
         )
     except (MediaPipelineUnavailable, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -335,13 +410,22 @@ async def complete_collection_asset(
         )
     )
     try:
-        verified = await CollectionMediaPipeline(settings).verify_and_pin(
-            object_key=asset["objectKey"],
-            expected_sha256=asset["expectedSha256"],
-            expected_mime_type=asset["expectedMimeType"],
-            expected_byte_size=asset["expectedByteSize"],
-            asset_name=asset_id,
-        )
+        pipeline = CollectionMediaPipeline(settings)
+        if asset["visibility"] == "PRIVATE":
+            verified = await pipeline.verify_private_document(
+                object_key=asset["objectKey"],
+                expected_sha256=asset["expectedSha256"],
+                expected_mime_type=asset["expectedMimeType"],
+                expected_byte_size=asset["expectedByteSize"],
+            )
+        else:
+            verified = await pipeline.verify_and_pin(
+                object_key=asset["objectKey"],
+                expected_sha256=asset["expectedSha256"],
+                expected_mime_type=asset["expectedMimeType"],
+                expected_byte_size=asset["expectedByteSize"],
+                asset_name=asset_id,
+            )
     except (MediaPipelineUnavailable, MediaVerificationError, httpx.HTTPError) as exc:
         _store_call(
             lambda: store.mark_asset_failed(
@@ -358,12 +442,43 @@ async def complete_collection_asset(
             actual_mime_type=verified.mime_type,
             actual_byte_size=verified.byte_size,
             malware_status=verified.malware_status,
-            verified_https_url=verified.https_url,
-            ipfs_cid=verified.cid,
+            verified_https_url=getattr(verified, "https_url", None),
+            ipfs_cid=getattr(verified, "cid", None),
             availability_status=verified.availability_status,
             actor_subject=claims.sub,
         )
     )
+
+
+@router.post(
+    "/admin/collections/{collection_id}/assets/{asset_id}/private-download",
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+)
+async def authorize_private_collection_asset_download(
+    collection_id: str,
+    asset_id: str,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+) -> dict[str, Any]:
+    asset = _store_call(
+        lambda: store.authorize_private_asset_download(
+            collection_id,
+            asset_id,
+            actor_subject=claims.sub,
+        )
+    )
+    try:
+        url = CollectionMediaPipeline(settings).presign_private_download(
+            object_key=asset["objectKey"]
+        )
+    except (MediaPipelineUnavailable, MediaVerificationError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "assetId": asset_id,
+        "downloadUrl": url,
+        "expiresIn": settings.collection_private_download_ttl_seconds,
+    }
 
 
 @router.post(
@@ -383,6 +498,7 @@ async def add_collection_comment(
             actor_subject=claims.sub,
             section=body.section,
             body=body.body,
+            blocking=body.blocking,
         )
     )
 
@@ -406,7 +522,10 @@ async def resolve_collection_comment(
 
 @router.post(
     "/admin/collections/{collection_id}/amendments",
-    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+    dependencies=[
+        Depends(require_admin_operation("collection.amend")),
+        Depends(require_collection_metadata),
+    ],
 )
 async def append_collection_amendment(
     collection_id: str,

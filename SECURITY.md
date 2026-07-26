@@ -14,8 +14,10 @@ created until every gate in this document is green.
   compiled assets pass `scripts/check_namespace.py`.
 - Every API release records exact API and protocol commits in `release.json`.
 - The protocol dependency is an exact 40-character commit, never a branch.
-- A deployment accepts only `schemaVersion: 2` and
-  `protocolVersion: "solslot-v2"` artifacts.
+- The Chia ceremony deployment accepts only `schemaVersion: 2` and
+  `protocolVersion: "solslot-v2"` artifacts. The independently versioned RC19
+  Omnichain evidence uses governance v2, preflight/deployment/activation v3,
+  and ownership-intent v2.
 
 ### Protocol coordinates
 
@@ -48,6 +50,14 @@ created until every gate in this document is green.
   expired.
 - Ceremony bearer credentials cannot authorize post-genesis mutations.
 - The bootstrap lock manifest is written last and cannot be reopened.
+- EVM operations use `slot0 AND (slot1 OR slot2)` on chain: a slot-0 Owner
+  Identity Safe and 1-of-2 Coadmin Safe jointly own a 2-of-2 root Safe. A flat
+  2-of-3 Safe is unsupported because slots 1 and 2 could otherwise bypass the
+  permanent owner requirement.
+- The root Safe alone controls the 24-hour timelock and receives protocol
+  payouts. Slot-0 recovery requires the separate secp256k1 guardian, both
+  coadmins, replacement acceptance, and seven days; its deployment evidence
+  also binds a separate BLS guardian commitment.
 
 ### zkPassport and vault credentials
 

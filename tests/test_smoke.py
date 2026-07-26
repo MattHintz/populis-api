@@ -57,13 +57,17 @@ def _v2_manifest() -> dict:
 def _signed_artifact(manifest: dict) -> dict:
     return {
         "artifactHash": "0x" + "ab" * 32,
+        "sourceManifestVersion": 3,
         "sourceShas": {
             "protocol": "1" * 40,
             "evm": "2" * 40,
-            "api": "3" * 40,
-            "legacyBackend": "4" * 40,
-            "customerWeb": "5" * 40,
-            "adminPortal": "6" * 40,
+            "omnichain": "3" * 40,
+            "api": "4" * 40,
+            "legacyBackend": "5" * 40,
+            "keyOfSolomon": "6" * 40,
+            "samuel": "7" * 40,
+            "customerWeb": "8" * 40,
+            "adminPortal": "9" * 40,
         },
         "launcherIds": {
             "pool": manifest["pool_launcher_id"],
@@ -115,6 +119,27 @@ def test_health(client: TestClient) -> None:
     body = r.json()
     assert "network" in body
     assert body["network"] in ("testnet11", "mainnet")
+
+
+def test_chia_provider_status_reports_unconfigured_primary_as_degraded(
+    client: TestClient,
+) -> None:
+    response = client.get("/chia/provider-status")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "schemaVersion": 1,
+        "network": "testnet11",
+        "activeProvider": "coinset-fallback",
+        "primaryConfigured": False,
+        "primaryRequired": False,
+        "fallbackActive": True,
+        "primaryOrigin": None,
+        "fallbackOrigin": "https://testnet11.api.coinset.org",
+        "lastPrimaryFailureAt": None,
+        "lastPrimarySuccessAt": None,
+        "lastPrimaryError": "primary provider is not configured",
+    }
 
 
 def test_protocol(client: TestClient) -> None:

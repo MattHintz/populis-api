@@ -15,6 +15,18 @@ from solslot_puzzles.property_metadata import (
     MetadataValidationError,
     commit_metadata,
 )
+from solslot_puzzles.real_estate_profiles import (
+    ASSET_CLASS_DILIGENCE_KEYS,
+    ASSET_CLASS_CODES,
+    COMMON_DILIGENCE_KEYS,
+    OVERLAY_DILIGENCE_KEYS,
+    PROJECT_STAGES,
+    PROPERTY_SUBTYPES,
+    PROGRAM_OVERLAYS,
+    STAGE_DILIGENCE_KEYS,
+    required_diligence_keys,
+    validate_classification,
+)
 
 
 DecimalString = Annotated[str, StringConstraints(pattern=r"^-?(0|[1-9][0-9]*)$")]
@@ -78,7 +90,7 @@ class AssetDescriptorV1(ContractModel):
 
 
 class MediaAssetV1(AssetDescriptorV1):
-    role: Literal["hero", "gallery", "floorplan", "other"]
+    role: Literal["hero", "gallery", "site", "rendering", "plan", "floorplan", "other"]
     alt: str = Field(min_length=1, max_length=240)
 
 
@@ -97,7 +109,7 @@ class DraftMediaAssetV1(ContractModel):
     """
 
     asset_id: str = Field(min_length=1, max_length=120)
-    role: Literal["hero", "gallery", "floorplan", "other"]
+    role: Literal["hero", "gallery", "site", "rendering", "plan", "floorplan", "other"]
     alt: str = Field(min_length=1, max_length=240)
     uris: Optional[list[str]] = Field(default=None, min_length=2, max_length=8)
     sha256: Optional[HexSha256] = None
@@ -136,6 +148,57 @@ class DraftPropertyIdentityV1(ContractModel):
     lot_square_feet: Optional[DecimalString] = None
     latitude: Optional[str] = None
     longitude: Optional[str] = None
+
+
+class ClassificationV1(ContractModel):
+    asset_class: str = Field(min_length=1, max_length=64)
+    property_subtype: str = Field(min_length=1, max_length=80)
+    project_stage: str = Field(min_length=1, max_length=80)
+    program_overlays: list[str] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> "ClassificationV1":
+        validate_classification(
+            asset_class=self.asset_class,
+            property_subtype=self.property_subtype,
+            project_stage=self.project_stage,
+            overlays=self.program_overlays,
+        )
+        self.asset_class = self.asset_class.strip().upper()
+        return self
+
+
+class DraftClassificationV1(ContractModel):
+    asset_class: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    property_subtype: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    project_stage: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    program_overlays: list[str] = Field(default_factory=list, max_length=10)
+
+
+class DiligenceItemV1(ContractModel):
+    key: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=100)
+    value: str = Field(min_length=1, max_length=4000)
+    unit: Optional[str] = Field(default=None, max_length=40)
+    as_of_date: Optional[str] = None
+    evidence_asset_ids: list[str] = Field(default_factory=list, max_length=40)
+
+    @field_validator("as_of_date")
+    @classmethod
+    def validate_date(cls, value: Optional[str]) -> Optional[str]:
+        return _iso_date(value, "diligence.asOfDate") if value else value
+
+
+class DraftDiligenceItemV1(ContractModel):
+    key: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=100)
+    value: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    unit: Optional[str] = Field(default=None, max_length=40)
+    as_of_date: Optional[str] = None
+    evidence_asset_ids: list[str] = Field(default_factory=list, max_length=40)
+
+    @field_validator("as_of_date")
+    @classmethod
+    def validate_date(cls, value: Optional[str]) -> Optional[str]:
+        return _iso_date(value, "diligence.asOfDate") if value else value
 
 
 class DraftValuationV1(ContractModel):
@@ -227,6 +290,14 @@ class OfferingV1(ContractModel):
     minimum_investment_minor: Optional[DecimalString] = None
     projected_return_bps: Optional[DecimalString] = None
     term_months: Optional[DecimalString] = None
+
+    @model_validator(mode="after")
+    def validate_fee_and_class(self) -> "OfferingV1":
+        if self.asset_class.strip().upper() not in ASSET_CLASS_CODES:
+            raise ValueError("offering asset class is not enabled for RC20")
+        if int(self.royalty_bps) > 1_000:
+            raise ValueError("primary technology fee cannot exceed 1000 bps")
+        return self
 
 
 class OperationsV1(ContractModel):
@@ -343,6 +414,7 @@ class PropertyDossierV1(ContractModel):
     revision: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=180)
     summary: str = Field(min_length=1, max_length=4000)
+    classification: Optional[ClassificationV1] = None
     property: PropertyIdentityV1
     media: list[MediaAssetV1] = Field(min_length=1, max_length=40)
     valuation: ValuationV1
@@ -355,6 +427,7 @@ class PropertyDossierV1(ContractModel):
     history: list[HistoryEventV1] = Field(default_factory=list, max_length=200)
     disclosures: list[str] = Field(min_length=1, max_length=100)
     data_sources: list[DataSourceV1] = Field(min_length=1, max_length=100)
+    diligence: list[DiligenceItemV1] = Field(default_factory=list, max_length=200)
     deed_allocation: list[DeedAllocationV1] = Field(min_length=1, max_length=1000)
 
     @model_validator(mode="after")
@@ -370,6 +443,20 @@ class PropertyDossierV1(ContractModel):
         media_ids = [asset.asset_id for asset in [*self.media, *self.documents]]
         if len(media_ids) != len(set(media_ids)):
             raise ValueError("media and document asset IDs must be unique")
+        diligence_keys = [item.key for item in self.diligence]
+        if len(diligence_keys) != len(set(diligence_keys)):
+            raise ValueError("diligence keys must be unique")
+        if self.classification is not None:
+            if self.classification.asset_class != self.offering.asset_class.strip().upper():
+                raise ValueError("classification asset class must match offering asset class")
+            required = required_diligence_keys(
+                asset_class=self.classification.asset_class,
+                project_stage=self.classification.project_stage,
+                overlays=self.classification.program_overlays,
+            )
+            missing = sorted(required - set(diligence_keys))
+            if missing:
+                raise ValueError("missing required diligence: " + ", ".join(missing))
         return self
 
     def canonical_payload(self) -> dict:
@@ -391,6 +478,7 @@ class PropertyDossierDraftV1(ContractModel):
     revision: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=180)
     summary: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    classification: Optional[DraftClassificationV1] = None
     property: Optional[DraftPropertyIdentityV1] = None
     media: list[DraftMediaAssetV1] = Field(default_factory=list, max_length=40)
     valuation: Optional[DraftValuationV1] = None
@@ -400,9 +488,11 @@ class PropertyDossierDraftV1(ContractModel):
     legal: Optional[DraftLegalV1] = None
     risks: list[DraftRiskV1] = Field(default_factory=list, max_length=80)
     documents: list[DraftDocumentAssetV1] = Field(default_factory=list, max_length=100)
+    private_documents: list[DraftDocumentAssetV1] = Field(default_factory=list, max_length=100)
     history: list[DraftHistoryEventV1] = Field(default_factory=list, max_length=200)
     disclosures: list[str] = Field(default_factory=list, max_length=100)
     data_sources: list[DraftDataSourceV1] = Field(default_factory=list, max_length=100)
+    diligence: list[DraftDiligenceItemV1] = Field(default_factory=list, max_length=200)
     deed_allocation: list[DraftDeedAllocationV1] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
@@ -414,14 +504,19 @@ class PropertyDossierDraftV1(ContractModel):
         ]
         if len(deed_ids) != len(set(deed_ids)):
             raise ValueError("deed allocation contains duplicate deed IDs")
-        asset_ids = [asset.asset_id for asset in [*self.media, *self.documents]]
+        asset_ids = [asset.asset_id for asset in [*self.media, *self.documents, *self.private_documents]]
         if len(asset_ids) != len(set(asset_ids)):
             raise ValueError("media and document asset IDs must be unique")
+        diligence_keys = [item.key for item in self.diligence]
+        if len(diligence_keys) != len(set(diligence_keys)):
+            raise ValueError("diligence keys must be unique")
         return self
 
     def to_sealed_dossier(self) -> PropertyDossierV1:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("privateDocuments", None)
         return PropertyDossierV1.model_validate(
-            self.model_dump(mode="json", by_alias=True, exclude_none=True)
+            payload
         )
 
 
@@ -460,6 +555,7 @@ class PropertyAmendmentV1(ContractModel):
 PROTECTED_AMENDMENT_PATHS = frozenset(
     {
         "/deedAllocation",
+        "/classification",
         "/offering/parValueMojos",
         "/offering/assetClass",
         "/offering/jurisdiction",
@@ -494,10 +590,18 @@ def _iso_date(value: str, field: str) -> str:
 
 
 __all__ = [
+    "ASSET_CLASS_DILIGENCE_KEYS",
+    "ASSET_CLASS_CODES",
+    "COMMON_DILIGENCE_KEYS",
     "MAX_CANONICAL_METADATA_BYTES",
+    "OVERLAY_DILIGENCE_KEYS",
     "PROTECTED_AMENDMENT_PATHS",
     "PropertyAmendmentV1",
     "PropertyDossierDraftV1",
     "PropertyDossierV1",
+    "PROJECT_STAGES",
+    "PROPERTY_SUBTYPES",
+    "PROGRAM_OVERLAYS",
+    "STAGE_DILIGENCE_KEYS",
     "validate_amendment_paths",
 ]

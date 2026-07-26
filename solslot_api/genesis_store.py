@@ -13,6 +13,13 @@ from typing import Any, Iterator
 SCHEMA_VERSION = 1
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
+OWNER_SLOT = 1
+COADMIN_SLOTS = frozenset({2, 3})
+
+
+def owner_plus_one_approved(slots: set[int]) -> bool:
+    """Ceremony slots are one-based: slot 1 is the permanent owner."""
+    return OWNER_SLOT in slots and bool(slots & COADMIN_SLOTS)
 
 
 class GenesisStoreError(RuntimeError):
@@ -454,13 +461,14 @@ class GenesisStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise GenesisConflict("roster slot already signed this plan") from exc
-            count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM plan_signatures WHERE ceremony_id=? AND plan_hash=?",
-                    (ceremony_id, plan_hash),
-                ).fetchone()[0]
-            )
-            state = "plan_approved" if count >= 2 else "planned"
+            rows = connection.execute(
+                "SELECT slot FROM plan_signatures WHERE ceremony_id=? AND plan_hash=?",
+                (ceremony_id, plan_hash),
+            ).fetchall()
+            signed_slots = {int(row["slot"]) for row in rows}
+            count = len(signed_slots)
+            approved = owner_plus_one_approved(signed_slots)
+            state = "plan_approved" if approved else "planned"
             connection.execute(
                 "UPDATE ceremonies SET state=?,updated_at=? WHERE ceremony_id=?",
                 (state, timestamp, ceremony_id),
@@ -469,7 +477,12 @@ class GenesisStore:
                 connection,
                 ceremony_id,
                 "plan_signed",
-                {"slot": slot, "planHash": plan_hash, "signatureCount": count},
+                {
+                    "slot": slot,
+                    "planHash": plan_hash,
+                    "signatureCount": count,
+                    "ownerPlusOneApproved": approved,
+                },
                 timestamp,
             )
         return self.get(ceremony_id)
@@ -593,14 +606,15 @@ class GenesisStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise GenesisConflict("roster slot already signed this artifact") from exc
-            count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM artifact_signatures WHERE ceremony_id=? "
-                    "AND artifact_hash=?",
-                    (ceremony_id, artifact_hash),
-                ).fetchone()[0]
-            )
-            state = "artifact_signed" if count >= 2 else "artifact_pending"
+            rows = connection.execute(
+                "SELECT slot FROM artifact_signatures WHERE ceremony_id=? "
+                "AND artifact_hash=?",
+                (ceremony_id, artifact_hash),
+            ).fetchall()
+            signed_slots = {int(row["slot"]) for row in rows}
+            count = len(signed_slots)
+            approved = owner_plus_one_approved(signed_slots)
+            state = "artifact_signed" if approved else "artifact_pending"
             connection.execute(
                 "UPDATE ceremonies SET state=?,updated_at=? WHERE ceremony_id=?",
                 (state, timestamp, ceremony_id),
@@ -609,7 +623,12 @@ class GenesisStore:
                 connection,
                 ceremony_id,
                 "artifact_signed",
-                {"slot": slot, "artifactHash": artifact_hash, "signatureCount": count},
+                {
+                    "slot": slot,
+                    "artifactHash": artifact_hash,
+                    "signatureCount": count,
+                    "ownerPlusOneApproved": approved,
+                },
                 timestamp,
             )
         return self.get(ceremony_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 import json
 
 import pytest
@@ -123,7 +124,8 @@ def _install_owner_bypass(monkeypatch) -> None:
     )
 
 
-def _request() -> Request:
+def _request(coinset=None) -> Request:
+    app = SimpleNamespace(state=SimpleNamespace(coinset=coinset))
     return Request(
         {
             "type": "http",
@@ -136,6 +138,7 @@ def _request() -> Request:
             "headers": [],
             "client": ("127.0.0.1", 1),
             "server": ("testserver", 443),
+            "app": app,
         }
     )
 
@@ -537,18 +540,12 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
     )
     pushed: list[dict] = []
 
-    class FakeCoinsetClient:
-        def __init__(self, _base_url):
-            pass
-
+    class FakeChiaProvider:
         async def push_tx(self, spend_bundle_json):
             pushed.append(spend_bundle_json)
             return {"success": True, "status": "SUCCESS"}
 
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(zkpassport_enrollments, "CoinsetClient", FakeCoinsetClient)
+    fake_chia_provider = FakeChiaProvider()
     reset_registry_for_tests(tmp_path / "vault_registry.db")
     get_registry().record(
         VaultRecord(
@@ -568,7 +565,7 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
             zkpassport_enrollments.CreateEnrollmentRequest(
                 vaultLauncherId=VAULT_A,
             ),
-            _request(),
+            _request(fake_chia_provider),
         )
     )
     proof = zkpassport_enrollments.record_evm_proof(
@@ -603,7 +600,7 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
             zkpassport_enrollments.SubmitChiaStampRequest(
                 signature="0x" + signature,
             ),
-            _request(),
+            _request(fake_chia_provider),
         )
     )
 
@@ -782,18 +779,12 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
     )
     pushed: list[dict] = []
 
-    class FakeCoinsetClient:
-        def __init__(self, _base_url):
-            pass
-
+    class FakeChiaProvider:
         async def push_tx(self, spend_bundle_json):
             pushed.append(spend_bundle_json)
             return {"success": True, "status": "SUCCESS"}
 
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(zkpassport_enrollments, "CoinsetClient", FakeCoinsetClient)
+    fake_chia_provider = FakeChiaProvider()
     reset_registry_for_tests(tmp_path / "vault_registry.db")
     get_registry().record(
         VaultRecord(
@@ -813,7 +804,7 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
             zkpassport_enrollments.CreateEnrollmentRequest(
                 vaultLauncherId=VAULT_A,
             ),
-            _request(),
+            _request(fake_chia_provider),
         )
     )
     credential_ledger = get_credential_ledger(Settings())
@@ -917,7 +908,7 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
                 signature="0x" + bytes(owner_signature).hex(),
                 currentTimestamp=prepared.currentTimestamp,
             ),
-            _request(),
+            _request(fake_chia_provider),
         )
     )
 

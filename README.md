@@ -47,12 +47,24 @@ share allocation, or delivery address.
   `SOLSLOT_PAYMENT_OMNICHAIN_ACTIVATION_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_GOVERNANCE_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_SAMUEL_EVIDENCE_PATH`,
+  `SOLSLOT_PAYMENT_OMNICHAIN_WARP_PORTAL_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_INTENT_EVIDENCE_PATH`,
   `SOLSLOT_PAYMENT_OMNICHAIN_SOURCE_SHA`, and
   `SOLSLOT_PAYMENT_OMNICHAIN_GATEWAY_PROFILE`; the API verifies the evidence
   hashes, source SHA, chain, token, gateway profile, runtime-code descriptors,
   and a post-handoff governance-ownership attestation before it quotes or
-  finalizes an EVM buy.
+  finalizes an EVM buy. RC19 requires schema-v2 owner-required governance:
+  slot 0 owns a 1-of-1 Owner Identity Safe, slots 1 and 2 own a 1-of-2 Coadmin
+  Safe, and those child Safes own a 2-of-2 root Safe. The API rejects the old
+  flat 2-of-3 Safe, pre-RC19 rail schemas, guardian key reuse, incorrect Safe
+  thresholds, missing seven-day recovery acceptance, and any payout or
+  timelock role not bound to the root Safe.
+- The one-shot ownership handoff desk is separately gated by
+  `SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED`. It requires the
+  reviewed Safe-operation path and exact artifact hash. Administrators sign
+  the actual nested Safe messages in the portal; the API stores no EVM private
+  key and accepts a broadcast receipt only when the Root Safe destination and
+  calldata match the reconstructed sealed transaction.
 - `SOLSLOT_PAYMENT_PURCHASE_DB_PATH` is the coordinator-owned SQLite-WAL
   purchase and replay ledger.
 - `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 6
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -77,6 +77,74 @@ class ValidatorLedger:
                         signed_at INTEGER NOT NULL
                     );
                     PRAGMA user_version = 2;
+                    COMMIT;
+                    """
+                )
+                version = 2
+            if version < 3:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE voucher_issuance_signatures (
+                        claim_hash TEXT PRIMARY KEY,
+                        canonical_claim TEXT NOT NULL,
+                        global_payment_id TEXT NOT NULL UNIQUE,
+                        series_coin_id TEXT NOT NULL UNIQUE,
+                        purchase_launcher_coin_id TEXT NOT NULL UNIQUE,
+                        signature TEXT NOT NULL,
+                        signed_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 3;
+                    COMMIT;
+                    """
+                )
+                version = 3
+            if version < 4:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE voucher_transition_signatures (
+                        claim_hash TEXT PRIMARY KEY,
+                        canonical_claim TEXT NOT NULL,
+                        global_payment_id TEXT NOT NULL UNIQUE,
+                        series_coin_id TEXT NOT NULL UNIQUE,
+                        voucher_coin_id TEXT NOT NULL UNIQUE,
+                        payment_coin_id TEXT NOT NULL UNIQUE,
+                        signature TEXT NOT NULL,
+                        signed_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 4;
+                    COMMIT;
+                    """
+                )
+                version = 4
+            if version < 5:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE voucher_series_phase_signatures (
+                        claim_hash TEXT PRIMARY KEY,
+                        canonical_claim TEXT NOT NULL,
+                        series_coin_id TEXT NOT NULL UNIQUE,
+                        transition INTEGER NOT NULL,
+                        signature TEXT NOT NULL,
+                        signed_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 5;
+                    COMMIT;
+                    """
+                )
+                version = 5
+            if version < 6:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE voucher_transition_signatures
+                        ADD COLUMN deed_coin_id TEXT;
+                    CREATE UNIQUE INDEX voucher_transition_deed_once
+                        ON voucher_transition_signatures(deed_coin_id)
+                        WHERE deed_coin_id IS NOT NULL;
+                    PRAGMA user_version = 6;
                     COMMIT;
                     """
                 )
@@ -191,6 +259,181 @@ class ValidatorLedger:
                 self._conn.execute("ROLLBACK")
                 raise ValidatorLedgerConflict(
                     "Purchase or SmartDeed coin was already authorized."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def record_voucher_issuance_or_recover(
+        self,
+        *,
+        claim_hash: str,
+        canonical_claim: str,
+        global_payment_id: str,
+        series_coin_id: str,
+        purchase_launcher_coin_id: str,
+        signature: str,
+    ) -> str:
+        """Record one series transition or recover an exact retry."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT canonical_claim, signature
+                    FROM voucher_issuance_signatures
+                    WHERE claim_hash = ?
+                    """,
+                    (claim_hash,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["canonical_claim"] != canonical_claim:
+                        raise ValidatorLedgerConflict(
+                            "Voucher claim hash collides with different evidence."
+                        )
+                    self._conn.execute("COMMIT")
+                    return str(existing["signature"])
+                self._conn.execute(
+                    """
+                    INSERT INTO voucher_issuance_signatures(
+                        claim_hash, canonical_claim, global_payment_id,
+                        series_coin_id, purchase_launcher_coin_id,
+                        signature, signed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_hash,
+                        canonical_claim,
+                        global_payment_id,
+                        series_coin_id,
+                        purchase_launcher_coin_id,
+                        signature,
+                        int(time.time()),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return signature
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Payment, series coin, or purchase launcher was already authorized."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def record_voucher_transition_or_recover(
+        self,
+        *,
+        claim_hash: str,
+        canonical_claim: str,
+        global_payment_id: str,
+        series_coin_id: str,
+        voucher_coin_id: str,
+        payment_coin_id: str,
+        signature: str,
+        deed_coin_id: str | None = None,
+    ) -> str:
+        """Record one terminal voucher transition or recover an exact retry."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT canonical_claim, signature
+                    FROM voucher_transition_signatures
+                    WHERE claim_hash = ?
+                    """,
+                    (claim_hash,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["canonical_claim"] != canonical_claim:
+                        raise ValidatorLedgerConflict(
+                            "Voucher transition hash collides with different evidence."
+                        )
+                    self._conn.execute("COMMIT")
+                    return str(existing["signature"])
+                self._conn.execute(
+                    """
+                    INSERT INTO voucher_transition_signatures(
+                        claim_hash, canonical_claim, global_payment_id,
+                        series_coin_id, voucher_coin_id, payment_coin_id,
+                        deed_coin_id, signature, signed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_hash,
+                        canonical_claim,
+                        global_payment_id,
+                        series_coin_id,
+                        voucher_coin_id,
+                        payment_coin_id,
+                        deed_coin_id,
+                        signature,
+                        int(time.time()),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return signature
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Voucher, payment, series coin, or payment ID was already settled."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def record_voucher_series_phase_or_recover(
+        self,
+        *,
+        claim_hash: str,
+        canonical_claim: str,
+        series_coin_id: str,
+        transition: int,
+        signature: str,
+    ) -> str:
+        """Record one phase advance or recover an exact idempotent retry."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT canonical_claim, signature
+                    FROM voucher_series_phase_signatures
+                    WHERE claim_hash = ?
+                    """,
+                    (claim_hash,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["canonical_claim"] != canonical_claim:
+                        raise ValidatorLedgerConflict(
+                            "Series phase claim hash collides with different evidence."
+                        )
+                    self._conn.execute("COMMIT")
+                    return str(existing["signature"])
+                self._conn.execute(
+                    """
+                    INSERT INTO voucher_series_phase_signatures(
+                        claim_hash, canonical_claim, series_coin_id,
+                        transition, signature, signed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_hash,
+                        canonical_claim,
+                        series_coin_id,
+                        transition,
+                        signature,
+                        int(time.time()),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return signature
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Series coin was already authorized for a phase transition."
                 ) from exc
             except Exception:
                 self._conn.execute("ROLLBACK")

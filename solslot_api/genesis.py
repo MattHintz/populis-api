@@ -37,11 +37,15 @@ from .validator_quorum import (
 
 router = APIRouter(prefix="/admin/genesis", tags=["admin-genesis"])
 
+SOURCE_MANIFEST_VERSION = 3
 REQUIRED_SOURCE_SHAS = (
     "protocol",
     "evm",
+    "omnichain",
     "api",
     "legacyBackend",
+    "keyOfSolomon",
+    "samuel",
     "customerWeb",
     "adminPortal",
 )
@@ -70,7 +74,7 @@ class DraftRequest(ApiModel):
     @classmethod
     def validate_source_shas(cls, value: dict[str, str]) -> dict[str, str]:
         if set(value) != set(REQUIRED_SOURCE_SHAS):
-            raise ValueError("sourceShas must contain all six frozen release commits")
+            raise ValueError("sourceShas must contain all nine frozen release commits")
         normalized: dict[str, str] = {}
         for key in REQUIRED_SOURCE_SHAS:
             sha = value[key].lower()
@@ -324,6 +328,7 @@ async def create_draft(
         raise HTTPException(status_code=409, detail="Ceremony output directory is not empty.")
     draft = {
         "schemaVersion": 2,
+        "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
         "network": "testnet11",
         "evmChainId": 11155111,
         "reviewClass": body.review_class,
@@ -609,6 +614,7 @@ def _validate_audit_approval(
         raise GenesisConflict("independent audit approval file is invalid") from exc
     expected = {
         "schemaVersion": 2,
+        "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
         "ceremonyId": record["ceremony_id"],
         "planHash": record["plan_hash"],
         "sourceShas": record["draft"]["sourceShas"],
@@ -671,8 +677,10 @@ def _internal_review_approval(
         record.get("plan_signatures") or [], key=lambda item: int(item.get("slot", 0))
     )
     signer_slots = [int(item.get("slot", 0)) for item in plan_signatures]
-    if len(set(signer_slots)) < 2:
-        raise GenesisConflict("internal testnet review requires two administrator signatures")
+    if 1 not in signer_slots or not set(signer_slots).intersection({2, 3}):
+        raise GenesisConflict(
+            "internal testnet review requires slot 1 and one coadministrator signature"
+        )
     if len(validator_health) != 3:
         raise GenesisConflict("internal testnet review requires three live validators")
     if any(item.artifactReady for item in validator_health):
@@ -687,6 +695,7 @@ def _internal_review_approval(
         raise GenesisConflict("live EVM deployment evidence is incomplete")
     return {
         "schemaVersion": 2,
+        "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
         "reviewClass": INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
         "auditStatus": "unaudited",
         "testOnly": True,
@@ -801,7 +810,7 @@ async def preflight(
     try:
         record = store.get(ceremony_id.lower())
         if record["state"] != "plan_approved":
-            raise GenesisConflict("two administrator plan signatures are required")
+            raise GenesisConflict("slot 1 and one coadministrator plan signature are required")
         plan, bundle, approval, validator_health = await _prepare_bundle(settings, record)
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
@@ -836,7 +845,7 @@ async def broadcast(
     try:
         record = store.get(ceremony_id.lower())
         if record["state"] != "plan_approved":
-            raise GenesisConflict("two administrator plan signatures are required")
+            raise GenesisConflict("slot 1 and one coadministrator plan signature are required")
         plan, bundle, approval, validator_health = await _prepare_bundle(settings, record)
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
@@ -1035,7 +1044,7 @@ async def finalize(
     try:
         record = store.get(ceremony_id.lower())
         if record["state"] != "artifact_signed":
-            raise GenesisConflict("two artifact signatures are required")
+            raise GenesisConflict("slot 1 and one coadministrator artifact signature are required")
         artifact = dict(record["artifact"])
         artifact["signatures"] = [
             {
@@ -1071,6 +1080,7 @@ async def finalize(
         # The lock manifest is intentionally the final public file written.
         lock = {
             "schemaVersion": 2,
+            "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
             "protocolVersion": "solslot-v2",
             "reviewClass": artifact["reviewClass"],
             "testOnly": artifact["testOnly"],

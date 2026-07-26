@@ -16,16 +16,26 @@ from chia.consensus.condition_tools import (
     pkm_pairs_for_conditions_dict,
 )
 from chia.types.blockchain_format.program import INFINITE_COST, Program
-from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD
+from chia.types.coin_spend import make_spend
+from chia.wallet.lineage_proof import LineageProof
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
+    SINGLETON_LAUNCHER_HASH,
+    SINGLETON_MOD,
+    lineage_proof_for_coinsol,
+)
+from chia.wallet.util.compute_additions import compute_additions
 from chia.wallet.trading.offer import Offer
 from chia_rs import AugSchemeMPL, Coin, G1Element, G2Element, PrivateKey
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
+from web3 import Web3
 
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
     AUTH_TYPE_SECP256K1,
     DEFAULT_IDENTITY_ATTEST_ROOT,
+    build_vault_receive_spend,
+    compact_signature_from_evm,
     eip712_typed_data_for_vault_spend,
     one_leaf_merkle_root,
     puzzle_for_vault_full,
@@ -38,13 +48,41 @@ from solslot_puzzles.payment_artifacts_v2 import (
     PaymentRail,
     purchase_artifact_from_json,
 )
+from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.primary_purchase_v2_driver import (
     PRIMARY_PURCHASE_PROVIDER_ID,
     PrimaryMintTermsV2,
-    make_mint_offer_v2_inner,
+    PrimaryPurchaseMode,
+    build_universal_primary_offer_v4,
+    make_mint_offer_v4_inner,
+    prepare_base_voucher_redemption_offer,
+    prepare_xch_voucher_redemption_offer,
     validate_chia_buyer_offer,
 )
 from solslot_puzzles.protocol_deployment import singleton_struct
+from solslot_puzzles.voucher_presale_v2 import (
+    DeedAllocationCommitmentV2,
+    VoucherPaymentRail,
+    VoucherSeriesState,
+    VoucherV2Error,
+    allocation_root,
+    series_terms_from_json,
+    validate_purchase,
+    voucher_commitment_from_json,
+)
+from solslot_puzzles.voucher_presale_v2_driver import (
+    SeriesTransition,
+    VoucherAction,
+    VoucherSeriesStateV2,
+    build_base_voucher_terminal_spends,
+    build_xch_voucher_terminal_spends,
+    build_voucher_issuance_spends,
+    build_voucher_series_phase_spend,
+    curry_external_receipt,
+    curry_xch_escrow,
+    external_receipt_evidence_message,
+    validate_xch_voucher_offer,
+)
 
 from .config import Settings
 from .evm_auth import recover_evm_signer
@@ -55,7 +93,14 @@ from .public_artifact import (
 )
 from .release_metadata import ReleaseMetadata, load_release_metadata
 from .validator_ledger import ValidatorLedger, ValidatorLedgerConflict
-from .validator_quorum import PrimaryPurchaseClaim, ValidatorClaim
+from .validator_quorum import (
+    PrimaryPurchaseClaim,
+    ValidatorClaim,
+    VoucherIssuanceClaim,
+    VoucherSeriesPhaseClaim,
+    VoucherTransitionClaim,
+    base_settlement_evidence_hash,
+)
 from .validator_settings import ValidatorSettings
 from .zkpassport_enrollments import _fetch_verified_evm_attestation
 
@@ -224,6 +269,48 @@ def _fetch_coin(
     ):
         raise ValidatorEvidenceError(f"{field} is already spent")
     return record
+
+
+def _fetch_coin_spend(
+    settings: ValidatorSettings,
+    coin: Coin,
+    spent_height: int,
+    field: str,
+):
+    if spent_height <= 0:
+        raise ValidatorEvidenceError(f"{field} is not spent on Chia")
+    try:
+        with httpx.Client(
+            base_url=settings.coinset_base_url.rstrip("/"),
+            timeout=20.0,
+            headers={"content-type": "application/json"},
+        ) as client:
+            response = client.post(
+                "/get_puzzle_and_solution",
+                json={
+                    "coin_id": "0x" + bytes(coin.name()).hex(),
+                    "height": spent_height,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ValidatorEvidenceError(f"Coinset could not verify {field}") from exc
+    solution = payload.get("coin_solution") if isinstance(payload, Mapping) else None
+    if not isinstance(solution, Mapping):
+        raise ValidatorEvidenceError(f"{field} puzzle solution is unavailable")
+    try:
+        puzzle_reveal = Program.from_bytes(
+            bytes.fromhex(str(solution["puzzle_reveal"]).removeprefix("0x"))
+        )
+        puzzle_solution = Program.from_bytes(
+            bytes.fromhex(str(solution["solution"]).removeprefix("0x"))
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(f"{field} puzzle solution is malformed") from exc
+    if puzzle_reveal.get_tree_hash() != coin.puzzle_hash:
+        raise ValidatorEvidenceError(f"{field} puzzle reveal does not match its coin")
+    return make_spend(coin, puzzle_reveal, puzzle_solution)
 
 
 def _verify_vault_and_owner(
@@ -621,7 +708,7 @@ def verify_primary_purchase_claim(
         )
         expected_puzzle = SINGLETON_MOD.curry(
             deed_struct,
-            make_mint_offer_v2_inner(terms),
+            make_mint_offer_v4_inner(terms),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValidatorEvidenceError(
@@ -712,14 +799,1149 @@ def sign_primary_purchase_claim(
         raise ValidatorEvidenceError(str(exc)) from exc
 
 
+def canonical_voucher_issuance_claim_json(
+    claim: VoucherIssuanceClaim,
+) -> str:
+    return json.dumps(
+        claim.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _verify_base_voucher_payment(
+    settings: ValidatorSettings,
+    evidence: Mapping[str, Any],
+    *,
+    purchase: Any,
+    voucher: Any,
+) -> None:
+    source = evidence.get("source")
+    if not isinstance(source, Mapping):
+        raise ValidatorEvidenceError("Base voucher has no chain provenance")
+    if (
+        not settings.base_sepolia_rpc_url
+        or not settings.base_sepolia_spoke_address
+        or not settings.base_sepolia_usdc_address
+    ):
+        raise ValidatorEvidenceError("Base Sepolia validator rail is not configured")
+    spoke = settings.base_sepolia_spoke_address.lower()
+    usdc = settings.base_sepolia_usdc_address.lower()
+    expected_payer = "0x" + bytes(voucher.original_payer)[-20:].hex()
+    expected = {
+        "globalPaymentId": "0x" + bytes(voucher.global_payment_id).hex(),
+        "purchaseId": "0x" + bytes(purchase.purchase_id).hex(),
+        "artifactHash": "0x" + bytes(purchase.artifact_hash).hex(),
+        "amount": int(voucher.payment_principal),
+        "quantity": 1,
+        "collectionId": "0x" + bytes(voucher.collection_id).hex(),
+        "deedLauncherId": "0x" + bytes(voucher.deed_launcher_id).hex(),
+        "vaultLauncherId": "0x" + bytes(voucher.approved_vault_launcher_id).hex(),
+        "destinationPuzzle": "0x" + bytes(voucher.approved_vault_p2_puzzle_hash).hex(),
+        "depositor": expected_payer,
+        "settlementToken": usdc,
+    }
+    for field, expected_value in expected.items():
+        observed = evidence.get(field)
+        if isinstance(expected_value, str):
+            observed = str(observed or "").lower()
+        if observed != expected_value:
+            raise ValidatorEvidenceError(
+                f"Base voucher payment {field} does not match commitments"
+            )
+    if (
+        int(source.get("chainId") or 0) != 84532
+        or str(source.get("spoke") or "").lower() != spoke
+        or int(source.get("confirmations") or 0)
+        < settings.base_sepolia_min_confirmations
+    ):
+        raise ValidatorEvidenceError("Base voucher source route is invalid")
+
+    w3 = Web3(
+        Web3.HTTPProvider(
+            settings.base_sepolia_rpc_url,
+            request_kwargs={"timeout": 20.0},
+        )
+    )
+    tx_hash = str(source.get("transactionHash") or "")
+    try:
+        receipt = w3.eth.get_transaction_receipt(tx_hash)
+        block = w3.eth.get_block(int(source["blockNumber"]))
+        latest = int(w3.eth.block_number)
+    except Exception as exc:  # noqa: BLE001
+        raise ValidatorEvidenceError(
+            "Base Sepolia could not independently verify the payment"
+        ) from exc
+    block_number = int(receipt.get("blockNumber") or 0)
+    if (
+        int(receipt.get("status") or 0) != 1
+        or block_number != int(source.get("blockNumber") or 0)
+        or "0x" + bytes(receipt.get("blockHash") or b"").hex()
+        != str(source.get("blockHash") or "").lower()
+        or int(block.get("timestamp") or 0) != int(source.get("blockTimestamp") or 0)
+        or latest - block_number + 1 < settings.base_sepolia_min_confirmations
+    ):
+        raise ValidatorEvidenceError("Base voucher receipt provenance changed")
+
+    log_index = int(source.get("logIndex") or 0)
+    event_topic = Web3.keccak(
+        text=(
+            "PaymentDeposited(bytes32,bytes32,address,address,uint256,uint64,"
+            "address,bytes32,uint256)"
+        )
+    )
+    matching = []
+    for log in receipt.get("logs", []):
+        topics = list(log.get("topics") or [])
+        if (
+            str(log.get("address") or "").lower() == spoke
+            and int(log.get("logIndex") or 0) == log_index
+            and len(topics) == 4
+            and bytes(topics[0]) == bytes(event_topic)
+            and "0x" + bytes(topics[1]).hex() == expected["globalPaymentId"]
+            and "0x" + bytes(topics[2]).hex()
+            == str(evidence.get("localPaymentId") or "").lower()
+            and "0x" + bytes(topics[3])[-20:].hex() == expected_payer
+        ):
+            matching.append(log)
+    if len(matching) != 1:
+        raise ValidatorEvidenceError("Base voucher deposit event is missing or ambiguous")
+
+    deposit_abi = [
+        {
+            "inputs": [{"name": "globalPaymentId", "type": "bytes32"}],
+            "name": "getDeposit",
+            "outputs": [
+                {
+                    "components": [
+                        {"name": "depositor", "type": "address"},
+                        {"name": "settlementToken", "type": "address"},
+                        {"name": "localPaymentId", "type": "bytes32"},
+                        {"name": "purchaseId", "type": "bytes32"},
+                        {"name": "artifactHash", "type": "bytes32"},
+                        {"name": "collectionId", "type": "bytes32"},
+                        {"name": "deedLauncherId", "type": "bytes32"},
+                        {"name": "vaultLauncherId", "type": "bytes32"},
+                        {"name": "destinationPuzzle", "type": "bytes32"},
+                        {"name": "requestMessageId", "type": "bytes32"},
+                        {"name": "resultMessageId", "type": "bytes32"},
+                        {"name": "warpNonce", "type": "bytes32"},
+                        {"name": "amount", "type": "uint256"},
+                        {"name": "quantity", "type": "uint256"},
+                        {"name": "hubChainSelector", "type": "uint64"},
+                        {"name": "hubGateway", "type": "address"},
+                        {"name": "createdAt", "type": "uint64"},
+                        {"name": "quoteExpiresAt", "type": "uint64"},
+                        {"name": "status", "type": "uint8"},
+                        {"name": "succeeded", "type": "bool"},
+                    ],
+                    "name": "",
+                    "type": "tuple",
+                }
+            ],
+            "stateMutability": "view",
+            "type": "function",
+        }
+    ]
+    try:
+        deposit = w3.eth.contract(
+            address=Web3.to_checksum_address(spoke), abi=deposit_abi
+        ).functions.getDeposit(expected["globalPaymentId"]).call()
+    except Exception as exc:  # noqa: BLE001
+        raise ValidatorEvidenceError("Base voucher deposit storage is unavailable") from exc
+    observed_deposit = {
+        "depositor": str(deposit[0]).lower(),
+        "settlementToken": str(deposit[1]).lower(),
+        "localPaymentId": "0x" + bytes(deposit[2]).hex(),
+        "purchaseId": "0x" + bytes(deposit[3]).hex(),
+        "artifactHash": "0x" + bytes(deposit[4]).hex(),
+        "collectionId": "0x" + bytes(deposit[5]).hex(),
+        "deedLauncherId": "0x" + bytes(deposit[6]).hex(),
+        "vaultLauncherId": "0x" + bytes(deposit[7]).hex(),
+        "destinationPuzzle": "0x" + bytes(deposit[8]).hex(),
+        "amount": int(deposit[12]),
+        "quantity": int(deposit[13]),
+    }
+    for field, expected_value in {
+        **expected,
+        "localPaymentId": str(evidence.get("localPaymentId") or "").lower(),
+    }.items():
+        if observed_deposit.get(field) != expected_value:
+            raise ValidatorEvidenceError(
+                f"Base voucher stored deposit {field} does not match"
+            )
+    status_value = int(deposit[18])
+    if status_value not in (1, 2, 3) or (
+        status_value >= 2 and bool(deposit[19]) is not True
+    ):
+        raise ValidatorEvidenceError("Base voucher deposit is not eligible")
+
+
+def verify_voucher_issuance_claim(
+    settings: ValidatorSettings,
+    claim: VoucherIssuanceClaim,
+    claim_hash: str,
+) -> None:
+    if claim.canonical_hash() != claim_hash.lower():
+        raise ValidatorEvidenceError(
+            "voucher claim hash does not match canonical evidence"
+        )
+    artifact, _release = load_validator_artifact(settings)
+    if (
+        claim.network != settings.network
+        or claim.genesis_artifact_hash
+        != str(artifact.get("artifactHash") or "").lower()
+    ):
+        raise ValidatorEvidenceError("voucher claim does not match active genesis")
+    try:
+        terms = series_terms_from_json(claim.series_terms)
+        voucher = voucher_commitment_from_json(claim.voucher_commitment)
+        purchase = purchase_artifact_from_json(claim.purchase_artifact)
+        if voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
+            payment_source = claim.payment_evidence.get("source")
+            if not isinstance(payment_source, Mapping):
+                raise ValueError("voucher payment source is missing")
+            authorization_time = int(payment_source.get("blockTimestamp") or 0)
+            if authorization_time <= 0:
+                raise ValueError("voucher payment confirmation time is missing")
+        elif voucher.payment_rail == VoucherPaymentRail.CHIA_XCH:
+            authorization_time = int(time.time())
+        else:
+            raise ValueError("voucher payment rail is unsupported")
+        purchase.assert_live(authorization_time)
+        state = VoucherSeriesStateV2(
+            sold_count=claim.series_sold_count,
+            redeemed_count=claim.series_redeemed_count,
+            refunded_count=claim.series_refunded_count,
+            phase=VoucherSeriesState(claim.series_phase),
+            launched_at=claim.series_launched_at,
+        )
+        validate_purchase(
+            series=terms,
+            voucher=voucher,
+            now_seconds=authorization_time,
+        )
+    except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError("voucher issuance commitments are invalid") from exc
+    raw_pubkeys = artifact.get("validatorSet", {}).get("pubkeys")
+    treasury = artifact.get("puzzleHashes", {}).get("protocolTreasuryPuzzleHash")
+    if (
+        raw_pubkeys != settings.roster_pubkeys
+        or tuple(bytes.fromhex(item.removeprefix("0x")) for item in raw_pubkeys)
+        != terms.validator_pubkeys
+        or str(treasury or "").lower()
+        != "0x" + bytes(terms.trusted_protocol_treasury).hex()
+        or purchase.artifact_hash != voucher.purchase_artifact_hash
+        or purchase.collection_id != voucher.collection_id
+        or purchase.deed_launcher_id != voucher.deed_launcher_id
+        or purchase.vault_launcher_id != voucher.approved_vault_launcher_id
+        or purchase.vault_p2_puzzle_hash != voucher.approved_vault_p2_puzzle_hash
+    ):
+        raise ValidatorEvidenceError("voucher issuance differs from governed terms")
+
+    series_record = _fetch_coin(settings, claim.series_coin_id, "voucher series coin")
+    series_coin = _coin_from_record(series_record, "voucher series coin")
+    if "0x" + bytes(series_coin.name()).hex() != claim.series_coin_id:
+        raise ValidatorEvidenceError("voucher issuance coin IDs are not canonical")
+    parent_record = _fetch_coin(
+        settings,
+        "0x" + bytes(series_coin.parent_coin_info).hex(),
+        "voucher series parent",
+        require_unspent=False,
+    )
+    parent_coin = _coin_from_record(parent_record, "voucher series parent")
+    series_height = int(series_record.get("confirmed_block_index") or 0)
+    parent_spent_height = int(parent_record.get("spent_block_index") or 0)
+    if (
+        parent_coin.name() != series_coin.parent_coin_info
+        or parent_spent_height != series_height
+    ):
+        raise ValidatorEvidenceError(
+            "voucher series parent did not create the current series coin"
+        )
+    parent_spend = _fetch_coin_spend(
+        settings,
+        parent_coin,
+        parent_spent_height,
+        "voucher series parent",
+    )
+    series_lineage = lineage_proof_for_coinsol(parent_spend)
+    if voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
+        if purchase.rail != PaymentRail.EVM_TEST_USD:
+            raise ValidatorEvidenceError("Base voucher purchase rail is inconsistent")
+        purchase_record = _fetch_coin(
+            settings, claim.purchase_launcher_coin_id, "voucher purchase launcher"
+        )
+        purchase_coin = _coin_from_record(purchase_record, "voucher purchase launcher")
+        if (
+            "0x" + bytes(purchase_coin.name()).hex()
+            != claim.purchase_launcher_coin_id
+        ):
+            raise ValidatorEvidenceError("voucher purchase launcher ID is not canonical")
+        payment_puzzle = curry_external_receipt(terms=terms, voucher=voucher)
+        payment_amount = 1
+        _verify_base_voucher_payment(
+            settings, claim.payment_evidence, purchase=purchase, voucher=voucher
+        )
+    elif voucher.payment_rail == VoucherPaymentRail.CHIA_XCH:
+        if purchase.rail != PaymentRail.CHIA_XCH or claim.buyer_offer is None:
+            raise ValidatorEvidenceError("native voucher offer evidence is missing")
+        source = claim.payment_evidence.get("source")
+        try:
+            buyer_offer = Offer.from_bech32(claim.buyer_offer)
+            purchase_coin = validate_xch_voucher_offer(
+                buyer_offer=buyer_offer,
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                voucher=voucher,
+                purchase=purchase,
+            )
+            if (
+                "0x" + bytes(purchase_coin.name()).hex()
+                != claim.purchase_launcher_coin_id
+                or not isinstance(source, Mapping)
+                or source.get("chain") != "chia"
+            ):
+                raise ValueError("native voucher launcher evidence changed")
+            payment_spends = buyer_offer.coin_spends()
+            if len(payment_spends) != 1:
+                raise ValueError("native voucher must use one payment coin")
+            payment_coin = payment_spends[0].coin
+            payment_coin_id = "0x" + bytes(payment_coin.name()).hex()
+            if (
+                str(source.get("paymentCoinId") or "").lower() != payment_coin_id
+                or payment_coin.puzzle_hash != voucher.original_payer
+            ):
+                raise ValueError("native voucher payer evidence changed")
+            payment_record = _fetch_coin(
+                settings,
+                payment_coin_id,
+                "native voucher payment coin",
+            )
+            if _coin_from_record(payment_record, "native voucher payment coin") != payment_coin:
+                raise ValueError("native voucher payment coin record changed")
+            pairs: list[tuple[G1Element, bytes]] = []
+            for spend in payment_spends:
+                conditions = conditions_dict_for_solution(
+                    spend.puzzle_reveal,
+                    spend.solution,
+                    INFINITE_COST,
+                )
+                pairs.extend(
+                    pkm_pairs_for_conditions_dict(
+                        conditions,
+                        spend.coin,
+                        AGG_SIG_ME_DATA[settings.network],
+                    )
+                )
+            if not pairs or not AugSchemeMPL.aggregate_verify(
+                [pair[0] for pair in pairs],
+                [pair[1] for pair in pairs],
+                buyer_offer.aggregated_signature(),
+            ):
+                raise ValueError("native voucher wallet signature is invalid")
+        except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+            raise ValidatorEvidenceError("native voucher offer is invalid") from exc
+        payment_puzzle = curry_xch_escrow(
+            terms=terms,
+            voucher=voucher,
+            purchase=purchase,
+        )
+        payment_amount = int(voucher.payment_principal)
+    else:
+        raise ValidatorEvidenceError("voucher payment rail is unsupported")
+    try:
+        issuance = build_voucher_issuance_spends(
+            terms=terms,
+            state=state,
+            series_coin=series_coin,
+            series_lineage_proof=series_lineage,
+            voucher=voucher,
+            purchase_launcher_coin=purchase_coin,
+            payment_puzzle=payment_puzzle,
+            payment_amount=payment_amount,
+            signer_indices=(0, 1),
+        )
+    except (PaymentArtifactError, VoucherV2Error, ValueError) as exc:
+        raise ValidatorEvidenceError("voucher issuance bundle cannot be re-derived") from exc
+    if "0x" + bytes(issuance.validator_message).hex() != claim.validator_message:
+        raise ValidatorEvidenceError("voucher validator message changed on re-derivation")
+
+
+def sign_voucher_issuance_claim(
+    settings: ValidatorSettings,
+    ledger: ValidatorLedger,
+    claim: VoucherIssuanceClaim,
+    claim_hash: str,
+) -> str:
+    verify_voucher_issuance_claim(settings, claim, claim_hash)
+    signature = "0x" + bytes(
+        AugSchemeMPL.sign(
+            load_validator_private_key(settings),
+            claim.signature_message(),
+        )
+    ).hex()
+    try:
+        return ledger.record_voucher_issuance_or_recover(
+            claim_hash=claim_hash.lower(),
+            canonical_claim=canonical_voucher_issuance_claim_json(claim),
+            global_payment_id=claim.global_payment_id(),
+            series_coin_id=claim.series_coin_id,
+            purchase_launcher_coin_id=claim.purchase_launcher_coin_id,
+            signature=signature,
+        )
+    except ValidatorLedgerConflict as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+
+
+def canonical_voucher_series_phase_claim_json(
+    claim: VoucherSeriesPhaseClaim,
+) -> str:
+    return json.dumps(
+        claim.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _verify_governed_deed_launchers(
+    settings: ValidatorSettings,
+    claim: VoucherSeriesPhaseClaim,
+    terms: Any,
+) -> None:
+    raw_deeds = claim.series_terms.get("deeds")
+    if not isinstance(raw_deeds, list) or len(raw_deeds) != terms.inventory_cap:
+        raise ValidatorEvidenceError("series deed allocation evidence is incomplete")
+    try:
+        ordered = sorted(raw_deeds, key=lambda item: int(item["ordinal"]))
+        if [int(item["ordinal"]) for item in ordered] != list(
+            range(terms.inventory_cap)
+        ):
+            raise ValueError("deed ordinals are not contiguous")
+        rows = tuple(
+            DeedAllocationCommitmentV2(
+                deed_id=bytes32.fromhex(
+                    str(item["deedIdCanon"]).removeprefix("0x")
+                ),
+                share_ppm=int(item["sharePpm"]),
+                par_value_mojos=int(item["parValueMojos"]),
+                deed_launcher_id=bytes32.fromhex(
+                    str(item["deedLauncherId"]).removeprefix("0x")
+                ),
+            )
+            for item in ordered
+        )
+        if any(
+            row.deed_id != canonicalise_property_id(str(item["deedId"]))
+            for row, item in zip(rows, ordered, strict=True)
+        ):
+            raise ValueError("canonical deed ID changed")
+    except (KeyError, TypeError, ValueError, VoucherV2Error) as exc:
+        raise ValidatorEvidenceError("series deed allocation is malformed") from exc
+    if allocation_root(rows) != terms.allocation_root:
+        raise ValidatorEvidenceError("series deed allocation root changed")
+    expected_launchers = [
+        "0x" + bytes(row.deed_launcher_id).hex() for row in rows
+    ]
+    if claim.deed_launcher_ids != expected_launchers:
+        raise ValidatorEvidenceError("governed deed launcher order changed")
+
+    for ordinal, launcher_id in enumerate(claim.deed_launcher_ids):
+        record = _fetch_coin(
+            settings,
+            launcher_id,
+            f"governed deed launcher {ordinal}",
+            require_unspent=False,
+        )
+        launcher = _coin_from_record(record, f"governed deed launcher {ordinal}")
+        spent_height = int(record.get("spent_block_index") or 0)
+        if (
+            "0x" + bytes(launcher.name()).hex() != launcher_id
+            or launcher.puzzle_hash != SINGLETON_LAUNCHER_HASH
+            or int(launcher.amount) != 1
+            or spent_height <= 0
+        ):
+            raise ValidatorEvidenceError(
+                f"governed deed launcher {ordinal} is not an executed singleton launch"
+            )
+        spend = _fetch_coin_spend(
+            settings,
+            launcher,
+            spent_height,
+            f"governed deed launcher {ordinal}",
+        )
+        additions = compute_additions(spend)
+        if (
+            len(additions) != 1
+            or additions[0].parent_coin_info != launcher.name()
+            or int(additions[0].amount) != 1
+        ):
+            raise ValidatorEvidenceError(
+                f"governed deed launcher {ordinal} did not create one SmartDeed singleton"
+            )
+
+
+def verify_voucher_series_phase_claim(
+    settings: ValidatorSettings,
+    claim: VoucherSeriesPhaseClaim,
+    claim_hash: str,
+) -> None:
+    if claim.canonical_hash() != claim_hash.lower():
+        raise ValidatorEvidenceError(
+            "series phase claim hash does not match canonical evidence"
+        )
+    artifact, _release = load_validator_artifact(settings)
+    if (
+        claim.network != settings.network
+        or claim.genesis_artifact_hash
+        != str(artifact.get("artifactHash") or "").lower()
+    ):
+        raise ValidatorEvidenceError("series phase does not match active genesis")
+    try:
+        terms = series_terms_from_json(claim.series_terms)
+        state = VoucherSeriesStateV2(
+            sold_count=claim.series_sold_count,
+            redeemed_count=claim.series_redeemed_count,
+            refunded_count=claim.series_refunded_count,
+            phase=VoucherSeriesState(claim.series_phase),
+            launched_at=claim.series_launched_at,
+        )
+        transition = SeriesTransition(claim.transition)
+    except (TypeError, ValueError, VoucherV2Error) as exc:
+        raise ValidatorEvidenceError("series phase commitments are invalid") from exc
+    if state.phase != VoucherSeriesState.PRESALE or state.launched_at != 0:
+        raise ValidatorEvidenceError("only a presale series can change phase")
+    raw_pubkeys = artifact.get("validatorSet", {}).get("pubkeys")
+    treasury = artifact.get("puzzleHashes", {}).get("protocolTreasuryPuzzleHash")
+    if (
+        raw_pubkeys != settings.roster_pubkeys
+        or tuple(bytes.fromhex(item.removeprefix("0x")) for item in raw_pubkeys)
+        != terms.validator_pubkeys
+        or str(treasury or "").lower()
+        != "0x" + bytes(terms.trusted_protocol_treasury).hex()
+    ):
+        raise ValidatorEvidenceError("series phase trust coordinates changed")
+    if transition == SeriesTransition.LAUNCH:
+        if abs(int(time.time()) - claim.launch_anchor) > 90:
+            raise ValidatorEvidenceError("series launch anchor is stale")
+        _verify_governed_deed_launchers(settings, claim, terms)
+    elif claim.deed_launcher_ids or claim.governance_execution_ids:
+        raise ValidatorEvidenceError("series cancellation carried launch evidence")
+
+    series_coin, lineage = _confirmed_coin_and_lineage(
+        settings,
+        claim.series_coin_id,
+        "voucher series coin",
+    )
+    try:
+        phase = build_voucher_series_phase_spend(
+            terms=terms,
+            state=state,
+            series_coin=series_coin,
+            series_lineage_proof=lineage,
+            transition=transition,
+            launch_anchor=claim.launch_anchor,
+            signer_indices=(0, 1),
+        )
+    except (TypeError, ValueError, VoucherV2Error) as exc:
+        raise ValidatorEvidenceError("series phase spend cannot be re-derived") from exc
+    if "0x" + bytes(phase.validator_message).hex() != claim.validator_message:
+        raise ValidatorEvidenceError(
+            "series phase validator message changed on re-derivation"
+        )
+
+
+def sign_voucher_series_phase_claim(
+    settings: ValidatorSettings,
+    ledger: ValidatorLedger,
+    claim: VoucherSeriesPhaseClaim,
+    claim_hash: str,
+) -> str:
+    verify_voucher_series_phase_claim(settings, claim, claim_hash)
+    signature = "0x" + bytes(
+        AugSchemeMPL.sign(
+            load_validator_private_key(settings),
+            claim.signature_message(),
+        )
+    ).hex()
+    try:
+        return ledger.record_voucher_series_phase_or_recover(
+            claim_hash=claim_hash.lower(),
+            canonical_claim=canonical_voucher_series_phase_claim_json(claim),
+            series_coin_id=claim.series_coin_id,
+            transition=claim.transition,
+            signature=signature,
+        )
+    except ValidatorLedgerConflict as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+
+
+def canonical_voucher_transition_claim_json(
+    claim: VoucherTransitionClaim,
+) -> str:
+    return json.dumps(
+        claim.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _confirmed_coin_and_lineage(
+    settings: ValidatorSettings,
+    coin_id: str,
+    field: str,
+) -> tuple[Coin, LineageProof]:
+    record = _fetch_coin(settings, coin_id, field)
+    coin = _coin_from_record(record, field)
+    if "0x" + bytes(coin.name()).hex() != coin_id:
+        raise ValidatorEvidenceError(f"{field} ID is not canonical")
+    parent_id = "0x" + bytes(coin.parent_coin_info).hex()
+    parent_record = _fetch_coin(
+        settings,
+        parent_id,
+        f"{field} parent",
+        require_unspent=False,
+    )
+    parent_coin = _coin_from_record(parent_record, f"{field} parent")
+    child_height = int(record.get("confirmed_block_index") or 0)
+    parent_spent_height = int(parent_record.get("spent_block_index") or 0)
+    if parent_coin.name() != coin.parent_coin_info or parent_spent_height != child_height:
+        raise ValidatorEvidenceError(f"{field} lineage is not atomic")
+    parent_spend = _fetch_coin_spend(
+        settings,
+        parent_coin,
+        parent_spent_height,
+        f"{field} parent",
+    )
+    return coin, lineage_proof_for_coinsol(parent_spend)
+
+
+def verify_voucher_transition_claim(
+    settings: ValidatorSettings,
+    claim: VoucherTransitionClaim,
+    claim_hash: str,
+) -> None:
+    if claim.canonical_hash() != claim_hash.lower():
+        raise ValidatorEvidenceError(
+            "voucher transition claim hash does not match canonical evidence"
+        )
+    artifact, _release = load_validator_artifact(settings)
+    if (
+        claim.network != settings.network
+        or claim.genesis_artifact_hash
+        != str(artifact.get("artifactHash") or "").lower()
+    ):
+        raise ValidatorEvidenceError("voucher transition does not match active genesis")
+    if abs(int(time.time()) - claim.current_timestamp) > settings.claim_clock_skew_seconds:
+        raise ValidatorEvidenceError("voucher owner authorization timestamp is stale")
+    try:
+        terms = series_terms_from_json(claim.series_terms)
+        voucher = voucher_commitment_from_json(claim.voucher_commitment)
+        purchase = purchase_artifact_from_json(claim.purchase_artifact)
+        state = VoucherSeriesStateV2(
+            sold_count=claim.series_sold_count,
+            redeemed_count=claim.series_redeemed_count,
+            refunded_count=claim.series_refunded_count,
+            phase=VoucherSeriesState(claim.series_phase),
+            launched_at=claim.series_launched_at,
+        )
+        action = VoucherAction(claim.action)
+    except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError("voucher transition commitments are invalid") from exc
+    is_base = (
+        voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC
+        and purchase.rail == PaymentRail.EVM_TEST_USD
+    )
+    is_native = (
+        voucher.payment_rail == VoucherPaymentRail.CHIA_XCH
+        and purchase.rail == PaymentRail.CHIA_XCH
+    )
+    if not is_base and not is_native:
+        raise ValidatorEvidenceError("voucher transition payment rail is inconsistent")
+    if is_base:
+        if (
+            claim.payment_evidence is None
+            or claim.external_settlement_evidence_hash is None
+            or claim.external_validator_message is None
+        ):
+            raise ValidatorEvidenceError(
+                "Base voucher transition has no authenticated payment evidence"
+            )
+        expected_evidence_hash = base_settlement_evidence_hash(
+            claim.payment_evidence
+        )
+        if claim.external_settlement_evidence_hash != expected_evidence_hash:
+            raise ValidatorEvidenceError(
+                "Base voucher settlement evidence hash changed"
+            )
+        try:
+            expected_validator_message = external_receipt_evidence_message(
+                voucher=voucher,
+                action=action,
+                external_settlement_evidence_hash=bytes32.fromhex(
+                    expected_evidence_hash.removeprefix("0x")
+                ),
+            )
+        except (TypeError, ValueError, VoucherV2Error) as exc:
+            raise ValidatorEvidenceError(
+                "Base voucher settlement message cannot be reconstructed"
+            ) from exc
+        if (
+            claim.external_validator_message
+            != "0x" + bytes(expected_validator_message).hex()
+        ):
+            raise ValidatorEvidenceError(
+                "Base voucher settlement validator message changed"
+            )
+        _verify_base_voucher_payment(
+            settings,
+            claim.payment_evidence,
+            purchase=purchase,
+            voucher=voucher,
+        )
+    if (
+        claim.vault_launcher_id
+        != "0x" + bytes(voucher.approved_vault_launcher_id).hex()
+        or purchase.artifact_hash != voucher.purchase_artifact_hash
+    ):
+        raise ValidatorEvidenceError("voucher transition vault or purchase binding changed")
+    now = int(time.time())
+    delivery_deadline = (
+        state.launched_at + DELIVERY_WINDOW_SECONDS
+        if state.phase == VoucherSeriesState.LIVE
+        else 0
+    )
+    if action == VoucherAction.REFUND_PRESALE and now >= terms.refund_deadline:
+        raise ValidatorEvidenceError("presale refund deadline has passed")
+    if action == VoucherAction.REFUND_EXPIRED and now < delivery_deadline:
+        raise ValidatorEvidenceError("voucher delivery window has not expired")
+    if action == VoucherAction.REDEEM and now >= delivery_deadline:
+        raise ValidatorEvidenceError("voucher delivery window has expired")
+
+    raw_pubkeys = artifact.get("validatorSet", {}).get("pubkeys")
+    treasury = artifact.get("puzzleHashes", {}).get("protocolTreasuryPuzzleHash")
+    if (
+        raw_pubkeys != settings.roster_pubkeys
+        or tuple(bytes.fromhex(item.removeprefix("0x")) for item in raw_pubkeys)
+        != terms.validator_pubkeys
+        or str(treasury or "").lower()
+        != "0x" + bytes(terms.trusted_protocol_treasury).hex()
+    ):
+        raise ValidatorEvidenceError("voucher transition trust coordinates changed")
+
+    series_coin, series_lineage = _confirmed_coin_and_lineage(
+        settings,
+        claim.series_coin_id,
+        "voucher series coin",
+    )
+    voucher_coin, voucher_lineage = _confirmed_coin_and_lineage(
+        settings,
+        claim.voucher_coin_id,
+        "voucher coin",
+    )
+    payment_record = _fetch_coin(settings, claim.payment_coin_id, "voucher payment coin")
+    payment_coin = _coin_from_record(payment_record, "voucher payment coin")
+    if "0x" + bytes(payment_coin.name()).hex() != claim.payment_coin_id:
+        raise ValidatorEvidenceError("voucher payment coin ID is not canonical")
+    if voucher_coin.parent_coin_info != bytes32.fromhex(
+        claim.voucher_launcher_id.removeprefix("0x")
+    ):
+        raise ValidatorEvidenceError("voucher singleton launcher lineage changed")
+
+    vault_coin_id = bytes32.zeros
+    vault_inner_puzzle_hash = bytes32.zeros
+    if action != VoucherAction.REFUND_EXPIRED:
+        if (
+            claim.vault_coin_id is None
+            or claim.vault_identity_attest_root is None
+            or claim.vault_owner_auth_type is None
+            or claim.vault_owner_key is None
+            or claim.vault_identity_attest_root
+            == "0x" + bytes(DEFAULT_IDENTITY_ATTEST_ROOT).hex()
+        ):
+            raise ValidatorEvidenceError(
+                "voucher transition has no current approved-vault evidence"
+            )
+        vault_coin, vault_lineage = _confirmed_coin_and_lineage(
+            settings,
+            claim.vault_coin_id,
+            "approved vault coin",
+        )
+        try:
+            owner_key = bytes.fromhex(claim.vault_owner_key.removeprefix("0x"))
+            launcher = bytes32.fromhex(claim.vault_launcher_id.removeprefix("0x"))
+            identity_root = bytes32.fromhex(
+                claim.vault_identity_attest_root.removeprefix("0x")
+            )
+            pool_launcher = bytes32.fromhex(
+                str(artifact["launcherIds"]["pool"]).removeprefix("0x")
+            )
+            bridge_policy_hash = bytes32.fromhex(
+                str(artifact["bridgePolicy"]["policyHash"]).removeprefix("0x")
+            )
+            expected_vault = puzzle_for_vault_full(
+                launcher,
+                owner_key,
+                claim.vault_owner_auth_type,
+                one_leaf_merkle_root(owner_key),
+                pool_launcher,
+                identity_attest_root=identity_root,
+                zkpassport_bridge_policy_hash=bridge_policy_hash,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidatorEvidenceError(
+                "approved vault ownership evidence is malformed"
+            ) from exc
+        if (
+            vault_coin.puzzle_hash != expected_vault.get_tree_hash()
+            or int(vault_coin.amount) != 1
+        ):
+            raise ValidatorEvidenceError(
+                "approved vault coin does not match its owner"
+            )
+
+    if action in {
+        VoucherAction.REFUND_PRESALE,
+        VoucherAction.REFUND_CANCELED,
+    }:
+        try:
+            owner_authorization = bytes.fromhex(
+                claim.owner_authorization.removeprefix("0x")
+            )
+        except ValueError as exc:
+            raise ValidatorEvidenceError(
+                "voucher owner authorization is malformed"
+            ) from exc
+        signature_data: bytes | None = None
+        if claim.vault_owner_auth_type == AUTH_TYPE_SECP256K1:
+            typed_data = eip712_typed_data_for_vault_spend(
+                b"i",
+                bytes32.fromhex(claim.voucher_launcher_id.removeprefix("0x")),
+                vault_coin.name(),
+            )
+            try:
+                recovered = recover_evm_signer(
+                    typed_data, claim.owner_authorization
+                )
+                if recovered.compressed_pubkey != owner_key:
+                    raise ValueError(
+                        "EVM signature does not belong to the vault owner"
+                    )
+                signature_data = compact_signature_from_evm(
+                    claim.owner_authorization
+                )
+            except ValueError as exc:
+                raise ValidatorEvidenceError(
+                    "voucher EVM owner authorization is invalid"
+                ) from exc
+        vault_spend = build_vault_receive_spend(
+            vault_coin=vault_coin,
+            vault_launcher_id=launcher,
+            owner_pubkey_bytes=owner_key,
+            auth_type=claim.vault_owner_auth_type,
+            members_merkle_root=one_leaf_merkle_root(owner_key),
+            pool_launcher_id=pool_launcher,
+            deed_launcher_id=bytes32.fromhex(
+                claim.voucher_launcher_id.removeprefix("0x")
+            ),
+            p2_vault_coin_id=voucher_coin.name(),
+            current_timestamp=claim.current_timestamp,
+            lineage_proof=vault_lineage,
+            signature_data=signature_data,
+            identity_attest_root=identity_root,
+            zkpassport_bridge_policy_hash=bridge_policy_hash,
+        )
+        if claim.vault_owner_auth_type == AUTH_TYPE_BLS:
+            try:
+                signature = G2Element.from_bytes(owner_authorization)
+                conditions = conditions_dict_for_solution(
+                    vault_spend.puzzle_reveal,
+                    vault_spend.solution,
+                    INFINITE_COST,
+                )
+                pairs = pkm_pairs_for_conditions_dict(
+                    conditions,
+                    vault_spend.coin,
+                    AGG_SIG_ME_DATA[settings.network],
+                )
+                if not pairs or not AugSchemeMPL.aggregate_verify(
+                    [pair[0] for pair in pairs],
+                    [pair[1] for pair in pairs],
+                    signature,
+                ):
+                    raise ValueError(
+                        "BLS signature does not authorize the vault spend"
+                    )
+            except ValueError as exc:
+                raise ValidatorEvidenceError(
+                    "voucher BLS owner authorization is invalid"
+                ) from exc
+
+        uncurried_vault = expected_vault.uncurry()
+        if uncurried_vault is None:
+            raise ValidatorEvidenceError(
+                "approved vault puzzle is not a curried singleton"
+            )
+        try:
+            vault_args = list(uncurried_vault[1].as_iter())
+        except ValueError as exc:
+            raise ValidatorEvidenceError(
+                "approved vault curry arguments are malformed"
+            ) from exc
+        if len(vault_args) != 2:
+            raise ValidatorEvidenceError(
+                "approved vault singleton shape is invalid"
+            )
+        vault_coin_id = vault_coin.name()
+        vault_inner_puzzle_hash = bytes32(vault_args[1].get_tree_hash())
+
+    try:
+        if is_base:
+            assert claim.external_settlement_evidence_hash is not None
+            transition = build_base_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                purchase=purchase,
+                voucher_launcher_id=bytes32.fromhex(
+                    claim.voucher_launcher_id.removeprefix("0x")
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                receipt_coin=payment_coin,
+                vault_coin_id=(
+                    vault_coin_id
+                    if action
+                    in {
+                        VoucherAction.REFUND_PRESALE,
+                        VoucherAction.REFUND_CANCELED,
+                    }
+                    else bytes32.zeros
+                ),
+                vault_inner_puzzle_hash=(
+                    vault_inner_puzzle_hash
+                    if action
+                    in {
+                        VoucherAction.REFUND_PRESALE,
+                        VoucherAction.REFUND_CANCELED,
+                    }
+                    else bytes32.zeros
+                ),
+                action=action,
+                external_settlement_evidence_hash=bytes32.fromhex(
+                    claim.external_settlement_evidence_hash.removeprefix("0x")
+                ),
+                signer_indices=(0, 1),
+            )
+        else:
+            transition = build_xch_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                purchase=purchase,
+                voucher_launcher_id=bytes32.fromhex(
+                    claim.voucher_launcher_id.removeprefix("0x")
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                payment_coin=payment_coin,
+                vault_coin_id=vault_coin_id,
+                vault_inner_puzzle_hash=vault_inner_puzzle_hash,
+                action=action,
+                signer_indices=(0, 1),
+            )
+    except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError("voucher terminal spends cannot be re-derived") from exc
+    if "0x" + bytes(transition.validator_message).hex() != claim.validator_message:
+        raise ValidatorEvidenceError("voucher transition validator message changed")
+
+    if action == VoucherAction.REDEEM:
+        if not all(
+            isinstance(value, str)
+            for value in (
+                claim.deed_coin_id,
+                claim.deed_puzzle_hash,
+                claim.smart_deed_inner_hash,
+                claim.protocol_puzzle_hash,
+                claim.buyer_offer,
+            )
+        ):
+            raise ValidatorEvidenceError(
+                "voucher redemption deed evidence is incomplete"
+            )
+        try:
+            mint_terms = PrimaryMintTermsV2(
+                network=purchase.network,
+                smart_deed_inner_hash=bytes32.fromhex(
+                    claim.smart_deed_inner_hash.removeprefix("0x")  # type: ignore[union-attr]
+                ),
+                deed_launcher_id=purchase.deed_launcher_id,
+                collection_id=purchase.collection_id,
+                metadata_root=purchase.metadata_root,
+                metadata_anchor_id=purchase.metadata_anchor_id,
+                share_ppm=purchase.share_ppm,
+                usd_amount_minor=purchase.usd_amount_minor,
+                protocol_puzhash=bytes32.fromhex(
+                    claim.protocol_puzzle_hash.removeprefix("0x")  # type: ignore[union-attr]
+                ),
+                validator_pubkeys=terms.validator_pubkeys,
+                provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+            )
+            did_struct = singleton_struct(
+                bytes32.fromhex(
+                    str(artifact["launcherIds"]["did"]).removeprefix("0x")
+                )
+            )
+            deed_struct = deed_singleton_struct(
+                deed_launcher_id=purchase.deed_launcher_id,
+                protocol_did_singleton_struct=did_struct,
+            )
+            expected_deed_puzzle = SINGLETON_MOD.curry(
+                deed_struct,
+                make_mint_offer_v4_inner(mint_terms),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidatorEvidenceError(
+                "voucher redemption mint terms cannot be reconstructed"
+            ) from exc
+        if (
+            claim.protocol_puzzle_hash != str(treasury).lower()
+            or claim.deed_puzzle_hash
+            != "0x" + bytes(expected_deed_puzzle.get_tree_hash()).hex()
+        ):
+            raise ValidatorEvidenceError(
+                "voucher redemption puzzle differs from governed mint"
+            )
+        deed_coin, deed_lineage = _confirmed_coin_and_lineage(
+            settings,
+            claim.deed_coin_id,  # type: ignore[arg-type]
+            "voucher redemption SmartDeed coin",
+        )
+        if (
+            deed_coin.parent_coin_info != purchase.deed_launcher_id
+            or deed_coin.puzzle_hash != expected_deed_puzzle.get_tree_hash()
+            or int(deed_coin.amount) != 1
+        ):
+            raise ValidatorEvidenceError(
+                "voucher redemption SmartDeed is not the governed coin"
+            )
+        try:
+            expected_buyer_offer = (
+                prepare_base_voucher_redemption_offer(
+                    terminal_coin_spends=transition.coin_spends,
+                    receipt_coin=payment_coin,
+                    artifact=purchase,
+                    terms=mint_terms,
+                )
+                if is_base
+                else prepare_xch_voucher_redemption_offer(
+                    terminal_coin_spends=transition.coin_spends,
+                    payment_coin=payment_coin,
+                    artifact=purchase,
+                    terms=mint_terms,
+                )
+            )
+            claimed_buyer_offer = Offer.from_bech32(
+                claim.buyer_offer  # type: ignore[arg-type]
+            )
+            if (
+                claimed_buyer_offer.aggregated_signature() != G2Element()
+                or claimed_buyer_offer.to_bech32()
+                != expected_buyer_offer.to_bech32()
+            ):
+                raise ValueError("voucher buyer offer differs from terminal spends")
+            primary = (
+                build_universal_primary_offer_v4(
+                    buyer_offer=claimed_buyer_offer,
+                    deed_coin=deed_coin,
+                    deed_singleton_struct=deed_struct,
+                    lineage_proof=deed_lineage,
+                    artifact=purchase,
+                    signer_indices=(0, 1),
+                    terms=mint_terms,
+                    purchase_mode=PrimaryPurchaseMode.VOUCHER,
+                    voucher_coin_id=voucher_coin.name(),
+                    voucher_transition_message=transition.validator_message,
+                    external_receipt_coin=payment_coin,
+                    external_settlement_evidence_hash=bytes32.fromhex(
+                        claim.external_settlement_evidence_hash.removeprefix("0x")  # type: ignore[union-attr]
+                    ),
+                )
+                if is_base
+                else build_universal_primary_offer_v4(
+                    buyer_offer=claimed_buyer_offer,
+                    deed_coin=deed_coin,
+                    deed_singleton_struct=deed_struct,
+                    lineage_proof=deed_lineage,
+                    artifact=purchase,
+                    signer_indices=(0, 1),
+                    terms=mint_terms,
+                    purchase_mode=PrimaryPurchaseMode.VOUCHER,
+                    voucher_coin_id=voucher_coin.name(),
+                    voucher_transition_message=transition.validator_message,
+                )
+            )
+            if not primary.aggregate_offer.is_valid():
+                raise ValueError("voucher redemption offer does not balance")
+        except (PaymentArtifactError, TypeError, ValueError) as exc:
+            raise ValidatorEvidenceError(
+                "voucher redemption offer cannot be re-derived"
+            ) from exc
+
+
+def sign_voucher_transition_claim(
+    settings: ValidatorSettings,
+    ledger: ValidatorLedger,
+    claim: VoucherTransitionClaim,
+    claim_hash: str,
+) -> str:
+    verify_voucher_transition_claim(settings, claim, claim_hash)
+    private_key = load_validator_private_key(settings)
+    signature = "0x" + bytes(
+        AugSchemeMPL.aggregate(
+            [
+                AugSchemeMPL.sign(private_key, message)
+                for message in claim.signature_messages()
+            ]
+        )
+    ).hex()
+    try:
+        return ledger.record_voucher_transition_or_recover(
+            claim_hash=claim_hash.lower(),
+            canonical_claim=canonical_voucher_transition_claim_json(claim),
+            global_payment_id=claim.global_payment_id(),
+            series_coin_id=claim.series_coin_id,
+            voucher_coin_id=claim.voucher_coin_id,
+            payment_coin_id=claim.payment_coin_id,
+            deed_coin_id=claim.deed_coin_id,
+            signature=signature,
+        )
+    except ValidatorLedgerConflict as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+
+
 __all__ = [
     "ValidatorEvidenceError",
     "canonical_claim_json",
     "canonical_primary_purchase_claim_json",
+    "canonical_voucher_issuance_claim_json",
+    "canonical_voucher_transition_claim_json",
     "load_validator_artifact",
     "load_validator_private_key",
     "sign_validator_claim",
     "sign_primary_purchase_claim",
+    "sign_voucher_issuance_claim",
+    "sign_voucher_transition_claim",
     "verify_validator_claim",
     "verify_primary_purchase_claim",
+    "verify_voucher_issuance_claim",
+    "verify_voucher_transition_claim",
 ]

@@ -7,6 +7,7 @@ completion is bound to the artifact the buyer saw.
 """
 from __future__ import annotations
 
+import secrets
 import time
 from typing import Annotated, Any, Literal, Mapping, Optional
 
@@ -58,7 +59,6 @@ from .public_artifact import (
 router = APIRouter(prefix="/protocol", tags=["protocol-artifacts"])
 
 ProtocolRail = Literal[
-    "chia",
     "chia_xch",
     "chia_cat",
     "base_usdc",
@@ -110,6 +110,8 @@ class ProtocolPaymentTerms(BaseModel):
 
 
 class BuildProtocolOfferArtifactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     protocol_version: Literal["solslot-v2"]
     network: Literal["testnet11"]
     genesis_artifact_hash: str = Field(..., min_length=66, max_length=66)
@@ -125,7 +127,6 @@ class BuildProtocolOfferArtifactRequest(BaseModel):
     identity_attest_root: str = Field(..., min_length=66, max_length=66)
     expires_at: int = Field(..., gt=0, description="Unix seconds")
     payment_terms: ProtocolPaymentTerms
-    raw_offer: Optional[str] = Field(None, max_length=2_000_000)
     zk_passport_required: bool = True
     current_state: PurchaseIntentState = "created"
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -146,13 +147,6 @@ class BuildProtocolOfferArtifactRequest(BaseModel):
     def require_zkpassport(self):
         if self.zk_passport_required is not True:
             raise ValueError("zk_passport_required must be true for Sols Lot protocol purchases")
-        if self.rail == "chia":
-            if self.deed_launcher_id is None:
-                raise ValueError("deed_launcher_id is required")
-            if self.share_ppm is None:
-                raise ValueError("share_ppm is required")
-            if self.payment_terms.amount is None:
-                raise ValueError("payment_terms.amount is required")
         return self
 
 
@@ -250,6 +244,45 @@ class VerifyExternalEscrowRequest(BaseModel):
         max_length=66,
     )
     quote_expires_at: int = Field(..., alias="quoteExpiresAt", gt=0)
+    depositor: str = Field(..., pattern=r"^0x[0-9a-fA-F]{40}$")
+    settlement_token: str = Field(
+        ...,
+        alias="settlementToken",
+        pattern=r"^0x[0-9a-fA-F]{40}$",
+    )
+    local_payment_id: str = Field(
+        ...,
+        alias="localPaymentId",
+        pattern=r"^0x[0-9a-fA-F]{64}$",
+    )
+
+
+class ExternalEscrowSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    chain_id: int = Field(..., alias="chainId", gt=0)
+    spoke: str = Field(..., pattern=r"^0x[0-9a-fA-F]{40}$")
+    transaction_hash: str = Field(
+        ...,
+        alias="transactionHash",
+        pattern=r"^0x[0-9a-fA-F]{64}$",
+    )
+    block_number: int = Field(..., alias="blockNumber", gt=0)
+    block_hash: str = Field(
+        ...,
+        alias="blockHash",
+        pattern=r"^0x[0-9a-fA-F]{64}$",
+    )
+    block_timestamp: int = Field(..., alias="blockTimestamp", gt=0)
+    log_index: int = Field(..., alias="logIndex", ge=0)
+    confirmations: int = Field(..., ge=12)
+
+
+class VerifyExternalEscrowWebhookRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    escrow_message: VerifyExternalEscrowRequest = Field(..., alias="escrowMessage")
+    source: ExternalEscrowSource
 
 
 class VerifyExternalEscrowResponse(BaseModel):
@@ -268,46 +301,17 @@ async def build_protocol_offer_artifact(
     require_minting_writes(settings)
     _require_server_to_server_token(settings, authorization)
     from .zkpassport_enrollments import _normalize_hex32, _sync_chia_stamp
+    from .vault_eligibility import require_current_approved_vault
 
     vault_launcher_id = _normalize_hex32(body.vault_launcher_id, "vault_launcher_id")
-    try:
-        enrollment = _sync_chia_stamp(settings, vault_launcher_id)
-    except HTTPException as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Vault credential receipt is not chain-confirmed: {exc.detail}",
-        ) from exc
-    receipt = enrollment.receipt
-    if (
-        enrollment.status != "chia_confirmed"
-        or receipt is None
-        or receipt.vaultLauncherId != vault_launcher_id
-        or receipt.policyVersion != settings.zkpassport_policy_version
-        or receipt.network != settings.network
-        or receipt.bridgePolicyHash != settings.zkpassport_bridge_policy_hash
-        or not receipt.chiaVaultCoinId
-        or receipt.confirmedBlockIndex is None
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A current, server-confirmed V2 Chia vault credential is required.",
-        )
-    expected_current_coin_id = _normalize_hex32(
-        body.current_vault_coin_id,
-        "current_vault_coin_id",
+    approved_vault = require_current_approved_vault(
+        settings,
+        vault_launcher_id,
+        expected_current_coin_id=body.current_vault_coin_id,
+        expected_identity_attest_root=body.identity_attest_root,
+        sync_enrollment=_sync_chia_stamp,
     )
-    expected_identity_root = _normalize_hex32(
-        body.identity_attest_root,
-        "identity_attest_root",
-    )
-    if (
-        receipt.chiaVaultCoinId != expected_current_coin_id
-        or receipt.identityAttestRoot != expected_identity_root
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The requested vault coin or identity root is no longer current.",
-        )
+    receipt = approved_vault.enrollment.receipt
     try:
         genesis_artifact = load_signed_public_artifact(settings)
     except PublicArtifactError as exc:
@@ -369,48 +373,34 @@ async def build_protocol_offer_artifact(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     artifact_hash = content_hash(artifact)
-    purchase_artifact = (
-        canonical_payment[0] if canonical_payment is not None else None
-    )
-    oracle_authorization = (
-        canonical_payment[1] if canonical_payment is not None else None
-    )
-    if purchase_artifact is not None:
-        try:
-            stored = get_payment_purchase_store(
-                settings.payment_purchase_db_path
-            ).save(
-                purchase_intent_id=body.purchase_intent_id,
-                rail=body.rail,
-                offer_artifact_hash=artifact_hash,
-                offer_artifact=artifact,
-                purchase_artifact=purchase_artifact,
-                created_at=int(time.time()),
-            )
-        except PaymentPurchaseConflict as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(exc),
-            ) from exc
-        artifact = stored.offer_artifact
-        artifact_hash = stored.offer_artifact_hash
-        purchase_artifact = stored.purchase_artifact
-        oracle_authorization = artifact.get("oracleAuthorization")
+    purchase_artifact, oracle_authorization = canonical_payment
+    try:
+        stored = get_payment_purchase_store(
+            settings.payment_purchase_db_path
+        ).save(
+            purchase_intent_id=body.purchase_intent_id,
+            rail=body.rail,
+            offer_artifact_hash=artifact_hash,
+            offer_artifact=artifact,
+            purchase_artifact=purchase_artifact,
+            created_at=int(time.time()),
+        )
+    except PaymentPurchaseConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    artifact = stored.offer_artifact
+    artifact_hash = stored.offer_artifact_hash
+    purchase_artifact = stored.purchase_artifact
+    oracle_authorization = artifact.get("oracleAuthorization")
     return ProtocolOfferArtifactResponse(
         artifact=artifact,
         artifact_hash=artifact_hash,
         protocol=_protocol_object_from_artifact(artifact, artifact_hash),
         purchase_artifact=purchase_artifact,
-        purchase_artifact_hash=(
-            purchase_artifact["artifactHash"]
-            if purchase_artifact is not None
-            else None
-        ),
-        purchase_id=(
-            purchase_artifact["purchaseId"]
-            if purchase_artifact is not None
-            else None
-        ),
+        purchase_artifact_hash=purchase_artifact["artifactHash"],
+        purchase_id=purchase_artifact["purchaseId"],
         oracle_authorization=oracle_authorization,
     )
 
@@ -525,13 +515,15 @@ async def verify_purchase_finalization(
     response_model=VerifyExternalEscrowResponse,
 )
 async def verify_external_escrow(
-    body: VerifyExternalEscrowRequest,
+    payload: VerifyExternalEscrowWebhookRequest,
     settings: Annotated[Settings, Depends(get_settings)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> VerifyExternalEscrowResponse:
-    """Verify and bind an authenticated ten-word escrow message."""
+    """Verify and bind one confirmed escrow event and its protocol message."""
 
-    _require_server_to_server_token(settings, authorization)
+    _require_omnichain_ingest_token(settings, authorization)
+    body = payload.escrow_message
+    source = payload.source
     normalized = {
         "gatewayProfile": body.gateway_profile,
         "globalPaymentId": _normalized_hex32(
@@ -565,6 +557,28 @@ async def verify_external_escrow(
             "destinationPuzzle",
         ),
         "quoteExpiresAt": body.quote_expires_at,
+        "depositor": _normalized_evm_address(body.depositor, "depositor"),
+        "settlementToken": _normalized_evm_address(
+            body.settlement_token,
+            "settlementToken",
+        ),
+        "localPaymentId": _normalized_hex32(
+            body.local_payment_id,
+            "localPaymentId",
+        ),
+        "source": {
+            "chainId": source.chain_id,
+            "spoke": _normalized_evm_address(source.spoke, "source.spoke"),
+            "transactionHash": _normalized_hex32(
+                source.transaction_hash,
+                "source.transactionHash",
+            ),
+            "blockNumber": source.block_number,
+            "blockHash": _normalized_hex32(source.block_hash, "source.blockHash"),
+            "blockTimestamp": source.block_timestamp,
+            "logIndex": source.log_index,
+            "confirmations": source.confirmations,
+        },
     }
     if normalized["globalPaymentId"] == _hex32(bytes32.zeros):
         raise HTTPException(
@@ -599,7 +613,7 @@ async def verify_external_escrow(
             detail="EVM chain is not enabled for protocol purchases",
         )
     try:
-        load_omnichain_evidence(
+        deployment = load_omnichain_evidence(
             settings,
             chain_id=canonical.rail_chain_id,
             token_address=token_address,
@@ -610,6 +624,18 @@ async def verify_external_escrow(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+    source_evidence = normalized["source"]
+    if (
+        source_evidence["chainId"] != canonical.rail_chain_id
+        or source_evidence["spoke"] != deployment.spoke_address
+        or source_evidence["confirmations"] < deployment.confirmations
+        or normalized["settlementToken"] != token_address.lower()
+        or canonical.rail_asset_id != _evm_token_asset_id(token_address)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="external payment provenance does not match the reviewed escrow rail",
+        )
     expected = {
         "purchaseId": _hex32(canonical.purchase_id),
         "artifactHash": _hex32(canonical.artifact_hash),
@@ -656,7 +682,86 @@ async def verify_external_escrow(
             "railChainId": canonical.rail_chain_id,
             "railAssetId": _hex32(canonical.rail_asset_id),
             "railAssetDecimals": canonical.rail_asset_decimals,
+            "depositor": normalized["depositor"],
+            "source": normalized["source"],
         },
+    )
+
+
+@router.post("/purchase-intents/escrow-webhook")
+async def receive_external_escrow_webhook(
+    payload: VerifyExternalEscrowWebhookRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Canonical callback consumed by the read-only confirmed-event relayer."""
+
+    verified = await verify_external_escrow(payload, settings, authorization)
+    presale = _ingest_verified_presale_payment(payload, verified, settings)
+    return {
+        "escrow": verified.model_dump(mode="json"),
+        "verification": verified.model_dump(mode="json"),
+        "presale": presale,
+    }
+
+
+def _ingest_verified_presale_payment(
+    payload: VerifyExternalEscrowWebhookRequest,
+    verified: VerifyExternalEscrowResponse,
+    settings: Settings,
+) -> dict[str, Any] | None:
+    """Route one confirmed Base payment into its active voucher campaign."""
+    from .presale_endpoints import (
+        VoucherIssuanceEvidenceRequest,
+        _external_escrow_contract,
+        get_presale_store,
+    )
+    from .credential_auth import require_presale_writes
+    from .vault_eligibility import require_current_approved_vault
+
+    store = get_presale_store(settings)
+    try:
+        series = store.get(payload.escrow_message.collection_id)
+    except KeyError:
+        return None
+    if series["state"] != "PRESALE":
+        return None
+    require_presale_writes(settings)
+    body = payload.escrow_message
+    source = payload.source
+    record = get_payment_purchase_store(settings.payment_purchase_db_path).get(
+        body.purchase_id
+    )
+    artifact = purchase_artifact_from_json(record.purchase_artifact)
+    payer = bytes32(
+        b"\x00" * 12 + bytes.fromhex(body.depositor.removeprefix("0x"))
+    )
+    evidence = VoucherIssuanceEvidenceRequest(
+        purchaseArtifact=verified.purchase_artifact,
+        globalPaymentId=body.global_payment_id,
+        originalPayer=_hex32(payer),
+        evidenceId=(
+            f"base:{source.transaction_hash.lower()}:{source.log_index}"
+        ),
+        confirmedHeight=source.block_number,
+        transactionIndex=0,
+        outputIndex=source.log_index,
+        confirmedAt=source.block_timestamp,
+    )
+    approved = require_current_approved_vault(
+        settings,
+        _hex32(artifact.vault_launcher_id),
+    )
+    return store.ingest_payment(
+        series["termsHash"],
+        evidence,
+        approved_vault=approved,
+        issued_purchase=record,
+        external_escrow_contract=_external_escrow_contract(
+            settings,
+            artifact,
+            record,
+        ),
     )
 
 
@@ -665,7 +770,7 @@ def _build_canonical_payment_artifact(
     settings: Settings,
     *,
     vault_launcher_id: str,
-) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     now = int(time.time())
     canonical_rails = {
         "chia_xch",
@@ -675,11 +780,7 @@ def _build_canonical_payment_artifact(
         "stripe",
     }
     if body.rail not in canonical_rails:
-        return None
-    if body.raw_offer is not None:
-        raise PaymentArtifactError(
-            "canonical quote creation cannot reuse a legacy raw offer"
-        )
+        raise PaymentArtifactError("unsupported protocol payment rail")
     if not settings.collection_metadata_enabled:
         raise PaymentArtifactError(
             "protocol purchases require the collection metadata workspace"
@@ -923,9 +1024,7 @@ def _build_artifact(
     *,
     receipt: dict[str, Any],
     genesis_artifact: Mapping[str, Any],
-    canonical_payment: (
-        tuple[dict[str, Any], dict[str, Any] | None] | None
-    ),
+    canonical_payment: tuple[dict[str, Any], dict[str, Any] | None],
 ) -> dict[str, Any]:
     launchers = _mapping(genesis_artifact.get("launcherIds"))
     protocol = {
@@ -941,29 +1040,23 @@ def _build_artifact(
         "currentState": body.current_state,
         "expiresAt": body.expires_at,
     }
-    if body.raw_offer:
-        protocol["rawOffer"] = body.raw_offer
-    if canonical_payment is not None:
-        purchase_artifact, _oracle_authorization = canonical_payment
-        protocol["deedLauncherId"] = purchase_artifact["deedLauncherId"]
-        protocol["collectionWorkspaceId"] = body.collection_id
-        protocol["collectionId"] = purchase_artifact["collectionId"]
-        protocol["sharePpm"] = purchase_artifact["sharePpm"]
-        protocol["purchaseArtifactHash"] = purchase_artifact["artifactHash"]
-        protocol["purchaseId"] = purchase_artifact["purchaseId"]
-    payment_terms = body.payment_terms.model_dump(exclude_none=True)
-    if canonical_payment is not None:
-        purchase_artifact, _oracle_authorization = canonical_payment
-        payment_terms = {
-            "currency": (
-                "XCH" if body.rail == "chia_xch" else body.payment_terms.currency
-            ),
-            "amount": purchase_artifact["railAmount"],
-            "quantity": 1,
-            "usd_amount_minor": purchase_artifact["usdAmountMinor"],
-            "asset_id": purchase_artifact["railAssetId"],
-            "asset_decimals": purchase_artifact["railAssetDecimals"],
-        }
+    purchase_artifact, _oracle_authorization = canonical_payment
+    protocol["deedLauncherId"] = purchase_artifact["deedLauncherId"]
+    protocol["collectionWorkspaceId"] = body.collection_id
+    protocol["collectionId"] = purchase_artifact["collectionId"]
+    protocol["sharePpm"] = purchase_artifact["sharePpm"]
+    protocol["purchaseArtifactHash"] = purchase_artifact["artifactHash"]
+    protocol["purchaseId"] = purchase_artifact["purchaseId"]
+    payment_terms = {
+        "currency": (
+            "XCH" if body.rail == "chia_xch" else body.payment_terms.currency
+        ),
+        "amount": purchase_artifact["railAmount"],
+        "quantity": 1,
+        "usd_amount_minor": purchase_artifact["usdAmountMinor"],
+        "asset_id": purchase_artifact["railAssetId"],
+        "asset_decimals": purchase_artifact["railAssetDecimals"],
+    }
     artifact: dict[str, Any] = {
         "schemaVersion": 2,
         "protocolVersion": "solslot-v2",
@@ -977,11 +1070,10 @@ def _build_artifact(
         "metadata": body.metadata,
         "issuedAt": int(time.time()),
     }
-    if canonical_payment is not None:
-        purchase_artifact, oracle_authorization = canonical_payment
-        artifact["purchaseArtifactV2"] = purchase_artifact
-        if oracle_authorization is not None:
-            artifact["oracleAuthorization"] = oracle_authorization
+    purchase_artifact, oracle_authorization = canonical_payment
+    artifact["purchaseArtifactV2"] = purchase_artifact
+    if oracle_authorization is not None:
+        artifact["oracleAuthorization"] = oracle_authorization
     artifact["poolLauncherId"] = launchers["pool"]
     artifact["protocolConfigLauncherId"] = launchers["protocolConfig"]
     artifact["vaultVersionRegistryLauncherId"] = launchers["vaultVersionRegistry"]
@@ -1219,7 +1311,7 @@ def _payment_evidence_rejection_reasons(
         _assert_public_artifact(evidence, "purchase_finalization_evidence")
     except ValueError as e:
         return [str(e)]
-    if rail in {"chia", "chia_xch", "chia_cat"}:
+    if rail in {"chia_xch", "chia_cat"}:
         if not any(evidence.get(k) for k in ("spend_bundle_id", "accepted_offer_id", "coin_spend_id")):
             return ["chia_evidence_missing"]
     elif rail in {"base_usdc", "evm_usdc"}:
@@ -1366,6 +1458,18 @@ def _normalized_hex32(value: str, label: str) -> str:
     return _hex32(_bytes32_field(value, label))
 
 
+def _normalized_evm_address(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("0x") or len(value) != 42:
+        raise PaymentArtifactError(f"{label} must be 0x-prefixed bytes20")
+    try:
+        raw = bytes.fromhex(value[2:])
+    except ValueError as exc:
+        raise PaymentArtifactError(f"{label} must be valid bytes20") from exc
+    if raw == b"\x00" * 20:
+        raise PaymentArtifactError(f"{label} cannot be zero")
+    return "0x" + raw.hex()
+
+
 def _evm_token_asset_id(value: str) -> bytes32:
     if not isinstance(value, str) or not value.startswith("0x") or len(value) != 42:
         raise PaymentArtifactError(
@@ -1401,4 +1505,24 @@ def _require_server_to_server_token(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid protocol artifact bearer token.",
+        )
+
+
+def _require_omnichain_ingest_token(
+    settings: Settings,
+    authorization: str | None,
+) -> None:
+    expected = settings.payment_omnichain_ingest_token
+    if not expected or len(expected) < 32:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Omnichain escrow callback authentication is not configured.",
+        )
+    supplied = ""
+    if authorization and authorization.startswith("Bearer "):
+        supplied = authorization.removeprefix("Bearer ").strip()
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid omnichain escrow callback credential.",
         )

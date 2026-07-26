@@ -64,6 +64,9 @@ os.environ["SOLSLOT_ZKPASSPORT_BRIDGE_POLICY_HASH"] = "0x" + "c1" * 32
 os.environ["SOLSLOT_RUNTIME_ENVIRONMENT"] = "test"
 os.environ["SOLSLOT_API_DOCS_ENABLED"] = "true"
 os.environ["SOLSLOT_CORS_ORIGINS"] = "http://localhost:4200,http://localhost:5173"
+# Historical endpoint tests isolate handler behavior. Brick 3 has dedicated
+# tests with this enabled to prove deployed owner-plus-one enforcement.
+os.environ["SOLSLOT_ADMIN_OPERATION_APPROVALS_ENABLED"] = "false"
 
 
 @pytest.fixture(autouse=True)

@@ -9,7 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from eth_utils import keccak
+
 from .config import Settings
+from .timelock_operation import (
+    TimelockOperationError,
+    decode_ownership_schedule,
+    validate_ownership_execute,
+)
 
 
 MAX_EVIDENCE_BYTES = 128 * 1024
@@ -29,8 +36,10 @@ class OmnichainEvidence:
     gateway_profile: str
     gateway_address: str
     spoke_address: str
-    governance_safe: str
+    confirmations: int
+    governance_root_safe: str
     governance_timelock: str
+    return_puzzle_hash: str
 
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
@@ -73,6 +82,62 @@ def _require_transaction(value: object, label: str) -> None:
     block_number = transaction.get("blockNumber")
     if not isinstance(block_number, int) or isinstance(block_number, bool) or block_number <= 0:
         raise OmnichainEvidenceError(f"Omnichain evidence {label}.blockNumber is invalid")
+
+
+def _require_deployment_transaction(value: object, label: str) -> None:
+    transaction = _require_mapping(value, label)
+    _require_transaction(transaction, label)
+    _require_address(transaction.get("from"), f"{label}.from")
+    _require_hash(transaction.get("dataHash"), f"{label}.dataHash")
+
+
+def _require_address_list(
+    value: object,
+    label: str,
+    *,
+    length: int,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) != length:
+        raise OmnichainEvidenceError(f"Omnichain evidence {label} is invalid")
+    normalized = [
+        _require_address(item, f"{label}[{index}]")
+        for index, item in enumerate(value)
+    ]
+    if len(set(normalized)) != length:
+        raise OmnichainEvidenceError(f"Omnichain evidence {label} is invalid")
+    return normalized
+
+
+def _validate_ownership_calldata(
+    *,
+    schedule_data: object,
+    execute_data: object,
+    expected_targets: list[str],
+    expected_operation_id: str,
+) -> None:
+    try:
+        schedule = decode_ownership_schedule(
+            schedule_data,
+            expected_operation_id=expected_operation_id,
+            label="Omnichain evidence ownershipIntent.scheduleTransaction.data",
+        )
+        normalized_expected = tuple(
+            _require_address(target, "ownershipIntent.expectedTarget")
+            for target in expected_targets
+        )
+        if tuple(target.lower() for target in schedule.targets) != tuple(
+            target.lower() for target in normalized_expected
+        ):
+            raise OmnichainEvidenceError(
+                "Omnichain ownership intent calldata mismatches"
+            )
+        validate_ownership_execute(
+            execute_data,
+            schedule=schedule,
+            label="Omnichain evidence ownershipIntent.executeTransaction.data",
+        )
+    except TimelockOperationError as exc:
+        raise OmnichainEvidenceError(str(exc)) from exc
 
 
 def _preflight_runtime_hash(
@@ -126,7 +191,7 @@ def load_omnichain_evidence(
         raise OmnichainEvidenceError("Omnichain deployment evidence is not configured")
     evidence = _load_evidence(settings.payment_omnichain_evidence_path, "deployment")
     declared_hash = str(evidence["artifactHash"])
-    if evidence.get("schemaVersion") != 2 or evidence.get("rail") != "ccip-warp-escrow":
+    if evidence.get("schemaVersion") != 5 or evidence.get("rail") != "ccip-warp-escrow":
         raise OmnichainEvidenceError("Omnichain deployment evidence schema is unsupported")
     if evidence.get("protocolVersion") != "solslot-v2":
         raise OmnichainEvidenceError("Omnichain deployment evidence protocol is invalid")
@@ -134,12 +199,25 @@ def load_omnichain_evidence(
         raise OmnichainEvidenceError("Omnichain deployment evidence source SHA mismatches")
     if evidence.get("chainId") != chain_id:
         raise OmnichainEvidenceError("Omnichain deployment evidence chain mismatches")
+    confirmations = evidence.get("confirmations")
+    if (
+        not isinstance(confirmations, int)
+        or isinstance(confirmations, bool)
+        or confirmations < 12
+    ):
+        raise OmnichainEvidenceError(
+            "Omnichain deployment evidence confirmations are invalid"
+        )
     governance_artifact_hash = _require_hash(
         evidence.get("governanceArtifactHash"), "governanceArtifactHash"
     )
     samuel_artifact_hash = _require_hash(
         evidence.get("samuelCoordinateArtifactHash"),
         "samuelCoordinateArtifactHash",
+    )
+    warp_portal_artifact_hash = _require_hash(
+        evidence.get("warpPortalArtifactHash"),
+        "warpPortalArtifactHash",
     )
 
     contracts = evidence.get("contracts")
@@ -155,8 +233,8 @@ def load_omnichain_evidence(
     for name in ("ccipRouter", "gateway", "spoke", "usdc"):
         _require_address(contracts.get(name), name)
         _require_hash(code_hashes.get(name), f"runtimeCodeHashes.{name}")
-    governance_safe = _require_address(
-        configuration.get("governanceSafe"), "configuration.governanceSafe"
+    governance_root_safe = _require_address(
+        configuration.get("governanceRootSafe"), "configuration.governanceRootSafe"
     )
     governance_timelock = _require_address(
         configuration.get("governanceTimelock"),
@@ -165,9 +243,18 @@ def load_omnichain_evidence(
     payout = _require_address(
         configuration.get("payoutAddress"), "configuration.payoutAddress"
     )
-    if payout != governance_safe or governance_safe == governance_timelock:
+    if (
+        payout != governance_root_safe
+        or governance_root_safe == governance_timelock
+        or configuration.get("ownershipAccepted") is not False
+        or _require_selector(
+            configuration.get("hubChainSelector"),
+            "configuration.hubChainSelector",
+        )
+        != _require_selector(evidence.get("chainSelector"), "chainSelector")
+    ):
         raise OmnichainEvidenceError("Omnichain governance configuration is invalid")
-    for name in ("governanceSafe", "governanceTimelock"):
+    for name in ("governanceRootSafe", "governanceTimelock"):
         _require_hash(code_hashes.get(name), f"runtimeCodeHashes.{name}")
     deployment_transactions = _require_mapping(
         evidence.get("deploymentTransactions"), "deploymentTransactions"
@@ -186,40 +273,169 @@ def load_omnichain_evidence(
     governance = _load_evidence(
         settings.payment_omnichain_governance_evidence_path, "governance"
     )
-    governance_safe_record = _require_mapping(governance.get("safe"), "governance.safe")
+    governance_safes = _require_mapping(governance.get("safes"), "governance.safes")
+    owner_safe_record = _require_mapping(
+        governance_safes.get("ownerIdentity"), "governance.safes.ownerIdentity"
+    )
+    coadmin_safe_record = _require_mapping(
+        governance_safes.get("coadmin"), "governance.safes.coadmin"
+    )
+    root_safe_record = _require_mapping(
+        governance_safes.get("root"), "governance.safes.root"
+    )
     governance_timelock_record = _require_mapping(
         governance.get("timelock"), "governance.timelock"
     )
     governance_hashes = _require_mapping(
         governance.get("runtimeCodeHashes"), "governance.runtimeCodeHashes"
     )
-    owners = governance_safe_record.get("owners")
+    owner_safe_owners = owner_safe_record.get("owners")
+    coadmin_safe_owners = coadmin_safe_record.get("owners")
+    root_safe_owners = root_safe_record.get("owners")
+    if not all(
+        isinstance(owners, list)
+        for owners in (owner_safe_owners, coadmin_safe_owners, root_safe_owners)
+    ):
+        raise OmnichainEvidenceError("Omnichain governance Safe owners are invalid")
+    owner_safe = _require_address(
+        owner_safe_record.get("address"), "governance.safes.ownerIdentity.address"
+    )
+    coadmin_safe = _require_address(
+        coadmin_safe_record.get("address"), "governance.safes.coadmin.address"
+    )
+    root_safe = _require_address(
+        root_safe_record.get("address"), "governance.safes.root.address"
+    )
+    owner_guard = _require_address(
+        owner_safe_record.get("guard"), "governance.safes.ownerIdentity.guard"
+    )
+    coadmin_guard = _require_address(
+        coadmin_safe_record.get("guard"), "governance.safes.coadmin.guard"
+    )
+    root_guard = _require_address(
+        root_safe_record.get("guard"), "governance.safes.root.guard"
+    )
+    owner_address = _require_address(
+        owner_safe_owners[0] if len(owner_safe_owners) == 1 else None,
+        "governance.safes.ownerIdentity.owner",
+    )
+    coadmin_addresses = [
+        _require_address(owner, "governance.safes.coadmin.owner")
+        for owner in coadmin_safe_owners
+    ]
+    root_addresses = [
+        _require_address(owner, "governance.safes.root.owner")
+        for owner in root_safe_owners
+    ]
+    recovery = _require_mapping(governance.get("recovery"), "governance.recovery")
+    infrastructure = _require_mapping(
+        governance.get("safeInfrastructure"), "governance.safeInfrastructure"
+    )
+    secp_guardian = _require_address(
+        recovery.get("secp256k1Guardian"), "governance.recovery.secp256k1Guardian"
+    )
+    bls_pubkey = recovery.get("blsGuardianPubkey")
     if (
-        governance.get("schemaVersion") != 1
-        or governance.get("kind") != "solslot-alpha-safe-timelock-deployment"
+        not isinstance(bls_pubkey, str)
+        or not re.fullmatch(r"0x[0-9a-fA-F]{96}", bls_pubkey)
+        or int(bls_pubkey, 16) == 0
+    ):
+        raise OmnichainEvidenceError("Omnichain governance BLS recovery key is invalid")
+    bls_commitment = _require_hash(
+        recovery.get("blsGuardianCommitment"),
+        "governance.recovery.blsGuardianCommitment",
+    )
+    observed_bls_commitment = "0x" + keccak(bytes.fromhex(bls_pubkey[2:])).hex()
+    administrator_records = governance.get("administrators")
+    if not isinstance(administrator_records, list) or len(administrator_records) != 3:
+        raise OmnichainEvidenceError("Omnichain governance administrators are invalid")
+    administrator_slots = [record.get("slot") for record in administrator_records if isinstance(record, Mapping)]
+    administrator_addresses = [
+        _require_address(record.get("address"), "governance.administrator.address")
+        for record in administrator_records
+        if isinstance(record, Mapping)
+    ]
+    recovery_coadmins = recovery.get("coadmins")
+    if not isinstance(recovery_coadmins, list):
+        raise OmnichainEvidenceError("Omnichain governance recovery coadmins are invalid")
+    normalized_recovery_coadmins = [
+        _require_address(owner, "governance.recovery.coadmin")
+        for owner in recovery_coadmins
+    ]
+    governance_contract_addresses = {
+        "ownerIdentitySafe": owner_safe,
+        "coadminSafe": coadmin_safe,
+        "rootSafe": root_safe,
+        "timelock": governance_timelock,
+        "recovery": _require_address(
+            recovery.get("address"), "governance.recovery.address"
+        ),
+        "ownerGuard": owner_guard,
+        "coadminGuard": coadmin_guard,
+        "rootGuard": root_guard,
+        "ownerSetup": _require_address(
+            infrastructure.get("ownerSetup"),
+            "governance.safeInfrastructure.ownerSetup",
+        ),
+        "compatibilityFallbackHandler": _require_address(
+            infrastructure.get("compatibilityFallbackHandler"),
+            "governance.safeInfrastructure.compatibilityFallbackHandler",
+        ),
+        "signMessageLibrary": _require_address(
+            infrastructure.get("signMessageLibrary"),
+            "governance.safeInfrastructure.signMessageLibrary",
+        ),
+    }
+    if secp_guardian in governance_contract_addresses.values():
+        raise OmnichainEvidenceError(
+            "Omnichain governance recovery guardian is not separate"
+        )
+    for name in governance_contract_addresses:
+        _require_hash(
+            governance_hashes.get(name),
+            f"governance.runtimeCodeHashes.{name}",
+        )
+    if (
+        governance.get("schemaVersion") != 2
+        or governance.get("kind") != "solslot-alpha-owner-required-governance-deployment"
+        or governance.get("authorityRule") != "slot0_and_one_of_slot1_slot2"
         or governance.get("sourceSha") != source_sha
         or governance.get("network") != "baseSepolia"
         or governance.get("chainId") != 84532
         or governance.get("artifactHash") != governance_artifact_hash
-        or governance_safe_record.get("threshold") != 2
-        or not isinstance(owners, list)
-        or len(owners) != 3
-        or len({_require_address(owner, "governance.safe.owner") for owner in owners}) != 3
-        or _require_address(governance_safe_record.get("address"), "governance.safe.address")
-        != governance_safe
+        or owner_safe_record.get("threshold") != 1
+        or coadmin_safe_record.get("threshold") != 1
+        or root_safe_record.get("threshold") != 2
+        or len(coadmin_addresses) != 2
+        or len(set((owner_address, *coadmin_addresses, secp_guardian))) != 4
+        or administrator_slots != [1, 2, 3]
+        or administrator_addresses != [owner_address, *coadmin_addresses]
+        or len(root_addresses) != 2
+        or set(root_addresses) != {owner_safe, coadmin_safe}
+        or root_safe != governance_root_safe
+        or len({owner_guard, coadmin_guard, root_guard}) != 3
+        or _require_address(recovery.get("ownerGuard"), "governance.recovery.ownerGuard")
+        != owner_guard
+        or normalized_recovery_coadmins != coadmin_addresses
+        or recovery.get("delaySeconds") != "604800"
+        or recovery.get("replacementAcceptanceRequired") is not True
+        or observed_bls_commitment != bls_commitment
+        or infrastructure.get("safeVersion") != "1.4.1"
         or _require_address(governance.get("payoutAddress"), "governance.payoutAddress")
-        != governance_safe
+        != governance_root_safe
         or _require_address(governance_timelock_record.get("address"), "governance.timelock.address")
         != governance_timelock
         or governance_timelock_record.get("minimumDelaySeconds") != "86400"
         or _require_address(governance_timelock_record.get("proposer"), "governance.timelock.proposer")
-        != governance_safe
+        != governance_root_safe
         or _require_address(governance_timelock_record.get("executor"), "governance.timelock.executor")
-        != governance_safe
+        != governance_root_safe
+        or _require_address(governance_timelock_record.get("canceller"), "governance.timelock.canceller")
+        != governance_root_safe
         or governance_timelock_record.get("externalAdmin")
         != "0x0000000000000000000000000000000000000000"
-        or _require_hash(governance_hashes.get("safe"), "governance.runtimeCodeHashes.safe")
-        != _require_hash(code_hashes.get("governanceSafe"), "runtimeCodeHashes.governanceSafe")
+        or _require_hash(governance_hashes.get("rootSafe"), "governance.runtimeCodeHashes.rootSafe")
+        != _require_hash(code_hashes.get("governanceRootSafe"), "runtimeCodeHashes.governanceRootSafe")
         or _require_hash(governance_hashes.get("timelock"), "governance.runtimeCodeHashes.timelock")
         != _require_hash(code_hashes.get("governanceTimelock"), "runtimeCodeHashes.governanceTimelock")
     ):
@@ -231,29 +447,163 @@ def load_omnichain_evidence(
     samuel_testnet = _require_mapping(samuel.get("testnet11"), "samuel.testnet11")
     samuel_base = _require_mapping(samuel.get("baseSepolia"), "samuel.baseSepolia")
     validator_keys = samuel.get("validatorPublicKeys")
+    validator_evm_addresses = _require_address_list(
+        samuel.get("validatorEvmAddresses"),
+        "samuel.validatorEvmAddresses",
+        length=3,
+    )
+    samuel_source_sha = str(samuel.get("sourceSha", "")).lower()
+    protocol_source_sha = str(samuel.get("protocolSourceSha", "")).lower()
     if (
-        samuel.get("schemaVersion") != 1
+        samuel.get("schemaVersion") != 3
         or samuel.get("kind") != "solslot-samuel-testnet-coordinates"
         or samuel.get("artifactHash") != samuel_artifact_hash
-        or not _GIT_SHA_RE.fullmatch(str(samuel.get("sourceSha", "")))
+        or not _GIT_SHA_RE.fullmatch(samuel_source_sha)
+        or not _GIT_SHA_RE.fullmatch(protocol_source_sha)
+        or samuel_source_sha
+        != str(configuration.get("samuelSourceSha", "")).lower()
+        or not _HASH_RE.fullmatch(
+            str(samuel.get("validatorRosterArtifactHash", ""))
+        )
         or samuel.get("threshold") != 2
         or not isinstance(validator_keys, list)
         or len(validator_keys) != 3
         or len({str(key).lower() for key in validator_keys}) != 3
         or any(not re.fullmatch(r"0x[0-9a-fA-F]{96}", str(key)) for key in validator_keys)
         or samuel_base.get("chainId") != 84532
+        or _require_address(
+            samuel_base.get("solomonGatewayAddress"),
+            "samuel.baseSepolia.solomonGatewayAddress",
+        )
+        != _require_address(contracts.get("gateway"), "gateway")
     ):
         raise OmnichainEvidenceError("Omnichain Samuel evidence mismatches")
-    for name in ("portalLauncherId", "bridgingPuzzleHash", "returnPuzzleHash"):
+    for name in (
+        "portalLauncherId",
+        "bridgingPuzzleHash",
+        "returnPuzzleHash",
+        "resultAuthorizationModHash",
+        "voucherBurnInnerHash",
+    ):
         _require_hash(samuel_testnet.get(name), f"samuel.testnet11.{name}")
     samuel_portal = _require_address(
         samuel_base.get("warpPortalAddress"), "samuel.baseSepolia.warpPortalAddress"
     )
+    return_route = _require_mapping(
+        samuel.get("returnRoute"), "samuel.returnRoute"
+    )
+    if (
+        return_route.get("destinationChain") != expected_profile
+        or _require_address(
+            return_route.get("destinationAddress"),
+            "samuel.returnRoute.destinationAddress",
+        )
+        != _require_address(contracts.get("gateway"), "gateway")
+    ):
+        raise OmnichainEvidenceError("Omnichain Samuel return route mismatches")
+
+    warp_portal = _load_evidence(
+        settings.payment_omnichain_warp_portal_evidence_path,
+        "warp_portal",
+    )
+    warp_portal_record = _require_mapping(
+        warp_portal.get("portal"), "warp_portal.portal"
+    )
+    warp_proxy_record = _require_mapping(
+        warp_portal.get("proxy"), "warp_portal.proxy"
+    )
+    warp_runtime_hashes = _require_mapping(
+        warp_portal.get("runtimeCodeHashes"),
+        "warp_portal.runtimeCodeHashes",
+    )
+    warp_artifact_hashes = _require_mapping(
+        warp_portal.get("artifactRuntimeCodeHashes"),
+        "warp_portal.artifactRuntimeCodeHashes",
+    )
+    warp_transactions = _require_mapping(
+        warp_portal.get("deploymentTransactions"),
+        "warp_portal.deploymentTransactions",
+    )
+    warp_signers = _require_address_list(
+        warp_portal_record.get("signers"),
+        "warp_portal.portal.signers",
+        length=3,
+    )
+    warp_owner = _require_address(
+        warp_portal_record.get("owner"), "warp_portal.portal.owner"
+    )
+    _require_address(
+        warp_proxy_record.get("implementation"),
+        "warp_portal.proxy.implementation",
+    )
+    _require_address(
+        warp_proxy_record.get("admin"),
+        "warp_portal.proxy.admin",
+    )
+    for name in ("validatorSafe", "portalImplementation", "portalProxy"):
+        _require_deployment_transaction(
+            warp_transactions.get(name),
+            f"warp_portal.deploymentTransactions.{name}",
+        )
+    for name in ("safe", "portal", "implementation", "proxyAdmin"):
+        _require_hash(
+            warp_runtime_hashes.get(name),
+            f"warp_portal.runtimeCodeHashes.{name}",
+        )
+    for name in ("portal", "transparentProxyTemplate", "proxyAdmin"):
+        _require_hash(
+            warp_artifact_hashes.get(name),
+            f"warp_portal.artifactRuntimeCodeHashes.{name}",
+        )
+    if (
+        warp_portal.get("schemaVersion") != 1
+        or warp_portal.get("kind")
+        != "solslot-warp-base-sepolia-portal-deployment"
+        or warp_portal.get("artifactHash") != warp_portal_artifact_hash
+        or warp_portal.get("sourceSha") != source_sha
+        or warp_portal.get("network") != evidence.get("network")
+        or warp_portal.get("chainId") != chain_id
+        or _require_address(
+            warp_portal_record.get("address"), "warp_portal.portal.address"
+        )
+        != samuel_portal
+        or set(warp_signers) != set(validator_evm_addresses)
+        or warp_owner in set(warp_signers)
+        or warp_portal_record.get("signatureThreshold") != 2
+        or warp_portal_record.get("messageTollWei") != "0"
+        or warp_portal_record.get("supportedChains") != ["0x786368"]
+        or warp_portal_record.get("initializedAtomically") is not True
+        or _require_address(
+            warp_proxy_record.get("adminOwner"),
+            "warp_portal.proxy.adminOwner",
+        )
+        != warp_owner
+        or warp_proxy_record.get("standard")
+        != "openzeppelin-transparent-proxy-5.0.2"
+        or _require_hash(
+            warp_runtime_hashes.get("implementation"),
+            "warp_portal.runtimeCodeHashes.implementation",
+        )
+        != _require_hash(
+            warp_artifact_hashes.get("portal"),
+            "warp_portal.artifactRuntimeCodeHashes.portal",
+        )
+        or _require_hash(
+            warp_runtime_hashes.get("proxyAdmin"),
+            "warp_portal.runtimeCodeHashes.proxyAdmin",
+        )
+        != _require_hash(
+            warp_artifact_hashes.get("proxyAdmin"),
+            "warp_portal.artifactRuntimeCodeHashes.proxyAdmin",
+        )
+    ):
+        raise OmnichainEvidenceError("Omnichain Warp portal evidence mismatches")
+
     preflight = _load_evidence(
         settings.payment_omnichain_preflight_evidence_path, "preflight"
     )
     if (
-        preflight.get("schemaVersion") != 2
+        preflight.get("schemaVersion") != 5
         or preflight.get("kind")
         != "solslot-omnichain-testnet-deployment-preflight"
         or preflight.get("sourceSha") != source_sha
@@ -264,6 +614,15 @@ def load_omnichain_evidence(
         or evidence.get("preflightArtifactHash") != preflight.get("artifactHash")
         or preflight.get("governanceArtifactHash") != governance_artifact_hash
         or preflight.get("samuelCoordinateArtifactHash") != samuel_artifact_hash
+        or preflight.get("warpPortalArtifactHash")
+        != warp_portal_artifact_hash
+        or preflight.get("hubName") != "baseSepolia"
+        or _require_selector(
+            preflight.get("hubChainSelector"),
+            "preflight.hubChainSelector",
+        )
+        != _require_selector(evidence.get("chainSelector"), "chainSelector")
+        or preflight.get("deploymentMode") != "new_gateway_and_spoke"
     ):
         raise OmnichainEvidenceError("Omnichain preflight evidence mismatches")
     preflight_settings = _require_mapping(
@@ -283,7 +642,7 @@ def load_omnichain_evidence(
         "ccipRouter": contracts.get("ccipRouter"),
         "payout": payout,
         "governance": governance_timelock,
-        "safe": governance_safe,
+        "rootSafe": governance_root_safe,
         "usdc": contracts.get("usdc"),
     }
     for name, address in expected_preflight_addresses.items():
@@ -301,6 +660,35 @@ def load_omnichain_evidence(
         or preflight_decimals.get("usdc") != 6
         or _require_address(preflight_settings.get("warpPortal"), "preflight.warpPortal")
         != samuel_portal
+        or preflight_settings.get("protocolSourceSha")
+        != protocol_source_sha
+        or preflight_settings.get("samuelSourceSha") != samuel_source_sha
+        or _require_address(
+            preflight_settings.get("predictedGatewayAddress"),
+            "preflight.predictedGatewayAddress",
+        )
+        != _require_address(contracts.get("gateway"), "gateway")
+        or _require_address(
+            configuration.get("predictedGatewayAddress"),
+            "configuration.predictedGatewayAddress",
+        )
+        != _require_address(contracts.get("gateway"), "gateway")
+        or _require_hash(
+            preflight_settings.get("voucherResultAuthorizationMod"),
+            "preflight.voucherResultAuthorizationMod",
+        )
+        != _require_hash(
+            samuel_testnet.get("resultAuthorizationModHash"),
+            "samuel.testnet11.resultAuthorizationModHash",
+        )
+        or _require_hash(
+            preflight_settings.get("voucherBurnInner"),
+            "preflight.voucherBurnInner",
+        )
+        != _require_hash(
+            samuel_testnet.get("voucherBurnInnerHash"),
+            "samuel.testnet11.voucherBurnInnerHash",
+        )
     ):
         raise OmnichainEvidenceError("Omnichain preflight evidence settings mismatch")
     for name in ("ccipRouter", "usdc"):
@@ -310,8 +698,19 @@ def load_omnichain_evidence(
             raise OmnichainEvidenceError(
                 "Omnichain preflight evidence runtime code mismatches"
             )
+    if _preflight_runtime_hash(
+        preflight_hashes,
+        samuel_portal,
+        "warpPortal",
+    ) != _require_hash(
+        warp_runtime_hashes.get("portal"),
+        "warp_portal.runtimeCodeHashes.portal",
+    ):
+        raise OmnichainEvidenceError(
+            "Omnichain preflight Warp portal runtime code mismatches"
+        )
     for name, address in (
-        ("governanceSafe", governance_safe),
+        ("governanceRootSafe", governance_root_safe),
         ("governanceTimelock", governance_timelock),
     ):
         if _preflight_runtime_hash(preflight_hashes, address, name) != _require_hash(
@@ -324,7 +723,7 @@ def load_omnichain_evidence(
         settings.payment_omnichain_activation_evidence_path, "activation"
     )
     if (
-        activation.get("schemaVersion") != 2
+        activation.get("schemaVersion") != 3
         or activation.get("kind") != "ccip-warp-escrow-activation"
         or activation.get("deploymentArtifactHash") != declared_hash
         or activation.get("sourceSha") != source_sha
@@ -353,8 +752,8 @@ def load_omnichain_evidence(
     if _require_address(
         activation.get("governance"), "activation.governance"
     ) != governance_timelock or _require_address(
-        activation.get("governanceSafe"), "activation.governanceSafe"
-    ) != governance_safe:
+        activation.get("governanceRootSafe"), "activation.governanceRootSafe"
+    ) != governance_root_safe:
         raise OmnichainEvidenceError("Omnichain activation evidence governance mismatches")
     owners = activation.get("observedOwners")
     if not isinstance(owners, Mapping) or any(
@@ -368,8 +767,96 @@ def load_omnichain_evidence(
         settings.payment_omnichain_ownership_intent_evidence_path,
         "ownership_intent",
     )
+    ownership_targets = ownership_intent.get("targets")
+    if not isinstance(ownership_targets, list) or len(ownership_targets) != 2:
+        raise OmnichainEvidenceError(
+            "Omnichain ownership intent targets are invalid"
+        )
+    expected_ownership_targets = {
+        "gateway": (
+            _require_address(contracts.get("gateway"), "gateway"),
+            _require_hash(
+                code_hashes.get("gateway"),
+                "runtimeCodeHashes.gateway",
+            ),
+            _require_hash(
+                deployment_transactions.get("gatewayOwnershipTransfer", {}).get(
+                    "hash"
+                ),
+                "deploymentTransactions.gatewayOwnershipTransfer.hash",
+            ),
+        ),
+        "spoke": (
+            _require_address(contracts.get("spoke"), "spoke"),
+            _require_hash(
+                code_hashes.get("spoke"),
+                "runtimeCodeHashes.spoke",
+            ),
+            _require_hash(
+                deployment_transactions.get("spokeOwnershipTransfer", {}).get(
+                    "hash"
+                ),
+                "deploymentTransactions.spokeOwnershipTransfer.hash",
+            ),
+        ),
+    }
+    observed_target_labels: set[str] = set()
+    for target_value in ownership_targets:
+        target = _require_mapping(target_value, "ownershipIntent.target")
+        label = target.get("label")
+        if not isinstance(label, str) or label not in expected_ownership_targets:
+            raise OmnichainEvidenceError(
+                "Omnichain ownership intent targets are invalid"
+            )
+        expected_address, expected_code_hash, expected_transfer_hash = (
+            expected_ownership_targets[label]
+        )
+        if (
+            label in observed_target_labels
+            or _require_address(
+                target.get("address"),
+                f"ownershipIntent.targets.{label}.address",
+            )
+            != expected_address
+            or _require_address(
+                target.get("pendingOwner"),
+                f"ownershipIntent.targets.{label}.pendingOwner",
+            )
+            != governance_timelock
+            or _require_address(
+                target.get("currentOwner"),
+                f"ownershipIntent.targets.{label}.currentOwner",
+            )
+            == governance_timelock
+            or _require_hash(
+                target.get("runtimeCodeHash"),
+                f"ownershipIntent.targets.{label}.runtimeCodeHash",
+            )
+            != expected_code_hash
+            or _require_hash(
+                target.get("ownershipTransferTransactionHash"),
+                f"ownershipIntent.targets.{label}.ownershipTransferTransactionHash",
+            )
+            != expected_transfer_hash
+        ):
+            raise OmnichainEvidenceError(
+                "Omnichain ownership intent targets mismatch"
+            )
+        observed_target_labels.add(label)
+    schedule_transaction = _require_mapping(
+        ownership_intent.get("scheduleTransaction"),
+        "ownershipIntent.scheduleTransaction",
+    )
+    execute_transaction = _require_mapping(
+        ownership_intent.get("executeTransaction"),
+        "ownershipIntent.executeTransaction",
+    )
+    operation_id = _require_hash(
+        ownership_intent.get("operationId"),
+        "ownershipIntent.operationId",
+    )
     if (
-        ownership_intent.get("schemaVersion") != 1
+        ownership_intent.get("schemaVersion") != 2
         or ownership_intent.get("kind")
         != "solslot-omnichain-ownership-activation-intent"
         or ownership_intent.get("artifactHash")
@@ -378,15 +865,47 @@ def load_omnichain_evidence(
         or ownership_intent.get("network") != evidence.get("network")
         or ownership_intent.get("chainId") != chain_id
         or ownership_intent.get("minimumDelaySeconds") != "86400"
-        or _require_address(ownership_intent.get("safe"), "ownershipIntent.safe")
-        != governance_safe
+        or ownership_intent.get("governanceArtifactHash")
+        != governance_artifact_hash
+        or not _GIT_SHA_RE.fullmatch(
+            str(ownership_intent.get("preparationSourceSha", "")).lower()
+        )
+        or not isinstance(
+            ownership_intent.get("preparationBlockNumber"),
+            int,
+        )
+        or isinstance(ownership_intent.get("preparationBlockNumber"), bool)
+        or int(ownership_intent.get("preparationBlockNumber", 0)) <= 0
+        or _require_address(ownership_intent.get("rootSafe"), "ownershipIntent.rootSafe")
+        != governance_root_safe
         or _require_address(
             ownership_intent.get("timelock"), "ownershipIntent.timelock"
         )
         != governance_timelock
+        or _require_address(
+            schedule_transaction.get("to"),
+            "ownershipIntent.scheduleTransaction.to",
+        )
+        != governance_timelock
+        or schedule_transaction.get("value") != "0"
+        or _require_address(
+            execute_transaction.get("to"),
+            "ownershipIntent.executeTransaction.to",
+        )
+        != governance_timelock
+        or execute_transaction.get("value") != "0"
+        or observed_target_labels != {"gateway", "spoke"}
     ):
         raise OmnichainEvidenceError("Omnichain ownership intent evidence mismatches")
-    _require_hash(ownership_intent.get("operationId"), "ownershipIntent.operationId")
+    _validate_ownership_calldata(
+        schedule_data=schedule_transaction.get("data"),
+        execute_data=execute_transaction.get("data"),
+        expected_targets=[
+            expected_ownership_targets["gateway"][0],
+            expected_ownership_targets["spoke"][0],
+        ],
+        expected_operation_id=operation_id,
+    )
 
     return OmnichainEvidence(
         source_sha=source_sha,
@@ -394,8 +913,13 @@ def load_omnichain_evidence(
         gateway_profile=gateway_profile,
         gateway_address=_require_address(contracts.get("gateway"), "gateway"),
         spoke_address=_require_address(contracts.get("spoke"), "spoke"),
-        governance_safe=governance_safe,
+        confirmations=confirmations,
+        governance_root_safe=governance_root_safe,
         governance_timelock=governance_timelock,
+        return_puzzle_hash=_require_hash(
+            samuel_testnet.get("returnPuzzleHash"),
+            "samuel.testnet11.returnPuzzleHash",
+        ),
     )
 
 

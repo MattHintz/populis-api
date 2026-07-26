@@ -17,7 +17,7 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from .admin_auth import require_admin_jwt
+from .admin_operations import require_admin_operation
 from .config import Settings, get_settings
 from .credential_auth import require_alpha_writes
 from .public_artifact import PublicArtifactError, load_signed_public_artifact
@@ -171,7 +171,7 @@ class BridgePoolTopUpResponse(BaseModel):
 @router.post(
     "/zkpassport/bridge-pool/top-up",
     response_model=BridgePoolTopUpResponse,
-    dependencies=[Depends(require_admin_jwt)],
+    dependencies=[Depends(require_admin_operation("bridge.top-up"))],
 )
 async def top_up_zkpassport_bridge_pool(
     body: BridgePoolTopUpRequest,

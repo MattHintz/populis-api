@@ -31,6 +31,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_VAULT_SESSION_JWT_SECRET",
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
+        "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN",
         "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY",
         "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN",
         "SOLSLOT_COLLECTION_MALWARE_SCAN_TOKEN",
@@ -81,10 +82,45 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    if settings.chia_primary_required and not settings.chia_primary_url:
+        raise RuntimeError(
+            "SOLSLOT_CHIA_PRIMARY_REQUIRED requires SOLSLOT_CHIA_PRIMARY_URL."
+        )
+    for label, url in (
+        ("SOLSLOT_CHIA_PRIMARY_URL", settings.chia_primary_url),
+        ("SOLSLOT_CHIA_FALLBACK_URL", settings.effective_chia_fallback_url()),
+    ):
+        if url and not url.startswith(("https://", "http://")):
+            raise RuntimeError(f"{label} must be an HTTP(S) URL.")
+    chia_mtls_paths = (
+        settings.chia_primary_ca_cert_path,
+        settings.chia_primary_client_cert_path,
+        settings.chia_primary_client_key_path,
+    )
+    if any(chia_mtls_paths) and not all(chia_mtls_paths):
+        raise RuntimeError(
+            "Chia primary mTLS requires CA, client certificate, and client key paths."
+        )
+
     if settings.minting_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_MINTING_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
         )
+    if settings.presale_enabled and not settings.alpha_writes_enabled:
+        raise RuntimeError(
+            "SOLSLOT_PRESALE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+    if settings.presale_enabled and not settings.collection_minting_enabled:
+        raise RuntimeError(
+            "SOLSLOT_PRESALE_ENABLED requires SOLSLOT_COLLECTION_MINTING_ENABLED."
+        )
+    if settings.voucher_issuance_worker_enabled and not settings.presale_enabled:
+        raise RuntimeError(
+            "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED requires "
+            "SOLSLOT_PRESALE_ENABLED."
+        )
+    if settings.voucher_issuance_worker_enabled and settings.network != "testnet11":
+        raise RuntimeError("RC20 voucher issuance is restricted to testnet11.")
     if settings.ceremony_mode_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
@@ -120,11 +156,53 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "KoS MINT execute signing requires CA, client certificate, and client key paths."
             )
 
+    if settings.payment_omnichain_ownership_activation_enabled:
+        if settings.network != "testnet11":
+            raise RuntimeError(
+                "Base Sepolia ownership activation is restricted to the Testnet11 alpha."
+            )
+        if (
+            not settings.payment_omnichain_rpc_url
+            or not settings.payment_omnichain_rpc_url.startswith("https://")
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED "
+                "requires an HTTPS SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL."
+            )
+        from .omnichain_ownership_activation import (
+            OwnershipActivationError,
+            load_authority_operation,
+        )
+
+        try:
+            load_authority_operation(settings)
+        except OwnershipActivationError as exc:
+            raise RuntimeError(
+                "Base Sepolia ownership activation requires the exact reviewed "
+                f"Safe operation package: {exc}"
+            ) from exc
+
     if settings.payment_omnichain_enabled:
+        if (
+            not settings.payment_omnichain_ingest_token
+            or len(settings.payment_omnichain_ingest_token) < 32
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires a dedicated "
+                "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN of at least 32 characters."
+            )
         if len(settings.payment_evm_usdc_tokens) != 1:
             raise RuntimeError(
                 "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires exactly one "
                 "SOLSLOT_PAYMENT_EVM_USDC_TOKENS chain binding."
+            )
+        if (
+            not settings.payment_omnichain_rpc_url
+            or not settings.payment_omnichain_rpc_url.startswith("https://")
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires an HTTPS "
+                "SOLSLOT_PAYMENT_OMNICHAIN_RPC_URL."
             )
         chain_id_raw, token_address = next(
             iter(settings.payment_evm_usdc_tokens.items())
@@ -152,11 +230,25 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         except OmnichainEvidenceError as exc:
             raise RuntimeError(
                 "SOLSLOT_PAYMENT_OMNICHAIN_ENABLED requires valid reviewed "
-                f"preflight, deployment, and activation evidence: {exc}"
+                "preflight, deployment, Warp portal, Samuel, governance, "
+                f"ownership, and activation evidence: {exc}"
             ) from exc
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
+    if settings.chia_primary_url:
+        if not settings.chia_primary_url.startswith("https://"):
+            raise RuntimeError(
+                "SOLSLOT_CHIA_PRIMARY_URL must use HTTPS in staging/production."
+            )
+        if not all(chia_mtls_paths):
+            raise RuntimeError(
+                "The staging/production Chia primary requires reviewed mTLS files."
+            )
+    if not settings.admin_operation_approvals_enabled:
+        raise RuntimeError(
+            "SOLSLOT_ADMIN_OPERATION_APPROVALS_ENABLED must be true in staging/production."
+        )
     if settings.collection_metadata_enabled:
         required_collection_settings = {
             "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
@@ -381,6 +473,10 @@ class Settings(BaseSettings):
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
+        "payment_omnichain_ingest_token",
+        "payment_omnichain_rpc_url",
+        "payment_omnichain_ownership_safe_operation_path",
+        "payment_omnichain_ownership_safe_operation_hash",
         "payment_oracle_rounds_path",
         "collection_s3_endpoint_url",
         "collection_s3_access_key_id",
@@ -392,6 +488,11 @@ class Settings(BaseSettings):
         "collection_ipfs_gateway_url",
         "collection_malware_scan_url",
         "collection_malware_scan_token",
+        "chia_primary_url",
+        "chia_fallback_url",
+        "chia_primary_ca_cert_path",
+        "chia_primary_client_cert_path",
+        "chia_primary_client_key_path",
         mode="before",
     )
     @classmethod
@@ -418,13 +519,34 @@ class Settings(BaseSettings):
 
     # ── Network ───────────────────────────────────────────────────────────
     network: Literal["testnet11", "mainnet"] = "testnet11"
+    # ``coinset_base_url`` remains as a compatibility input while callers
+    # migrate to the explicit fallback setting.
     coinset_base_url: str = "https://testnet11.api.coinset.org"
+    chia_primary_url: Optional[str] = None
+    chia_fallback_url: Optional[str] = None
+    chia_primary_required: bool = False
+    chia_primary_retry_count: int = Field(1, ge=0, le=3)
+    chia_recovery_probe_seconds: float = Field(30.0, ge=5.0, le=300.0)
+    chia_rpc_timeout_seconds: float = Field(20.0, gt=0, le=60.0)
+    chia_push_per_ip_per_minute: int = Field(6, ge=1, le=60)
+    chia_primary_ca_cert_path: Optional[str] = None
+    chia_primary_client_cert_path: Optional[str] = None
+    chia_primary_client_key_path: Optional[str] = None
+
+    def effective_chia_fallback_url(self) -> str:
+        return self.chia_fallback_url or self.coinset_base_url
 
     # High-risk protocol writes remain locked until the frozen V2 artifact
     # bundle has passed ceremony preflight. Read-only health, protocol, vault,
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
+    presale_enabled: bool = False
+    # Automatic paid-reservation -> Chia voucher reconciliation. This is a
+    # separate opt-in because it spends faucet coins and requests validator
+    # quorum. Presale endpoints may be rehearsed while this remains disabled.
+    voucher_issuance_worker_enabled: bool = False
+    voucher_issuance_interval_seconds: float = Field(15.0, ge=5.0, le=300.0)
     # KoS is an isolated, optional co-signer for the one MINT EXECUTE
     # condition emitted by governance. The coordinator never receives a KoS
     # private key; it calls a separately deployed signer over mutual TLS.
@@ -635,12 +757,22 @@ class Settings(BaseSettings):
     # External CCIP/Warp escrow is separately deployed from the ceremony EVM
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False
+    payment_omnichain_ingest_token: Optional[str] = None
+    payment_omnichain_rpc_url: Optional[str] = None
     payment_omnichain_preflight_evidence_path: Optional[str] = None
     payment_omnichain_evidence_path: Optional[str] = None
     payment_omnichain_activation_evidence_path: Optional[str] = None
     payment_omnichain_governance_evidence_path: Optional[str] = None
     payment_omnichain_samuel_evidence_path: Optional[str] = None
+    payment_omnichain_warp_portal_evidence_path: Optional[str] = None
     payment_omnichain_ownership_intent_evidence_path: Optional[str] = None
+    # A separate, one-shot gate for transferring the Base Sepolia rail to the
+    # reviewed 2-of-3 Safe + timelock. Administrators sign the actual nested
+    # SafeMessage payload; no API-specific approval envelope is introduced.
+    payment_omnichain_ownership_activation_enabled: bool = False
+    payment_omnichain_ownership_safe_operation_path: Optional[str] = None
+    payment_omnichain_ownership_safe_operation_hash: Optional[str] = None
+    payment_omnichain_ownership_min_confirmations: int = Field(12, ge=12)
     payment_omnichain_source_sha: Optional[str] = None
     payment_omnichain_gateway_profile: Optional[str] = Field(
         None, min_length=1, max_length=32
@@ -748,6 +880,11 @@ class Settings(BaseSettings):
     # restart.  In production, set this explicitly.
     admin_jwt_secret: str = ""
 
+    # Consequential post-genesis mutations require a persistent operation
+    # envelope signed by slot 0 and one of slots 1/2. This may be disabled
+    # only in explicit development/test fixtures.
+    admin_operation_approvals_enabled: bool = True
+
     # Lifetime (seconds) of an admin JWT.  Default 15 minutes.  Refresh via
     # /admin/auth/refresh while the session is active.
     admin_jwt_ttl_seconds: int = 900
@@ -788,6 +925,7 @@ class Settings(BaseSettings):
     collection_asset_verification_timeout_seconds: float = Field(
         30.0, gt=0, le=120.0
     )
+    collection_private_download_ttl_seconds: int = Field(300, ge=60, le=900)
 
     # Bytes first enter an IPFS node/API, then the provider-neutral Pinning
     # Service API records the returned CID. Gateway re-fetch verifies that

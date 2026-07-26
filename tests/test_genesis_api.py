@@ -16,6 +16,24 @@ from solslot_api.genesis_store import GenesisStore
 
 
 ADMIN_TOKEN = "test-ceremony-operator-token"
+SOURCE_NAMES = (
+    "protocol",
+    "evm",
+    "omnichain",
+    "api",
+    "legacyBackend",
+    "keyOfSolomon",
+    "samuel",
+    "customerWeb",
+    "adminPortal",
+)
+
+
+def _source_shas() -> dict[str, str]:
+    return {
+        name: f"{index:x}" * 40
+        for index, name in enumerate(SOURCE_NAMES, start=1)
+    }
 
 
 def _signature(account, typed_data: dict) -> str:
@@ -49,9 +67,7 @@ def _headers() -> dict[str, str]:
 
 
 def _create_and_enroll(client: TestClient) -> tuple[str, list]:
-    commits = {name: f"{index:x}" * 40 for index, name in enumerate(
-        ("protocol", "evm", "api", "legacyBackend", "customerWeb", "adminPortal"), start=1
-    )}
+    commits = _source_shas()
     response = client.post(
         "/admin/genesis/drafts",
         json={
@@ -63,6 +79,7 @@ def _create_and_enroll(client: TestClient) -> tuple[str, list]:
     assert response.status_code == 200, response.text
     ceremony_id = response.json()["ceremony_id"]
     assert response.json()["draft"]["reviewClass"] == "internal-engineering-testnet"
+    assert response.json()["draft"]["sourceManifestVersion"] == 3
     accounts = [Account.create(f"admin-{slot}") for slot in (1, 2, 3)]
     for slot, account in enumerate(accounts, start=1):
         issued = client.post(
@@ -203,6 +220,7 @@ def test_preflight_returns_canonical_review_approval_for_offline_gate(
 
     approval = {
         "schemaVersion": 2,
+        "sourceManifestVersion": 3,
         "reviewClass": "internal-engineering-testnet",
         "auditStatus": "unaudited",
         "testOnly": True,
@@ -256,14 +274,7 @@ def test_operator_routes_require_ceremony_token(tmp_path) -> None:
     response = client.post(
         "/admin/genesis/drafts",
         json={
-            "sourceShas": {
-                "protocol": "1" * 40,
-                "evm": "2" * 40,
-                "api": "3" * 40,
-                "legacyBackend": "4" * 40,
-                "customerWeb": "5" * 40,
-                "adminPortal": "6" * 40,
-            }
+            "sourceShas": _source_shas()
         },
     )
     assert response.status_code == 401
@@ -274,16 +285,25 @@ def test_draft_rejects_unknown_review_class(tmp_path) -> None:
     response = client.post(
         "/admin/genesis/drafts",
         json={
-            "sourceShas": {
-                "protocol": "1" * 40,
-                "evm": "2" * 40,
-                "api": "3" * 40,
-                "legacyBackend": "4" * 40,
-                "customerWeb": "5" * 40,
-                "adminPortal": "6" * 40,
-            },
+            "sourceShas": _source_shas(),
             "reviewClass": "self-approved-mainnet",
         },
         headers=_headers(),
     )
     assert response.status_code == 422
+
+
+def test_draft_rejects_retired_six_repository_source_set(tmp_path) -> None:
+    client, _, _ = _client(tmp_path)
+    retired = {
+        key: value
+        for key, value in _source_shas().items()
+        if key not in {"omnichain", "keyOfSolomon", "samuel"}
+    }
+    response = client.post(
+        "/admin/genesis/drafts",
+        json={"sourceShas": retired},
+        headers=_headers(),
+    )
+    assert response.status_code == 422
+    assert "all nine frozen release commits" in response.text

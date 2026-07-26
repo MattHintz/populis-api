@@ -41,6 +41,17 @@ def _hex(value: str, size: int, field: str) -> str:
     return normalized
 
 
+def base_settlement_evidence_hash(evidence: dict[str, Any]) -> str:
+    """Hash the authenticated Base deposit evidence used for terminal settlement."""
+    encoded = json.dumps(
+        evidence,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return "0x" + hashlib.sha256(encoded).hexdigest()
+
+
 class ValidatorClaim(BaseModel):
     """All public evidence a signer must independently revalidate."""
 
@@ -202,6 +213,334 @@ class PrimaryPurchaseClaim(BaseModel):
             + bytes.fromhex(self.deed_coin_id[2:])
             + additional_data
         )
+
+
+class VoucherIssuanceClaim(BaseModel):
+    """Public evidence for one paid, chain-bound RC20 voucher issuance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: str
+    genesis_artifact_hash: str
+    series_terms: dict[str, Any]
+    voucher_commitment: dict[str, Any]
+    purchase_artifact: dict[str, Any]
+    series_coin_id: str
+    series_sold_count: int = Field(..., ge=0)
+    series_redeemed_count: int = Field(..., ge=0)
+    series_refunded_count: int = Field(..., ge=0)
+    series_phase: int = Field(..., ge=1, le=3)
+    series_launched_at: int = Field(..., ge=0)
+    purchase_launcher_coin_id: str
+    payment_evidence: dict[str, Any]
+    buyer_offer: str | None = Field(default=None, min_length=16, max_length=2_000_000)
+    validator_message: str
+
+    @field_validator(
+        "genesis_artifact_hash",
+        "series_coin_id",
+        "purchase_launcher_coin_id",
+        "validator_message",
+    )
+    @classmethod
+    def _issuance_hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+    def canonical_hash(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return "0x" + hashlib.sha256(encoded).hexdigest()
+
+    def global_payment_id(self) -> str:
+        value = self.voucher_commitment.get("globalPaymentId")
+        if not isinstance(value, str):
+            raise ValidatorQuorumError("voucher has no global payment ID")
+        return _hex(value, 32, "globalPaymentId")
+
+    def signature_message(self) -> bytes:
+        additional_data = AGG_SIG_ME_DATA.get(self.network)
+        if additional_data is None:
+            raise ValidatorQuorumError(
+                f"unsupported Chia network: {self.network}"
+            )
+        return (
+            bytes.fromhex(self.validator_message[2:])
+            + bytes.fromhex(self.series_coin_id[2:])
+            + additional_data
+        )
+
+
+class VoucherSeriesPhaseClaim(BaseModel):
+    """Chain evidence for one validator-governed series phase advance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: str
+    genesis_artifact_hash: str
+    series_terms: dict[str, Any]
+    series_coin_id: str
+    series_sold_count: int = Field(..., ge=0)
+    series_redeemed_count: int = Field(..., ge=0)
+    series_refunded_count: int = Field(..., ge=0)
+    series_phase: int = Field(..., ge=1, le=3)
+    series_launched_at: int = Field(..., ge=0)
+    transition: int = Field(..., ge=2, le=3)
+    launch_anchor: int = Field(..., ge=0)
+    deed_launcher_ids: list[str] = Field(default_factory=list, max_length=100_000)
+    governance_execution_ids: list[str] = Field(
+        default_factory=list,
+        max_length=100_000,
+    )
+    validator_message: str
+
+    @field_validator(
+        "genesis_artifact_hash",
+        "series_coin_id",
+        "validator_message",
+    )
+    @classmethod
+    def _phase_hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+    @field_validator("deed_launcher_ids", "governance_execution_ids")
+    @classmethod
+    def _phase_hex32_list(cls, value: list[str], info) -> list[str]:
+        return [_hex(item, 32, info.field_name) for item in value]
+
+    @model_validator(mode="after")
+    def _validate_phase_transition(self) -> "VoucherSeriesPhaseClaim":
+        if self.transition not in {2, 3}:
+            raise ValueError("series phase transition must launch or cancel")
+        if self.transition == 2:
+            if self.launch_anchor <= 0:
+                raise ValueError("series launch requires a positive launch anchor")
+            if not self.deed_launcher_ids:
+                raise ValueError("series launch requires governed deed evidence")
+            if len(self.deed_launcher_ids) != len(self.governance_execution_ids):
+                raise ValueError("series launch governance evidence is incomplete")
+        elif (
+            self.launch_anchor != 0
+            or self.deed_launcher_ids
+            or self.governance_execution_ids
+        ):
+            raise ValueError("series cancellation cannot carry launch evidence")
+        if len(set(self.deed_launcher_ids)) != len(self.deed_launcher_ids):
+            raise ValueError("series launch deed evidence contains duplicates")
+        if len(set(self.governance_execution_ids)) != len(
+            self.governance_execution_ids
+        ):
+            raise ValueError("series launch execution evidence contains duplicates")
+        return self
+
+    def canonical_hash(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return "0x" + hashlib.sha256(encoded).hexdigest()
+
+    def signature_message(self) -> bytes:
+        additional_data = AGG_SIG_ME_DATA.get(self.network)
+        if additional_data is None:
+            raise ValidatorQuorumError(
+                f"unsupported Chia network: {self.network}"
+            )
+        return (
+            bytes.fromhex(self.validator_message[2:])
+            + bytes.fromhex(self.series_coin_id[2:])
+            + additional_data
+        )
+
+
+class VoucherTransitionClaim(BaseModel):
+    """Evidence for one terminal RC20 voucher refund or redemption."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: str
+    genesis_artifact_hash: str
+    series_terms: dict[str, Any]
+    voucher_commitment: dict[str, Any]
+    purchase_artifact: dict[str, Any]
+    series_coin_id: str
+    series_sold_count: int = Field(..., ge=0)
+    series_redeemed_count: int = Field(..., ge=0)
+    series_refunded_count: int = Field(..., ge=0)
+    series_phase: int = Field(..., ge=1, le=3)
+    series_launched_at: int = Field(..., ge=0)
+    voucher_launcher_id: str
+    voucher_coin_id: str
+    payment_coin_id: str
+    vault_launcher_id: str
+    vault_coin_id: str | None = None
+    vault_identity_attest_root: str | None = None
+    vault_owner_auth_type: int | None = None
+    vault_owner_key: str | None = None
+    owner_authorization: str = ""
+    current_timestamp: int = Field(..., ge=1)
+    action: int = Field(..., ge=1, le=4)
+    deed_coin_id: str | None = None
+    deed_puzzle_hash: str | None = None
+    smart_deed_inner_hash: str | None = None
+    protocol_puzzle_hash: str | None = None
+    buyer_offer: str | None = Field(default=None, min_length=16, max_length=2_000_000)
+    payment_evidence: dict[str, Any] | None = None
+    external_settlement_evidence_hash: str | None = None
+    external_validator_message: str | None = None
+    validator_message: str
+
+    @field_validator(
+        "genesis_artifact_hash",
+        "series_coin_id",
+        "voucher_launcher_id",
+        "voucher_coin_id",
+        "payment_coin_id",
+        "vault_launcher_id",
+        "validator_message",
+    )
+    @classmethod
+    def _transition_hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+    @field_validator(
+        "deed_coin_id",
+        "deed_puzzle_hash",
+        "smart_deed_inner_hash",
+        "protocol_puzzle_hash",
+        "vault_coin_id",
+        "vault_identity_attest_root",
+        "external_settlement_evidence_hash",
+        "external_validator_message",
+    )
+    @classmethod
+    def _optional_transition_hex32(cls, value: str | None, info) -> str | None:
+        return None if value is None else _hex(value, 32, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_owner_and_action(self) -> "VoucherTransitionClaim":
+        if self.action not in {1, 2, 3, 4}:
+            raise ValueError("voucher transition action is invalid")
+        owner_fields = (
+            self.vault_coin_id,
+            self.vault_identity_attest_root,
+            self.vault_owner_auth_type,
+            self.vault_owner_key,
+        )
+        if self.action == 2:
+            if any(value is not None for value in owner_fields):
+                raise ValueError(
+                    "expired refund cannot carry current vault ownership evidence"
+                )
+            if self.owner_authorization:
+                raise ValueError("expired refund cannot request an owner signature")
+        else:
+            if any(value is None for value in owner_fields):
+                raise ValueError("voucher transition requires current vault evidence")
+            expected_size = {1: 48, 3: 33}.get(self.vault_owner_auth_type)
+            if expected_size is None:
+                raise ValueError("voucher vault owner must use BLS or secp256k1")
+            normalized = _hex(
+                self.vault_owner_key,  # type: ignore[arg-type]
+                expected_size,
+                "vault_owner_key",
+            )
+            object.__setattr__(self, "vault_owner_key", normalized)
+            if self.vault_owner_auth_type == 1:
+                G1Element.from_bytes(bytes.fromhex(normalized[2:]))
+        redemption_fields = (
+            self.deed_coin_id,
+            self.deed_puzzle_hash,
+            self.smart_deed_inner_hash,
+            self.protocol_puzzle_hash,
+            self.buyer_offer,
+        )
+        if self.action == 3:
+            if any(value is None for value in redemption_fields):
+                raise ValueError("voucher redemption requires exact deed evidence")
+            if self.owner_authorization:
+                raise ValueError("voucher redemption cannot request a second owner signature")
+        elif self.action in {1, 4}:
+            if any(value is not None for value in redemption_fields):
+                raise ValueError("voucher refund cannot carry deed evidence")
+            assert self.vault_owner_auth_type is not None
+            auth_size = 96 if self.vault_owner_auth_type == 1 else 65
+            object.__setattr__(
+                self,
+                "owner_authorization",
+                _hex(self.owner_authorization, auth_size, "owner_authorization"),
+            )
+        else:
+            if any(value is not None for value in redemption_fields):
+                raise ValueError("voucher refund cannot carry deed evidence")
+        is_base = self.voucher_commitment.get("paymentRail") == 1
+        external_fields = (
+            self.payment_evidence,
+            self.external_settlement_evidence_hash,
+            self.external_validator_message,
+        )
+        if is_base:
+            if any(value is None for value in external_fields):
+                raise ValueError(
+                    "Base voucher transition requires authenticated settlement evidence"
+                )
+        elif any(value is not None for value in external_fields):
+            raise ValueError(
+                "native voucher transition cannot carry external settlement evidence"
+            )
+        return self
+
+    def canonical_hash(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return "0x" + hashlib.sha256(encoded).hexdigest()
+
+    def global_payment_id(self) -> str:
+        value = self.voucher_commitment.get("globalPaymentId")
+        if not isinstance(value, str):
+            raise ValidatorQuorumError("voucher has no global payment ID")
+        return _hex(value, 32, "globalPaymentId")
+
+    def signature_messages(self) -> tuple[bytes, ...]:
+        additional_data = AGG_SIG_ME_DATA.get(self.network)
+        if additional_data is None:
+            raise ValidatorQuorumError(
+                f"unsupported Chia network: {self.network}"
+            )
+        inner = bytes.fromhex(self.validator_message[2:])
+        messages = tuple(
+            inner + bytes.fromhex(coin_id[2:]) + additional_data
+            for coin_id in (self.series_coin_id, self.voucher_coin_id)
+        )
+        payment_message = (
+            bytes.fromhex(self.external_validator_message[2:])
+            if self.external_validator_message is not None
+            else inner
+        )
+        messages += (
+            payment_message
+            + bytes.fromhex(self.payment_coin_id[2:])
+            + additional_data,
+        )
+        if self.action == 3:
+            artifact_hash = self.purchase_artifact.get("artifactHash")
+            if not isinstance(artifact_hash, str) or self.deed_coin_id is None:
+                raise ValidatorQuorumError("voucher redemption has no deed binding")
+            messages += (
+                bytes.fromhex(_hex(artifact_hash, 32, "artifactHash")[2:])
+                + bytes.fromhex(self.deed_coin_id[2:])
+                + additional_data,
+            )
+        return messages
 
 
 class ValidatorSignatureResponse(BaseModel):
@@ -553,14 +892,258 @@ async def collect_primary_purchase_quorum(
     )
 
 
+async def collect_voucher_issuance_quorum(
+    settings: Settings,
+    claim: VoucherIssuanceClaim,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ValidatorQuorumResult:
+    """Collect two independent signatures for an exact voucher issuance."""
+    pubkeys = configured_validator_pubkeys(settings)
+    claim_hash = claim.canonical_hash()
+    message = claim.signature_message()
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_signature(
+        index: int, url: str
+    ) -> tuple[int, G2Element] | None:
+        try:
+            response = await client.post(
+                url.rstrip("/") + "/v1/voucher-issuance/sign",
+                json={
+                    "claim": claim.model_dump(mode="json"),
+                    "claimHash": claim_hash,
+                },
+            )
+            response.raise_for_status()
+            parsed = ValidatorSignatureResponse.model_validate(response.json())
+            if parsed.claimHash.lower() != claim_hash or parsed.signerIndex != index:
+                raise ValueError("voucher signer response does not match claim")
+            configured_pubkey = pubkeys[index]
+            if bytes.fromhex(parsed.validatorPubkey.removeprefix("0x")) != configured_pubkey:
+                raise ValueError("validator public key mismatch")
+            signature = G2Element.from_bytes(
+                bytes.fromhex(parsed.signature.removeprefix("0x"))
+            )
+            if not AugSchemeMPL.verify(
+                G1Element.from_bytes(configured_pubkey), message, signature
+            ):
+                raise ValueError("invalid validator signature")
+            return index, signature
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "voucher issuance signer %s rejected or unavailable: %s",
+                index,
+                exc,
+            )
+            return None
+
+    try:
+        responses = await asyncio.gather(
+            *(
+                request_signature(index, url)
+                for index, url in enumerate(settings.zkpassport_validator_urls)
+            )
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    valid = sorted(
+        (item for item in responses if item is not None),
+        key=lambda item: item[0],
+    )
+    threshold = settings.zkpassport_validator_threshold
+    if len(valid) < threshold:
+        raise ValidatorQuorumError(
+            "voucher issuance validator quorum unavailable: "
+            f"received {len(valid)} of {threshold} required signatures"
+        )
+    selected = valid[:threshold]
+    return ValidatorQuorumResult(
+        signer_indices=tuple(index for index, _ in selected),
+        aggregated_signature=AugSchemeMPL.aggregate(
+            [signature for _, signature in selected]
+        ),
+        claim_hash=claim_hash,
+    )
+
+
+async def collect_voucher_transition_quorum(
+    settings: Settings,
+    claim: VoucherTransitionClaim,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ValidatorQuorumResult:
+    """Collect quorum signatures for all three terminal protocol spends."""
+    pubkeys = configured_validator_pubkeys(settings)
+    claim_hash = claim.canonical_hash()
+    messages = claim.signature_messages()
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_signature(
+        index: int, url: str
+    ) -> tuple[int, G2Element] | None:
+        try:
+            response = await client.post(
+                url.rstrip("/") + "/v1/voucher-transition/sign",
+                json={
+                    "claim": claim.model_dump(mode="json"),
+                    "claimHash": claim_hash,
+                },
+            )
+            response.raise_for_status()
+            parsed = ValidatorSignatureResponse.model_validate(response.json())
+            if parsed.claimHash.lower() != claim_hash or parsed.signerIndex != index:
+                raise ValueError("voucher transition signer response does not match claim")
+            configured_pubkey = pubkeys[index]
+            if bytes.fromhex(parsed.validatorPubkey.removeprefix("0x")) != configured_pubkey:
+                raise ValueError("validator public key mismatch")
+            signature = G2Element.from_bytes(
+                bytes.fromhex(parsed.signature.removeprefix("0x"))
+            )
+            public_key = G1Element.from_bytes(configured_pubkey)
+            if not AugSchemeMPL.aggregate_verify(
+                [public_key] * len(messages),
+                list(messages),
+                signature,
+            ):
+                raise ValueError("invalid voucher transition validator signature")
+            return index, signature
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "voucher transition signer %s rejected or unavailable: %s",
+                index,
+                exc,
+            )
+            return None
+
+    try:
+        responses = await asyncio.gather(
+            *(
+                request_signature(index, url)
+                for index, url in enumerate(settings.zkpassport_validator_urls)
+            )
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    valid = sorted(
+        (item for item in responses if item is not None),
+        key=lambda item: item[0],
+    )
+    threshold = settings.zkpassport_validator_threshold
+    if len(valid) < threshold:
+        raise ValidatorQuorumError(
+            "voucher transition validator quorum unavailable: "
+            f"received {len(valid)} of {threshold} required signatures"
+        )
+    selected = valid[:threshold]
+    return ValidatorQuorumResult(
+        signer_indices=tuple(index for index, _ in selected),
+        aggregated_signature=AugSchemeMPL.aggregate(
+            [signature for _, signature in selected]
+        ),
+        claim_hash=claim_hash,
+    )
+
+
+async def collect_voucher_series_phase_quorum(
+    settings: Settings,
+    claim: VoucherSeriesPhaseClaim,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ValidatorQuorumResult:
+    """Collect two independent signatures for an exact series phase spend."""
+    pubkeys = configured_validator_pubkeys(settings)
+    claim_hash = claim.canonical_hash()
+    message = claim.signature_message()
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_signature(
+        index: int, url: str
+    ) -> tuple[int, G2Element] | None:
+        try:
+            response = await client.post(
+                url.rstrip("/") + "/v1/voucher-series-phase/sign",
+                json={
+                    "claim": claim.model_dump(mode="json"),
+                    "claimHash": claim_hash,
+                },
+            )
+            response.raise_for_status()
+            parsed = ValidatorSignatureResponse.model_validate(response.json())
+            if parsed.claimHash.lower() != claim_hash or parsed.signerIndex != index:
+                raise ValueError("series phase signer response does not match claim")
+            configured_pubkey = pubkeys[index]
+            if bytes.fromhex(parsed.validatorPubkey.removeprefix("0x")) != configured_pubkey:
+                raise ValueError("validator public key mismatch")
+            signature = G2Element.from_bytes(
+                bytes.fromhex(parsed.signature.removeprefix("0x"))
+            )
+            if not AugSchemeMPL.verify(
+                G1Element.from_bytes(configured_pubkey), message, signature
+            ):
+                raise ValueError("invalid series phase validator signature")
+            return index, signature
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "series phase signer %s rejected or unavailable: %s",
+                index,
+                exc,
+            )
+            return None
+
+    try:
+        responses = await asyncio.gather(
+            *(
+                request_signature(index, url)
+                for index, url in enumerate(settings.zkpassport_validator_urls)
+            )
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    valid = sorted(
+        (item for item in responses if item is not None),
+        key=lambda item: item[0],
+    )
+    threshold = settings.zkpassport_validator_threshold
+    if len(valid) < threshold:
+        raise ValidatorQuorumError(
+            "series phase validator quorum unavailable: "
+            f"received {len(valid)} of {threshold} required signatures"
+        )
+    selected = valid[:threshold]
+    return ValidatorQuorumResult(
+        signer_indices=tuple(index for index, _ in selected),
+        aggregated_signature=AugSchemeMPL.aggregate(
+            [signature for _, signature in selected]
+        ),
+        claim_hash=claim_hash,
+    )
+
+
 __all__ = [
     "ValidatorClaim",
     "PrimaryPurchaseClaim",
+    "VoucherIssuanceClaim",
+    "VoucherSeriesPhaseClaim",
+    "VoucherTransitionClaim",
     "ValidatorHealthResponse",
     "ValidatorQuorumError",
     "ValidatorQuorumResult",
+    "base_settlement_evidence_hash",
     "collect_validator_quorum",
     "collect_primary_purchase_quorum",
+    "collect_voucher_issuance_quorum",
+    "collect_voucher_series_phase_quorum",
+    "collect_voucher_transition_quorum",
     "configured_bridge_policy_hash",
     "configured_validator_pubkeys",
     "probe_validator_health",

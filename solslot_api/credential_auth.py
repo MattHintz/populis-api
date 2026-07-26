@@ -315,6 +315,15 @@ def require_minting_writes(settings: Settings) -> None:
         )
 
 
+def require_presale_writes(settings: Settings) -> None:
+    require_minting_writes(settings)
+    if not settings.presale_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Refundable voucher presales are disabled.",
+        )
+
+
 def require_vault_record(vault_launcher_id: str) -> VaultRecord:
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
     record = get_registry().get(bytes32.fromhex(vault.removeprefix("0x")))
@@ -457,6 +466,7 @@ __all__ = [
     "issue_vault_session",
     "require_alpha_writes",
     "require_minting_writes",
+    "require_presale_writes",
     "verify_owner_auth",
     "verify_vault_session",
     "vault_session_payload",

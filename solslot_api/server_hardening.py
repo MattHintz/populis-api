@@ -39,6 +39,7 @@ class ServerHardeningMiddleware:
         self.app = app
         self.settings = settings
         self._challenge_limiter: RequestRateLimiter | None = None
+        self._chia_push_limiter: RequestRateLimiter | None = None
 
     async def __call__(
         self,
@@ -78,6 +79,25 @@ class ServerHardeningMiddleware:
                     hardened_send,
                     status_code=429,
                     detail="Too many challenge requests. Try again later.",
+                )
+                return
+
+        if self._is_chia_push_request(scope):
+            source_ip = self._source_ip(scope)
+            try:
+                allowed = self._get_chia_push_limiter().allow(source_ip)
+            except Exception:
+                await self._json_error(
+                    hardened_send,
+                    status_code=503,
+                    detail="Chia transaction rate limiter is unavailable.",
+                )
+                return
+            if not allowed:
+                await self._json_error(
+                    hardened_send,
+                    status_code=429,
+                    detail="Too many Chia transaction submissions. Try again later.",
                 )
                 return
 
@@ -182,11 +202,31 @@ class ServerHardeningMiddleware:
             )
         return self._challenge_limiter
 
+    def _get_chia_push_limiter(self) -> RequestRateLimiter:
+        if self._chia_push_limiter is None:
+            self._chia_push_limiter = RequestRateLimiter(
+                self.settings.chia_push_per_ip_per_minute,
+                db_path=(
+                    None
+                    if self.settings.runtime_environment == "test"
+                    else self.settings.challenge_store_path
+                ),
+                namespace="http_chia_push_tx",
+            )
+        return self._chia_push_limiter
+
     @staticmethod
     def _is_public_challenge_request(scope: dict[str, Any]) -> bool:
         return (
             str(scope.get("method", "")).upper() == "POST"
             and scope.get("path") == "/auth/challenge"
+        )
+
+    @staticmethod
+    def _is_chia_push_request(scope: dict[str, Any]) -> bool:
+        return (
+            str(scope.get("method", "")).upper() == "POST"
+            and scope.get("path") == "/chia/push_tx"
         )
 
     def _source_ip(self, scope: dict[str, Any]) -> str:

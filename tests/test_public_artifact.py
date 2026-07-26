@@ -25,7 +25,18 @@ from tests.test_genesis_api import _plan_body
 SOURCE_SHAS = {
     name: f"{index:x}" * 40
     for index, name in enumerate(
-        ("protocol", "evm", "api", "legacyBackend", "customerWeb", "adminPortal"), start=1
+        (
+            "protocol",
+            "evm",
+            "omnichain",
+            "api",
+            "legacyBackend",
+            "keyOfSolomon",
+            "samuel",
+            "customerWeb",
+            "adminPortal",
+        ),
+        start=1,
     )
 }
 
@@ -34,7 +45,7 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
     accounts = [Account.create(f"public-artifact-admin-{slot}") for slot in range(3)]
     ceremony = {
         "ceremony_id": "0x" + "91" * 32,
-        "draft": {"sourceShas": SOURCE_SHAS},
+        "draft": {"sourceManifestVersion": 3, "sourceShas": SOURCE_SHAS},
         "invitations": [
             {
                 "slot": slot + 1,

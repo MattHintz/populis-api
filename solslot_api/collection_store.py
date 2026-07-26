@@ -29,7 +29,7 @@ from .property_metadata import (
 from .config import Settings, get_settings
 
 
-COLLECTION_SCHEMA_VERSION = 1
+COLLECTION_SCHEMA_VERSION = 3
 COLLECTION_STATES = ("DRAFT", "REVIEW", "SEALED", "PUBLISHED")
 ASSET_STATES = ("PENDING_UPLOAD", "UPLOADED", "VERIFIED", "PINNED", "FAILED")
 
@@ -152,6 +152,7 @@ class CollectionStore:
                     title TEXT,
                     alt_text TEXT,
                     category TEXT,
+                    visibility TEXT NOT NULL DEFAULT 'PUBLIC',
                     expected_sha256 TEXT NOT NULL,
                     expected_mime_type TEXT NOT NULL,
                     expected_byte_size INTEGER NOT NULL,
@@ -170,6 +171,7 @@ class CollectionStore:
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (collection_id, asset_id),
                     CHECK (kind IN ('MEDIA','DOCUMENT')),
+                    CHECK (visibility IN ('PUBLIC','PRIVATE')),
                     CHECK (state IN ('PENDING_UPLOAD','UPLOADED','VERIFIED','PINNED','FAILED')),
                     CHECK (expected_byte_size > 0),
                     CHECK (revision > 0)
@@ -181,10 +183,21 @@ class CollectionStore:
                     actor_subject TEXT NOT NULL,
                     section TEXT NOT NULL,
                     body TEXT NOT NULL,
+                    blocking INTEGER NOT NULL DEFAULT 1,
                     resolved INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     resolved_at INTEGER,
                     resolved_by TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS property_collection_reviews (
+                    id TEXT PRIMARY KEY,
+                    collection_id TEXT NOT NULL REFERENCES property_collections(id) ON DELETE CASCADE,
+                    reviewer_subject TEXT NOT NULL,
+                    decision TEXT NOT NULL CHECK (decision IN ('APPROVED','CHANGES_REQUESTED')),
+                    note TEXT,
+                    collection_revision INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS property_metadata_versions (
@@ -240,6 +253,20 @@ class CollectionStore:
                     ON property_collection_audit_events(collection_id, occurred_at);
                 """
             )
+            comment_columns = {
+                row[1] for row in cur.execute("PRAGMA table_info(property_collection_comments)")
+            }
+            if "blocking" not in comment_columns:
+                cur.execute(
+                    "ALTER TABLE property_collection_comments ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1"
+                )
+            asset_columns = {
+                row[1] for row in cur.execute("PRAGMA table_info(property_collection_assets)")
+            }
+            if "visibility" not in asset_columns:
+                cur.execute(
+                    "ALTER TABLE property_collection_assets ADD COLUMN visibility TEXT NOT NULL DEFAULT 'PUBLIC'"
+                )
             cur.execute(
                 """
                 INSERT INTO collection_schema_versions(component, version)
@@ -410,10 +437,16 @@ class CollectionStore:
         title: Optional[str] = None,
         alt_text: Optional[str] = None,
         category: Optional[str] = None,
+        visibility: str = "PUBLIC",
     ) -> dict[str, Any]:
         kind = kind.upper()
         if kind not in ("MEDIA", "DOCUMENT"):
             raise ValueError("asset kind must be MEDIA or DOCUMENT")
+        visibility = visibility.upper()
+        if visibility not in ("PUBLIC", "PRIVATE"):
+            raise ValueError("asset visibility must be PUBLIC or PRIVATE")
+        if visibility == "PRIVATE" and kind != "DOCUMENT":
+            raise ValueError("only documents may be private originals")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
             raise ValueError("expected_sha256 must be 64 hexadecimal characters")
         if expected_byte_size <= 0:
@@ -435,13 +468,14 @@ class CollectionStore:
             cur.execute(
                 """
                 INSERT INTO property_collection_assets(
-                    collection_id, asset_id, kind, role, title, alt_text, category,
+                    collection_id, asset_id, kind, role, title, alt_text, category, visibility,
                     expected_sha256, expected_mime_type, expected_byte_size,
                     state, revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_UPLOAD', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_UPLOAD', ?, ?, ?)
                 ON CONFLICT(collection_id, asset_id) DO UPDATE SET
                     kind=excluded.kind, role=excluded.role, title=excluded.title,
                     alt_text=excluded.alt_text, category=excluded.category,
+                    visibility=excluded.visibility,
                     expected_sha256=excluded.expected_sha256,
                     expected_mime_type=excluded.expected_mime_type,
                     expected_byte_size=excluded.expected_byte_size,
@@ -452,14 +486,14 @@ class CollectionStore:
                     revision=excluded.revision, updated_at=excluded.updated_at
                 """,
                 (
-                    collection_id, asset_id, kind, role, title, alt_text, category,
+                    collection_id, asset_id, kind, role, title, alt_text, category, visibility,
                     expected_sha256.lower(), expected_mime_type.lower(), expected_byte_size,
                     revision, now, now,
                 ),
             )
             self._audit(
                 cur, collection_id, actor_subject, "ASSET_DECLARED",
-                {"assetId": asset_id, "revision": revision},
+                {"assetId": asset_id, "revision": revision, "visibility": visibility},
             )
         return self.get_asset(collection_id, asset_id)
 
@@ -505,8 +539,8 @@ class CollectionStore:
         actual_mime_type: str,
         actual_byte_size: int,
         malware_status: str,
-        verified_https_url: str,
-        ipfs_cid: str,
+        verified_https_url: Optional[str],
+        ipfs_cid: Optional[str],
         availability_status: str,
         actor_subject: str,
     ) -> dict[str, Any]:
@@ -527,11 +561,16 @@ class CollectionStore:
                 actor_subject=actor_subject,
             )
             raise CollectionConflict("asset verification mismatch: " + ", ".join(mismatches))
-        state = (
-            "PINNED"
-            if malware_status == "CLEAN" and availability_status == "HEALTHY" and ipfs_cid
-            else "VERIFIED"
-        )
+        if asset["visibility"] == "PRIVATE":
+            if verified_https_url is not None or ipfs_cid is not None:
+                raise CollectionConflict("private originals cannot have public URLs or IPFS CIDs")
+            state = "VERIFIED" if malware_status == "CLEAN" else "UPLOADED"
+        else:
+            state = (
+                "PINNED"
+                if malware_status == "CLEAN" and availability_status == "HEALTHY" and ipfs_cid
+                else "VERIFIED"
+            )
         return self._update_asset(
             collection_id,
             asset_id,
@@ -570,6 +609,30 @@ class CollectionStore:
         with self._lock:
             return self._render_asset(self._asset_row(collection_id, asset_id))
 
+    def authorize_private_asset_download(
+        self,
+        collection_id: str,
+        asset_id: str,
+        *,
+        actor_subject: str,
+    ) -> dict[str, Any]:
+        with self._lock, self._txn() as cur:
+            self._collection_row(collection_id, cur=cur)
+            row = self._asset_row(collection_id, asset_id, cur=cur)
+            if row["visibility"] != "PRIVATE":
+                raise CollectionForbidden("asset is not a private original")
+            if row["state"] != "VERIFIED" or row["malware_status"] != "CLEAN":
+                raise CollectionInvalidState("private original is not verified")
+            self._audit(
+                cur,
+                collection_id,
+                actor_subject,
+                "PRIVATE_DOCUMENT_ACCESSED",
+                {"assetId": asset_id},
+            )
+            result = self._render_asset(row)
+        return result
+
     def add_comment(
         self,
         collection_id: str,
@@ -577,6 +640,7 @@ class CollectionStore:
         actor_subject: str,
         section: str,
         body: str,
+        blocking: bool = True,
     ) -> dict[str, Any]:
         if not body.strip():
             raise ValueError("comment body is required")
@@ -587,13 +651,57 @@ class CollectionStore:
             cur.execute(
                 """
                 INSERT INTO property_collection_comments(
-                    id, collection_id, actor_subject, section, body, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, collection_id, actor_subject, section, body, blocking, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (comment_id, collection_id, actor_subject.lower(), section, body.strip(), now),
+                (comment_id, collection_id, actor_subject.lower(), section, body.strip(), int(blocking), now),
             )
-            self._audit(cur, collection_id, actor_subject, "COMMENT_ADDED", {"commentId": comment_id})
+            self._audit(
+                cur,
+                collection_id,
+                actor_subject,
+                "COMMENT_ADDED",
+                {"commentId": comment_id, "blocking": blocking},
+            )
         return self._comment(comment_id)
+
+    def submit_review(
+        self,
+        collection_id: str,
+        *,
+        reviewer_subject: str,
+        decision: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision = decision.strip().upper()
+        if decision not in ("APPROVED", "CHANGES_REQUESTED"):
+            raise ValueError("review decision must be APPROVED or CHANGES_REQUESTED")
+        with self._lock, self._txn() as cur:
+            row = self._collection_row(collection_id, cur=cur)
+            if row["state"] != "REVIEW":
+                raise CollectionInvalidState("collection must be submitted for review")
+            reviewer = reviewer_subject.lower()
+            if reviewer == row["owner_subject"]:
+                raise CollectionForbidden("collection owner cannot approve their own collection")
+            review_id = "review_" + uuid.uuid4().hex
+            now = int(time.time())
+            cur.execute(
+                """
+                INSERT INTO property_collection_reviews(
+                    id, collection_id, reviewer_subject, decision, note,
+                    collection_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (review_id, collection_id, reviewer, decision, note, row["revision"], now),
+            )
+            self._audit(
+                cur,
+                collection_id,
+                reviewer_subject,
+                "REVIEW_" + decision,
+                {"reviewId": review_id, "revision": row["revision"]},
+            )
+        return self.get(collection_id)
 
     def resolve_comment(
         self,
@@ -629,6 +737,14 @@ class CollectionStore:
                 ).fetchall()
             }
         issues: list[dict[str, str]] = []
+        if draft.classification is None:
+            issues.append(
+                {
+                    "code": "CLASSIFICATION_REQUIRED",
+                    "path": "/classification",
+                    "message": "asset class, subtype, and project stage are required",
+                }
+            )
         dossier: Optional[PropertyDossierV1] = None
         try:
             dossier = draft.to_sealed_dossier()
@@ -669,6 +785,49 @@ class CollectionStore:
                     issues.append({"code": "MALWARE_SCAN_REQUIRED", "path": path, "message": "asset has not passed malware scanning"})
                 if asset["availability_status"] != "HEALTHY":
                     issues.append({"code": "ASSET_UNAVAILABLE", "path": path, "message": "HTTPS and IPFS availability checks must pass"})
+
+            for descriptor in draft.private_documents:
+                asset = assets.get(descriptor.asset_id)
+                path = f"/privateDocuments/{descriptor.asset_id}"
+                if asset is None:
+                    issues.append({"code": "PRIVATE_ASSET_MISSING", "path": path, "message": "private original has not been uploaded"})
+                elif asset["visibility"] != "PRIVATE":
+                    issues.append({"code": "PRIVATE_ASSET_PUBLIC", "path": path, "message": "private original is incorrectly stored as a public asset"})
+                elif asset["state"] != "VERIFIED" or asset["malware_status"] != "CLEAN":
+                    issues.append({"code": "PRIVATE_ASSET_UNVERIFIED", "path": path, "message": "private original must be hash-verified and malware-scanned"})
+
+        unresolved = self._conn.execute(
+            """
+            SELECT COUNT(*) FROM property_collection_comments
+            WHERE collection_id=? AND blocking=1 AND resolved=0
+            """,
+            (row["id"],),
+        ).fetchone()[0]
+        if unresolved:
+            issues.append(
+                {
+                    "code": "BLOCKING_COMMENTS",
+                    "path": "/review",
+                    "message": f"{unresolved} blocking review comment(s) remain unresolved",
+                }
+            )
+        approval = self._conn.execute(
+            """
+            SELECT 1 FROM property_collection_reviews
+            WHERE collection_id=? AND decision='APPROVED'
+              AND reviewer_subject<>? AND collection_revision=?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (row["id"], row["owner_subject"], row["revision"]),
+        ).fetchone()
+        if approval is None:
+            issues.append(
+                {
+                    "code": "INDEPENDENT_REVIEW_REQUIRED",
+                    "path": "/review",
+                    "message": "a different enrolled administrator must approve the current revision",
+                }
+            )
 
         return {
             "ready": not issues,
@@ -1029,6 +1188,17 @@ class CollectionStore:
         result = self.get(identifier)
         if result["state"] != "PUBLISHED":
             raise CollectionNotFound(identifier)
+        with self._lock:
+            row = self._collection_row(identifier)
+            canonical_json = row["canonical_json"]
+        if canonical_json is None:
+            raise CollectionInvalidState(
+                "published collection has no canonical public metadata"
+            )
+        # The admin draft intentionally retains private document descriptors.
+        # Public responses must come from the sealed canonical bytes, which
+        # exclude those descriptors and are the bytes committed on chain.
+        result["dossier"] = json.loads(bytes(canonical_json))
         versions = result["metadataVersions"]
         issuance = next((version for version in versions if version["kind"] == "ISSUANCE"), None)
         confirmed = any(
@@ -1064,6 +1234,10 @@ class CollectionStore:
         }
         result.pop("auditEvents", None)
         result.pop("comments", None)
+        result.pop("reviews", None)
+        result["assets"] = [
+            asset for asset in result["assets"] if asset["visibility"] == "PUBLIC"
+        ]
         return result
 
     def public_deed(self, deed_id: str) -> dict[str, Any]:
@@ -1223,6 +1397,20 @@ class CollectionStore:
                 (collection_id,),
             ).fetchall()
         ]
+        result["reviews"] = [
+            {
+                "id": item["id"],
+                "reviewerSubject": item["reviewer_subject"],
+                "decision": item["decision"],
+                "note": item["note"],
+                "collectionRevision": item["collection_revision"],
+                "createdAt": item["created_at"],
+            }
+            for item in self._conn.execute(
+                "SELECT * FROM property_collection_reviews WHERE collection_id=? ORDER BY created_at, id",
+                (collection_id,),
+            ).fetchall()
+        ]
         result["metadataVersions"] = [
             self._render_version(item)
             for item in self._conn.execute(
@@ -1245,6 +1433,7 @@ class CollectionStore:
         return {
             "assetId": row["asset_id"], "kind": row["kind"], "role": row["role"],
             "title": row["title"], "alt": row["alt_text"], "category": row["category"],
+            "visibility": row["visibility"],
             "expectedSha256": row["expected_sha256"],
             "expectedMimeType": row["expected_mime_type"],
             "expectedByteSize": row["expected_byte_size"], "objectKey": row["object_key"],
@@ -1273,6 +1462,7 @@ class CollectionStore:
         return {
             "id": row["id"], "actorSubject": row["actor_subject"],
             "section": row["section"], "body": row["body"],
+            "blocking": bool(row["blocking"]),
             "resolved": bool(row["resolved"]), "createdAt": row["created_at"],
             "resolvedAt": row["resolved_at"], "resolvedBy": row["resolved_by"],
         }
@@ -1375,6 +1565,7 @@ def _assert_protected_fields_unchanged(old: Any, new: Any) -> None:
     new_payload = new.model_dump(mode="json", by_alias=True, exclude_none=True)
     paths = (
         ("deedAllocation",),
+        ("classification",),
         ("offering", "parValueMojos"),
         ("offering", "assetClass"),
         ("offering", "jurisdiction"),
