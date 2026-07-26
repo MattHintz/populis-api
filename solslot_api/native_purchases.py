@@ -49,6 +49,7 @@ from .config import Settings, get_settings
 from .credential_auth import require_minting_writes
 from .faucet import AGG_SIG_ME_DATA
 from .mint_endpoints import get_mint_proposal_store
+from .launch_gates import require_operation_gate
 from .payment_purchase_store import (
     PaymentPurchaseNotFound,
     StoredPaymentPurchase,
@@ -147,6 +148,7 @@ async def prepare_native_purchase(
     authorization: Annotated[str | None, Header()] = None,
 ) -> PrepareNativePurchaseResponse:
     require_minting_writes(settings)
+    require_operation_gate(settings, "purchases")
     _require_server_to_server_token(settings, authorization)
     context = await _load_context(
         settings,
@@ -207,6 +209,7 @@ async def complete_native_purchase(
     authorization: Annotated[str | None, Header()] = None,
 ) -> CompleteNativePurchaseResponse:
     require_minting_writes(settings)
+    require_operation_gate(settings, "purchases")
     _require_server_to_server_token(settings, authorization)
     context = await _load_context(
         settings,

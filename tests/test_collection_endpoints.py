@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from chia_rs.sized_bytes import bytes32
 
 from solslot_api.admin_auth import AdminClaims, require_admin_jwt
 from solslot_api.collection_endpoints import router
@@ -79,6 +81,103 @@ def test_feature_gate_and_revisioned_draft_round_trip(tmp_path) -> None:
         )
         assert conflict.status_code == 409
         assert "current 2" in conflict.json()["detail"]
+    finally:
+        client.close()
+        store.close()
+
+
+def test_collection_identifier_is_generated_server_side(tmp_path) -> None:
+    client, store, _app = _client(tmp_path)
+    try:
+        created = client.post(
+            "/admin/collections",
+            json={"title": "127 Eastmoreland Street"},
+        )
+        assert created.status_code == 201
+        payload = created.json()
+        assert payload["id"].startswith("COL-")
+        assert len(payload["id"]) == 20
+        assert payload["dossier"]["title"] == "127 Eastmoreland Street"
+    finally:
+        client.close()
+        store.close()
+
+
+def test_display_unit_conversion_derives_protocol_values_from_signed_sources(
+    tmp_path, monkeypatch
+) -> None:
+    client, store, _app = _client(tmp_path)
+    oracle_round = SimpleNamespace(
+        network="testnet11",
+        price_usd_minor_per_asset=200_000,
+        asset_decimals=12,
+        valid_until=int(time.time()) + 600,
+        round_hash=bytes32(bytes.fromhex("42" * 32)),
+    )
+    monkeypatch.setattr(
+        "solslot_api.collection_endpoints._signed_governance_threshold",
+        lambda _settings: 500_000,
+    )
+    monkeypatch.setattr(
+        "solslot_api.collection_endpoints.load_authorized_oracle_round",
+        lambda _settings, **_kwargs: SimpleNamespace(round=oracle_round),
+    )
+    try:
+        response = client.post(
+            "/admin/collections/display-units/convert",
+            json={
+                "money": {
+                    "marketValue": "825000.00",
+                    "targetRaise": "500000.00",
+                },
+                "percentages": {
+                    "technologyFee": "2.50",
+                    "projectedReturn": "6.25",
+                },
+                "ownershipShares": {"deed.0": "60", "deed.1": "40"},
+                "deriveXchPar": True,
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["moneyMinor"]["targetRaise"] == "50000000"
+        assert body["percentageBps"] == {
+            "technologyFee": "250",
+            "projectedReturn": "625",
+        }
+        assert body["ownershipPpm"] == {"deed.0": 600_000, "deed.1": 400_000}
+        assert body["governanceQuorum"] == "500000"
+        assert body["xchParMojos"] == {
+            "collection": "250000000000000",
+            "deeds": {
+                "deed.0": "150000000000000",
+                "deed.1": "100000000000000",
+            },
+        }
+        assert body["xchOracle"]["roundHash"] == "0x" + "42" * 32
+    finally:
+        client.close()
+        store.close()
+
+
+def test_display_unit_conversion_fails_closed_on_bad_fee(tmp_path, monkeypatch) -> None:
+    client, store, _app = _client(tmp_path)
+    monkeypatch.setattr(
+        "solslot_api.collection_endpoints._signed_governance_threshold",
+        lambda _settings: 500_000,
+    )
+    try:
+        response = client.post(
+            "/admin/collections/display-units/convert",
+            json={
+                "money": {},
+                "percentages": {"technologyFee": "10.01"},
+                "ownershipShares": {},
+                "deriveXchPar": False,
+            },
+        )
+        assert response.status_code == 422
+        assert "too large" in response.json()["detail"]
     finally:
         client.close()
         store.close()

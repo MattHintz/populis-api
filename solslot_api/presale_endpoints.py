@@ -86,6 +86,7 @@ from .credential_auth import require_presale_writes, verify_vault_session
 from .evm_auth import recover_evm_signer
 from .faucet import AGG_SIG_ME_DATA
 from .omnichain_evidence import OmnichainEvidenceError, load_omnichain_evidence
+from .launch_gates import require_operation_gate
 from .native_purchases import (
     _coin_from_record,
     _coin_spend_json,
@@ -3257,6 +3258,7 @@ async def _submit_series_phase_transition(
 
 def _require_ingest(settings: Settings, authorization: Optional[str]) -> None:
     require_presale_writes(settings)
+    require_operation_gate(settings, "presale")
     token = settings.payment_omnichain_ingest_token
     if not token or authorization != f"Bearer {token}":
         raise HTTPException(
@@ -4018,6 +4020,7 @@ async def prepare_native_voucher(
     authorization: Annotated[Optional[str], Header()] = None,
 ) -> PrepareNativeVoucherResponse:
     require_presale_writes(settings)
+    require_operation_gate(settings, "presale")
     series, issued, artifact, approved, deed = _load_native_voucher_context(
         terms_hash=terms_hash,
         purchase_id=body.purchase_id,
@@ -4108,6 +4111,7 @@ async def complete_native_voucher(
     authorization: Annotated[Optional[str], Header()] = None,
 ) -> CompleteNativeVoucherResponse:
     require_presale_writes(settings)
+    require_operation_gate(settings, "presale")
     series, issued, artifact, approved, deed = _load_native_voucher_context(
         terms_hash=terms_hash,
         purchase_id=body.purchase_id,
@@ -4348,6 +4352,7 @@ async def request_voucher_refund(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> PrepareVoucherRefundResponse:
     require_presale_writes(settings)
+    require_operation_gate(settings, "presale")
     voucher = response_or_404(lambda: store.voucher(terms_hash, serial))
     session = verify_vault_session(settings, request, voucher["vaultLauncherId"])
     approved = require_current_approved_vault(settings, session.vault_launcher_id)
@@ -4412,6 +4417,7 @@ async def complete_voucher_refund(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CompleteVoucherRefundResponse:
     require_presale_writes(settings)
+    require_operation_gate(settings, "presale")
     voucher_json = response_or_404(lambda: store.voucher(terms_hash, serial))
     session = verify_vault_session(settings, request, voucher_json["vaultLauncherId"])
     approved = require_current_approved_vault(
