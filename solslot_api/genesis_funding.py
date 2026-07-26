@@ -24,6 +24,13 @@ FUNDING_NAMES = (
     "bridgeBatch",
 )
 GENESIS_BRIDGE_PARENT_TOTAL = sum(range(1, 33))
+GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT = 1
+GENESIS_BRIDGE_BATCH_BUFFER = 1
+GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT = (
+    GENESIS_BRIDGE_PARENT_TOTAL
+    + GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT
+    + GENESIS_BRIDGE_BATCH_BUFFER
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +72,7 @@ def plan_genesis_funding_fanout(
         "protocolConfig": 1 + fee,
         "adminAuthority": 1 + fee,
         "vaultVersionRegistry": 1 + fee,
-        "bridgeBatch": GENESIS_BRIDGE_PARENT_TOTAL + fee,
+        "bridgeBatch": GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT + fee,
     }
     used: set[int] = set()
     amounts: dict[str, int] = {}
@@ -115,7 +122,10 @@ def plan_genesis_funding_fanout(
 
 __all__ = [
     "FUNDING_NAMES",
+    "GENESIS_BRIDGE_BATCH_BUFFER",
+    "GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT",
     "GENESIS_BRIDGE_PARENT_TOTAL",
+    "GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT",
     "GenesisFundingFanout",
     "plan_genesis_funding_fanout",
 ]

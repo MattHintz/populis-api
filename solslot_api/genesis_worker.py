@@ -227,6 +227,10 @@ def _expected_outputs(plan: Any) -> list[str]:
             plan.vault_version_registry.launcher_id,
             plan.vault_version_registry.full_puzzle_hash,
         ),
+        (
+            plan.property_registry.launcher_id,
+            plan.property_registry.full_puzzle_hash,
+        ),
     )
     outputs.extend(
         _hex(Coin(parent, puzzle_hash, uint64(1)).name())

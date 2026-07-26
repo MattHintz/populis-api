@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from chia.types.blockchain_format.coin import Coin
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint64
+
+from solslot_api.genesis_worker import _expected_outputs
+
+
+def _surface(seed: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        launcher_id=bytes32(bytes([seed]) * 32),
+        full_puzzle_hash=bytes32(bytes([seed + 1]) * 32),
+    )
+
+
+def test_expected_outputs_include_property_registry_current_coin() -> None:
+    pool = _surface(10)
+    did = _surface(20)
+    governance = _surface(30)
+    property_registry = _surface(80)
+    plan = SimpleNamespace(
+        funding=SimpleNamespace(sgt=bytes32(b"s" * 32)),
+        base_protocol=SimpleNamespace(
+            params=SimpleNamespace(sgt_total_supply=1_000_000),
+            sgt_full_puzhash=bytes32(b"t" * 32),
+            pool_launcher_id=pool.launcher_id,
+            pool_full_puzhash=pool.full_puzzle_hash,
+            did_launcher_id=did.launcher_id,
+            did_full_puzhash=did.full_puzzle_hash,
+            tracker_launcher_id=governance.launcher_id,
+            tracker_full_puzhash=governance.full_puzzle_hash,
+        ),
+        nav_registry=_surface(40),
+        protocol_config=_surface(50),
+        admin_authority=_surface(60),
+        vault_version_registry=_surface(70),
+        property_registry=property_registry,
+        bridge_batch=SimpleNamespace(
+            bridge_coins=tuple(
+                Coin(
+                    bytes32(bytes([index]) * 32),
+                    bytes32(bytes([index + 32]) * 32),
+                    uint64(1),
+                )
+                for index in range(1, 33)
+            )
+        ),
+    )
+
+    coin_ids = _expected_outputs(plan)
+    property_registry_coin_id = "0x" + bytes(
+        Coin(
+            property_registry.launcher_id,
+            property_registry.full_puzzle_hash,
+            uint64(1),
+        ).name()
+    ).hex()
+
+    assert property_registry_coin_id in coin_ids
+    assert len(coin_ids) == 41
