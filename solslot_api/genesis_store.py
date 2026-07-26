@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
 OWNER_SLOT = 1
@@ -102,10 +102,9 @@ class GenesisStore:
                 raise RuntimeError(
                     f"Genesis store schema {version} is newer than supported {SCHEMA_VERSION}."
                 )
-            if version == SCHEMA_VERSION:
-                return
-            connection.executescript(
-                """
+            if version < 1:
+                connection.executescript(
+                    """
                 BEGIN IMMEDIATE;
                 CREATE TABLE ceremonies (
                     ceremony_id TEXT PRIMARY KEY,
@@ -185,7 +184,136 @@ class GenesisStore:
                 PRAGMA user_version = 1;
                 COMMIT;
                 """
-            )
+                )
+                version = 1
+            if version < 2:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE launch_claims (
+                        ceremony_id TEXT PRIMARY KEY,
+                        token_hash TEXT NOT NULL UNIQUE,
+                        consumed_at INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id)
+                    );
+
+                    CREATE TABLE launch_profiles (
+                        ceremony_id TEXT NOT NULL,
+                        slot INTEGER NOT NULL,
+                        display_name TEXT NOT NULL,
+                        role_label TEXT NOT NULL,
+                        email TEXT,
+                        timezone TEXT NOT NULL,
+                        reminders_enabled INTEGER NOT NULL DEFAULT 1,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (ceremony_id, slot),
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (slot IN (1, 2, 3)),
+                        CHECK (reminders_enabled IN (0, 1))
+                    );
+
+                    CREATE TABLE launch_auth_challenges (
+                        nonce_hash TEXT PRIMARY KEY,
+                        ceremony_id TEXT NOT NULL,
+                        slot INTEGER NOT NULL,
+                        wallet_address TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        consumed_at INTEGER,
+                        created_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (slot IN (1, 2, 3))
+                    );
+                    CREATE INDEX launch_auth_challenges_expiry_idx
+                        ON launch_auth_challenges(expires_at, consumed_at);
+
+                    CREATE TABLE launch_action_approvals (
+                        ceremony_id TEXT NOT NULL,
+                        action_id TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        payload_hash TEXT NOT NULL,
+                        slot INTEGER NOT NULL,
+                        signer_address TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        submitted_at INTEGER NOT NULL,
+                        PRIMARY KEY (ceremony_id, action_id, slot),
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (slot IN (1, 2, 3))
+                    );
+
+                    CREATE TABLE launch_gates (
+                        ceremony_id TEXT NOT NULL,
+                        gate_name TEXT NOT NULL,
+                        network TEXT NOT NULL,
+                        opens_at INTEGER NOT NULL,
+                        closes_at INTEGER NOT NULL,
+                        payload_hash TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (ceremony_id, gate_name),
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (network = 'testnet11'),
+                        CHECK (state IN ('pending', 'open', 'closed', 'cancelled')),
+                        CHECK (closes_at > opens_at)
+                    );
+
+                    CREATE TABLE genesis_funding_receipts (
+                        ceremony_id TEXT PRIMARY KEY,
+                        plan_json TEXT NOT NULL,
+                        plan_hash TEXT NOT NULL UNIQUE,
+                        spend_bundle_id TEXT UNIQUE,
+                        response_json TEXT,
+                        state TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (state IN (
+                            'prepared', 'approved', 'broadcast', 'confirmed', 'ambiguous'
+                        ))
+                    );
+
+                    PRAGMA user_version = 2;
+                    COMMIT;
+                    """
+                )
+                version = 2
+            if version < 3:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE launch_action_intents (
+                        ceremony_id TEXT NOT NULL,
+                        action_id TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        payload_hash TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (ceremony_id, action_id),
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (state IN ('prepared', 'executed', 'cancelled'))
+                    );
+
+                    CREATE TABLE launch_settlement_rehearsals (
+                        ceremony_id TEXT PRIMARY KEY,
+                        job_id TEXT NOT NULL UNIQUE,
+                        config_hash TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (state IN (
+                            'PREPARED', 'AWAITING_WALLET', 'PAYMENT_SUBMITTED',
+                            'VALIDATING', 'SUCCEEDED', 'FAILED'
+                        ))
+                    );
+
+                    PRAGMA user_version = 3;
+                    COMMIT;
+                    """
+                )
 
     def _event(
         self,
@@ -248,6 +376,7 @@ class GenesisStore:
         token_hash: str,
         nonce: str,
         expires_at: int,
+        replace_live: bool = False,
         now: int | None = None,
     ) -> dict[str, Any]:
         if slot not in ADMIN_SLOTS:
@@ -265,7 +394,7 @@ class GenesisStore:
             ).fetchone()
             if existing and existing["consumed_at"] is not None:
                 raise GenesisConflict("administrator slot is already enrolled")
-            if existing and int(existing["expires_at"]) > timestamp:
+            if existing and int(existing["expires_at"]) > timestamp and not replace_live:
                 raise GenesisConflict("administrator slot already has a live invitation")
             connection.execute(
                 "DELETE FROM invitations WHERE ceremony_id = ? AND slot = ?",
@@ -670,6 +799,700 @@ class GenesisStore:
             )
         return self.get(ceremony_id)
 
+    def list_ceremonies(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 200:
+            raise ValueError("limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT ceremony_id FROM ceremonies ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self.get(str(row["ceremony_id"])) for row in rows]
+
+    def active(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT ceremony_id FROM ceremonies "
+                "WHERE state NOT IN ('locked', 'abandoned') "
+                "ORDER BY created_at DESC"
+            ).fetchall()
+        if len(rows) > 1:
+            raise GenesisConflict(
+                "more than one active ceremony exists; archive the stale launch first"
+            )
+        return self.get(str(rows[0]["ceremony_id"])) if rows else None
+
+    def audit_events(
+        self, ceremony_id: str, *, after_event_id: int = 0, limit: int = 250
+    ) -> list[dict[str, Any]]:
+        if after_event_id < 0 or limit < 1 or limit > 1000:
+            raise ValueError("invalid audit event cursor")
+        with self._connect() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            rows = connection.execute(
+                "SELECT event_id,event_type,event_json,created_at FROM audit_events "
+                "WHERE ceremony_id=? AND event_id>? ORDER BY event_id LIMIT ?",
+                (ceremony_id, after_event_id, limit),
+            ).fetchall()
+        return [
+            {
+                "eventId": int(row["event_id"]),
+                "type": str(row["event_type"]),
+                "details": json.loads(str(row["event_json"])),
+                "createdAt": int(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def consume_owner_claim(
+        self,
+        ceremony_id: str,
+        *,
+        token_hash: str,
+        now: int | None = None,
+    ) -> None:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            existing = connection.execute(
+                "SELECT ceremony_id FROM launch_claims WHERE token_hash=?",
+                (token_hash,),
+            ).fetchone()
+            if existing:
+                raise GenesisConflict("owner launch link was already consumed")
+            connection.execute(
+                "INSERT INTO launch_claims(ceremony_id,token_hash,consumed_at,created_at) "
+                "VALUES(?,?,?,?)",
+                (ceremony_id, token_hash, timestamp, timestamp),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "owner_link_consumed",
+                {"slot": OWNER_SLOT},
+                timestamp,
+            )
+
+    def owner_claim_used(self, token_hash: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM launch_claims WHERE token_hash=?",
+                (token_hash,),
+            ).fetchone()
+        return row is not None
+
+    def set_profile(
+        self,
+        ceremony_id: str,
+        *,
+        slot: int,
+        display_name: str,
+        role_label: str,
+        email: str | None,
+        timezone: str,
+        reminders_enabled: bool,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if slot not in ADMIN_SLOTS:
+            raise ValueError("slot must be 1, 2, or 3")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            connection.execute(
+                """
+                INSERT INTO launch_profiles(
+                    ceremony_id,slot,display_name,role_label,email,timezone,
+                    reminders_enabled,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(ceremony_id,slot) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    role_label=excluded.role_label,
+                    email=excluded.email,
+                    timezone=excluded.timezone,
+                    reminders_enabled=excluded.reminders_enabled,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ceremony_id,
+                    slot,
+                    display_name,
+                    role_label,
+                    email,
+                    timezone,
+                    int(reminders_enabled),
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "administrator_profile_updated",
+                {"slot": slot, "role": role_label},
+                timestamp,
+            )
+        return self.profiles(ceremony_id)[slot]
+
+    def profiles(self, ceremony_id: str) -> dict[int, dict[str, Any]]:
+        with self._connect() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            rows = connection.execute(
+                "SELECT * FROM launch_profiles WHERE ceremony_id=? ORDER BY slot",
+                (ceremony_id,),
+            ).fetchall()
+        return {
+            int(row["slot"]): {
+                "slot": int(row["slot"]),
+                "displayName": str(row["display_name"]),
+                "role": str(row["role_label"]),
+                "email": row["email"],
+                "timezone": str(row["timezone"]),
+                "remindersEnabled": bool(row["reminders_enabled"]),
+                "updatedAt": int(row["updated_at"]),
+            }
+            for row in rows
+        }
+
+    def create_auth_challenge(
+        self,
+        ceremony_id: str,
+        *,
+        slot: int,
+        wallet_address: str,
+        nonce_hash: str,
+        expires_at: int,
+        now: int | None = None,
+    ) -> None:
+        timestamp = int(time.time()) if now is None else now
+        if expires_at <= timestamp:
+            raise GenesisExpired("authentication challenge must expire in the future")
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            member = connection.execute(
+                "SELECT wallet_address FROM invitations WHERE ceremony_id=? AND slot=? "
+                "AND consumed_at IS NOT NULL",
+                (ceremony_id, slot),
+            ).fetchone()
+            if member is None or str(member["wallet_address"]).lower() != wallet_address.lower():
+                raise GenesisConflict("wallet is not enrolled in this administrator slot")
+            connection.execute(
+                "DELETE FROM launch_auth_challenges WHERE expires_at<? OR consumed_at IS NOT NULL",
+                (timestamp,),
+            )
+            connection.execute(
+                "INSERT INTO launch_auth_challenges("
+                "nonce_hash,ceremony_id,slot,wallet_address,expires_at,created_at"
+                ") VALUES(?,?,?,?,?,?)",
+                (
+                    nonce_hash,
+                    ceremony_id,
+                    slot,
+                    wallet_address.lower(),
+                    expires_at,
+                    timestamp,
+                ),
+            )
+
+    def consume_auth_challenge(
+        self,
+        *,
+        nonce_hash: str,
+        wallet_address: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM launch_auth_challenges WHERE nonce_hash=?",
+                (nonce_hash,),
+            ).fetchone()
+            if row is None:
+                raise GenesisNotFound("administrator challenge not found")
+            if row["consumed_at"] is not None:
+                raise GenesisConflict("administrator challenge was already used")
+            if int(row["expires_at"]) < timestamp:
+                raise GenesisExpired("administrator challenge expired")
+            if str(row["wallet_address"]).lower() != wallet_address.lower():
+                raise GenesisConflict("administrator challenge wallet changed")
+            connection.execute(
+                "UPDATE launch_auth_challenges SET consumed_at=? WHERE nonce_hash=?",
+                (timestamp, nonce_hash),
+            )
+            self._event(
+                connection,
+                str(row["ceremony_id"]),
+                "administrator_session_started",
+                {"slot": int(row["slot"]), "wallet": wallet_address.lower()},
+                timestamp,
+            )
+        return dict(row)
+
+    def auth_challenge(self, nonce_hash: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM launch_auth_challenges WHERE nonce_hash=?",
+                (nonce_hash,),
+            ).fetchone()
+        if row is None:
+            raise GenesisNotFound("administrator challenge not found")
+        return dict(row)
+
+    def add_action_approval(
+        self,
+        ceremony_id: str,
+        *,
+        action_id: str,
+        action_type: str,
+        payload_hash: str,
+        slot: int,
+        signer_address: str,
+        signature: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            member = connection.execute(
+                "SELECT wallet_address FROM invitations WHERE ceremony_id=? AND slot=? "
+                "AND consumed_at IS NOT NULL",
+                (ceremony_id, slot),
+            ).fetchone()
+            if member is None or str(member["wallet_address"]).lower() != signer_address.lower():
+                raise GenesisConflict("action signer is not the enrolled administrator")
+            existing = connection.execute(
+                "SELECT payload_hash,signature FROM launch_action_approvals "
+                "WHERE ceremony_id=? AND action_id=? AND slot=?",
+                (ceremony_id, action_id, slot),
+            ).fetchone()
+            if existing:
+                if (
+                    str(existing["payload_hash"]).lower() == payload_hash.lower()
+                    and str(existing["signature"]).lower() == signature.lower()
+                ):
+                    return self.action_approvals(ceremony_id, action_id)
+                raise GenesisConflict("administrator slot already approved this action")
+            connection.execute(
+                "INSERT INTO launch_action_approvals("
+                "ceremony_id,action_id,action_type,payload_hash,slot,signer_address,"
+                "signature,submitted_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    ceremony_id,
+                    action_id,
+                    action_type,
+                    payload_hash.lower(),
+                    slot,
+                    signer_address.lower(),
+                    signature.lower(),
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "launch_action_approved",
+                {
+                    "actionId": action_id,
+                    "actionType": action_type,
+                    "payloadHash": payload_hash.lower(),
+                    "slot": slot,
+                },
+                timestamp,
+            )
+        return self.action_approvals(ceremony_id, action_id)
+
+    def action_approvals(
+        self, ceremony_id: str, action_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM launch_action_approvals "
+                "WHERE ceremony_id=? AND action_id=? ORDER BY slot",
+                (ceremony_id, action_id),
+            ).fetchall()
+        slots = {int(row["slot"]) for row in rows}
+        return {
+            "actionId": action_id,
+            "approved": owner_plus_one_approved(slots),
+            "slots": sorted(slots),
+            "approvals": [
+                {
+                    "slot": int(row["slot"]),
+                    "signer": str(row["signer_address"]),
+                    "submittedAt": int(row["submitted_at"]),
+                }
+                for row in rows
+            ],
+        }
+
+    def upsert_gate(
+        self,
+        ceremony_id: str,
+        *,
+        gate_name: str,
+        opens_at: int,
+        closes_at: int,
+        payload_hash: str,
+        state: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if state not in {"pending", "open", "closed", "cancelled"}:
+            raise ValueError("invalid launch gate state")
+        if closes_at <= opens_at:
+            raise ValueError("gate close must be after gate open")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            connection.execute(
+                """
+                INSERT INTO launch_gates(
+                    ceremony_id,gate_name,network,opens_at,closes_at,
+                    payload_hash,state,updated_at
+                ) VALUES(?,?,'testnet11',?,?,?,?,?)
+                ON CONFLICT(ceremony_id,gate_name) DO UPDATE SET
+                    opens_at=excluded.opens_at,
+                    closes_at=excluded.closes_at,
+                    payload_hash=excluded.payload_hash,
+                    state=excluded.state,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ceremony_id,
+                    gate_name,
+                    opens_at,
+                    closes_at,
+                    payload_hash.lower(),
+                    state,
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "launch_gate_updated",
+                {
+                    "gate": gate_name,
+                    "opensAt": opens_at,
+                    "closesAt": closes_at,
+                    "state": state,
+                },
+                timestamp,
+            )
+        return self.gates(ceremony_id)[gate_name]
+
+    def gates(
+        self, ceremony_id: str, *, now: int | None = None
+    ) -> dict[str, dict[str, Any]]:
+        timestamp = int(time.time()) if now is None else now
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM launch_gates WHERE ceremony_id=? ORDER BY gate_name",
+                (ceremony_id,),
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            stored_state = str(row["state"])
+            effective_state = stored_state
+            if stored_state == "open" and timestamp >= int(row["closes_at"]):
+                effective_state = "closed"
+            elif stored_state == "pending" and int(row["opens_at"]) <= timestamp < int(
+                row["closes_at"]
+            ):
+                effective_state = "open"
+            result[str(row["gate_name"])] = {
+                "name": str(row["gate_name"]),
+                "network": str(row["network"]),
+                "opensAt": int(row["opens_at"]),
+                "closesAt": int(row["closes_at"]),
+                "state": effective_state,
+                "configuredState": stored_state,
+                "payloadHash": str(row["payload_hash"]),
+                "updatedAt": int(row["updated_at"]),
+            }
+        return result
+
+    def set_funding_receipt(
+        self,
+        ceremony_id: str,
+        *,
+        plan: dict[str, Any],
+        plan_hash: str,
+        state: str = "prepared",
+        spend_bundle_id: str | None = None,
+        response: dict[str, Any] | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if state not in {"prepared", "approved", "broadcast", "confirmed", "ambiguous"}:
+            raise ValueError("invalid funding receipt state")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            existing = connection.execute(
+                "SELECT plan_hash FROM genesis_funding_receipts WHERE ceremony_id=?",
+                (ceremony_id,),
+            ).fetchone()
+            if existing and str(existing["plan_hash"]).lower() != plan_hash.lower():
+                raise GenesisConflict("ceremony funding plan is already sealed")
+            connection.execute(
+                """
+                INSERT INTO genesis_funding_receipts(
+                    ceremony_id,plan_json,plan_hash,spend_bundle_id,response_json,
+                    state,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(ceremony_id) DO UPDATE SET
+                    spend_bundle_id=COALESCE(excluded.spend_bundle_id,spend_bundle_id),
+                    response_json=COALESCE(excluded.response_json,response_json),
+                    state=excluded.state,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ceremony_id,
+                    canonical_json(plan),
+                    plan_hash.lower(),
+                    spend_bundle_id,
+                    canonical_json(response) if response is not None else None,
+                    state,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "genesis_funding_updated",
+                {
+                    "planHash": plan_hash.lower(),
+                    "state": state,
+                    "spendBundleId": spend_bundle_id,
+                },
+                timestamp,
+            )
+        receipt = self.funding_receipt(ceremony_id)
+        assert receipt is not None
+        return receipt
+
+    def funding_receipt(self, ceremony_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM genesis_funding_receipts WHERE ceremony_id=?",
+                (ceremony_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "plan": json.loads(str(row["plan_json"])),
+            "planHash": str(row["plan_hash"]),
+            "spendBundleId": row["spend_bundle_id"],
+            "response": (
+                json.loads(str(row["response_json"])) if row["response_json"] else None
+            ),
+            "state": str(row["state"]),
+            "createdAt": int(row["created_at"]),
+            "updatedAt": int(row["updated_at"]),
+        }
+
+    def set_action_intent(
+        self,
+        ceremony_id: str,
+        *,
+        action_id: str,
+        action_type: str,
+        payload_hash: str,
+        payload: dict[str, Any],
+        state: str = "prepared",
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if state not in {"prepared", "executed", "cancelled"}:
+            raise ValueError("invalid launch action intent state")
+        timestamp = int(time.time()) if now is None else now
+        encoded = canonical_json(payload)
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            existing = connection.execute(
+                "SELECT action_type,payload_hash,payload_json FROM launch_action_intents "
+                "WHERE ceremony_id=? AND action_id=?",
+                (ceremony_id, action_id),
+            ).fetchone()
+            if existing and (
+                str(existing["action_type"]) != action_type
+                or str(existing["payload_hash"]).lower() != payload_hash.lower()
+                or str(existing["payload_json"]) != encoded
+            ):
+                raise GenesisConflict("launch action intent changed after preparation")
+            connection.execute(
+                """
+                INSERT INTO launch_action_intents(
+                    ceremony_id,action_id,action_type,payload_hash,payload_json,
+                    state,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(ceremony_id,action_id) DO UPDATE SET
+                    state=excluded.state,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ceremony_id,
+                    action_id,
+                    action_type,
+                    payload_hash.lower(),
+                    encoded,
+                    state,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "launch_action_intent_updated",
+                {
+                    "actionId": action_id,
+                    "actionType": action_type,
+                    "payloadHash": payload_hash.lower(),
+                    "state": state,
+                },
+                timestamp,
+            )
+        intent = self.action_intent(ceremony_id, action_id)
+        assert intent is not None
+        return intent
+
+    def action_intent(
+        self, ceremony_id: str, action_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM launch_action_intents WHERE ceremony_id=? AND action_id=?",
+                (ceremony_id, action_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "actionId": str(row["action_id"]),
+            "actionType": str(row["action_type"]),
+            "payloadHash": str(row["payload_hash"]),
+            "payload": json.loads(str(row["payload_json"])),
+            "state": str(row["state"]),
+            "createdAt": int(row["created_at"]),
+            "updatedAt": int(row["updated_at"]),
+        }
+
+    def latest_action_intent(
+        self, ceremony_id: str, action_type: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT action_id FROM launch_action_intents "
+                "WHERE ceremony_id=? AND action_type=? ORDER BY created_at DESC LIMIT 1",
+                (ceremony_id, action_type),
+            ).fetchone()
+        return (
+            self.action_intent(ceremony_id, str(row["action_id"]))
+            if row is not None
+            else None
+        )
+
+    def set_settlement_rehearsal(
+        self,
+        ceremony_id: str,
+        *,
+        job_id: str,
+        config_hash: str,
+        state: str,
+        payload: dict[str, Any],
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        allowed = {
+            "PREPARED",
+            "AWAITING_WALLET",
+            "PAYMENT_SUBMITTED",
+            "VALIDATING",
+            "SUCCEEDED",
+            "FAILED",
+        }
+        state_order = {
+            "PREPARED": 0,
+            "AWAITING_WALLET": 1,
+            "PAYMENT_SUBMITTED": 2,
+            "VALIDATING": 3,
+            "SUCCEEDED": 4,
+        }
+        if state not in allowed:
+            raise ValueError("invalid settlement rehearsal state")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            existing = connection.execute(
+                "SELECT job_id,config_hash,state FROM launch_settlement_rehearsals "
+                "WHERE ceremony_id=?",
+                (ceremony_id,),
+            ).fetchone()
+            if existing and (
+                str(existing["job_id"]) != job_id
+                or str(existing["config_hash"]).lower() != config_hash.lower()
+            ):
+                if str(existing["state"]) != "FAILED" or state != "PREPARED":
+                    raise GenesisConflict("settlement rehearsal job is already sealed")
+                connection.execute(
+                    "DELETE FROM launch_settlement_rehearsals WHERE ceremony_id=?",
+                    (ceremony_id,),
+                )
+                existing = None
+            if existing:
+                existing_state = str(existing["state"])
+                if existing_state in {"SUCCEEDED", "FAILED"} and state != existing_state:
+                    raise GenesisConflict("completed settlement rehearsal cannot be replaced")
+                if (
+                    existing_state in state_order
+                    and state in state_order
+                    and state_order[state] < state_order[existing_state]
+                ):
+                    raise GenesisConflict("settlement rehearsal cannot move backwards")
+            connection.execute(
+                """
+                INSERT INTO launch_settlement_rehearsals(
+                    ceremony_id,job_id,config_hash,state,payload_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(ceremony_id) DO UPDATE SET
+                    state=excluded.state,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ceremony_id,
+                    job_id,
+                    config_hash.lower(),
+                    state,
+                    canonical_json(payload),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "settlement_rehearsal_updated",
+                {"jobId": job_id, "state": state, "configHash": config_hash.lower()},
+                timestamp,
+            )
+        result = self.settlement_rehearsal(ceremony_id)
+        assert result is not None
+        return result
+
+    def settlement_rehearsal(self, ceremony_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM launch_settlement_rehearsals WHERE ceremony_id=?",
+                (ceremony_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "jobId": str(row["job_id"]),
+            "configHash": str(row["config_hash"]),
+            "state": str(row["state"]),
+            "payload": json.loads(str(row["payload_json"])),
+            "createdAt": int(row["created_at"]),
+            "updatedAt": int(row["updated_at"]),
+        }
+
     def get(self, ceremony_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
@@ -707,5 +1530,8 @@ __all__ = [
     "GenesisNotFound",
     "GenesisConflict",
     "GenesisExpired",
+    "OWNER_SLOT",
+    "COADMIN_SLOTS",
     "canonical_json",
+    "owner_plus_one_approved",
 ]

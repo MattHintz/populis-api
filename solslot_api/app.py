@@ -40,6 +40,7 @@ from chia_rs.sized_bytes import bytes32
 
 from .admin import router as admin_router
 from .genesis import router as genesis_router
+from .launch_control import router as launch_control_router
 from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
@@ -348,6 +349,7 @@ app.add_middleware(
 # not mounted.
 app.include_router(admin_router)
 app.include_router(genesis_router)
+app.include_router(launch_control_router)
 
 # Post-genesis admin desk: wallet-signed JWT auth backed only by verified
 # records committed by the current admin-authority singleton.

@@ -28,6 +28,10 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_FAUCET_MNEMONIC",
         "SOLSLOT_CHALLENGE_SECRET",
         "SOLSLOT_BOOTSTRAP_SESSION_SECRET",
+        "SOLSLOT_LAUNCH_SESSION_SECRET",
+        "SOLSLOT_LAUNCH_REHEARSAL_SERVICE_TOKEN",
+        "SOLSLOT_LAUNCH_REHEARSAL_EVIDENCE_HMAC_SECRET",
+        "SOLSLOT_SMTP_PASSWORD",
         "SOLSLOT_VAULT_SESSION_JWT_SECRET",
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
@@ -125,6 +129,36 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
         )
+    if settings.launch_control_enabled:
+        if settings.network != "testnet11":
+            raise RuntimeError("Guided alpha launch control is restricted to Testnet11.")
+        if not settings.launch_source_evidence_path:
+            raise RuntimeError(
+                "SOLSLOT_LAUNCH_CONTROL_ENABLED requires RC21 source evidence."
+            )
+        if settings.runtime_environment in {"staging", "production"}:
+            if (
+                not settings.launch_source_evidence_sha256
+                or len(settings.launch_source_evidence_sha256.removeprefix("0x")) != 64
+            ):
+                raise RuntimeError(
+                    "Guided launch control requires a pinned source-evidence SHA-256."
+                )
+            if len(settings.launch_session_secret) < 32:
+                raise RuntimeError(
+                    "Guided launch control requires a persistent 32-byte session secret."
+                )
+            if not settings.admin_token or len(settings.admin_token) < 32:
+                raise RuntimeError(
+                    "Guided launch control requires a one-time owner claim token."
+                )
+        if (
+            settings.launch_rehearsal_service_url
+            and not settings.launch_rehearsal_service_url.startswith("https://")
+        ):
+            raise RuntimeError(
+                "SOLSLOT_LAUNCH_REHEARSAL_SERVICE_URL must use HTTPS."
+            )
     if settings.collection_minting_enabled and not settings.collection_metadata_enabled:
         raise RuntimeError(
             "SOLSLOT_COLLECTION_MINTING_ENABLED requires "
@@ -477,6 +511,20 @@ class Settings(BaseSettings):
         "payment_omnichain_rpc_url",
         "payment_omnichain_ownership_safe_operation_path",
         "payment_omnichain_ownership_safe_operation_hash",
+        "payment_omnichain_ownership_execute_operation_path",
+        "payment_omnichain_ownership_execute_operation_hash",
+        "launch_source_evidence_path",
+        "launch_settlement_rehearsal_path",
+        "launch_rehearsal_service_url",
+        "launch_rehearsal_service_token",
+        "launch_rehearsal_config_hash",
+        "launch_rehearsal_evidence_hmac_secret",
+        "launch_plan_template_path",
+        "launch_source_evidence_sha256",
+        "smtp_host",
+        "smtp_username",
+        "smtp_password",
+        "smtp_from_address",
         "payment_oracle_rounds_path",
         "collection_s3_endpoint_url",
         "collection_s3_access_key_id",
@@ -560,6 +608,10 @@ class Settings(BaseSettings):
     # writes may run before a chain-bound admin authority exists. It requires
     # the bootstrap token, disables minting, and refuses all CORS origins.
     ceremony_mode_enabled: bool = False
+    # The guided launch desk can be deployed while every chain-write ceiling
+    # remains closed. It exposes preparation and signed review only; dynamic
+    # operation windows never override the hard environment flags above.
+    launch_control_enabled: bool = False
     release_metadata_path: str = "./release.json"
 
     # ── Auth / challenges ────────────────────────────────────────────────
@@ -610,6 +662,33 @@ class Settings(BaseSettings):
     bootstrap_session_secret: str = ""
     bootstrap_session_ttl_seconds: int = Field(900, ge=1)
     bootstrap_cookie_secure: bool = True
+    launch_session_secret: str = ""
+    launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
+    launch_cookie_path: str = "/protocol-api/admin/launch"
+    launch_release_tag: str = "solslot-v2-alpha-rc21-20260725"
+    launch_source_evidence_path: Optional[str] = (
+        "./state/source-freeze-evidence-rc21.json"
+    )
+    launch_source_evidence_sha256: Optional[str] = None
+    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc21.json"
+    launch_settlement_rehearsal_path: Optional[str] = (
+        "./state/settlement-rehearsal-rc21.json"
+    )
+    launch_rehearsal_service_url: Optional[str] = None
+    launch_rehearsal_service_token: Optional[str] = None
+    launch_rehearsal_config_hash: Optional[str] = None
+    launch_rehearsal_evidence_hmac_secret: Optional[str] = None
+    launch_rehearsal_timeout_seconds: int = Field(20, ge=5, le=60)
+    launch_gate_max_seconds: int = Field(3600, ge=300, le=86400)
+
+    # Provider-neutral reminders. Email is advisory; the persisted task inbox
+    # remains authoritative when SMTP is absent or delivery fails.
+    smtp_host: Optional[str] = None
+    smtp_port: int = Field(587, ge=1, le=65535)
+    smtp_username: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from_address: Optional[str] = None
+    smtp_starttls: bool = True
 
     # Canonical publish context. These values are populated only from the
     # signed ceremony artifact and are required before a mint can be
@@ -772,6 +851,8 @@ class Settings(BaseSettings):
     payment_omnichain_ownership_activation_enabled: bool = False
     payment_omnichain_ownership_safe_operation_path: Optional[str] = None
     payment_omnichain_ownership_safe_operation_hash: Optional[str] = None
+    payment_omnichain_ownership_execute_operation_path: Optional[str] = None
+    payment_omnichain_ownership_execute_operation_hash: Optional[str] = None
     payment_omnichain_ownership_min_confirmations: int = Field(12, ge=12)
     payment_omnichain_source_sha: Optional[str] = None
     payment_omnichain_gateway_profile: Optional[str] = Field(

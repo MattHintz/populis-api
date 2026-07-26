@@ -10,6 +10,7 @@ from eth_utils import keccak
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from solslot_api.admin_auth import require_admin_jwt
 from solslot_api.config import Settings, get_settings
 from solslot_api.omnichain_ownership_activation import (
     ChainState,
@@ -68,6 +69,23 @@ def _schedule_calldata(
         )
     ).hex()
     return data, operation_id
+
+
+def _execute_calldata() -> str:
+    targets = [GATEWAY, SPOKE]
+    values = [0, 0]
+    actions = [keccak(text="acceptOwnership()")[:4]] * 2
+    predecessor = bytes(32)
+    salt = bytes.fromhex("44" * 32)
+    return "0x" + (
+        keccak(
+            text="executeBatch(address[],uint256[],bytes[],bytes32,bytes32)"
+        )[:4]
+        + abi_encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [targets, values, actions, predecessor, salt],
+        )
+    ).hex()
 
 
 def _safe_message(safe: str, message: str) -> dict:
@@ -145,6 +163,77 @@ def _write_package(
     return package
 
 
+def _write_execute_package(
+    path: Path,
+    *,
+    schedule: dict,
+    owner_address: str,
+    coadmin_addresses: list[str],
+) -> dict:
+    transaction_data = "0x1901" + "33" * 64
+    approvals = []
+    for role, safe, allowed in (
+        ("owner_identity", OWNER_SAFE, [owner_address]),
+        ("coadmin", COADMIN_SAFE, coadmin_addresses),
+    ):
+        typed_data = _safe_message(safe, transaction_data)
+        approvals.append(
+            {
+                "role": role,
+                "safe": safe,
+                "allowedSigners": allowed,
+                "messageHash": _typed_data_digest(typed_data),
+                "typedData": typed_data,
+            }
+        )
+    package = {
+        **{
+            key: schedule[key]
+            for key in (
+                "schemaVersion",
+                "kind",
+                "deploymentArtifactHash",
+                "ownershipIntentArtifactHash",
+                "governanceArtifactHash",
+                "sourceSha",
+                "network",
+                "chainId",
+                "operationId",
+                "rootSafe",
+                "timelock",
+            )
+        },
+        "phase": "execute",
+        "operationTimestamp": "2000000000",
+        "operationReady": True,
+        "observedAtBlock": 100,
+        "observedAtTimestamp": 2000000000,
+        "authorityOperation": {
+            "phase": "execute",
+            "rootSafe": ROOT_SAFE,
+            "transaction": {
+                "to": TIMELOCK,
+                "value": "0",
+                "data": _execute_calldata(),
+                "operation": 0,
+                "safeTxGas": "0",
+                "baseGas": "0",
+                "gasPrice": "0",
+                "gasToken": "0x" + "00" * 20,
+                "refundReceiver": "0x" + "00" * 20,
+                "nonce": "1",
+            },
+            "transactionHash": "0x" + "35" * 32,
+            "transactionData": transaction_data,
+            "approvals": approvals,
+        },
+        "createdAt": "2026-07-25T00:00:00.000Z",
+    }
+    package["artifactHash"] = _canonical_hash(package)
+    path.write_text(json.dumps(package), encoding="utf-8")
+    return package
+
+
 def _signature(account, typed_data: dict) -> str:
     signed = Account.sign_message(
         encode_typed_data(full_message=typed_data),
@@ -177,12 +266,55 @@ def _scheduled_chain_state() -> ChainState:
     )
 
 
+def _ready_chain_state() -> ChainState:
+    return ChainState(
+        operation_exists=True,
+        operation_ready=True,
+        operation_done=False,
+        operation_timestamp=2_000_000_000,
+        live_nonce=1,
+        live_transaction_hash="0x" + "35" * 32,
+        latest_block=200,
+    )
+
+
+def _done_chain_state() -> ChainState:
+    return ChainState(
+        operation_exists=True,
+        operation_ready=False,
+        operation_done=True,
+        operation_timestamp=1,
+        live_nonce=2,
+        live_transaction_hash="0x" + "35" * 32,
+        latest_block=212,
+    )
+
+
 def _test_app(settings: Settings, store: OwnershipActivationStore) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_ownership_activation_store] = lambda: store
+    app.dependency_overrides[require_admin_jwt] = lambda: object()
     return app
+
+
+def test_standalone_ownership_routes_require_admin_authentication(tmp_path) -> None:
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_activation_enabled=True,
+        admin_db_path=str(tmp_path / "admin.db"),
+    )
+    store = OwnershipActivationStore(settings.admin_db_path)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_ownership_activation_store] = lambda: store
+
+    response = TestClient(app).get("/admin/omnichain/ownership-activation")
+
+    assert response.status_code in {401, 503}
+    assert "Admin desk" in response.text or "authentication" in response.text
 
 
 def test_real_safe_signatures_are_the_only_approvals(
@@ -387,6 +519,100 @@ def test_package_hash_and_feature_flag_fail_closed(tmp_path) -> None:
     )
     response = TestClient(app).get("/admin/omnichain/ownership-activation")
     assert response.status_code == 503
+
+
+def test_execute_phase_requires_fresh_approvals_after_24_hour_delay(
+    tmp_path, monkeypatch
+) -> None:
+    owner = Account.create()
+    coadmin = Account.create()
+    schedule_path = tmp_path / "schedule.json"
+    schedule = _write_package(
+        schedule_path,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    execute_path = tmp_path / "execute.json"
+    execute = _write_execute_package(
+        execute_path,
+        schedule=schedule,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_activation_enabled=True,
+        payment_omnichain_ownership_safe_operation_path=str(schedule_path),
+        payment_omnichain_ownership_safe_operation_hash=schedule["artifactHash"],
+        payment_omnichain_ownership_execute_operation_path=str(execute_path),
+        payment_omnichain_ownership_execute_operation_hash=execute["artifactHash"],
+        payment_omnichain_rpc_url="https://base-sepolia.example.invalid",
+        admin_db_path=str(tmp_path / "admin.db"),
+    )
+    store = OwnershipActivationStore(settings.admin_db_path)
+    app = _test_app(settings, store)
+    client = TestClient(app)
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._chain_state",
+        lambda *_args, **_kwargs: _ready_chain_state(),
+    )
+    package = load_authority_operation(settings, phase="execute")
+    descriptors = {
+        value["role"]: value for value in package["authorityOperation"]["approvals"]
+    }
+    initial = client.get("/admin/omnichain/ownership-activation/execute")
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["state"] == "AWAITING_APPROVALS"
+    assert initial.json()["review"]["action"] == "executeAcceptOwnership"
+
+    for role, account in (("owner_identity", owner), ("coadmin", coadmin)):
+        signed = client.post(
+            "/admin/omnichain/ownership-activation/execute/sign",
+            json={
+                "signature": _signature(
+                    account, descriptors[role]["typedData"]
+                )
+            },
+        )
+        assert signed.status_code == 200, signed.text
+    assert signed.json()["state"] == "READY_TO_BROADCAST"
+    assert len(store.approvals(execute["artifactHash"])) == 2
+    assert store.approvals(schedule["artifactHash"]) == {}
+
+
+def test_execute_package_cannot_change_the_scheduled_batch(tmp_path) -> None:
+    owner = Account.create()
+    coadmin = Account.create()
+    schedule_path = tmp_path / "schedule.json"
+    schedule = _write_package(
+        schedule_path,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    execute_path = tmp_path / "execute.json"
+    execute = _write_execute_package(
+        execute_path,
+        schedule=schedule,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    execute["authorityOperation"]["transaction"]["data"] = "0x1234"
+    execute.pop("artifactHash")
+    execute["artifactHash"] = _canonical_hash(execute)
+    execute_path.write_text(json.dumps(execute), encoding="utf-8")
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_safe_operation_path=str(schedule_path),
+        payment_omnichain_ownership_safe_operation_hash=schedule["artifactHash"],
+        payment_omnichain_ownership_execute_operation_path=str(execute_path),
+        payment_omnichain_ownership_execute_operation_hash=execute["artifactHash"],
+    )
+    try:
+        load_authority_operation(settings, phase="execute")
+    except OwnershipActivationError as exc:
+        assert "ownership execute data is invalid" in str(exc)
+    else:
+        raise AssertionError("altered execute package was accepted")
 
 
 def test_package_rejects_non_ownership_timelock_actions(tmp_path) -> None:

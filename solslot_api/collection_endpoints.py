@@ -1,14 +1,25 @@
 """Admin and public APIs for chain-verifiable property collections."""
 from __future__ import annotations
 
-from typing import Annotated, Any, Callable, Literal, Optional, TypeVar
+import secrets
+import time
+from typing import Annotated, Any, Callable, Literal, Mapping, Optional, TypeVar
 
 import httpx
+from chia_rs.sized_bytes import bytes32
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from .admin_auth import AdminClaims, require_admin_jwt
 from .admin_operations import require_admin_operation
+from .collection_display_units import (
+    DisplayUnitError,
+    allocate_par_mojos,
+    dollars_to_minor,
+    ownership_to_ppm,
+    percentage_to_bps,
+    usd_minor_to_asset_units,
+)
 from .collection_media import (
     CollectionMediaPipeline,
     MediaPipelineUnavailable,
@@ -25,8 +36,10 @@ from .collection_store import (
 )
 from .coinset_client import CoinsetClient
 from .config import Settings, get_settings
+from .payment_quotes import PaymentQuoteError, load_authorized_oracle_round
 from .property_amendment_auth import verify_amendment_signature
 from .metadata_chain_indexer import MetadataChainIndexer, MetadataIndexError
+from .public_artifact import PublicArtifactError, load_signed_public_artifact
 from .property_metadata import (
     ASSET_CLASS_DILIGENCE_KEYS,
     ASSET_CLASS_CODES,
@@ -45,6 +58,14 @@ from .property_metadata import (
 router = APIRouter(tags=["property-collections"])
 T = TypeVar("T")
 HexSha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-fA-F]{64}$")]
+DisplayDecimal = Annotated[
+    str,
+    StringConstraints(pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$", max_length=40),
+]
+DisplayKey = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][A-Za-z0-9_.:-]{0,119}$"),
+]
 
 
 class ApiModel(BaseModel):
@@ -52,7 +73,9 @@ class ApiModel(BaseModel):
 
 
 class CreateCollectionRequest(ApiModel):
-    collection_id: str = Field(alias="collectionId", min_length=1, max_length=120)
+    collection_id: Optional[str] = Field(
+        default=None, alias="collectionId", min_length=1, max_length=120
+    )
     title: str = Field(min_length=1, max_length=180)
     slug: Optional[str] = Field(default=None, min_length=1, max_length=100)
 
@@ -85,6 +108,51 @@ class ReviewRequest(ApiModel):
 class AmendmentRequest(ApiModel):
     dossier: PropertyDossierV1
     amendment: PropertyAmendmentV1
+
+
+class DisplayUnitConversionRequest(ApiModel):
+    money: dict[DisplayKey, DisplayDecimal] = Field(default_factory=dict, max_length=100)
+    percentages: dict[DisplayKey, DisplayDecimal] = Field(
+        default_factory=dict, max_length=40
+    )
+    ownership_shares: dict[DisplayKey, DisplayDecimal] = Field(
+        default_factory=dict, alias="ownershipShares", max_length=100
+    )
+    derive_xch_par: bool = Field(default=False, alias="deriveXchPar")
+
+    @field_validator("percentages")
+    @classmethod
+    def validate_percentage_names(
+        cls, value: dict[str, str]
+    ) -> dict[str, str]:
+        allowed = {"projectedReturn", "technologyFee", "debtRate"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"unsupported percentage field: {sorted(unknown)[0]}")
+        return value
+
+
+def _signed_governance_threshold(settings: Settings) -> int:
+    artifact = load_signed_public_artifact(settings)
+    parameters = artifact.get("protocolParameters")
+    if not isinstance(parameters, Mapping):
+        raise PublicArtifactError("signed protocol parameters are unavailable")
+    quorum_bps = parameters.get("quorumBps")
+    total_supply = parameters.get("sgtTotalSupply")
+    if (
+        isinstance(quorum_bps, bool)
+        or not isinstance(quorum_bps, int)
+        or quorum_bps <= 0
+        or quorum_bps > 10_000
+        or isinstance(total_supply, bool)
+        or not isinstance(total_supply, int)
+        or total_supply <= 0
+    ):
+        raise PublicArtifactError("signed governance parameters are invalid")
+    threshold = (quorum_bps * total_supply) // 10_000
+    if threshold <= 0:
+        raise PublicArtifactError("signed governance threshold is invalid")
+    return threshold
 
 
 def require_collection_metadata(
@@ -207,6 +275,91 @@ async def collection_profiles() -> dict[str, Any]:
 
 
 @router.post(
+    "/admin/collections/display-units/convert",
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+)
+async def convert_collection_display_units(
+    body: DisplayUnitConversionRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Convert owner-facing values into canonical protocol integers.
+
+    The browser cannot choose governance or oracle-derived values.  Both are
+    taken from cryptographically verified runtime artifacts.
+    """
+
+    try:
+        money_minor = {
+            key: dollars_to_minor(value, label=key)
+            for key, value in body.money.items()
+        }
+        percentage_bps = {
+            key: percentage_to_bps(
+                value,
+                label=key,
+                maximum_bps=1_000 if key == "technologyFee" else 10_000,
+            )
+            for key, value in body.percentages.items()
+        }
+        ownership_ppm = {
+            key: ownership_to_ppm(value, label=key)
+            for key, value in body.ownership_shares.items()
+        }
+        governance_quorum = _signed_governance_threshold(settings)
+        result: dict[str, Any] = {
+            "moneyMinor": money_minor,
+            "percentageBps": percentage_bps,
+            "ownershipPpm": ownership_ppm,
+            "governanceQuorum": str(governance_quorum),
+            "xchParMojos": None,
+            "xchOracle": None,
+        }
+        if not body.derive_xch_par:
+            return result
+
+        target_raise = money_minor.get("targetRaise")
+        if target_raise is None or int(target_raise) <= 0:
+            raise DisplayUnitError(
+                "target raise is required before protocol par can be calculated"
+            )
+        authorized = load_authorized_oracle_round(
+            settings,
+            asset_id=bytes32.zeros,
+            now=int(time.time()),
+        )
+        round_ = authorized.round
+        if round_.network != settings.network:
+            raise DisplayUnitError("XCH oracle network does not match this workspace")
+        collection_par = usd_minor_to_asset_units(
+            int(target_raise),
+            price_usd_minor_per_asset=round_.price_usd_minor_per_asset,
+            asset_decimals=round_.asset_decimals,
+        )
+        deed_par = (
+            allocate_par_mojos(collection_par, ownership_ppm)
+            if sum(ownership_ppm.values()) == 1_000_000
+            else {}
+        )
+        result["xchParMojos"] = {
+            "collection": str(collection_par),
+            "deeds": {key: str(value) for key, value in deed_par.items()},
+        }
+        result["xchOracle"] = {
+            "priceUsdMinorPerXch": str(round_.price_usd_minor_per_asset),
+            "validUntil": round_.valid_until,
+            "roundHash": "0x" + round_.round_hash.hex(),
+        }
+        return result
+    except (DisplayUnitError, PaymentQuoteError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PublicArtifactError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Signed genesis economics are not available yet.",
+        ) from exc
+
+
+@router.post(
     "/admin/collections",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
     status_code=201,
@@ -217,9 +370,10 @@ async def create_collection(
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     store: Annotated[CollectionStore, Depends(get_collection_store)],
 ) -> dict[str, Any]:
+    collection_id = body.collection_id or f"COL-{secrets.token_hex(8).upper()}"
     payload = _store_call(
         lambda: store.create(
-            collection_id=body.collection_id,
+            collection_id=collection_id,
             title=body.title,
             owner_subject=claims.sub,
             owner_auth_type=claims.auth_type,

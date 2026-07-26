@@ -25,11 +25,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from web3 import Web3
 
+from .admin_auth import require_admin_jwt
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
 from .timelock_operation import (
     TimelockOperationError,
     decode_ownership_schedule,
+    validate_ownership_execute,
 )
 
 
@@ -398,11 +400,19 @@ def _validate_approval(
     }
 
 
-def load_authority_operation(settings: Settings) -> dict[str, Any]:
-    """Load and strictly validate the configured immutable schedule package."""
+def load_authority_operation(
+    settings: Settings, *, phase: str = "schedule"
+) -> dict[str, Any]:
+    """Load and strictly validate one immutable Safe operation package."""
 
-    path_value = settings.payment_omnichain_ownership_safe_operation_path
-    expected_hash = settings.payment_omnichain_ownership_safe_operation_hash
+    if phase == "schedule":
+        path_value = settings.payment_omnichain_ownership_safe_operation_path
+        expected_hash = settings.payment_omnichain_ownership_safe_operation_hash
+    elif phase == "execute":
+        path_value = settings.payment_omnichain_ownership_execute_operation_path
+        expected_hash = settings.payment_omnichain_ownership_execute_operation_hash
+    else:
+        raise OwnershipActivationError("ownership activation phase is unsupported")
     if not path_value or not expected_hash:
         raise OwnershipActivationError("ownership activation package is not configured")
     expected_hash = _require_hash(expected_hash, "configured package hash")
@@ -430,7 +440,7 @@ def load_authority_operation(settings: Settings) -> dict[str, Any]:
         or package.get("kind") != "solslot-safe-authority-operation"
         or package.get("network") != "baseSepolia"
         or package.get("chainId") != BASE_SEPOLIA_CHAIN_ID
-        or package.get("phase") != "schedule"
+        or package.get("phase") != phase
         or not isinstance(package.get("sourceSha"), str)
         or not _SHA_RE.fullmatch(package["sourceSha"])
     ):
@@ -448,7 +458,7 @@ def load_authority_operation(settings: Settings) -> dict[str, Any]:
     if not isinstance(authority, Mapping):
         raise OwnershipActivationError("authorityOperation is invalid")
     if (
-        authority.get("phase") != "schedule"
+        authority.get("phase") != phase
         or _require_address(authority.get("rootSafe"), "authorityOperation.rootSafe").lower()
         != package["rootSafe"].lower()
     ):
@@ -492,10 +502,29 @@ def load_authority_operation(settings: Settings) -> dict[str, Any]:
         authority.get("transactionHash"), "authorityOperation.transactionHash"
     )
     try:
-        schedule = decode_ownership_schedule(
-            validated_transaction["data"],
-            expected_operation_id=package["operationId"],
-        )
+        if phase == "schedule":
+            schedule = decode_ownership_schedule(
+                validated_transaction["data"],
+                expected_operation_id=package["operationId"],
+            )
+        else:
+            schedule_package = load_authority_operation(settings, phase="schedule")
+            if (
+                schedule_package["operationId"] != package["operationId"]
+                or schedule_package["rootSafe"].lower() != package["rootSafe"].lower()
+                or schedule_package["timelock"].lower() != package["timelock"].lower()
+            ):
+                raise OwnershipActivationError(
+                    "ownership execute package does not match the reviewed schedule"
+                )
+            schedule = decode_ownership_schedule(
+                schedule_package["authorityOperation"]["transaction"]["data"],
+                expected_operation_id=package["operationId"],
+            )
+            validate_ownership_execute(
+                validated_transaction["data"],
+                schedule=schedule,
+            )
     except TimelockOperationError as exc:
         raise OwnershipActivationError(str(exc)) from exc
     approvals_raw = authority.get("approvals")
@@ -520,7 +549,7 @@ def load_authority_operation(settings: Settings) -> dict[str, Any]:
     authority["transactionHash"] = transaction_hash
     authority["approvals"] = approvals
     authority["review"] = {
-        "action": "acceptOwnership",
+        "action": "acceptOwnership" if phase == "schedule" else "executeAcceptOwnership",
         "targets": list(schedule.targets),
         "delaySeconds": schedule.delay_seconds,
         "operationId": schedule.operation_id,
@@ -578,7 +607,12 @@ def _chain_state(settings: Settings, package: Mapping[str, Any]) -> ChainState:
             "Base Sepolia Safe/timelock state could not be independently verified"
         ) from exc
     live_hash_hex = Web3.to_hex(live_hash).lower()
-    if not operation_exists and (
+    should_validate_package = (
+        package["phase"] == "schedule" and not operation_exists
+    ) or (
+        package["phase"] == "execute" and operation_exists and not operation_done
+    )
+    if should_validate_package and (
         live_nonce != int(package["authorityOperation"]["transaction"]["nonce"])
         or live_hash_hex != package["authorityOperation"]["transactionHash"]
     ):
@@ -780,6 +814,15 @@ def _public_status(
         )
     if chain.operation_done:
         state = "DONE"
+    elif package["phase"] == "execute":
+        if not chain.operation_exists:
+            state = "WAITING_FOR_SCHEDULE"
+        elif not chain.operation_ready:
+            state = "WAITING_FOR_DELAY"
+        elif complete:
+            state = "READY_TO_BROADCAST"
+        else:
+            state = "AWAITING_APPROVALS"
     elif chain.operation_ready:
         state = "READY_TO_EXECUTE"
     elif chain.operation_exists:
@@ -808,7 +851,15 @@ def _public_status(
         "approvals": approvals,
         "broadcastTransaction": (
             _build_exec_transaction(package, stored)
-            if complete and not chain.operation_exists
+            if complete
+            and (
+                (package["phase"] == "schedule" and not chain.operation_exists)
+                or (
+                    package["phase"] == "execute"
+                    and chain.operation_ready
+                    and not chain.operation_done
+                )
+            )
             else None
         ),
         "broadcast": broadcast,
@@ -818,6 +869,7 @@ def _public_status(
 router = APIRouter(
     prefix="/admin/omnichain/ownership-activation",
     tags=["admin-omnichain-ownership"],
+    dependencies=[Depends(require_admin_jwt)],
 )
 
 
@@ -903,6 +955,111 @@ def record_ownership_activation_broadcast(
         chain = _chain_state(settings, package)
         if not chain.operation_exists or chain.operation_timestamp <= 0:
             raise ValueError("timelock did not record the sealed ownership schedule")
+        store.record_broadcast(
+            package_hash=package["artifactHash"],
+            transaction_hash=body.transaction_hash.lower(),
+            submitted_by=submitted_by,
+            block_number=block_number,
+            confirmations=confirmations,
+            minimum_confirmations=settings.payment_omnichain_ownership_min_confirmations,
+            now=int(time.time()),
+        )
+        return _public_status(settings=settings, package=package, store=store)
+    except OwnershipActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/execute")
+def get_ownership_execution(
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[
+        OwnershipActivationStore, Depends(get_ownership_activation_store)
+    ],
+) -> dict[str, Any]:
+    _require_enabled(settings)
+    try:
+        package = load_authority_operation(settings, phase="execute")
+        return _public_status(settings=settings, package=package, store=store)
+    except OwnershipActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/execute/sign")
+def sign_ownership_execution(
+    body: SignatureRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[
+        OwnershipActivationStore, Depends(get_ownership_activation_store)
+    ],
+) -> dict[str, Any]:
+    _require_enabled(settings)
+    try:
+        package = load_authority_operation(settings, phase="execute")
+        chain = _chain_state(settings, package)
+        if not chain.operation_exists:
+            raise ValueError("ownership schedule is not on Base Sepolia")
+        if not chain.operation_ready:
+            raise ValueError("the 24-hour ownership delay has not finished")
+        if chain.operation_done:
+            raise ValueError("ownership execution is already complete")
+        matching: list[tuple[Mapping[str, Any], Any]] = []
+        for descriptor in package["authorityOperation"]["approvals"]:
+            recovered = recover_evm_signer(descriptor["typedData"], body.signature)
+            if any(
+                signer.lower() == recovered.address.lower()
+                for signer in descriptor["allowedSigners"]
+            ):
+                matching.append((descriptor, recovered))
+        if len(matching) != 1:
+            raise ValueError(
+                "SafeMessage signature does not match one unique authorized Safe role"
+            )
+        descriptor, recovered = matching[0]
+        if "0x" + recovered.digest.hex() != descriptor["messageHash"]:
+            raise ValueError("SafeMessage digest changed after package review")
+        _normalize_signature(body.signature)
+        store.add_approval(
+            package_hash=package["artifactHash"],
+            role=descriptor["role"],
+            signer_address=recovered.address,
+            signature=body.signature,
+            now=int(time.time()),
+        )
+        return _public_status(settings=settings, package=package, store=store)
+    except OwnershipActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/execute/broadcast")
+def record_ownership_execution_broadcast(
+    body: BroadcastRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[
+        OwnershipActivationStore, Depends(get_ownership_activation_store)
+    ],
+) -> dict[str, Any]:
+    _require_enabled(settings)
+    try:
+        package = load_authority_operation(settings, phase="execute")
+        approvals = store.approvals(package["artifactHash"])
+        if any(role not in approvals for role in REQUIRED_ROLES):
+            raise ValueError("fresh owner and coadministrator signatures are required")
+        before = _chain_state(settings, package)
+        if not before.operation_ready or before.operation_done:
+            raise ValueError("ownership operation is not ready for execution")
+        block_number, confirmations, submitted_by = _verify_broadcast(
+            settings=settings,
+            package=package,
+            approvals=approvals,
+            transaction_hash=body.transaction_hash,
+        )
+        after = _chain_state(settings, package)
+        if not after.operation_done:
+            raise ValueError("timelock execution did not complete ownership acceptance")
         store.record_broadcast(
             package_hash=package["artifactHash"],
             transaction_hash=body.transaction_hash.lower(),

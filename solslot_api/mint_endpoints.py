@@ -51,6 +51,7 @@ from .kos_mint_execute_signer import (
     KosMintExecuteSignerError,
     request_kos_mint_execute_signature,
 )
+from .launch_gates import require_operation_gate
 from .mint_chain_validation import (
     validate_kos_mint_execute_bundle,
     validate_publish_bundle,
@@ -75,6 +76,7 @@ def require_mint_writes(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
     require_minting_writes(settings)
+    require_operation_gate(settings, "minting")
 
 
 # ── Module-level store singleton ────────────────────────────────────────────

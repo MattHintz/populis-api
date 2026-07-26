@@ -241,6 +241,34 @@ class OperationStore:
         )
         return value
 
+    def list(
+        self,
+        *,
+        status_filter: str = "active",
+        limit: int = 100,
+        now: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if status_filter not in {"active", "pending", "approved", "consumed", "all"}:
+            raise ValueError("unsupported admin operation status filter")
+        current = int(time.time()) if now is None else now
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT operation_id FROM admin_operations "
+                "ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 200)),),
+            ).fetchall()
+        values = [self.get(str(row["operation_id"])) for row in rows]
+        if status_filter == "active":
+            return [
+                value
+                for value in values
+                if value["status"] in {"pending", "approved"}
+                and int(value["expires_at"]) >= current
+            ]
+        if status_filter == "all":
+            return values
+        return [value for value in values if value["status"] == status_filter]
+
     def add_signature(
         self,
         *,
@@ -387,6 +415,10 @@ def _public_operation(
         "network": value["network"],
         "nonce": value["nonce"],
         "requestBinding": value["request_binding"],
+        "createdBy": value["created_by"],
+        "createdAt": value["created_at"],
+        "approvedAt": value["approved_at"],
+        "consumedAt": value["consumed_at"],
         "signatures": [
             {
                 "adminIndex": item["admin_index"],
@@ -442,6 +474,29 @@ def prepare_operation(
         value = store.create(core=core, binding=binding, created_by=claims.sub, now=now)
         return _public_operation(value, core, chain_id=settings.eip712_chain_id)
     except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("")
+def list_operations(
+    _claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[OperationStore, Depends(get_operation_store)],
+    status_filter: Literal["active", "pending", "approved", "consumed", "all"] = "active",
+    limit: int = 100,
+) -> dict[str, Any]:
+    try:
+        values = store.list(status_filter=status_filter, limit=limit)
+        operations = [
+            _public_operation(
+                value,
+                _core_from_record(value),
+                chain_id=settings.eip712_chain_id,
+            )
+            for value in values
+        ]
+        return {"operations": operations, "count": len(operations)}
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

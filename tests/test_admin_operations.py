@@ -279,6 +279,11 @@ def test_http_prepare_sign_and_execute_requires_owner_plus_one(
     assert prepared.status_code == 201
     operation = prepared.json()
     assert operation["typedData"]["domain"]["chainId"] == 11155111
+    inbox = client.get("/admin/auth/operations")
+    assert inbox.status_code == 200
+    assert inbox.json()["count"] == 1
+    assert inbox.json()["operations"][0]["operationId"] == operation["operationId"]
+    assert inbox.json()["operations"][0]["createdBy"] == accounts[0].address.lower()
 
     for index in (0, 1):
         current_subject["value"] = accounts[index].address.lower()
@@ -303,3 +308,10 @@ def test_http_prepare_sign_and_execute_requires_owner_plus_one(
     assert client.get(
         f"/admin/auth/operations/{operation['operationId']}"
     ).json()["status"] == "consumed"
+    assert client.get("/admin/auth/operations").json()["count"] == 0
+    assert (
+        client.get(
+            "/admin/auth/operations", params={"status_filter": "consumed"}
+        ).json()["count"]
+        == 1
+    )
