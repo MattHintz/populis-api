@@ -5,7 +5,11 @@ from chia_rs import Coin
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
-from solslot_api.genesis_funding import FUNDING_NAMES, plan_genesis_funding_fanout
+from solslot_api.genesis_funding import (
+    FUNDING_NAMES,
+    GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT,
+    plan_genesis_funding_fanout,
+)
 
 
 def _source(amount: int = 2_000_000) -> Coin:
@@ -24,7 +28,9 @@ def test_funding_plan_derives_nine_distinct_confirmable_coin_ids() -> None:
     assert len({item["amount"] for item in outputs}) == 9
     assert len({item["coinId"] for item in outputs}) == 9
     assert outputs[0]["amount"] == 1_000_000
-    assert result.plan["fundingCoinIds"]["bridgeBatch"]
+    bridge_batch = next(item for item in outputs if item["name"] == "bridgeBatch")
+    assert bridge_batch["amount"] == GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT == 530
+    assert result.plan["fundingCoinIds"]["bridgeBatch"] == bridge_batch["coinId"]
     assert result.digest.startswith("0x") and len(result.digest) == 66
 
 
