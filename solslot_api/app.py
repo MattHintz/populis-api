@@ -65,6 +65,7 @@ from .payment_purchase_store import get_payment_purchase_store
 from .alpha_observability import router as alpha_observability_router
 from .alpha_metrics import router as alpha_metrics_router
 from .chia_proxy import router as chia_proxy_router
+from .sols_market import router as sols_market_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
@@ -366,6 +367,7 @@ app.include_router(presale_router)
 app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)
 app.include_router(chia_proxy_router)
+app.include_router(sols_market_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)

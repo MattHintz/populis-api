@@ -1258,6 +1258,50 @@ class CollectionStore:
         rendered["collectionSlug"] = row["slug"]
         return rendered
 
+    def sols_market_candidates(self) -> list[dict[str, Any]]:
+        """Return only published, executed deeds that can be checked on chain.
+
+        This is intentionally a candidate feed rather than an availability
+        feed. Pool custody, current NAV evidence, and the live deed lineage are
+        verified by the SOLS market reader before anything reaches a buyer.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    d.*,
+                    c.id AS parent_collection_id,
+                    c.slug,
+                    c.canonical_json,
+                    c.metadata_root
+                FROM property_collection_deeds d
+                JOIN property_collections c ON c.id=d.collection_id
+                WHERE c.state='PUBLISHED'
+                  AND d.proposal_state='EXECUTED'
+                  AND d.deed_launcher_id IS NOT NULL
+                  AND d.output_coin_id IS NOT NULL
+                  AND d.confirmation_height IS NOT NULL
+                ORDER BY c.created_at, d.ordinal, d.deed_id
+                """
+            ).fetchall()
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            if row["canonical_json"] is None:
+                continue
+            dossier = json.loads(bytes(row["canonical_json"]))
+            candidates.append(
+                {
+                    **self._render_deed(row),
+                    "collectionId": row["parent_collection_id"],
+                    "collectionSlug": row["slug"],
+                    "collectionTitle": dossier.get("title"),
+                    "collectionSummary": dossier.get("summary"),
+                    "metadataRoot": _hex(row["metadata_root"]),
+                }
+            )
+        return candidates
+
     def _update_asset(
         self,
         collection_id: str,
