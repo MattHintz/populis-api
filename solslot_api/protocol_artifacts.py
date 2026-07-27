@@ -84,7 +84,7 @@ PurchaseIntentState = Literal[
 async def get_signed_public_artifact(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
-    """Return only the administrator-signed V2 ceremony artifact."""
+    """Return only the administrator-signed RC22 ceremony artifact."""
     try:
         return load_signed_public_artifact(settings)
     except PublicArtifactMissing as exc:
@@ -95,7 +95,7 @@ async def get_signed_public_artifact(
     except PublicArtifactError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The signed V2 public artifact failed verification.",
+            detail="The signed RC22 public artifact failed verification.",
         ) from exc
 
 
@@ -317,7 +317,7 @@ async def build_protocol_offer_artifact(
     except PublicArtifactError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The signed V2 genesis artifact is unavailable or invalid.",
+            detail="The signed RC22 genesis artifact is unavailable or invalid.",
         ) from exc
     expected_genesis_hash = _normalize_hex32(
         body.genesis_artifact_hash,

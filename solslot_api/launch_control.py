@@ -1930,7 +1930,7 @@ async def build_guided_plan(
         if not funding or funding["state"] != "confirmed":
             raise GenesisConflict("confirm the fixed ceremony funding first")
         template, _ = _read_json_file(
-            settings.launch_plan_template_path, "RC21 launch plan template"
+            settings.launch_plan_template_path, "RC22 launch plan template"
         )
         template["fundingCoinIds"] = dict(funding["plan"]["fundingCoinIds"])
         body = PlanRequest.model_validate(template)

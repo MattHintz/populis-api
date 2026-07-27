@@ -24,7 +24,11 @@ def test_funding_plan_derives_nine_distinct_confirmable_coin_ids() -> None:
         network="testnet11",
     )
     outputs = result.plan["outputs"]
+    assert result.plan["schemaVersion"] == 3
+    assert result.plan["protocolVersion"] == "solslot-v2-rc22"
     assert [item["name"] for item in outputs] == list(FUNDING_NAMES)
+    assert "statutes" in result.plan["fundingCoinIds"]
+    assert "navRegistry" not in result.plan["fundingCoinIds"]
     assert len({item["amount"] for item in outputs}) == 9
     assert len({item["coinId"] for item in outputs}) == 9
     assert outputs[0]["amount"] == 1_000_000

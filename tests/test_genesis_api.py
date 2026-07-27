@@ -116,7 +116,7 @@ def _plan_body() -> dict:
         "pool",
         "did",
         "governance",
-        "navRegistry",
+        "statutes",
         "protocolConfig",
         "adminAuthority",
         "vaultVersionRegistry",
@@ -148,15 +148,15 @@ def _plan_body() -> dict:
         "trustedGovernanceRewardsRoot": "0x" + "44" * 32,
         "retiredCoordinates": ["0x" + "51" * 32],
         "protocolParameters": {
-            "quorumBps": 5000,
             "votingWindowSeconds": 300,
-            "sgtTotalSupply": 1_000_000,
+            "quorumBps": 5000,
             "minProposalStake": 10_000,
-            "fpScale": 1000,
-            "minNavRegistryVersion": 1,
-            "initialPoolStatus": 1,
-            "initialTotalPoolTokenSupply": 0,
-            "initialTreasuryReserveTokens": 0,
+            "navValiditySeconds": 86_400,
+            "oracleMaxAgeSeconds": 600,
+            "exchangeFeeBps": 100,
+            "protocolFeeBps": 30,
+            "sgtRewardsFeeBps": 70,
+            "rewardEpochSeconds": 86_400,
         },
     }
 
@@ -199,6 +199,31 @@ def test_three_admin_http_flow_reaches_plan_approval(tmp_path) -> None:
     final = store.get(ceremony_id)
     assert final["state"] == "plan_approved"
     assert len(final["plan_signatures"]) == 2
+    assert final["plan"]["schema"] == "solslot-genesis-plan-v3"
+    assert final["plan"]["protocolVersion"] == "solslot-v2-rc22"
+    assert "statutes" in final["plan"]["launcherIds"]
+    assert "navRegistry" not in final["plan"]["launcherIds"]
+    assert final["plan"]["bridgeBatch"]["fundingAmount"] == 529
+
+
+def test_plan_rejects_retired_nav_registry_and_rc21_parameters(tmp_path) -> None:
+    client, _, _ = _client(tmp_path)
+    ceremony_id, _ = _create_and_enroll(client)
+    body = _plan_body()
+    body["fundingCoinIds"]["navRegistry"] = body["fundingCoinIds"].pop(
+        "statutes"
+    )
+    body["protocolParameters"]["minNavRegistryVersion"] = 1
+
+    response = client.post(
+        f"/admin/genesis/{ceremony_id}/plan",
+        json=body,
+        headers=_headers(),
+    )
+
+    assert response.status_code == 422
+    assert "statutes" in response.text
+    assert "navRegistry" in response.text
 
 
 def test_broadcast_requires_fee_funded_local_mempool_submission(

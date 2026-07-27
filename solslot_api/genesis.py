@@ -96,11 +96,13 @@ class InvitationAcceptRequest(InvitationPrepareRequest):
 
 
 class FundingCoinIds(ApiModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     sgt: str
     pool: str
     did: str
     governance: str
-    nav_registry: str = Field(alias="navRegistry")
+    statutes: str
     protocol_config: str = Field(alias="protocolConfig")
     admin_authority: str = Field(alias="adminAuthority")
     vault_version_registry: str = Field(alias="vaultVersionRegistry")
@@ -108,22 +110,30 @@ class FundingCoinIds(ApiModel):
 
 
 class ProtocolParameters(ApiModel):
-    quorum_bps: int = Field(5000, alias="quorumBps", ge=1, le=10000)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     voting_window_seconds: int = Field(300, alias="votingWindowSeconds", ge=1)
-    sgt_total_supply: int = Field(1_000_000, alias="sgtTotalSupply", ge=1)
+    quorum_bps: int = Field(5000, alias="quorumBps", ge=1, le=10000)
     min_proposal_stake: int = Field(10_000, alias="minProposalStake", ge=1)
-    fp_scale: int = Field(1000, alias="fpScale", ge=1)
-    min_nav_registry_version: int = Field(1, alias="minNavRegistryVersion", ge=1)
-    initial_pool_status: int = Field(1, alias="initialPoolStatus", ge=0, le=1)
-    initial_total_pool_token_supply: int = Field(
-        0, alias="initialTotalPoolTokenSupply", ge=0
+    nav_validity_seconds: int = Field(
+        86_400, alias="navValiditySeconds", ge=60
     )
-    initial_treasury_reserve_tokens: int = Field(
-        0, alias="initialTreasuryReserveTokens", ge=0
+    oracle_max_age_seconds: int = Field(
+        600, alias="oracleMaxAgeSeconds", ge=30
+    )
+    exchange_fee_bps: int = Field(100, alias="exchangeFeeBps", ge=0, le=100)
+    protocol_fee_bps: int = Field(30, alias="protocolFeeBps", ge=0, le=100)
+    sgt_rewards_fee_bps: int = Field(
+        70, alias="sgtRewardsFeeBps", ge=0, le=100
+    )
+    reward_epoch_seconds: int = Field(
+        86_400, alias="rewardEpochSeconds", ge=60
     )
 
 
 class PlanRequest(ApiModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     evm_addresses: dict[str, str] = Field(alias="evmAddresses")
     funding_coin_ids: FundingCoinIds = Field(alias="fundingCoinIds")
     faucet_puzzle_hash: str = Field(alias="faucetPuzzleHash")
@@ -574,7 +584,7 @@ async def _live_funding(
         "pool",
         "did",
         "governance",
-        "navRegistry",
+        "statutes",
         "protocolConfig",
         "adminAuthority",
         "vaultVersionRegistry",
@@ -1098,9 +1108,9 @@ async def finalize(
 
         # The lock manifest is intentionally the final public file written.
         lock = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
-            "protocolVersion": "solslot-v2",
+            "protocolVersion": "solslot-v2-rc22",
             "reviewClass": artifact["reviewClass"],
             "testOnly": artifact["testOnly"],
             "auditStatus": artifact["auditStatus"],

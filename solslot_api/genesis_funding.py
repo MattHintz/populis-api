@@ -1,4 +1,4 @@
-"""Deterministic nine-coin funding fan-out for the V2 ceremony."""
+"""Deterministic nine-coin funding fan-out for the RC22 ceremony."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ FUNDING_NAMES = (
     "pool",
     "did",
     "governance",
-    "navRegistry",
+    "statutes",
     "protocolConfig",
     "adminAuthority",
     "vaultVersionRegistry",
@@ -70,7 +70,7 @@ def plan_genesis_funding_fanout(
         "pool": 1,
         "did": 1,
         "governance": 1,
-        "navRegistry": 1,
+        "statutes": 1,
         "protocolConfig": 1,
         "adminAuthority": 1,
         "vaultVersionRegistry": 1,
@@ -107,8 +107,8 @@ def plan_genesis_funding_fanout(
             }
         )
     plan = {
-        "schemaVersion": 2,
-        "protocolVersion": "solslot-v2",
+        "schemaVersion": 3,
+        "protocolVersion": "solslot-v2-rc22",
         "network": network,
         "sourceCoinId": "0x" + bytes(source_id).hex(),
         "sourceAmount": int(source_coin.amount),

@@ -703,7 +703,7 @@ class Settings(BaseSettings):
         "./state/source-freeze-evidence-rc21.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
-    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc21.json"
+    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc22.json"
     launch_settlement_rehearsal_path: Optional[str] = (
         "./state/settlement-rehearsal-rc21.json"
     )
