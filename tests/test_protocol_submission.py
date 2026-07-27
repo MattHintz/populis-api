@@ -151,21 +151,21 @@ async def test_medium_fee_is_added_from_till_without_changing_protocol_outputs()
 
 
 @pytest.mark.asyncio
-async def test_530_mojo_ceremony_input_keeps_its_full_output_value() -> None:
+async def test_529_mojo_ceremony_input_keeps_its_full_output_value() -> None:
     faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
     fee_coin = Coin(b32(40), faucet.address_puzzle_hash, uint64(100))
     provider = FakeProvider(fee_coin=fee_coin)
-    ceremony = protocol_bundle(530)
+    ceremony = protocol_bundle(529)
 
     receipt = await submitter(provider, faucet).submit(ceremony.to_json_dict())
 
     assert receipt["feeMojos"] == "7"
     assert provider.submitted is not None
     final = SpendBundle.from_json_dict(provider.submitted)
-    assert int(final.removals()[0].amount) == 530
+    assert int(final.removals()[0].amount) == 529
     assert sum(
         int(coin.amount) for coin in compute_additions(final.coin_spends[0])
-    ) == 530
+    ) == 529
     assert bytes(final.removals()[1].name()) == bytes(fee_coin.name())
 
 

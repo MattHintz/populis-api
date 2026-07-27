@@ -29,9 +29,20 @@ def test_funding_plan_derives_nine_distinct_confirmable_coin_ids() -> None:
     assert len({item["coinId"] for item in outputs}) == 9
     assert outputs[0]["amount"] == 1_000_000
     bridge_batch = next(item for item in outputs if item["name"] == "bridgeBatch")
-    assert bridge_batch["amount"] == GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT == 530
+    assert bridge_batch["amount"] == GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT == 529
     assert result.plan["fundingCoinIds"]["bridgeBatch"] == bridge_batch["coinId"]
     assert result.digest.startswith("0x") and len(result.digest) == 66
+
+
+def test_funding_plan_rejects_embedded_fee_padding() -> None:
+    source = _source()
+    with pytest.raises(ValueError, match="separate fee till"):
+        plan_genesis_funding_fanout(
+            source_coin=source,
+            faucet_puzzle_hash=source.puzzle_hash,
+            network="testnet11",
+            fee=1,
+        )
 
 
 def test_funding_plan_rejects_wrong_network_or_insufficient_source() -> None:

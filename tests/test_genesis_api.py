@@ -208,7 +208,7 @@ def test_broadcast_requires_fee_funded_local_mempool_submission(
     ceremony_id, accounts = _create_and_enroll(client)
     _approve_plan(client, ceremony_id, accounts)
     protocol_bundle = {
-        "coin_spends": [{"coin": {"amount": 530}}],
+        "coin_spends": [{"coin": {"amount": 529}}],
         "aggregated_signature": "0xc0",
     }
 

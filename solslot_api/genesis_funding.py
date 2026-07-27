@@ -25,11 +25,9 @@ FUNDING_NAMES = (
 )
 GENESIS_BRIDGE_PARENT_TOTAL = sum(range(1, 33))
 GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT = 1
-GENESIS_BRIDGE_BATCH_BUFFER = 1
 GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT = (
     GENESIS_BRIDGE_PARENT_TOTAL
     + GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT
-    + GENESIS_BRIDGE_BATCH_BUFFER
 )
 
 
@@ -60,19 +58,23 @@ def plan_genesis_funding_fanout(
         raise ValueError("genesis funding fan-out is restricted to testnet11")
     if source_coin.puzzle_hash != faucet_puzzle_hash:
         raise ValueError("source coin does not belong to the configured ceremony faucet")
-    if sgt_total_supply <= 0 or fee < 0:
-        raise ValueError("SGT supply must be positive and fee must be non-negative")
+    if sgt_total_supply <= 0:
+        raise ValueError("SGT supply must be positive")
+    if fee != 0:
+        raise ValueError(
+            "ceremony funding outputs are fee-free; use the separate fee till"
+        )
 
     minimums = {
-        "sgt": sgt_total_supply + fee,
-        "pool": 1 + fee,
-        "did": 1 + fee,
-        "governance": 1 + fee,
-        "navRegistry": 1 + fee,
-        "protocolConfig": 1 + fee,
-        "adminAuthority": 1 + fee,
-        "vaultVersionRegistry": 1 + fee,
-        "bridgeBatch": GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT + fee,
+        "sgt": sgt_total_supply,
+        "pool": 1,
+        "did": 1,
+        "governance": 1,
+        "navRegistry": 1,
+        "protocolConfig": 1,
+        "adminAuthority": 1,
+        "vaultVersionRegistry": 1,
+        "bridgeBatch": GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT,
     }
     used: set[int] = set()
     amounts: dict[str, int] = {}
@@ -122,7 +124,6 @@ def plan_genesis_funding_fanout(
 
 __all__ = [
     "FUNDING_NAMES",
-    "GENESIS_BRIDGE_BATCH_BUFFER",
     "GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT",
     "GENESIS_BRIDGE_PARENT_TOTAL",
     "GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT",
