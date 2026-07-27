@@ -828,6 +828,34 @@ async def _readiness(
             }
         )
 
+    fee_submitter = getattr(request.app.state, "protocol_submitter", None)
+    fee_funding_healthy = (
+        settings.protocol_fee_funding_enabled
+        and fee_submitter is not None
+    )
+    items.append(
+        {
+            "id": "networkFee",
+            "title": "Network fee funding",
+            "status": "Healthy" if fee_funding_healthy else "Blocked",
+            "impact": (
+                "The fountain till will add the current medium Testnet11 fee "
+                "and confirm the launch in the local mempool."
+                if fee_funding_healthy
+                else "Enable the bounded fountain fee till before launch; "
+                "the 530-mojo bridge coin is reserved for ceremony outputs."
+            ),
+            "assignedRole": "technical-coadmin",
+            "action": None if fee_funding_healthy else "configureFeeTill",
+            "evidence": {
+                "targetSeconds": settings.protocol_medium_fee_target_seconds,
+                "minimumMojos": settings.protocol_minimum_fee_mojos,
+                "maximumMojos": settings.protocol_maximum_fee_mojos,
+                "source": "local-full-node",
+            },
+        }
+    )
+
     try:
         ownership_store = get_ownership_activation_store(settings)
         ownership = _rail_phase_status(settings, ownership_store)

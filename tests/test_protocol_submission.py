@@ -36,10 +36,10 @@ def coin_record(coin: Coin) -> dict[str, Any]:
     }
 
 
-def protocol_bundle() -> SpendBundle:
-    coin = Coin(b32(1), b32(2), uint64(10))
+def protocol_bundle(amount: int = 10) -> SpendBundle:
+    coin = Coin(b32(1), b32(2), uint64(amount))
     output = b32(3)
-    puzzle = Program.to((1, [[51, output, 10]]))
+    puzzle = Program.to((1, [[51, output, amount]]))
     return SpendBundle(
         [make_spend(coin, puzzle, Program.to(0))],
         G2Element(),
@@ -148,6 +148,25 @@ async def test_medium_fee_is_added_from_till_without_changing_protocol_outputs()
     assert len(fee_additions) == 1
     assert fee_additions[0].puzzle_hash == faucet.address_puzzle_hash
     assert int(fee_additions[0].amount) == 93
+
+
+@pytest.mark.asyncio
+async def test_530_mojo_ceremony_input_keeps_its_full_output_value() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(40), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    ceremony = protocol_bundle(530)
+
+    receipt = await submitter(provider, faucet).submit(ceremony.to_json_dict())
+
+    assert receipt["feeMojos"] == "7"
+    assert provider.submitted is not None
+    final = SpendBundle.from_json_dict(provider.submitted)
+    assert int(final.removals()[0].amount) == 530
+    assert sum(
+        int(coin.amount) for coin in compute_additions(final.coin_spends[0])
+    ) == 530
+    assert bytes(final.removals()[1].name()) == bytes(fee_coin.name())
 
 
 @pytest.mark.asyncio

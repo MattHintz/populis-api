@@ -19,6 +19,15 @@ RESERVE_FEE = 52
 class ProtocolSubmissionError(RuntimeError):
     """A server-funded protocol bundle cannot be safely submitted."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        submission_attempted: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.submission_attempted = submission_attempted
+
 
 @dataclass(frozen=True)
 class ProtocolFeePolicy:
@@ -92,7 +101,10 @@ class ProtocolBundleSubmitter:
                     poll_seconds=self.policy.mempool_poll_seconds,
                 )
             except ChiaProviderError as exc:
-                raise ProtocolSubmissionError(str(exc)) from exc
+                raise ProtocolSubmissionError(
+                    str(exc),
+                    submission_attempted=True,
+                ) from exc
 
         return {
             "schemaVersion": 1,
