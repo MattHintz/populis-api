@@ -184,6 +184,28 @@ async def test_pending_or_insufficient_till_coin_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fee_coin_cannot_duplicate_a_protocol_input() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    shared_coin = Coin(b32(70), faucet.address_puzzle_hash, uint64(100))
+    protocol_spend = SpendBundle(
+        [
+            make_spend(
+                shared_coin,
+                Program.to((1, [[51, b32(71), 100]])),
+                Program.to(0),
+            )
+        ],
+        G2Element(),
+    )
+    provider = FakeProvider(fee_coin=shared_coin)
+
+    with pytest.raises(ProtocolSubmissionError, match="no eligible"):
+        await submitter(provider, faucet).submit(protocol_spend.to_json_dict())
+
+    assert provider.submitted is None
+
+
+@pytest.mark.asyncio
 async def test_protocol_fee_funding_is_fail_closed_by_default() -> None:
     faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
     provider = FakeProvider(

@@ -72,7 +72,13 @@ class ProtocolBundleSubmitter:
         # lock until mempool observation prevents reuse of an unconfirmed coin.
         async with self._lock:
             preliminary_fee = await self._estimate_fee(protocol_bundle)
-            fee_coin = await self._select_fee_coin(preliminary_fee)
+            protocol_input_ids = {
+                bytes(coin.name()) for coin in protocol_bundle.removals()
+            }
+            fee_coin = await self._select_fee_coin(
+                preliminary_fee,
+                excluded_coin_ids=protocol_input_ids,
+            )
             final_bundle, fee = await self._converge_fee(
                 protocol_bundle,
                 fee_coin,
@@ -137,7 +143,12 @@ class ProtocolBundleSubmitter:
             )
         return fee
 
-    async def _select_fee_coin(self, fee: int):
+    async def _select_fee_coin(
+        self,
+        fee: int,
+        *,
+        excluded_coin_ids: set[bytes],
+    ):
         try:
             records = await self.provider.get_coin_records_by_puzzle_hash(
                 self.faucet.address_hex,
@@ -157,6 +168,8 @@ class ProtocolBundleSubmitter:
             except (KeyError, TypeError, ValueError):
                 continue
             if coin is None:
+                continue
+            if bytes(coin.name()) in excluded_coin_ids:
                 continue
             try:
                 pending = await self.provider.get_mempool_items_by_coin_name(

@@ -60,6 +60,10 @@ from .protocol_artifacts import (
     _require_server_to_server_token,
 )
 from .public_artifact import PublicArtifactError, load_signed_public_artifact
+from .protocol_submission import (
+    ProtocolBundleSubmitter,
+    ProtocolSubmissionError,
+)
 from .state import get_registry
 from .validator_quorum import (
     PrimaryPurchaseClaim,
@@ -124,6 +128,10 @@ class CompleteNativePurchaseResponse(NativePurchaseModel):
     transaction_id: str = Field(alias="transactionId")
     status: str
     signer_indices: list[int] = Field(alias="signerIndices")
+    fee_mojos: int = Field(alias="feeMojos")
+    fee_target_seconds: int = Field(alias="feeTargetSeconds")
+    submission_provider: str = Field(alias="submissionProvider")
+    mempool_observed_at: str = Field(alias="mempoolObservedAt")
 
 
 @dataclass(frozen=True)
@@ -295,23 +303,31 @@ async def complete_native_purchase(
             [valid_spend.aggregated_signature, quorum.aggregated_signature]
         ),
     )
-    result = await request.app.state.coinset.push_tx(
-        signed_spend.to_json_dict()
-    )
-    network_status = str(result.get("status") or "").upper()
-    if not result.get("success") and network_status not in {
-        "SUCCESS",
-        "PENDING",
-    }:
+    submitter = getattr(request.app.state, "protocol_submitter", None)
+    if not isinstance(submitter, ProtocolBundleSubmitter):
         raise HTTPException(
-            status_code=502,
-            detail="The atomic purchase was rejected by the Chia node.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Protocol fee funding is unavailable. The purchase was not "
+                "submitted."
+            ),
         )
+    try:
+        result = await submitter.submit(signed_spend.to_json_dict())
+    except ProtocolSubmissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"The atomic purchase was not accepted into the local mempool: {exc}",
+        ) from exc
     return CompleteNativePurchaseResponse(
         purchaseId=_hex32(context.purchase.purchase_id),
-        transactionId=_hex32(signed_spend.name()),
-        status=network_status or "SUCCESS",
+        transactionId=str(result["spendBundleId"]),
+        status=str(result["status"]),
         signerIndices=list(quorum.signer_indices),
+        feeMojos=int(result["feeMojos"]),
+        feeTargetSeconds=int(result["feeTargetSeconds"]),
+        submissionProvider=str(result["submissionProvider"]),
+        mempoolObservedAt=str(result["mempoolObservedAt"]),
     )
 
 
