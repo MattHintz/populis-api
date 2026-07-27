@@ -130,6 +130,12 @@ SOLSLOT_CHIA_PRIMARY_REQUIRED=true
 SOLSLOT_CHIA_PRIMARY_CA_CERT_PATH=/opt/solslot/api-staging/shared/tls/chia/private_ca.crt
 SOLSLOT_CHIA_PRIMARY_CLIENT_CERT_PATH=/opt/solslot/api-staging/shared/tls/chia/solslot_api.crt
 SOLSLOT_CHIA_PRIMARY_CLIENT_KEY_PATH=/opt/solslot/api-staging/shared/tls/chia/solslot_api.key
+SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=false
+SOLSLOT_PROTOCOL_MEDIUM_FEE_TARGET_SECONDS=300
+SOLSLOT_PROTOCOL_MINIMUM_FEE_MOJOS=1
+SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS=10000000
+SOLSLOT_PROTOCOL_MEMPOOL_TIMEOUT_SECONDS=20
+SOLSLOT_PROTOCOL_MEMPOOL_POLL_SECONDS=0.5
 ```
 
 The challenge database is SQLite-WAL state shared by vault registration and
@@ -143,6 +149,14 @@ bound to that host's loopback interface. The coordinator reaches it through
 `solslot-chia-rpc-tunnel.service`, using a restricted forwarding-only SSH key,
 an explicitly pinned SSH host key, and a dedicated Chia private-CA client
 certificate. Neither the RPC port nor its mTLS credentials are public.
+
+Before a protocol-write window opens, set
+`SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=true` and restart the coordinator. This
+uses the existing configured faucet as a bounded fee till. Each server-authored
+protocol bundle is priced with the local node's native 300-second fee estimate,
+receives one separate XCH fee spend, and remains unaccepted by the coordinator
+until the fee input is visible in that same node's mempool. Keep the one-worker
+deployment rule: the fee-till lock is deliberately process-local.
 
 Provision the tunnel only after the forwarding key has been restricted on the
 node to `permitopen="127.0.0.1:18555"`:

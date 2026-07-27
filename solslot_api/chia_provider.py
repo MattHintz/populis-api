@@ -309,6 +309,39 @@ class ChiaProvider:
             lambda client: client.get_mempool_items_by_coin_name(coin_id),
         )
 
+    async def get_fee_estimate(
+        self,
+        *,
+        target_times: list[int],
+        spend_bundle: dict[str, Any],
+        require_primary: bool = False,
+    ) -> dict[str, Any]:
+        """Return an absolute fee estimate for a complete spend bundle."""
+        if require_primary:
+            if self.primary is None or not await self._primary_available():
+                raise ChiaProviderError(
+                    "local Chia full node is required for protocol fee estimation"
+                )
+            try:
+                result = await self.primary.get_fee_estimate(
+                    target_times=target_times,
+                    spend_bundle=spend_bundle,
+                )
+                self._last_primary_success_at = _utc_now()
+                return result
+            except Exception as exc:
+                await self._mark_primary_failure("get_fee_estimate", exc)
+                raise ChiaProviderError(
+                    f"local Chia fee estimation failed: {exc}"
+                ) from exc
+        return await self._read(
+            "get_fee_estimate",
+            lambda client: client.get_fee_estimate(
+                target_times=target_times,
+                spend_bundle=spend_bundle,
+            ),
+        )
+
     async def push_tx(self, spend_bundle_json: dict[str, Any]) -> dict[str, Any]:
         if await self._primary_available():
             assert self.primary is not None
@@ -331,6 +364,71 @@ class ChiaProvider:
                 "Chia push_tx failed through primary and fallback: "
                 f"primary={self._last_primary_error}; fallback={fallback_error}"
             ) from fallback_error
+
+    async def push_tx_confirmed_in_primary_mempool(
+        self,
+        spend_bundle_json: dict[str, Any],
+        *,
+        required_coin_id: str,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> dict[str, Any]:
+        """Push locally and require this full node to observe the fee input."""
+        normalized_coin_id = _normalize_coin_id(required_coin_id)
+        if normalized_coin_id not in set(_input_coin_ids(spend_bundle_json)):
+            raise ChiaProviderError(
+                "mempool confirmation coin is not an input to the spend bundle"
+            )
+        if self.primary is None or not await self._primary_available():
+            raise ChiaProviderError(
+                "local Chia full node is required for protocol submission"
+            )
+
+        push_result: dict[str, Any] | None = None
+        push_error: Exception | None = None
+        try:
+            push_result = await self.primary.push_tx(spend_bundle_json)
+            self._last_primary_success_at = _utc_now()
+        except Exception as exc:
+            push_error = exc
+        else:
+            push_status = str(push_result.get("status") or "").upper()
+            if not push_result.get("success") and push_status not in {
+                "SUCCESS",
+                "PENDING",
+            }:
+                raise ChiaProviderError(
+                    f"local Chia node rejected protocol bundle: {push_result}"
+                )
+
+        deadline = self._monotonic() + timeout_seconds
+        while True:
+            try:
+                items = await self.primary.get_mempool_items_by_coin_name(
+                    normalized_coin_id
+                )
+                if items:
+                    self._last_primary_success_at = _utc_now()
+                    return {
+                        "success": True,
+                        "status": "MEMPOOL",
+                        "provider": "local-full-node",
+                        "required_coin_id": normalized_coin_id,
+                        "push_response": push_result,
+                        "ambiguous_push": push_error is not None,
+                        "observed_at": _utc_now(),
+                    }
+            except Exception as exc:
+                push_error = push_error or exc
+            if self._monotonic() >= deadline:
+                detail = (
+                    f" after ambiguous push ({push_error})" if push_error else ""
+                )
+                raise ChiaProviderError(
+                    "protocol bundle was not observed in the local mempool"
+                    f"{detail}"
+                )
+            await asyncio.sleep(poll_seconds)
 
     async def _spend_observed(self, spend_bundle_json: dict[str, Any]) -> bool:
         coin_ids = _input_coin_ids(spend_bundle_json)
@@ -394,6 +492,17 @@ def _input_coin_ids(spend_bundle_json: dict[str, Any]) -> list[str]:
             continue
         result.append("0x" + hashlib.sha256(parent + puzzle_hash + amount_bytes).hexdigest())
     return result
+
+
+def _normalize_coin_id(value: str) -> str:
+    clean = value.removeprefix("0x").lower()
+    if len(clean) != 64:
+        raise ChiaProviderError("coin id must be exactly 32 bytes")
+    try:
+        bytes.fromhex(clean)
+    except ValueError as exc:
+        raise ChiaProviderError("coin id must be hexadecimal") from exc
+    return "0x" + clean
 
 
 def create_chia_provider(config: ChiaProviderConfig) -> ChiaProvider:

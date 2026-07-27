@@ -179,6 +179,23 @@ class CoinsetClient:
         )
         return r.get("mempool_items") or []
 
+    async def get_fee_estimate(
+        self,
+        *,
+        target_times: list[int],
+        spend_bundle: dict[str, Any] | None = None,
+        cost: int | None = None,
+    ) -> dict[str, Any]:
+        """Estimate absolute fees for a spend at the requested target times."""
+        if (spend_bundle is None) == (cost is None):
+            raise ValueError("provide exactly one of spend_bundle or cost")
+        body: dict[str, Any] = {"target_times": list(target_times)}
+        if spend_bundle is not None:
+            body["spend_bundle"] = spend_bundle
+        else:
+            body["cost"] = cost
+        return await self._post("/get_fee_estimate", body)
+
     # ── Writes ───────────────────────────────────────────────────────────
 
     async def push_tx(self, spend_bundle_json: dict[str, Any]) -> dict[str, Any]:

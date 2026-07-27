@@ -26,6 +26,7 @@ class FakeRpc:
         push_result: dict[str, Any] | None = None,
         push_error: Exception | None = None,
         mempool: dict[str, list[dict[str, Any]]] | None = None,
+        fee_estimate: int = 0,
     ) -> None:
         self.network = network
         self.synced = synced
@@ -34,6 +35,7 @@ class FakeRpc:
         self.push_result = push_result or {"success": True, "status": "SUCCESS"}
         self.push_error = push_error
         self.mempool = mempool or {}
+        self.fee_estimate = fee_estimate
         self.calls: list[tuple[str, Any]] = []
         self.closed = False
 
@@ -116,6 +118,24 @@ class FakeRpc:
         if self.read_error:
             raise self.read_error
         return self.mempool.get(coin_id, [])
+
+    async def get_fee_estimate(
+        self,
+        *,
+        target_times: list[int],
+        spend_bundle: dict[str, Any] | None = None,
+        cost: int | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("get_fee_estimate", (target_times, spend_bundle, cost))
+        )
+        if self.read_error:
+            raise self.read_error
+        return {
+            "success": True,
+            "target_times": target_times,
+            "estimates": [self.fee_estimate for _ in target_times],
+        }
 
     async def close(self) -> None:
         self.closed = True
@@ -269,6 +289,70 @@ async def test_ambiguous_push_submits_exactly_once_to_fallback_when_unobserved()
     assert result["success"] is True
     assert sum(call[0] == "push_tx" for call in fallback.calls) == 1
     assert next(call[1] for call in fallback.calls if call[0] == "push_tx") == bundle
+
+
+@pytest.mark.asyncio
+async def test_protocol_push_requires_primary_mempool_observation() -> None:
+    bundle = spend_bundle()
+    [coin_id] = _input_coin_ids(bundle)
+    primary = FakeRpc(mempool={coin_id: [{"spend_bundle_name": "observed"}]})
+    fallback = FakeRpc()
+    provider = ChiaProvider(primary, fallback, config())
+    await provider.start()
+
+    result = await provider.push_tx_confirmed_in_primary_mempool(
+        bundle,
+        required_coin_id=coin_id,
+        timeout_seconds=1,
+        poll_seconds=0.01,
+    )
+
+    assert result["status"] == "MEMPOOL"
+    assert result["provider"] == "local-full-node"
+    assert any(call[0] == "push_tx" for call in primary.calls)
+    assert not any(call[0] == "push_tx" for call in fallback.calls)
+
+
+@pytest.mark.asyncio
+async def test_protocol_fee_estimate_fails_closed_without_primary() -> None:
+    provider = ChiaProvider(None, FakeRpc(fee_estimate=5), config(primary_url=None))
+
+    with pytest.raises(ChiaProviderError, match="local Chia full node"):
+        await provider.get_fee_estimate(
+            target_times=[300],
+            spend_bundle=spend_bundle(),
+            require_primary=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_protocol_push_rejection_or_missing_mempool_evidence_fails_closed() -> None:
+    bundle = spend_bundle()
+    [coin_id] = _input_coin_ids(bundle)
+    rejected = ChiaProvider(
+        FakeRpc(push_result={"success": False, "status": "FAILED", "error": "bad"}),
+        FakeRpc(),
+        config(),
+    )
+    await rejected.start()
+    with pytest.raises(ChiaProviderError, match="rejected protocol bundle"):
+        await rejected.push_tx_confirmed_in_primary_mempool(
+            bundle,
+            required_coin_id=coin_id,
+            timeout_seconds=0,
+            poll_seconds=0.01,
+        )
+
+    absent = ChiaProvider(FakeRpc(), FakeRpc(), config())
+    await absent.start()
+    with pytest.raises(ChiaProviderError, match="not observed"):
+        await absent.push_tx_confirmed_in_primary_mempool(
+            bundle,
+            required_coin_id=coin_id,
+            timeout_seconds=0,
+            poll_seconds=0.01,
+        )
+    assert not any(call[0] == "push_tx" for call in absent.fallback.calls)
 
 
 @pytest.mark.asyncio

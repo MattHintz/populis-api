@@ -89,6 +89,7 @@ from .config import (
 )
 from .credential_auth import require_alpha_writes
 from .protocol_config import build_snapshot as build_protocol_config_snapshot
+from .protocol_submission import ProtocolBundleSubmitter, ProtocolFeePolicy
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
@@ -260,6 +261,40 @@ async def lifespan(app: FastAPI):
             "Faucet ready: %s  (puzhash %s)",
             app.state.faucet.bech32_address(),
             app.state.faucet.address_hex,
+        )
+
+    app.state.protocol_submitter = None
+    if settings.protocol_fee_funding_enabled:
+        if app.state.faucet is None:
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires the existing "
+                "SOLSLOT_FAUCET_* fee-till credential."
+            )
+        if not settings.chia_primary_url:
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires "
+                "SOLSLOT_CHIA_PRIMARY_URL."
+            )
+        if (
+            settings.protocol_minimum_fee_mojos
+            > settings.protocol_maximum_fee_mojos
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_MINIMUM_FEE_MOJOS cannot exceed "
+                "SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS."
+            )
+        app.state.protocol_submitter = ProtocolBundleSubmitter(
+            provider=app.state.coinset,
+            faucet=app.state.faucet,
+            policy=ProtocolFeePolicy(
+                enabled=True,
+                target_seconds=settings.protocol_medium_fee_target_seconds,
+                minimum_mojos=settings.protocol_minimum_fee_mojos,
+                maximum_mojos=settings.protocol_maximum_fee_mojos,
+                maximum_funding_coin_mojos=settings.faucet_max_spend_mojos,
+                mempool_timeout_seconds=settings.protocol_mempool_timeout_seconds,
+                mempool_poll_seconds=settings.protocol_mempool_poll_seconds,
+            ),
         )
 
     app.state.voucher_issuance_worker = None

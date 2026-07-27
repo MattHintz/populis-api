@@ -105,6 +105,31 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "Chia primary mTLS requires CA, client certificate, and client key paths."
         )
+    if settings.protocol_fee_funding_enabled:
+        if not settings.chia_primary_url:
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires "
+                "SOLSLOT_CHIA_PRIMARY_URL."
+            )
+        if not any(
+            (
+                settings.faucet_master_sk_hex,
+                settings.faucet_seed_hex,
+                settings.faucet_mnemonic,
+            )
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires one existing "
+                "SOLSLOT_FAUCET_* credential."
+            )
+        if (
+            settings.protocol_minimum_fee_mojos
+            > settings.protocol_maximum_fee_mojos
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_MINIMUM_FEE_MOJOS cannot exceed "
+                "SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS."
+            )
 
     if settings.minting_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
@@ -580,6 +605,14 @@ class Settings(BaseSettings):
     chia_primary_ca_cert_path: Optional[str] = None
     chia_primary_client_cert_path: Optional[str] = None
     chia_primary_client_key_path: Optional[str] = None
+    # Server-funded protocol submissions use the local node's native fee
+    # estimator. The existing faucet wallet acts as a bounded fee till.
+    protocol_fee_funding_enabled: bool = False
+    protocol_medium_fee_target_seconds: int = Field(300, ge=60, le=1800)
+    protocol_minimum_fee_mojos: int = Field(1, ge=0)
+    protocol_maximum_fee_mojos: int = Field(10_000_000, ge=1)
+    protocol_mempool_timeout_seconds: float = Field(20.0, ge=2.0, le=120.0)
+    protocol_mempool_poll_seconds: float = Field(0.5, ge=0.1, le=5.0)
 
     def effective_chia_fallback_url(self) -> str:
         return self.chia_fallback_url or self.coinset_base_url
