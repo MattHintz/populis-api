@@ -1,34 +1,53 @@
-"""Chain-authoritative SOLS secondary SmartDeed market.
+"""Chain-authoritative RC22 Sols secondary SmartDeed market.
 
-SOLS is the pool CAT used by Pool V3 spend case 6. It is not a primary
-checkout rail. This module deliberately refuses to turn database rows into
-market inventory until the live pool, deed custody, and governed collection
-NAV have all been reconstructed from Testnet11 puzzle solutions.
+Sols is the Pool V4 CAT. It is not a primary checkout rail. Database rows are
+used only to decorate inventory that has already been reconstructed from the
+Pool V4 and statutes singleton lineages on Testnet11.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
+from time import time
 from typing import Annotated, Any, Mapping, Optional
 
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
-from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD_HASH
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
+    SINGLETON_LAUNCHER_HASH,
+    SINGLETON_MOD_HASH,
+)
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from solslot_puzzles import load_puzzle
-from solslot_puzzles.collection_nav_registry_driver import (
-    collection_nav_registry_inner_mod_hash,
-    collection_nav_root,
-    normalise_nav_entries,
-)
 from solslot_puzzles.mint_publish_driver import canonical_p2_pool_mod_hash
-from solslot_puzzles.pool_economics_v2 import (
-    PoolEconomicState,
-    deed_metadata_commitment,
-    quote_specific_deed_swap,
+from solslot_puzzles.pool_economics_v2 import deed_metadata_commitment
+from solslot_puzzles.pool_v4_driver import pool_v4_inner_mod_hash
+from solslot_puzzles.protocol_statutes_driver import (
+    protocol_statutes_inner_mod_hash,
+)
+from solslot_puzzles.protocol_statutes_v1 import (
+    CollectionStatute,
+    MutationKind,
+    PermanentRules,
+    ProtocolParameters,
+    ScopedPause,
+    StatutesState,
+    initial_state,
+    keyed_root,
+)
+from solslot_puzzles.sols_economics_v3 import (
+    SolsEconomicState,
+    quote_sols_to_deed,
+)
+from solslot_puzzles.sols_pool_v4 import (
+    INVENTORY_AVAILABLE,
+    PoolInventoryRecord,
+    SolsPoolStateV4,
+    canonical_inventory,
+    inventory_root,
 )
 from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, puzzle_for_p2_vault
 
@@ -46,13 +65,12 @@ from .vault_eligibility import require_current_approved_vault
 
 router = APIRouter(prefix="/sols", tags=["sols-secondary-market"])
 
-POOL_ACTIVE = 1
-POOL_SPEND_DEPOSIT = 1
-POOL_SPEND_SETTLEMENT = 3
-POOL_SPEND_GOVERNANCE = 4
-POOL_SPEND_V2_SPECIFIC_DEED_SWAP = 6
-POOL_SPEND_V2_TRUE_REDEMPTION = 7
-POOL_SPEND_V2_RESERVE_ACQUISITION = 8
+POOL_SPEND_DEED_TO_SOLS = 1
+POOL_SPEND_SOLS_TO_DEED = 2
+STATUTES_SPEND_EVIDENCE = 1
+STATUTES_SPEND_UPDATE = 2
+STATUTES_SPEND_SOLS_EVIDENCE = 3
+STATUTES_SPEND_GOVERNANCE_EVIDENCE = 4
 DEED_SPEND_POOL_DEPOSIT = 0x64
 MAX_SINGLETON_DEPTH = 10_000
 
@@ -74,37 +92,48 @@ class SingletonTip:
     live: LiveCoin
     latest_spent: Optional[LiveCoin]
     depth: int
+    lineage: tuple[LiveCoin, ...]
 
 
 @dataclass(frozen=True)
 class PoolState:
-    pool_status: int
-    total_nav_locked_mojos: int
+    bootstrap_complete: bool
+    inventory_nav_micro_usd: int
+    treasury_assets_micro_usd: int
+    proven_liabilities_micro_usd: int
     deed_count: int
-    total_pool_token_supply: int
-    treasury_reserve_tokens: int
+    total_sols_mojos: int
+    reserve_sols_mojos: int
+    state_version: int
+    inventory: tuple[PoolInventoryRecord, ...]
     live_coin_id: str
     live_puzzle_hash: str
     confirmed_height: int
     lineage_depth: int
 
-    def economics(self) -> PoolEconomicState:
-        return PoolEconomicState(
-            total_nav_locked_mojos=self.total_nav_locked_mojos,
+    def economics(self) -> SolsEconomicState:
+        return SolsEconomicState(
+            bootstrap_complete=self.bootstrap_complete,
+            inventory_nav_micro_usd=self.inventory_nav_micro_usd,
+            treasury_assets_micro_usd=self.treasury_assets_micro_usd,
+            proven_liabilities_micro_usd=self.proven_liabilities_micro_usd,
             deed_count=self.deed_count,
-            total_pool_token_supply=self.total_pool_token_supply,
-            treasury_reserve_tokens=self.treasury_reserve_tokens,
+            total_sols_mojos=self.total_sols_mojos,
+            reserve_sols_mojos=self.reserve_sols_mojos,
         )
 
 
 @dataclass(frozen=True)
-class NavRegistryState:
+class StatutesSnapshot:
     live_coin_id: str
     live_puzzle_hash: str
-    collection_nav_root: str
+    state: StatutesState
+    parameters: ProtocolParameters
+    collections: tuple[CollectionStatute, ...]
+    pauses: tuple[ScopedPause, ...]
     registry_version: int
-    entries: dict[str, int]
     confirmed_height: int
+    lineage_depth: int
 
 
 @dataclass(frozen=True)
@@ -116,6 +145,7 @@ class PoolDeed:
     property_id_canon: str
     collection_id_canon: str
     share_ppm: int
+    deed_commitment: str
     confirmed_height: int
 
 
@@ -187,7 +217,13 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
     launcher = _coin(launcher_record, launcher=True)
     nodes = [launcher]
     if launcher.spent_height is None:
-        return SingletonTip(launcher_id, launcher, None, 0)
+        return SingletonTip(
+            launcher_id,
+            launcher,
+            None,
+            0,
+            tuple(nodes),
+        )
 
     parent = launcher.coin_id
     for _ in range(MAX_SINGLETON_DEPTH):
@@ -209,6 +245,7 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
                 child,
                 next((item for item in reversed(nodes[:-1]) if item.spent_height), None),
                 len(nodes) - 1,
+                tuple(nodes),
             )
         parent = child.coin_id
     raise ValueError("singleton lineage exceeds the safety limit")
@@ -231,77 +268,94 @@ def _solution_parts(solution_hex: str, label: str) -> tuple[list[Program], list[
     return outer, inner
 
 
-def _apply_pool_transition(
-    previous: PoolEconomicState,
-    *,
-    pool_status: int,
-    fp_scale: int,
-    spend_case: int,
-    params: list[Program],
-) -> tuple[int, PoolEconomicState]:
-    if spend_case == POOL_SPEND_DEPOSIT:
-        if len(params) != 9:
-            raise ValueError("pool deposit has the wrong parameter count")
-        par = int(params[2].as_int())
-        minted = (par * fp_scale) // 1000
-        return pool_status, PoolEconomicState(
-            previous.total_nav_locked_mojos + par,
-            previous.deed_count + 1,
-            previous.total_pool_token_supply + minted,
-            previous.treasury_reserve_tokens,
-        )
-    if spend_case == POOL_SPEND_SETTLEMENT:
-        return 1, PoolEconomicState(
-            0,
-            0,
-            previous.total_pool_token_supply,
-            previous.treasury_reserve_tokens,
-        )
-    if spend_case == POOL_SPEND_GOVERNANCE:
-        if len(params) != 2:
-            raise ValueError("pool governance has the wrong parameter count")
-        return int(params[0].as_int()), previous
-    if spend_case in (POOL_SPEND_V2_SPECIFIC_DEED_SWAP, POOL_SPEND_V2_TRUE_REDEMPTION):
-        expected = 24 if spend_case == POOL_SPEND_V2_SPECIFIC_DEED_SWAP else 15
-        if len(params) != expected:
-            raise ValueError("pool deed exit has the wrong parameter count")
-        nav = int(params[7].as_int())
-        share = int(params[6].as_int())
-        deed_nav = (nav * share + 999_999) // 1_000_000
-        circulating = (
-            previous.total_pool_token_supply - previous.treasury_reserve_tokens
-        )
-        principal = (
-            deed_nav * circulating + previous.total_nav_locked_mojos - 1
-        ) // previous.total_nav_locked_mojos
-        return pool_status, PoolEconomicState(
-            previous.total_nav_locked_mojos - deed_nav,
-            previous.deed_count - 1,
-            previous.total_pool_token_supply
-            - (principal if spend_case == POOL_SPEND_V2_TRUE_REDEMPTION else 0),
-            previous.treasury_reserve_tokens
-            + (principal if spend_case == POOL_SPEND_V2_SPECIFIC_DEED_SWAP else 0),
-        )
-    if spend_case == POOL_SPEND_V2_RESERVE_ACQUISITION:
-        if len(params) != 15:
-            raise ValueError("pool acquisition has the wrong parameter count")
-        nav = int(params[7].as_int())
-        share = int(params[6].as_int())
-        deed_nav = (nav * share + 999_999) // 1_000_000
-        price = int(params[13].as_int())
-        reserve_paid = min(previous.treasury_reserve_tokens, price)
-        fresh = price - reserve_paid
-        return pool_status, PoolEconomicState(
-            previous.total_nav_locked_mojos + deed_nav,
-            previous.deed_count + 1,
-            previous.total_pool_token_supply + fresh,
-            previous.treasury_reserve_tokens - reserve_paid,
-        )
-    raise ValueError(f"unsupported Pool V3 spend case {spend_case}")
+def _bytes32_node(node: Program, label: str) -> bytes32:
+    raw = node.as_atom()
+    if len(raw) != 32:
+        raise ValueError(f"{label} must be exactly 32 bytes")
+    return bytes32(raw)
+
+
+def _protocol_parameters(node: Program) -> ProtocolParameters:
+    values = [int(value.as_int()) for value in node.as_iter()]
+    return ProtocolParameters.from_sequence(values).validate()
+
+
+def _collection_statute(node: Program) -> CollectionStatute:
+    values = list(node.as_iter())
+    if len(values) != 7:
+        raise ValueError("collection statute must have seven fields")
+    return CollectionStatute(
+        collection_id=_bytes32_node(values[0], "collection id"),
+        nav_micro_usd=int(values[1].as_int()),
+        allocation_ceiling_micro_usd=int(values[2].as_int()),
+        nav_version=int(values[3].as_int()),
+        valid_after=int(values[4].as_int()),
+        valid_until=int(values[5].as_int()),
+        status=int(values[6].as_int()),
+    ).validate()
+
+
+def _scoped_pause(node: Program) -> ScopedPause:
+    values = list(node.as_iter())
+    if len(values) != 4:
+        raise ValueError("scoped pause must have four fields")
+    return ScopedPause(
+        scope_id=_bytes32_node(values[0], "pause scope id"),
+        paused=int(values[1].as_int()),
+        expires_at=int(values[2].as_int()),
+        reason_hash=_bytes32_node(values[3], "pause reason hash"),
+    ).validate()
+
+
+def _pool_inventory_record(node: Program) -> PoolInventoryRecord:
+    values = list(node.as_iter())
+    if len(values) != 9:
+        raise ValueError("Pool V4 inventory record must have nine fields")
+    return PoolInventoryRecord(
+        deed_launcher_id=_bytes32_node(values[0], "deed launcher id"),
+        custody_coin_id=_bytes32_node(values[1], "custody coin id"),
+        deed_commitment=_bytes32_node(values[2], "deed commitment"),
+        collection_id=_bytes32_node(values[3], "collection id"),
+        share_ppm=int(values[4].as_int()),
+        deed_value_micro_usd=int(values[5].as_int()),
+        nav_version=int(values[6].as_int()),
+        valid_until=int(values[7].as_int()),
+        settlement_state=int(values[8].as_int()),
+    ).validate()
+
+
+def _pool_inventory(node: Program) -> tuple[PoolInventoryRecord, ...]:
+    return canonical_inventory(
+        tuple(_pool_inventory_record(item) for item in node.as_iter())
+    )
+
+
+def _pool_state_from_args(
+    inner_args: list[Program],
+    inventory: tuple[PoolInventoryRecord, ...],
+) -> SolsPoolStateV4:
+    bootstrap_flag = int(inner_args[5].as_int())
+    if bootstrap_flag not in (0, 1):
+        raise ValueError("Pool V4 bootstrap flag must be 0 or 1")
+    state = SolsPoolStateV4(
+        inventory_root=_bytes32_node(inner_args[4], "pool inventory root"),
+        economics=SolsEconomicState(
+            bootstrap_complete=bool(bootstrap_flag),
+            inventory_nav_micro_usd=int(inner_args[6].as_int()),
+            treasury_assets_micro_usd=int(inner_args[7].as_int()),
+            proven_liabilities_micro_usd=int(inner_args[8].as_int()),
+            deed_count=int(inner_args[9].as_int()),
+            total_sols_mojos=int(inner_args[10].as_int()),
+            reserve_sols_mojos=int(inner_args[11].as_int()),
+        ),
+        state_version=int(inner_args[12].as_int()),
+    )
+    return state.validate(inventory)
 
 
 def _decode_pool_state(
-    puzzle_solution: Mapping[str, Any], tip: SingletonTip
+    puzzle_solution: Mapping[str, Any],
+    tip: SingletonTip,
 ) -> PoolState:
     full = _program(str(puzzle_solution["puzzle_reveal"]))
     full_uncurried = full.uncurry()
@@ -317,49 +371,142 @@ def _decode_pool_state(
         raise ValueError("pool inner puzzle is not curried")
     inner_mod, inner_args_program = old_uncurried
     inner_args = list(inner_args_program.as_iter())
-    if len(inner_args) != 24:
-        raise ValueError("Pool V3 inner puzzle must have 24 arguments")
-    if inner_mod.get_tree_hash() != load_puzzle("pool_singleton_inner_v3.clsp").get_tree_hash():
-        raise ValueError("pool inner module hash is not Pool V3")
+    if len(inner_args) != 13:
+        raise ValueError("Pool V4 inner puzzle must have 13 arguments")
+    if inner_mod.get_tree_hash() != pool_v4_inner_mod_hash():
+        raise ValueError("pool inner module hash is not Pool V4")
 
     _, inner_solution = _solution_parts(
         str(puzzle_solution["solution"]), "pool"
     )
     if len(inner_solution) != 5:
-        raise ValueError("Pool V3 inner solution must have five items")
+        raise ValueError("Pool V4 inner solution must have five items")
     spend_case = int(inner_solution[3].as_int())
     params = list(inner_solution[4].as_iter())
-    previous_status = int(inner_args[19].as_int())
-    previous = PoolEconomicState(
-        int(inner_args[20].as_int()),
-        int(inner_args[21].as_int()),
-        int(inner_args[22].as_int()),
-        int(inner_args[23].as_int()),
+    expected_params = (
+        38
+        if spend_case == POOL_SPEND_DEED_TO_SOLS
+        else 32
+        if spend_case == POOL_SPEND_SOLS_TO_DEED
+        else -1
     )
-    current_status, current = _apply_pool_transition(
-        previous,
-        pool_status=previous_status,
-        fp_scale=int(inner_args[18].as_int()),
-        spend_case=spend_case,
-        params=params,
-    )
+    if len(params) != expected_params:
+        raise ValueError("Pool V4 transition has the wrong parameter count")
+    previous_inventory = _pool_inventory(params[0])
+    previous = _pool_state_from_args(inner_args, previous_inventory)
+
+    if spend_case == POOL_SPEND_DEED_TO_SOLS:
+        record = _pool_inventory_record(params[29])
+        current_inventory = canonical_inventory(
+            (*previous_inventory, record)
+        )
+        current = SolsPoolStateV4(
+            inventory_root=_bytes32_node(params[33], "next inventory root"),
+            economics=SolsEconomicState(
+                bootstrap_complete=True,
+                inventory_nav_micro_usd=(
+                    previous.economics.inventory_nav_micro_usd
+                    + record.deed_value_micro_usd
+                ),
+                treasury_assets_micro_usd=(
+                    previous.economics.treasury_assets_micro_usd
+                ),
+                proven_liabilities_micro_usd=(
+                    previous.economics.proven_liabilities_micro_usd
+                ),
+                deed_count=previous.economics.deed_count + 1,
+                total_sols_mojos=(
+                    previous.economics.total_sols_mojos
+                    + int(params[32].as_int())
+                ),
+                reserve_sols_mojos=(
+                    previous.economics.reserve_sols_mojos
+                    - int(params[31].as_int())
+                ),
+            ),
+            state_version=previous.state_version + 1,
+        ).validate(current_inventory)
+        current_commitment = params[34]
+        next_commitment = params[35]
+    else:
+        deed_launcher_id = _bytes32_node(params[10], "deed launcher id")
+        matches = [
+            item
+            for item in previous_inventory
+            if item.deed_launcher_id == deed_launcher_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("Pool V4 release deed is not in inventory")
+        record = matches[0]
+        if _pool_inventory_record(params[19]) != record:
+            raise ValueError("Pool V4 release record does not match inventory")
+        current_inventory = tuple(
+            item
+            for item in previous_inventory
+            if item.deed_launcher_id != deed_launcher_id
+        )
+        current = SolsPoolStateV4(
+            inventory_root=_bytes32_node(params[27], "next inventory root"),
+            economics=SolsEconomicState(
+                bootstrap_complete=True,
+                inventory_nav_micro_usd=(
+                    previous.economics.inventory_nav_micro_usd
+                    - record.deed_value_micro_usd
+                ),
+                treasury_assets_micro_usd=(
+                    previous.economics.treasury_assets_micro_usd
+                ),
+                proven_liabilities_micro_usd=(
+                    previous.economics.proven_liabilities_micro_usd
+                ),
+                deed_count=previous.economics.deed_count - 1,
+                total_sols_mojos=previous.economics.total_sols_mojos,
+                reserve_sols_mojos=(
+                    previous.economics.reserve_sols_mojos
+                    + int(params[24].as_int())
+                ),
+            ),
+            state_version=previous.state_version + 1,
+        ).validate(current_inventory)
+        current_commitment = params[28]
+        next_commitment = params[29]
+    if _bytes32_node(current_commitment, "current pool state commitment") != (
+        previous.commitment_hash
+    ):
+        raise ValueError("Pool V4 previous state commitment is invalid")
+    if _bytes32_node(next_commitment, "next pool state commitment") != (
+        current.commitment_hash
+    ):
+        raise ValueError("Pool V4 next state commitment is invalid")
     current_inner = inner_mod.curry(
-        *inner_args[:19],
-        current_status,
-        current.total_nav_locked_mojos,
-        current.deed_count,
-        current.total_pool_token_supply,
-        current.treasury_reserve_tokens,
+        *inner_args[:4],
+        current.inventory_root,
+        int(current.economics.bootstrap_complete),
+        current.economics.inventory_nav_micro_usd,
+        current.economics.treasury_assets_micro_usd,
+        current.economics.proven_liabilities_micro_usd,
+        current.economics.deed_count,
+        current.economics.total_sols_mojos,
+        current.economics.reserve_sols_mojos,
+        current.state_version,
     )
     current_full = full_mod.curry(full_args[0], current_inner)
     if _hex(current_full.get_tree_hash()) != tip.live.puzzle_hash:
-        raise ValueError("reconstructed pool state does not match the live coin")
+        raise ValueError(
+            "reconstructed Pool V4 state does not match the live coin"
+        )
     return PoolState(
-        pool_status=current_status,
-        total_nav_locked_mojos=current.total_nav_locked_mojos,
-        deed_count=current.deed_count,
-        total_pool_token_supply=current.total_pool_token_supply,
-        treasury_reserve_tokens=current.treasury_reserve_tokens,
+        bootstrap_complete=current.economics.bootstrap_complete,
+        inventory_nav_micro_usd=current.economics.inventory_nav_micro_usd,
+        treasury_assets_micro_usd=current.economics.treasury_assets_micro_usd,
+        proven_liabilities_micro_usd=(
+            current.economics.proven_liabilities_micro_usd
+        ),
+        deed_count=current.economics.deed_count,
+        total_sols_mojos=current.economics.total_sols_mojos,
+        reserve_sols_mojos=current.economics.reserve_sols_mojos,
+        state_version=current.state_version,
+        inventory=current_inventory,
         live_coin_id=tip.live.coin_id,
         live_puzzle_hash=tip.live.puzzle_hash,
         confirmed_height=tip.live.confirmed_height,
@@ -367,76 +514,514 @@ def _decode_pool_state(
     )
 
 
-def _nav_entries(node: Program) -> list[tuple[bytes32, int]]:
-    entries: list[tuple[bytes32, int]] = []
-    for item in node.as_iter():
-        values = list(item.as_iter())
-        if len(values) != 2:
-            raise ValueError("NAV entry must contain collection id and value")
-        entries.append((bytes32(values[0].as_atom()), int(values[1].as_int())))
-    return normalise_nav_entries(entries)
+def _singleton_struct(launcher_id: str) -> Program:
+    return Program.to(
+        (
+            SINGLETON_MOD_HASH,
+            (
+                bytes32.fromhex(
+                    _hex32(launcher_id, "launcher id").removeprefix("0x")
+                ),
+                SINGLETON_LAUNCHER_HASH,
+            ),
+        )
+    )
 
 
-def _decode_nav_state(
-    puzzle_solution: Mapping[str, Any], tip: SingletonTip
-) -> NavRegistryState:
+def _statutes_state_from_args(
+    inner_args: list[Program],
+    permanent_rules: PermanentRules,
+) -> StatutesState:
+    return StatutesState(
+        parameters_root=_bytes32_node(inner_args[9], "parameters root"),
+        collections_root=_bytes32_node(inner_args[10], "collections root"),
+        oracle_root=_bytes32_node(inner_args[11], "oracle root"),
+        routes_root=_bytes32_node(inner_args[12], "routes root"),
+        pauses_root=_bytes32_node(inner_args[13], "pauses root"),
+        registry_version=int(inner_args[14].as_int()),
+        permanent_rules_hash=permanent_rules.commitment_hash,
+    ).validate()
+
+
+def _raw_keyed_upsert_root(
+    entries_node: Program,
+    replacement_node: Program,
+    expected_key: Program,
+) -> bytes32:
+    entries = list(entries_node.as_iter())
+    replacement = list(replacement_node.as_iter())
+    if not replacement:
+        raise ValueError("statutes replacement record is empty")
+    if bytes(replacement[0]) != bytes(expected_key):
+        raise ValueError("statutes mutation key does not match its record")
+    replacement_key = replacement[0].as_atom()
+    seen: set[bytes] = set()
+    updated: list[object] = []
+    replaced = False
+    for entry_node in entries:
+        values = list(entry_node.as_iter())
+        if not values:
+            raise ValueError("statutes witness record is empty")
+        key = values[0].as_atom()
+        if key in seen:
+            raise ValueError("statutes witness contains duplicate keys")
+        seen.add(key)
+        if key == replacement_key:
+            updated.append(replacement_node.as_python())
+            replaced = True
+        else:
+            updated.append(entry_node.as_python())
+    if not replaced:
+        updated.append(replacement_node.as_python())
+    return bytes32(Program.to(updated).get_tree_hash())
+
+
+def _apply_statutes_transition(
+    state: StatutesState,
+    inner_solution: list[Program],
+) -> StatutesState:
+    if len(inner_solution) != 5:
+        raise ValueError("statutes inner solution must have five items")
+    action = int(inner_solution[3].as_int())
+    params = list(inner_solution[4].as_iter())
+    if action != STATUTES_SPEND_UPDATE:
+        if action not in (
+            STATUTES_SPEND_EVIDENCE,
+            STATUTES_SPEND_SOLS_EVIDENCE,
+            STATUTES_SPEND_GOVERNANCE_EVIDENCE,
+        ):
+            raise ValueError("unsupported statutes spend action")
+        return state
+    if len(params) != 6:
+        raise ValueError("statutes update has the wrong parameter count")
+    kind = MutationKind(int(params[0].as_int()))
+    old_root = {
+        MutationKind.PARAMETER: state.parameters_root,
+        MutationKind.COLLECTION: state.collections_root,
+        MutationKind.ORACLE: state.oracle_root,
+        MutationKind.ROUTE: state.routes_root,
+        MutationKind.PAUSE: state.pauses_root,
+    }[kind]
+    if bytes32(params[3].get_tree_hash()) != old_root:
+        raise ValueError("statutes update witness does not match its old root")
+    if kind == MutationKind.PARAMETER:
+        current = [int(item.as_int()) for item in params[3].as_iter()]
+        if len(current) != 9:
+            raise ValueError("statutes parameter witness is malformed")
+        index = int(params[1].as_int())
+        if not 0 <= index < len(current):
+            raise ValueError("statutes parameter index is invalid")
+        current[index] = int(params[2].as_int())
+        new_root = bytes32(Program.to(current).get_tree_hash())
+    else:
+        new_root = _raw_keyed_upsert_root(
+            params[3],
+            params[2],
+            params[1],
+        )
+    new_version = int(params[4].as_int())
+    if new_version != state.registry_version + 1:
+        raise ValueError("statutes version must advance exactly once")
+    field = {
+        MutationKind.PARAMETER: "parameters_root",
+        MutationKind.COLLECTION: "collections_root",
+        MutationKind.ORACLE: "oracle_root",
+        MutationKind.ROUTE: "routes_root",
+        MutationKind.PAUSE: "pauses_root",
+    }[kind]
+    return replace(
+        state,
+        **{field: new_root},
+        registry_version=new_version,
+    ).validate()
+
+
+def _decode_statutes_state(
+    puzzle_solution: Mapping[str, Any],
+    tip: SingletonTip,
+    *,
+    expected_permanent_rules: PermanentRules,
+    expected_governance_launcher_id: str,
+) -> StatutesState:
     full = _program(str(puzzle_solution["puzzle_reveal"]))
     full_uncurried = full.uncurry()
     if full_uncurried is None:
-        raise ValueError("NAV registry puzzle is not a curried singleton")
+        raise ValueError("statutes puzzle is not a curried singleton")
     full_mod, full_args_program = full_uncurried
     full_args = list(full_args_program.as_iter())
     if len(full_args) != 2 or full_mod.get_tree_hash() != SINGLETON_MOD_HASH:
-        raise ValueError("NAV registry is not a canonical singleton")
+        raise ValueError("statutes puzzle is not a canonical singleton")
     old_inner = full_args[1]
     inner_uncurried = old_inner.uncurry()
     if inner_uncurried is None:
-        raise ValueError("NAV registry inner puzzle is not curried")
+        raise ValueError("statutes inner puzzle is not curried")
     inner_mod, inner_args_program = inner_uncurried
     inner_args = list(inner_args_program.as_iter())
     if (
-        len(inner_args) != 4
-        or inner_mod.get_tree_hash() != collection_nav_registry_inner_mod_hash()
+        len(inner_args) != 15
+        or inner_mod.get_tree_hash() != protocol_statutes_inner_mod_hash()
     ):
-        raise ValueError("NAV registry inner puzzle is not canonical")
+        raise ValueError("statutes inner puzzle is not RC22 V1")
+    permanent_rules = PermanentRules(
+        sgt_tail_hash=_bytes32_node(inner_args[3], "SGT tail"),
+        sgt_total_supply=int(inner_args[4].as_int()),
+        sols_tail_hash=_bytes32_node(inner_args[5], "Sols tail"),
+        zkpassport_policy_hash=_bytes32_node(
+            inner_args[6], "zkPassport policy"
+        ),
+        protocol_treasury_puzzle_hash=_bytes32_node(
+            inner_args[7], "protocol treasury"
+        ),
+        network_id=_bytes32_node(inner_args[8], "network id"),
+    ).validate()
+    if permanent_rules != expected_permanent_rules:
+        raise ValueError("statutes permanent rules do not match genesis")
+    if bytes(inner_args[1]) != bytes(_singleton_struct(tip.launcher_id)):
+        raise ValueError("statutes singleton struct does not match launcher")
+    if bytes(inner_args[2]) != bytes(
+        _singleton_struct(expected_governance_launcher_id)
+    ):
+        raise ValueError("statutes governance struct does not match genesis")
     _, inner_solution = _solution_parts(
-        str(puzzle_solution["solution"]), "NAV registry"
+        str(puzzle_solution["solution"]), "statutes"
     )
-    if len(inner_solution) != 5:
-        raise ValueError("NAV registry inner solution must have five items")
-    previous_entries = _nav_entries(inner_solution[3])
-    old_root = bytes32(inner_args[2].as_atom())
-    if collection_nav_root(previous_entries) != old_root:
-        raise ValueError("NAV registry witness does not reproduce its previous root")
-    old_version = int(inner_args[3].as_int())
-    new_version = int(inner_solution[4].as_int())
-    collection_id = bytes32(inner_solution[1].as_atom())
-    nav_value = int(inner_solution[2].as_int())
-    if new_version == old_version:
-        entries = previous_entries
-        if (collection_id, nav_value) not in entries:
-            raise ValueError("NAV read witness does not match current entries")
-    elif new_version == old_version + 1:
-        entries = [
-            (collection_id, nav_value),
-            *(item for item in previous_entries if item[0] != collection_id),
-        ]
-    else:
-        raise ValueError("NAV registry version transition is invalid")
-    root = collection_nav_root(entries)
+    previous = _statutes_state_from_args(inner_args, permanent_rules)
+    current = _apply_statutes_transition(previous, inner_solution)
     current_inner = inner_mod.curry(
-        inner_args[0], inner_args[1], root, new_version
+        *inner_args[:9],
+        current.parameters_root,
+        current.collections_root,
+        current.oracle_root,
+        current.routes_root,
+        current.pauses_root,
+        current.registry_version,
     )
     current_full = full_mod.curry(full_args[0], current_inner)
     if _hex(current_full.get_tree_hash()) != tip.live.puzzle_hash:
-        raise ValueError("reconstructed NAV registry does not match the live coin")
-    return NavRegistryState(
+        raise ValueError(
+            "reconstructed statutes state does not match the live coin"
+        )
+    return current
+
+
+def _artifact_parameters(artifact: Mapping[str, Any]) -> ProtocolParameters:
+    values = artifact["protocolParameters"]
+    return ProtocolParameters(
+        voting_window_seconds=int(values["votingWindowSeconds"]),
+        quorum_bps=int(values["quorumBps"]),
+        min_proposal_stake=int(values["minProposalStake"]),
+        nav_validity_seconds=int(values["navValiditySeconds"]),
+        oracle_max_age_seconds=int(values["oracleMaxAgeSeconds"]),
+        exchange_fee_bps=int(values["exchangeFeeBps"]),
+        protocol_fee_bps=int(values["protocolFeeBps"]),
+        sgt_rewards_fee_bps=int(values["sgtRewardsFeeBps"]),
+        reward_epoch_seconds=int(values["rewardEpochSeconds"]),
+    ).validate()
+
+
+def _artifact_permanent_rules(
+    artifact: Mapping[str, Any],
+) -> PermanentRules:
+    values = artifact["permanentRules"]
+    return PermanentRules(
+        sgt_tail_hash=bytes32.fromhex(
+            _hex32(str(values["sgtTailHash"]), "SGT tail").removeprefix("0x")
+        ),
+        sgt_total_supply=int(values["sgtTotalSupply"]),
+        sols_tail_hash=bytes32.fromhex(
+            _hex32(str(values["solsTailHash"]), "Sols tail").removeprefix("0x")
+        ),
+        zkpassport_policy_hash=bytes32.fromhex(
+            _hex32(
+                str(values["zkPassportPolicyHash"]),
+                "zkPassport policy",
+            ).removeprefix("0x")
+        ),
+        protocol_treasury_puzzle_hash=bytes32.fromhex(
+            _hex32(
+                str(values["protocolTreasuryPuzzleHash"]),
+                "protocol treasury",
+            ).removeprefix("0x")
+        ),
+        network_id=bytes32.fromhex(
+            _hex32(str(values["networkId"]), "network id").removeprefix("0x")
+        ),
+    ).validate()
+
+
+def _collections(node: Program) -> tuple[CollectionStatute, ...]:
+    values = tuple(_collection_statute(item) for item in node.as_iter())
+    keyed_root(values)
+    return values
+
+
+def _pauses(node: Program) -> tuple[ScopedPause, ...]:
+    values = tuple(_scoped_pause(item) for item in node.as_iter())
+    keyed_root(values)
+    return values
+
+
+def _upsert_typed(
+    current: tuple[CollectionStatute, ...] | tuple[ScopedPause, ...],
+    replacement: CollectionStatute | ScopedPause,
+) -> tuple[CollectionStatute, ...] | tuple[ScopedPause, ...]:
+    replacement_key = (
+        replacement.collection_id
+        if isinstance(replacement, CollectionStatute)
+        else replacement.scope_id
+    )
+    updated: list[CollectionStatute | ScopedPause] = []
+    found = False
+    for item in current:
+        key = (
+            item.collection_id
+            if isinstance(item, CollectionStatute)
+            else item.scope_id
+        )
+        if key == replacement_key:
+            updated.append(replacement)
+            found = True
+        else:
+            updated.append(item)
+    if not found:
+        updated.append(replacement)
+    return tuple(updated)  # type: ignore[return-value]
+
+
+def _statutes_witnesses(
+    puzzle_solution: Mapping[str, Any],
+) -> tuple[
+    ProtocolParameters | None,
+    tuple[CollectionStatute, ...] | None,
+    tuple[ScopedPause, ...] | None,
+]:
+    _, inner_solution = _solution_parts(
+        str(puzzle_solution["solution"]), "statutes"
+    )
+    if len(inner_solution) != 5:
+        raise ValueError("statutes inner solution must have five items")
+    action = int(inner_solution[3].as_int())
+    params = list(inner_solution[4].as_iter())
+    parameters: ProtocolParameters | None = None
+    collections: tuple[CollectionStatute, ...] | None = None
+    pauses: tuple[ScopedPause, ...] | None = None
+    if action == STATUTES_SPEND_EVIDENCE:
+        if len(params) != 3:
+            raise ValueError("statutes evidence has the wrong parameter count")
+        kind = MutationKind(int(params[0].as_int()))
+        if kind == MutationKind.PARAMETER:
+            parameters = _protocol_parameters(params[2])
+        elif kind == MutationKind.COLLECTION:
+            collections = _collections(params[2])
+        elif kind == MutationKind.PAUSE:
+            pauses = _pauses(params[2])
+    elif action == STATUTES_SPEND_UPDATE:
+        if len(params) != 6:
+            raise ValueError("statutes update has the wrong parameter count")
+        kind = MutationKind(int(params[0].as_int()))
+        if kind == MutationKind.PARAMETER:
+            current = _protocol_parameters(params[3])
+            parameters = current.mutate(
+                int(params[1].as_int()),
+                int(params[2].as_int()),
+            )
+        elif kind == MutationKind.COLLECTION:
+            collections = _upsert_typed(
+                _collections(params[3]),
+                _collection_statute(params[2]),
+            )
+        elif kind == MutationKind.PAUSE:
+            pauses = _upsert_typed(
+                _pauses(params[3]),
+                _scoped_pause(params[2]),
+            )
+    elif action == STATUTES_SPEND_SOLS_EVIDENCE:
+        if len(params) != 5:
+            raise ValueError(
+                "statutes Sols evidence has the wrong parameter count"
+            )
+        parameters = _protocol_parameters(params[2])
+        collections = _collections(params[3])
+        pauses = _pauses(params[4])
+    elif action == STATUTES_SPEND_GOVERNANCE_EVIDENCE:
+        if len(params) != 1:
+            raise ValueError(
+                "statutes governance evidence has the wrong parameter count"
+            )
+        parameters = _protocol_parameters(params[0])
+    else:
+        raise ValueError("unsupported statutes spend action")
+    return parameters, collections, pauses
+
+
+async def _resolve_statutes_witnesses(
+    provider: ChiaProvider,
+    tip: SingletonTip,
+    state: StatutesState,
+    initial_parameters: ProtocolParameters,
+) -> tuple[
+    ProtocolParameters,
+    tuple[CollectionStatute, ...],
+    tuple[ScopedPause, ...],
+]:
+    empty_root = bytes32(Program.to([]).get_tree_hash())
+    initial_parameters_root = bytes32(
+        Program.to(list(initial_parameters.as_tuple())).get_tree_hash()
+    )
+    parameters: ProtocolParameters | None = (
+        initial_parameters
+        if state.parameters_root == initial_parameters_root
+        else None
+    )
+    collections: tuple[CollectionStatute, ...] | None = (
+        () if state.collections_root == empty_root else None
+    )
+    pauses: tuple[ScopedPause, ...] | None = (
+        () if state.pauses_root == empty_root else None
+    )
+    spent = [
+        coin
+        for coin in reversed(tip.lineage)
+        if not coin.is_launcher and coin.spent_height is not None
+    ]
+    for coin in spent:
+        puzzle_solution = await provider.get_puzzle_and_solution(
+            coin.coin_id,
+            int(coin.spent_height),
+        )
+        if puzzle_solution is None:
+            raise ValueError("statutes lineage solution is unavailable")
+        candidate_parameters, candidate_collections, candidate_pauses = (
+            _statutes_witnesses(puzzle_solution)
+        )
+        if (
+            parameters is None
+            and candidate_parameters is not None
+            and bytes32(
+                Program.to(
+                    list(candidate_parameters.as_tuple())
+                ).get_tree_hash()
+            )
+            == state.parameters_root
+        ):
+            parameters = candidate_parameters
+        if (
+            collections is None
+            and candidate_collections is not None
+            and keyed_root(candidate_collections) == state.collections_root
+        ):
+            collections = candidate_collections
+        if (
+            pauses is None
+            and candidate_pauses is not None
+            and keyed_root(candidate_pauses) == state.pauses_root
+        ):
+            pauses = candidate_pauses
+        if parameters is not None and collections is not None and pauses is not None:
+            break
+    if parameters is None or collections is None or pauses is None:
+        raise ValueError(
+            "current statutes parameters, collections, or pauses "
+            "cannot be reconstructed"
+        )
+    return parameters, collections, pauses
+
+
+async def _statutes_snapshot(
+    provider: ChiaProvider,
+    tip: SingletonTip,
+    artifact: Mapping[str, Any],
+) -> StatutesSnapshot:
+    parameters = _artifact_parameters(artifact)
+    permanent_rules = _artifact_permanent_rules(artifact)
+    if len(tip.lineage) < 2:
+        raise ValueError("statutes launcher has no singleton continuation")
+    expected_initial = str(
+        artifact["puzzleHashes"]["statutesFullPuzzleHash"]
+    ).lower()
+    if tip.lineage[1].puzzle_hash.lower() != expected_initial:
+        raise ValueError("statutes genesis puzzle hash does not match artifact")
+    solution = await _latest_solution(provider, tip)
+    if solution is None:
+        state = initial_state(
+            parameters=parameters,
+            permanent_rules=permanent_rules,
+        )
+        collections: tuple[CollectionStatute, ...] = ()
+        pauses: tuple[ScopedPause, ...] = ()
+        if tip.live.puzzle_hash.lower() != expected_initial:
+            raise ValueError("initial statutes coin does not match artifact")
+    else:
+        state = _decode_statutes_state(
+            solution,
+            tip,
+            expected_permanent_rules=permanent_rules,
+            expected_governance_launcher_id=str(
+                artifact["launcherIds"]["governance"]
+            ),
+        )
+        parameters, collections, pauses = await _resolve_statutes_witnesses(
+            provider,
+            tip,
+            state,
+            parameters,
+        )
+    return StatutesSnapshot(
         live_coin_id=tip.live.coin_id,
         live_puzzle_hash=tip.live.puzzle_hash,
-        collection_nav_root=_hex(root),
-        registry_version=new_version,
-        entries={_hex(key): value for key, value in entries},
+        state=state,
+        parameters=parameters,
+        collections=collections,
+        pauses=pauses,
+        registry_version=state.registry_version,
         confirmed_height=tip.live.confirmed_height,
+        lineage_depth=tip.depth,
+    )
+
+
+def _initial_pool_state(
+    tip: SingletonTip,
+    artifact: Mapping[str, Any],
+) -> PoolState:
+    if len(tip.lineage) < 2:
+        raise ValueError("pool launcher has no singleton continuation")
+    expected = str(artifact["puzzleHashes"]["poolFullPuzzleHash"]).lower()
+    if tip.lineage[1].puzzle_hash.lower() != expected:
+        raise ValueError("pool genesis puzzle hash does not match artifact")
+    if tip.live.puzzle_hash.lower() != expected:
+        raise ValueError("initial pool coin does not match artifact")
+    state = SolsPoolStateV4(
+        inventory_root=inventory_root(()),
+        economics=SolsEconomicState(
+            bootstrap_complete=False,
+            inventory_nav_micro_usd=0,
+            treasury_assets_micro_usd=0,
+            proven_liabilities_micro_usd=0,
+            deed_count=0,
+            total_sols_mojos=0,
+            reserve_sols_mojos=0,
+        ),
+        state_version=1,
+    ).validate(())
+    expected_commitment = str(
+        artifact["genesisPlan"]["state"]["poolCommitmentHash"]
+    ).lower()
+    if _hex(state.commitment_hash) != expected_commitment:
+        raise ValueError("initial pool commitment does not match artifact")
+    return PoolState(
+        bootstrap_complete=False,
+        inventory_nav_micro_usd=0,
+        treasury_assets_micro_usd=0,
+        proven_liabilities_micro_usd=0,
+        deed_count=0,
+        total_sols_mojos=0,
+        reserve_sols_mojos=0,
+        state_version=1,
+        inventory=(),
+        live_coin_id=tip.live.coin_id,
+        live_puzzle_hash=tip.live.puzzle_hash,
+        confirmed_height=tip.live.confirmed_height,
+        lineage_depth=tip.depth,
     )
 
 
@@ -522,8 +1107,92 @@ def _decode_pool_deed(
         property_id_canon=_hex(property_id),
         collection_id_canon=_hex(collection_id),
         share_ppm=share_ppm,
+        deed_commitment=_hex(commitment),
         confirmed_height=tip.live.confirmed_height,
     )
+
+
+def _inventory_payload(record: PoolInventoryRecord) -> dict[str, Any]:
+    return {
+        "deedLauncherId": _hex(record.deed_launcher_id),
+        "custodyCoinId": _hex(record.custody_coin_id),
+        "deedCommitment": _hex(record.deed_commitment),
+        "collectionIdCanon": _hex(record.collection_id),
+        "sharePpm": record.share_ppm,
+        "deedValueMicroUsd": str(record.deed_value_micro_usd),
+        "navVersion": record.nav_version,
+        "validUntil": record.valid_until,
+        "settlementState": record.settlement_state,
+    }
+
+
+def _pool_payload(pool: PoolState | None) -> dict[str, Any] | None:
+    if pool is None:
+        return None
+    return {
+        "bootstrapComplete": pool.bootstrap_complete,
+        "inventoryNavMicroUsd": str(pool.inventory_nav_micro_usd),
+        "treasuryAssetsMicroUsd": str(pool.treasury_assets_micro_usd),
+        "provenLiabilitiesMicroUsd": str(pool.proven_liabilities_micro_usd),
+        "deedCount": pool.deed_count,
+        "totalSolsMojos": str(pool.total_sols_mojos),
+        "reserveSolsMojos": str(pool.reserve_sols_mojos),
+        "stateVersion": pool.state_version,
+        "inventoryRoot": _hex(inventory_root(pool.inventory)),
+        "inventory": [_inventory_payload(item) for item in pool.inventory],
+        "liveCoinId": pool.live_coin_id,
+        "livePuzzleHash": pool.live_puzzle_hash,
+        "confirmedHeight": pool.confirmed_height,
+        "lineageDepth": pool.lineage_depth,
+    }
+
+
+def _statutes_payload(
+    statutes: StatutesSnapshot | None,
+) -> dict[str, Any] | None:
+    if statutes is None:
+        return None
+    state = statutes.state
+    return {
+        "registryVersion": statutes.registry_version,
+        "contentHash": _hex(state.content_hash),
+        "parametersRoot": _hex(state.parameters_root),
+        "collectionsRoot": _hex(state.collections_root),
+        "pausesRoot": _hex(state.pauses_root),
+        "parameters": {
+            "navValiditySeconds": statutes.parameters.nav_validity_seconds,
+            "exchangeFeeBps": statutes.parameters.exchange_fee_bps,
+            "protocolFeeBps": statutes.parameters.protocol_fee_bps,
+            "sgtRewardsFeeBps": statutes.parameters.sgt_rewards_fee_bps,
+        },
+        "collections": [
+            {
+                "collectionIdCanon": _hex(item.collection_id),
+                "navMicroUsd": str(item.nav_micro_usd),
+                "allocationCeilingMicroUsd": str(
+                    item.allocation_ceiling_micro_usd
+                ),
+                "navVersion": item.nav_version,
+                "validAfter": item.valid_after,
+                "validUntil": item.valid_until,
+                "status": item.status,
+            }
+            for item in statutes.collections
+        ],
+        "pauses": [
+            {
+                "scopeId": _hex(item.scope_id),
+                "paused": bool(item.paused),
+                "expiresAt": item.expires_at,
+                "reasonHash": _hex(item.reason_hash),
+            }
+            for item in statutes.pauses
+        ],
+        "liveCoinId": statutes.live_coin_id,
+        "livePuzzleHash": statutes.live_puzzle_hash,
+        "confirmedHeight": statutes.confirmed_height,
+        "lineageDepth": statutes.lineage_depth,
+    }
 
 
 class SolsMarketReader:
@@ -542,28 +1211,59 @@ class SolsMarketReader:
         launchers = artifact["launcherIds"]
         puzzle_hashes = artifact["puzzleHashes"]
         pool_tip = await _singleton_tip(self.provider, str(launchers["pool"]))
-        nav_tip = await _singleton_tip(self.provider, str(launchers["navRegistry"]))
+        statutes_tip = await _singleton_tip(
+            self.provider,
+            str(launchers["statutes"]),
+        )
         pool_solution = (
             await _latest_solution(self.provider, pool_tip) if pool_tip else None
         )
-        nav_solution = (
-            await _latest_solution(self.provider, nav_tip) if nav_tip else None
-        )
-        pool = (
-            _decode_pool_state(pool_solution, pool_tip)
-            if pool_tip and pool_solution
-            else None
-        )
-        nav = (
-            _decode_nav_state(nav_solution, nav_tip)
-            if nav_tip and nav_solution
+        if pool_tip is None:
+            pool = None
+        elif pool_solution is None:
+            pool = _initial_pool_state(pool_tip, artifact)
+        else:
+            if len(pool_tip.lineage) < 2 or (
+                pool_tip.lineage[1].puzzle_hash.lower()
+                != str(puzzle_hashes["poolFullPuzzleHash"]).lower()
+            ):
+                raise ValueError(
+                    "pool genesis puzzle hash does not match artifact"
+                )
+            pool = _decode_pool_state(pool_solution, pool_tip)
+        statutes = (
+            await _statutes_snapshot(
+                self.provider,
+                statutes_tip,
+                artifact,
+            )
+            if statutes_tip
             else None
         )
 
         opportunities: list[dict[str, Any]] = []
         rejected = 0
-        for candidate in self.store.sols_market_candidates():
+        candidates = {
+            str(candidate["deedLauncherId"]).lower(): candidate
+            for candidate in self.store.sols_market_candidates()
+        }
+        collections = {
+            item.collection_id: item
+            for item in statutes.collections
+        } if statutes else {}
+        pauses = {
+            item.scope_id: item
+            for item in statutes.pauses
+        } if statutes else {}
+        for inventory_record in pool.inventory if pool else ():
             try:
+                candidate = candidates.get(
+                    _hex(inventory_record.deed_launcher_id).lower()
+                )
+                if candidate is None:
+                    raise ValueError(
+                        "pool inventory has no published collection record"
+                    )
                 collection = self.store.public_collection(candidate["collectionId"])
                 if not collection["verification"]["chainReconstructed"]:
                     raise ValueError("collection metadata is not reconstructed")
@@ -588,15 +1288,67 @@ class SolsMarketReader:
                     raise ValueError("SmartDeed share does not match collection")
                 if deed.par_value_mojos != int(candidate["parValueMojos"]):
                     raise ValueError("SmartDeed par value does not match collection")
-                if pool is None or nav is None:
-                    raise ValueError("pool or NAV registry has no confirmed state")
-                nav_value = nav.entries.get(deed.collection_id_canon)
-                if nav_value is None:
-                    raise ValueError("collection has no current governed NAV")
-                quote = quote_specific_deed_swap(
+                if deed.deed_coin_id.lower() != (
+                    _hex(inventory_record.custody_coin_id).lower()
+                ):
+                    raise ValueError(
+                        "SmartDeed custody coin does not match Pool V4"
+                    )
+                if deed.deed_commitment.lower() != (
+                    _hex(inventory_record.deed_commitment).lower()
+                ):
+                    raise ValueError(
+                        "SmartDeed commitment does not match Pool V4"
+                    )
+                if deed.collection_id_canon.lower() != (
+                    _hex(inventory_record.collection_id).lower()
+                ):
+                    raise ValueError(
+                        "SmartDeed collection does not match Pool V4"
+                    )
+                if deed.share_ppm != inventory_record.share_ppm:
+                    raise ValueError(
+                        "SmartDeed share does not match Pool V4"
+                    )
+                statute = collections.get(inventory_record.collection_id)
+                if statute is None:
+                    raise ValueError(
+                        "collection has no current governed statute"
+                    )
+                if statute.status not in (1, 3):
+                    raise ValueError(
+                        "collection is not available for Sols acquisition"
+                    )
+                pause = pauses.get(inventory_record.collection_id)
+                if pause is not None and pause.paused:
+                    raise ValueError("collection Sols swaps are paused")
+                if (
+                    inventory_record.nav_version != statute.nav_version
+                    or inventory_record.valid_until != statute.valid_until
+                ):
+                    raise ValueError(
+                        "Pool V4 inventory requires governed revaluation"
+                    )
+                governed_value = (
+                    statute.nav_micro_usd * inventory_record.share_ppm
+                    + 999_999
+                ) // 1_000_000
+                if inventory_record.deed_value_micro_usd != governed_value:
+                    raise ValueError(
+                        "Pool V4 deed value does not match the statute"
+                    )
+                if statute.valid_until <= int(time()):
+                    raise ValueError("collection NAV is expired")
+                quote = quote_sols_to_deed(
                     pool.economics(),
-                    collection_nav_mojos=nav_value,
-                    share_ppm=deed.share_ppm,
+                    deed_value_micro_usd=(
+                        inventory_record.deed_value_micro_usd
+                    ),
+                    exchange_fee_bps=statutes.parameters.exchange_fee_bps,
+                    protocol_fee_bps=statutes.parameters.protocol_fee_bps,
+                    sgt_rewards_fee_bps=(
+                        statutes.parameters.sgt_rewards_fee_bps
+                    ),
                 )
                 opportunities.append(
                     {
@@ -613,16 +1365,26 @@ class SolsMarketReader:
                         "sharePpm": deed.share_ppm,
                         "parValueMojos": str(deed.par_value_mojos),
                         "assetClass": deed.asset_class,
-                        "navValueMojos": str(nav_value),
-                        "deedNavMojos": str(quote.deed_nav_mojos),
-                        "principalSolsMojos": str(quote.principal_tokens),
+                        "collectionNavMicroUsd": str(
+                            statute.nav_micro_usd
+                        ),
+                        "deedValueMicroUsd": str(
+                            inventory_record.deed_value_micro_usd
+                        ),
+                        "navVersion": statute.nav_version,
+                        "navValidUntil": statute.valid_until,
+                        "principalSolsMojos": str(
+                            quote.principal_sols_mojos
+                        ),
                         "protocolFeeSolsMojos": str(
-                            quote.fee_split.protocol_fee_tokens
+                            quote.fee_split.protocol_fee_sols_mojos
                         ),
-                        "governanceFeeSolsMojos": str(
-                            quote.fee_split.governance_fee_tokens
+                        "sgtRewardsFeeSolsMojos": str(
+                            quote.fee_split.sgt_rewards_fee_sols_mojos
                         ),
-                        "totalSolsMojos": str(quote.buyer_total_tokens),
+                        "totalSolsMojos": str(
+                            quote.buyer_total_sols_mojos
+                        ),
                         "chainVerified": True,
                         "confirmedHeight": deed.confirmed_height,
                     }
@@ -630,43 +1392,50 @@ class SolsMarketReader:
             except (KeyError, TypeError, ValueError):
                 rejected += 1
 
-        if pool is None or nav is None:
+        if pool is None or statutes is None:
             outcome = "WAITING"
-            title = "SOLS liquidity is waiting for its first confirmed pool state"
-            body = "No customer swap is exposed until the pool and NAV registry reconstruct from Testnet11."
-        elif pool.pool_status != POOL_ACTIVE:
-            outcome = "PAUSED"
-            title = "SOLS secondary swaps are paused"
-            body = "The governed pool is frozen. Existing vault balances remain visible."
+            title = "Sols market is waiting for confirmed protocol state"
+            body = (
+                "Inventory remains hidden until Pool V4 and statutes "
+                "reconstruct from Testnet11."
+            )
         elif not opportunities:
             outcome = "WAITING"
             title = "No SmartDeeds are available for SOLS yet"
-            body = "A deed appears only after mint, primary delivery, pool deposit, and governed NAV confirmation."
+            body = (
+                "A deed appears after its Pool V4 custody record, collection "
+                "statute, and public dossier all verify."
+            )
         else:
             outcome = "READY"
-            title = f"{len(opportunities)} SmartDeed swap{'s' if len(opportunities) != 1 else ''} available"
-            body = "Prices are derived from the current governed NAV and Pool V3 state."
+            title = (
+                f"{len(opportunities)} SmartDeed swap"
+                f"{'s' if len(opportunities) != 1 else ''} available"
+            )
+            body = (
+                "Prices come from the current governed statute and Pool V4 "
+                "backing state."
+            )
         visible_opportunities = (
             opportunities
             if pool is not None
-            and nav is not None
-            and pool.pool_status == POOL_ACTIVE
+            and statutes is not None
             else []
         )
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "network": self.settings.network,
             "asset": {
                 "symbol": "SOLS",
-                "name": "Solslot Pool Token",
-                "tailHash": puzzle_hashes["poolTokenTailHash"],
+                "name": "Sols",
+                "tailHash": puzzle_hashes["solsTailHash"],
                 "purpose": "secondary-smartdeed-swaps-only",
             },
             "outcome": outcome,
             "title": title,
             "body": body,
-            "pool": asdict(pool) if pool else None,
-            "navRegistry": asdict(nav) if nav else None,
+            "pool": _pool_payload(pool),
+            "statutes": _statutes_payload(statutes),
             "opportunities": visible_opportunities,
             "verifiedOpportunityCount": len(visible_opportunities),
             "rejectedCandidateCount": rejected,
@@ -711,13 +1480,13 @@ async def sols_market(
         return await reader.snapshot()
     except PublicArtifactMissing:
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "network": "testnet11",
             "outcome": "LOCKED",
             "title": "SOLS secondary swaps begin after protocol launch",
             "body": "The signed genesis artifact is not installed. No swap inventory is exposed.",
             "pool": None,
-            "navRegistry": None,
+            "statutes": None,
             "opportunities": [],
             "verifiedOpportunityCount": 0,
             "rejectedCandidateCount": 0,
@@ -792,6 +1561,7 @@ async def vault_sols_opportunities(
 __all__ = [
     "PoolDeed",
     "PoolState",
+    "StatutesSnapshot",
     "SolsMarketReader",
     "router",
 ]
