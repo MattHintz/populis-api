@@ -20,6 +20,7 @@ class StoredSolsSwap:
     quote_expires_at: int
     pool_input_coin_id: str
     expected_pool_output_coin_id: str
+    destination_puzzle_hash: str
     transaction_id: str | None
     fee_mojos: str | None
     fee_target_seconds: int | None
@@ -107,6 +108,7 @@ class SolsSwapStore:
                     quote_expires_at INTEGER NOT NULL,
                     pool_input_coin_id TEXT NOT NULL,
                     expected_pool_output_coin_id TEXT NOT NULL,
+                    destination_puzzle_hash TEXT NOT NULL DEFAULT '',
                     transaction_id TEXT,
                     fee_mojos TEXT,
                     fee_target_seconds INTEGER,
@@ -117,6 +119,19 @@ class SolsSwapStore:
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(sols_swap_operations)"
+                ).fetchall()
+            }
+            if "destination_puzzle_hash" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE sols_swap_operations
+                    ADD COLUMN destination_puzzle_hash TEXT NOT NULL DEFAULT ''
+                    """
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_sols_swap_vault_updated
@@ -134,6 +149,7 @@ class SolsSwapStore:
         quote_expires_at: int,
         pool_input_coin_id: str,
         expected_pool_output_coin_id: str,
+        destination_puzzle_hash: str,
     ) -> StoredSolsSwap:
         now = time()
         identity = (
@@ -143,6 +159,7 @@ class SolsSwapStore:
             quote_expires_at,
             pool_input_coin_id,
             expected_pool_output_coin_id,
+            destination_puzzle_hash,
         )
         with self._transaction() as connection:
             row = connection.execute(
@@ -158,6 +175,7 @@ class SolsSwapStore:
                     existing.quote_expires_at,
                     existing.pool_input_coin_id,
                     existing.expected_pool_output_coin_id,
+                    existing.destination_puzzle_hash,
                 ):
                     raise ValueError(
                         "operation hash is already bound to another swap"
@@ -169,8 +187,8 @@ class SolsSwapStore:
                     operation_hash, direction, vault_launcher_id,
                     deed_launcher_id, status, quote_expires_at,
                     pool_input_coin_id, expected_pool_output_coin_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?)
+                    destination_puzzle_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation_hash,
@@ -180,6 +198,7 @@ class SolsSwapStore:
                     quote_expires_at,
                     pool_input_coin_id,
                     expected_pool_output_coin_id,
+                    destination_puzzle_hash,
                     now,
                     now,
                 ),
@@ -300,6 +319,7 @@ class SolsSwapStore:
             expected_pool_output_coin_id=str(
                 row["expected_pool_output_coin_id"]
             ),
+            destination_puzzle_hash=str(row["destination_puzzle_hash"]),
             transaction_id=(
                 str(row["transaction_id"])
                 if row["transaction_id"] is not None

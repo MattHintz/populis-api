@@ -251,6 +251,7 @@ async def customer_journey_snapshot(
     opportunities = list(market.get("opportunities") or [])
     bls_vault = record.auth_type == AUTH_TYPE_BLS
     swap_ready = eligible and bls_vault and bool(opportunities)
+    reverse_swap_ready = eligible and bls_vault and bool(holdings)
     capabilities = {
         "primaryPurchase": _capability(
             available=eligible,
@@ -272,11 +273,24 @@ async def customer_journey_snapshot(
             path="/swap/sols-to-deed",
         ),
         "deedToSols": _capability(
-            available=False,
-            state="NOT_YET_AVAILABLE",
+            available=reverse_swap_ready,
+            state=(
+                "AVAILABLE"
+                if reverse_swap_ready
+                else "WAITING" if bls_vault else "NOT_YET_AVAILABLE"
+            ),
             reason=(
-                "SmartDeed-to-Sols execution remains locked until the "
-                "complete atomic vault, deed, pool, and Sols mint path passes."
+                None
+                if reverse_swap_ready
+                else (
+                    "A verified SmartDeed holding is required."
+                    if bls_vault
+                    else (
+                        "EVM vault payouts require the governed Warp wSOLS "
+                        "route. Native Testnet11 swaps use a Chia or Google "
+                        "vault."
+                    )
+                )
             ),
             path="/swap/deed-to-sols",
         ),
@@ -324,7 +338,7 @@ async def customer_journey_snapshot(
         network=settings.network,
         vault={
             "launcherId": session.vault_launcher_id,
-            "authType": record.auth_type,
+            "authType": "chia_bls" if bls_vault else "evm",
             "identityConfirmed": eligible,
             "eligibilityReason": eligibility_reason,
         },

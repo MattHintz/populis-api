@@ -4,6 +4,7 @@ from chia.types.blockchain_format.program import Program
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
+    SINGLETON_MOD,
     SINGLETON_MOD_HASH,
     puzzle_for_singleton,
     solution_for_singleton,
@@ -120,8 +121,8 @@ EMPTY_POOL = SolsPoolStateV4(
         treasury_assets_micro_usd=0,
         proven_liabilities_micro_usd=0,
         deed_count=0,
-        total_sols_mojos=0,
-        reserve_sols_mojos=0,
+        total_sols_mojos=1,
+        reserve_sols_mojos=1,
     ),
     state_version=1,
 )
@@ -140,6 +141,7 @@ CONFIG = PoolV4Config(
     p2_pool_v2_mod_hash=bytes32(
         load_puzzle("p2_pool_v2.clsp").get_tree_hash()
     ),
+    deed_launcher_puzzle_hash=_b32(34),
     reserve_puzzle_hash=_b32(32),
     sgt_rewards_puzzle_hash=_b32(33),
 )
@@ -274,7 +276,8 @@ def test_pool_v4_reader_reconstructs_inventory_and_economics() -> None:
     assert pool.bootstrap_complete is True
     assert pool.deed_count == 1
     assert pool.inventory_nav_micro_usd == 99_900_000
-    assert pool.total_sols_mojos == 30_000
+    assert pool.total_sols_mojos == 30_001
+    assert pool.reserve_sols_mojos == 1
     assert len(pool.inventory) == 1
     assert pool.inventory[0].deed_launcher_id == DEED_LAUNCHER
 
@@ -597,9 +600,20 @@ async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None
     governance = await governance_summary(settings, reader)
 
     assert bridge["mode"] == "PREVIEW"
+    assert bridge["activationState"] == "MAINNET_ONLY"
     assert bridge["routes"][0]["governedActive"] is True
     assert bridge["routes"][0]["executable"] is False
+    assert {
+        item["id"]: item["status"] for item in bridge["readiness"]
+    } == {
+        "governance": "READY",
+        "network": "WAITING",
+        "releaseEvidence": "WAITING",
+        "adapter": "WAITING",
+        "operatorGate": "READY",
+    }
     assert liquidity["mode"] == "PREVIEW"
+    assert liquidity["activationState"] == "MAINNET_ONLY"
     assert liquidity["venues"][0]["executable"] is False
     assert governance["statutesVersion"] == 4
     assert governance["minimumProposalStake"] == "10000"
@@ -638,11 +652,13 @@ async def test_feature_flags_cannot_bypass_missing_beta_adapter_evidence() -> No
     assert bridge["mode"] == "PREVIEW"
     assert bridge["executable"] is False
     assert bridge["routes"][0]["executable"] is False
-    assert "runtime evidence" in bridge["reason"]
+    assert bridge["activationState"] == "AWAITING_RELEASE_EVIDENCE"
+    assert "release evidence" in bridge["reason"]
     assert liquidity["mode"] == "PREVIEW"
     assert liquidity["executable"] is False
     assert liquidity["venues"][0]["executable"] is False
-    assert "runtime code evidence" in liquidity["reason"]
+    assert liquidity["activationState"] == "AWAITING_RELEASE_EVIDENCE"
+    assert "release evidence" in liquidity["reason"]
 
 
 def test_singleton_continuation_ignores_other_created_coins() -> None:
@@ -743,8 +759,14 @@ class _HoldingStore:
 async def test_vault_holdings_require_exact_live_p2_vault_and_mint_lineage(
     monkeypatch,
 ) -> None:
-    live_hash = puzzle_for_singleton(
-        DEED_LAUNCHER,
+    deed_launcher_hash = _b32(0x95)
+    live_hash = SINGLETON_MOD.curry(
+        Program.to(
+            (
+                SINGLETON_MOD_HASH,
+                (DEED_LAUNCHER, deed_launcher_hash),
+            )
+        ),
         puzzle_for_p2_vault(VAULT_LAUNCHER),
     ).get_tree_hash()
     tip = SingletonTip(
@@ -777,7 +799,10 @@ async def test_vault_holdings_require_exact_live_p2_vault_and_mint_lineage(
     monkeypatch.setattr(
         "solslot_api.sols_market.load_signed_public_artifact",
         lambda _settings: {
-            "launcherIds": {"pool": _hex(POOL_LAUNCHER)}
+            "launcherIds": {"pool": _hex(POOL_LAUNCHER)},
+            "puzzleHashes": {
+                "deedLauncherPuzzleHash": _hex(deed_launcher_hash)
+            },
         },
     )
     monkeypatch.setattr(

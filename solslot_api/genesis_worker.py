@@ -233,6 +233,7 @@ def _expected_outputs(plan: Any) -> list[str]:
         _hex(Coin(parent, puzzle_hash, uint64(1)).name())
         for parent, puzzle_hash in surfaces
     )
+    outputs.append(_hex(plan.protocol.sols_reserve_seed_coin_id))
     outputs.extend(_hex(coin.name()) for coin in plan.bridge_batch.bridge_coins)
     return outputs
 

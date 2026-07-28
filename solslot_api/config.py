@@ -150,6 +150,45 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         )
     if settings.voucher_issuance_worker_enabled and settings.network != "testnet11":
         raise RuntimeError("RC20 voucher issuance is restricted to testnet11.")
+    for capability, capability_id, enabled, path_value, digest in (
+        (
+            "SOLS bridge",
+            "warp-cat-bridge",
+            settings.sols_bridge_enabled,
+            settings.sols_bridge_release_evidence_path,
+            settings.sols_bridge_release_evidence_sha256,
+        ),
+        (
+            "SOLS liquidity",
+            "governed-liquidity",
+            settings.sols_liquidity_enabled,
+            settings.sols_liquidity_release_evidence_path,
+            settings.sols_liquidity_release_evidence_sha256,
+        ),
+    ):
+        if not enabled:
+            continue
+        if settings.network != "mainnet":
+            raise RuntimeError(f"{capability} execution is mainnet-only.")
+        if not path_value or not digest or len(digest.removeprefix("0x")) != 64:
+            raise RuntimeError(
+                f"{capability} execution requires checksum-pinned release evidence."
+            )
+        from .sols_capability_evidence import (
+            SolsCapabilityEvidenceError,
+            load_sols_capability_evidence,
+        )
+
+        try:
+            load_sols_capability_evidence(
+                path_value=path_value,
+                expected_sha256=digest,
+                capability=capability_id,
+            )
+        except SolsCapabilityEvidenceError as exc:
+            raise RuntimeError(
+                f"{capability} execution requires valid reviewed release evidence: {exc}"
+            ) from exc
     if settings.ceremony_mode_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
@@ -627,6 +666,13 @@ class Settings(BaseSettings):
     # necessary but never sufficient to make either customer action live.
     sols_bridge_enabled: bool = False
     sols_liquidity_enabled: bool = False
+    # Mainnet capability evidence is a reviewed JSON package whose exact
+    # checksum is pinned by deployment. The API also binds its governed root
+    # and records to reconstructed statutes before advertising execution.
+    sols_bridge_release_evidence_path: Optional[str] = None
+    sols_bridge_release_evidence_sha256: Optional[str] = None
+    sols_liquidity_release_evidence_path: Optional[str] = None
+    sols_liquidity_release_evidence_sha256: Optional[str] = None
     # Automatic paid-reservation -> Chia voucher reconciliation. This is a
     # separate opt-in because it spends faucet coins and requests validator
     # quorum. Presale endpoints may be rehearsed while this remains disabled.

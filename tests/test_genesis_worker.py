@@ -32,6 +32,7 @@ def test_expected_outputs_include_property_registry_current_coin() -> None:
             did_full_puzzle_hash=did.full_puzzle_hash,
             governance_launcher_id=governance.launcher_id,
             governance_full_puzzle_hash=governance.full_puzzle_hash,
+            sols_reserve_seed_coin_id=bytes32(b"r" * 32),
         ),
         statutes=_surface(40),
         protocol_config=_surface(50),
@@ -60,4 +61,4 @@ def test_expected_outputs_include_property_registry_current_coin() -> None:
     ).hex()
 
     assert property_registry_coin_id in coin_ids
-    assert len(coin_ids) == 41
+    assert len(coin_ids) == 42

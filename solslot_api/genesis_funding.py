@@ -67,7 +67,9 @@ def plan_genesis_funding_fanout(
 
     minimums = {
         "sgt": sgt_total_supply,
-        "pool": 1,
+        # One mojo launches the pool singleton; one creates the permanent,
+        # noncirculating Sols CAT lineage anchor at the governed reserve.
+        "pool": 2,
         "did": 1,
         "governance": 1,
         "statutes": 1,

@@ -85,6 +85,28 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
 
 
+def test_customer_bridge_and_liquidity_cannot_execute_on_testnet() -> None:
+    with pytest.raises(RuntimeError, match="bridge execution is mainnet-only"):
+        validate_server_hardening_at_startup(
+            _staging(sols_bridge_enabled=True)
+        )
+    with pytest.raises(RuntimeError, match="liquidity execution is mainnet-only"):
+        validate_server_hardening_at_startup(
+            _staging(sols_liquidity_enabled=True)
+        )
+
+
+def test_mainnet_capability_flag_requires_checksum_pinned_evidence() -> None:
+    with pytest.raises(RuntimeError, match="checksum-pinned release evidence"):
+        validate_server_hardening_at_startup(
+            _staging(
+                runtime_environment="production",
+                network="mainnet",
+                sols_bridge_enabled=True,
+            )
+        )
+
+
 def test_required_chia_primary_requires_a_url() -> None:
     with pytest.raises(RuntimeError, match="CHIA_PRIMARY_REQUIRED"):
         validate_server_hardening_at_startup(

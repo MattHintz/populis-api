@@ -32,6 +32,8 @@ def test_funding_plan_derives_nine_distinct_confirmable_coin_ids() -> None:
     assert len({item["amount"] for item in outputs}) == 9
     assert len({item["coinId"] for item in outputs}) == 9
     assert outputs[0]["amount"] == 1_000_000
+    pool = next(item for item in outputs if item["name"] == "pool")
+    assert pool["amount"] == 2
     bridge_batch = next(item for item in outputs if item["name"] == "bridgeBatch")
     assert bridge_batch["amount"] == GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT == 529
     assert result.plan["fundingCoinIds"]["bridgeBatch"] == bridge_batch["coinId"]

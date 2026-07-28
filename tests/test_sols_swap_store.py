@@ -19,6 +19,7 @@ def test_swap_store_is_idempotent_and_resumable() -> None:
         quote_expires_at=1_900_000_000,
         pool_input_coin_id=_hex(4),
         expected_pool_output_coin_id=_hex(5),
+        destination_puzzle_hash=_hex(7),
     )
     duplicate = store.record_prepared(
         operation_hash=_hex(1),
@@ -28,6 +29,7 @@ def test_swap_store_is_idempotent_and_resumable() -> None:
         quote_expires_at=1_900_000_000,
         pool_input_coin_id=_hex(4),
         expected_pool_output_coin_id=_hex(5),
+        destination_puzzle_hash=_hex(7),
     )
 
     assert prepared.status == "PREPARED"
@@ -66,6 +68,7 @@ def test_swap_store_rejects_operation_hash_rebinding() -> None:
         quote_expires_at=1_900_000_000,
         pool_input_coin_id=_hex(4),
         expected_pool_output_coin_id=_hex(5),
+        destination_puzzle_hash=_hex(7),
     )
 
     with pytest.raises(ValueError, match="another swap"):
@@ -77,4 +80,5 @@ def test_swap_store_rejects_operation_hash_rebinding() -> None:
             quote_expires_at=1_900_000_000,
             pool_input_coin_id=_hex(4),
             expected_pool_output_coin_id=_hex(5),
+            destination_puzzle_hash=_hex(7),
         )

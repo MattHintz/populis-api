@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from time import time
-from typing import Annotated, Any, Mapping, Optional
+from typing import Annotated, Any, Literal, Mapping, Optional
 
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
@@ -16,8 +16,8 @@ from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
+    SINGLETON_MOD,
     SINGLETON_MOD_HASH,
-    puzzle_for_singleton,
 )
 from chia_rs import G1Element
 from chia_rs.sized_bytes import bytes32
@@ -67,6 +67,10 @@ from .public_artifact import (
     PublicArtifactMissing,
     load_signed_public_artifact,
 )
+from .sols_capability_evidence import (
+    SolsCapabilityEvidenceError,
+    load_sols_capability_evidence,
+)
 from .vault_eligibility import require_current_approved_vault
 
 
@@ -78,6 +82,12 @@ STATUTES_SPEND_EVIDENCE = 1
 STATUTES_SPEND_UPDATE = 2
 STATUTES_SPEND_SOLS_EVIDENCE = 3
 STATUTES_SPEND_GOVERNANCE_EVIDENCE = 4
+
+# These constants are deliberately code-owned. A feature flag and an evidence
+# file cannot advertise a transaction surface that this release does not
+# actually implement.
+WARP_CAT_EXECUTION_SURFACE_INSTALLED = False
+LIQUIDITY_EXECUTION_SURFACE_INSTALLED = False
 DEED_SPEND_POOL_DEPOSIT = 0x64
 MAX_SINGLETON_DEPTH = 10_000
 
@@ -1223,8 +1233,8 @@ def _initial_pool_state(
             treasury_assets_micro_usd=0,
             proven_liabilities_micro_usd=0,
             deed_count=0,
-            total_sols_mojos=0,
-            reserve_sols_mojos=0,
+            total_sols_mojos=1,
+            reserve_sols_mojos=1,
         ),
         state_version=1,
     ).validate(())
@@ -1239,8 +1249,8 @@ def _initial_pool_state(
         treasury_assets_micro_usd=0,
         proven_liabilities_micro_usd=0,
         deed_count=0,
-        total_sols_mojos=0,
-        reserve_sols_mojos=0,
+        total_sols_mojos=1,
+        reserve_sols_mojos=1,
         state_version=1,
         inventory=(),
         live_coin_id=tip.live.coin_id,
@@ -1768,9 +1778,27 @@ class SolsMarketReader:
                     raise ValueError("SmartDeed launcher is not confirmed")
                 # The singleton launcher is part of the full puzzle. Derive the
                 # exact expected hash per deed rather than trusting an index.
+                deed_id = bytes32.fromhex(
+                    deed_launcher.removeprefix("0x")
+                )
+                deed_struct = Program.to(
+                    (
+                        SINGLETON_MOD_HASH,
+                        (
+                            deed_id,
+                            bytes32.fromhex(
+                                str(
+                                    artifact["puzzleHashes"][
+                                        "deedLauncherPuzzleHash"
+                                    ]
+                                ).removeprefix("0x")
+                            ),
+                        ),
+                    )
+                )
                 expected = _hex(
-                    puzzle_for_singleton(
-                        bytes32.fromhex(deed_launcher.removeprefix("0x")),
+                    SINGLETON_MOD.curry(
+                        deed_struct,
                         puzzle_for_p2_vault(launcher_id),
                     ).get_tree_hash()
                 )
@@ -1941,23 +1969,34 @@ async def bridge_routes(
         routes = statutes.get("bridgeRoutes")
         if not isinstance(routes, list):
             raise ValueError("governed bridge routes are unavailable")
-        # The governed record is necessary but not sufficient. Runtime Warp
-        # code/evidence verification and the transfer adapter are a separate
-        # beta release gate, so RC22 never advertises an executable bridge.
-        executable = False
+        governed_routes = [item for item in routes if isinstance(item, Mapping)]
+        checks, evidence_ready = _capability_checks(
+            settings=settings,
+            capability="warp-cat-bridge",
+            governed_root=str(statutes["routesRoot"]),
+            governed_records=governed_routes,
+            governed_active=any(bool(item.get("active")) for item in governed_routes),
+            feature_enabled=settings.sols_bridge_enabled,
+            evidence_path=settings.sols_bridge_release_evidence_path,
+            evidence_sha256=settings.sols_bridge_release_evidence_sha256,
+            execution_surface_installed=WARP_CAT_EXECUTION_SURFACE_INSTALLED,
+        )
+        executable = all(item["status"] == "READY" for item in checks)
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "network": settings.network,
             "mode": "LIVE" if executable else "PREVIEW",
             "executable": executable,
-            "reason": (
-                None
-                if executable
-                else (
-                    "Warp bridge actions remain preview-only until the "
-                    "official route adapter and runtime evidence are installed."
-                )
+            "activationState": _activation_state(
+                settings.network,
+                executable,
+                governed_routes,
+                evidence_ready,
+                WARP_CAT_EXECUTION_SURFACE_INSTALLED,
+                settings.sols_bridge_enabled,
             ),
+            "reason": None if executable else _first_incomplete_detail(checks),
+            "readiness": checks,
             "routesRoot": statutes["routesRoot"],
             "routes": [
                 {
@@ -1965,9 +2004,14 @@ async def bridge_routes(
                     "governedActive": bool(item.get("active")),
                     "executable": executable and bool(item.get("active")),
                 }
-                for item in routes
-                if isinstance(item, Mapping)
+                for item in governed_routes
             ],
+            "existingEvidenceScope": (
+                "The pinned Samuel/Base Sepolia Warp portal supports the "
+                "escrow purchase rail. A customer wSOLS CAT bridge additionally "
+                "requires its own WrappedCAT deployment, registration, runtime "
+                "evidence, and transfer adapter."
+            ),
             "source": "chain-reconstructed-statutes",
             "confirmedHeight": statutes["confirmedHeight"],
         }
@@ -2003,22 +2047,34 @@ async def liquidity_venues(
         venues = statutes.get("liquidityVenues")
         if not isinstance(venues, list):
             raise ValueError("governed liquidity venues are unavailable")
-        # A statute authorizes identity only. It does not prove that adapter
-        # calldata or live factory bytecode has passed the beta release gate.
-        executable = False
+        governed_venues = [item for item in venues if isinstance(item, Mapping)]
+        checks, evidence_ready = _capability_checks(
+            settings=settings,
+            capability="governed-liquidity",
+            governed_root=str(statutes["liquidityRoot"]),
+            governed_records=governed_venues,
+            governed_active=any(bool(item.get("active")) for item in governed_venues),
+            feature_enabled=settings.sols_liquidity_enabled,
+            evidence_path=settings.sols_liquidity_release_evidence_path,
+            evidence_sha256=settings.sols_liquidity_release_evidence_sha256,
+            execution_surface_installed=LIQUIDITY_EXECUTION_SURFACE_INSTALLED,
+        )
+        executable = all(item["status"] == "READY" for item in checks)
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "network": settings.network,
             "mode": "LIVE" if executable else "PREVIEW",
             "executable": executable,
-            "reason": (
-                None
-                if executable
-                else (
-                    "Liquidity actions remain preview-only until reviewed "
-                    "venue adapters and runtime code evidence are installed."
-                )
+            "activationState": _activation_state(
+                settings.network,
+                executable,
+                governed_venues,
+                evidence_ready,
+                LIQUIDITY_EXECUTION_SURFACE_INSTALLED,
+                settings.sols_liquidity_enabled,
             ),
+            "reason": None if executable else _first_incomplete_detail(checks),
+            "readiness": checks,
             "liquidityRoot": statutes["liquidityRoot"],
             "venues": [
                 {
@@ -2026,8 +2082,7 @@ async def liquidity_venues(
                     "governedActive": bool(item.get("active")),
                     "executable": executable and bool(item.get("active")),
                 }
-                for item in venues
-                if isinstance(item, Mapping)
+                for item in governed_venues
             ],
             "source": "chain-reconstructed-statutes",
             "confirmedHeight": statutes["confirmedHeight"],
@@ -2057,15 +2112,158 @@ def _locked_capability_view(
     reason: str,
 ) -> dict[str, Any]:
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "network": network,
         "mode": "PREVIEW",
         "executable": False,
+        "activationState": "AWAITING_SIGNED_GENESIS",
         "reason": reason,
+        "readiness": [
+            {
+                "id": "governance",
+                "label": "Governed records",
+                "status": "WAITING",
+                "detail": reason,
+            }
+        ],
         collection_key: [],
         "source": "awaiting-signed-genesis",
         "confirmedHeight": None,
     }
+
+
+def _capability_checks(
+    *,
+    settings: Settings,
+    capability: Literal["warp-cat-bridge", "governed-liquidity"],
+    governed_root: str,
+    governed_records: list[Mapping[str, Any]],
+    governed_active: bool,
+    feature_enabled: bool,
+    evidence_path: str | None,
+    evidence_sha256: str | None,
+    execution_surface_installed: bool,
+) -> tuple[list[dict[str, str]], bool]:
+    checks: list[dict[str, str]] = [
+        _readiness(
+            "governance",
+            "Governed route or venue",
+            "READY" if governed_active else "WAITING",
+            (
+                "An active record was reconstructed from protocol statutes."
+                if governed_active
+                else "An administrator proposal and SGT approval must activate a record."
+            ),
+        ),
+        _readiness(
+            "network",
+            "Mainnet beta boundary",
+            "READY" if settings.network == "mainnet" else "WAITING",
+            (
+                "The API is running on Chia mainnet."
+                if settings.network == "mainnet"
+                else "Customer bridge and liquidity execution stay disabled on Testnet11."
+            ),
+        ),
+    ]
+
+    evidence_ready = False
+    evidence_detail = "Checksum-pinned reviewed release evidence is not configured."
+    if evidence_path or evidence_sha256:
+        try:
+            load_sols_capability_evidence(
+                path_value=evidence_path,
+                expected_sha256=evidence_sha256,
+                capability=capability,
+                governed_root=governed_root,
+                governed_records=governed_records,
+            )
+            evidence_ready = True
+            evidence_detail = (
+                "Release evidence matches the current statutes root and exact records."
+            )
+        except SolsCapabilityEvidenceError as exc:
+            evidence_detail = str(exc)
+    checks.append(
+        _readiness(
+            "releaseEvidence",
+            "Reviewed release evidence",
+            "READY" if evidence_ready else "WAITING",
+            evidence_detail,
+        )
+    )
+    checks.extend(
+        [
+            _readiness(
+                "adapter",
+                "Transaction adapter",
+                "READY" if execution_surface_installed else "WAITING",
+                (
+                    "The reviewed transaction surface is installed in this release."
+                    if execution_surface_installed
+                    else (
+                        "This release has no customer transaction builder for the "
+                        "approved route or venue yet."
+                    )
+                ),
+            ),
+            _readiness(
+                "operatorGate",
+                "Runtime activation",
+                "READY" if feature_enabled else "WAITING",
+                (
+                    "The mainnet runtime gate is enabled."
+                    if feature_enabled
+                    else "The operator gate remains safely disabled."
+                ),
+            ),
+        ]
+    )
+    return checks, evidence_ready
+
+
+def _readiness(
+    check_id: str,
+    label: str,
+    status_value: str,
+    detail: str,
+) -> dict[str, str]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status_value,
+        "detail": detail,
+    }
+
+
+def _first_incomplete_detail(checks: list[dict[str, str]]) -> str:
+    for item in checks:
+        if item["status"] != "READY":
+            return item["detail"]
+    return "Capability activation is pending."
+
+
+def _activation_state(
+    network: str,
+    executable: bool,
+    records: list[Mapping[str, Any]],
+    evidence_ready: bool,
+    execution_surface_installed: bool,
+    feature_enabled: bool,
+) -> str:
+    if executable:
+        return "LIVE"
+    if network != "mainnet":
+        return "MAINNET_ONLY"
+    if not any(bool(item.get("active")) for item in records):
+        return "AWAITING_GOVERNANCE"
+    if not evidence_ready:
+        return "AWAITING_RELEASE_EVIDENCE"
+    if not execution_surface_installed:
+        return "AWAITING_EXECUTION_SURFACE"
+    if not feature_enabled:
+        return "READY_DISABLED"
+    return "BLOCKED"
 
 
 @router.get("/vaults/{vault_launcher_id}/opportunities")
