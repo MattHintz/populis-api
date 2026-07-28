@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
+from .sols_capability_adapters import (
+    SolsCapabilityAdapterError,
+    validate_adapter_descriptor,
+    validate_adapter_governance_binding,
+)
+
 
 MAX_CAPABILITY_EVIDENCE_BYTES = 256 * 1024
 CapabilityName = Literal["warp-cat-bridge", "governed-liquidity"]
@@ -30,6 +36,7 @@ class SolsCapabilityEvidence:
     source_sha: str
     governed_root: str
     adapter_ids: tuple[str, ...]
+    adapter_descriptors: tuple[dict[str, Any], ...]
     records: tuple[dict[str, Any], ...]
     runtime_evidence_root: str
     sha256: str
@@ -76,7 +83,7 @@ def load_sols_capability_evidence(
     if not isinstance(payload, Mapping):
         raise SolsCapabilityEvidenceError("release evidence must be an object")
     if (
-        payload.get("schemaVersion") != 1
+        payload.get("schemaVersion") != 2
         or payload.get("kind") != "solslot-sols-capability-release"
         or payload.get("capability") != capability
         or payload.get("network") != "mainnet"
@@ -99,6 +106,15 @@ def load_sols_capability_evidence(
     runtime_root = "0x" + _hex(
         runtime.get("evidenceRoot"), 32, "runtimeEvidence.evidenceRoot"
     )
+    descriptor_values = runtime.get("adapters")
+    if not isinstance(descriptor_values, list) or not descriptor_values:
+        raise SolsCapabilityEvidenceError(
+            "runtimeEvidence.adapters must be a non-empty list"
+        )
+    adapter_descriptors = tuple(
+        dict(_mapping(value, f"runtimeEvidence.adapters[{index}]"))
+        for index, value in enumerate(descriptor_values)
+    )
     if (
         implementation.get("complete") is not True
         or implementation.get("fixturesPassed") is not True
@@ -116,6 +132,18 @@ def load_sols_capability_evidence(
     )
     if len(set(adapter_ids)) != len(adapter_ids):
         raise SolsCapabilityEvidenceError("adapterIds contains duplicates")
+    descriptor_ids = tuple(
+        _nonempty(value.get("adapterId"), f"runtime adapterIds[{index}]")
+        for index, value in enumerate(adapter_descriptors)
+    )
+    if len(set(descriptor_ids)) != len(descriptor_ids):
+        raise SolsCapabilityEvidenceError(
+            "runtimeEvidence.adapters contains duplicate adapter IDs"
+        )
+    if set(descriptor_ids) != set(adapter_ids):
+        raise SolsCapabilityEvidenceError(
+            "runtime adapter IDs do not match adapterIds"
+        )
 
     record_values = payload.get("records")
     if not isinstance(record_values, list) or not record_values:
@@ -124,6 +152,37 @@ def load_sols_capability_evidence(
         dict(_mapping(value, f"records[{index}]"))
         for index, value in enumerate(record_values)
     )
+    record_ids = {
+        str(value.get("routeId") or value.get("venueId", "")).lower()
+        for value in records
+    }
+    records_by_id = {
+        str(value.get("routeId") or value.get("venueId", "")).lower(): value
+        for value in records
+    }
+    if "" in record_ids or len(record_ids) != len(records):
+        raise SolsCapabilityEvidenceError(
+            "records must have unique routeId or venueId values"
+        )
+    for index, descriptor in enumerate(adapter_descriptors):
+        descriptor_record_id = _nonempty(
+            descriptor.get("recordId"),
+            f"runtimeEvidence.adapters[{index}].recordId",
+        ).lower()
+        if descriptor_record_id not in record_ids:
+            raise SolsCapabilityEvidenceError(
+                "runtime adapter targets an ungoverned record"
+            )
+        try:
+            validate_adapter_descriptor(descriptor)
+            validate_adapter_governance_binding(
+                descriptor,
+                records_by_id[descriptor_record_id],
+            )
+        except SolsCapabilityAdapterError as exc:
+            raise SolsCapabilityEvidenceError(
+                f"runtime adapter is invalid: {exc}"
+            ) from exc
 
     if governed_root is not None and evidence_root.lower() != governed_root.lower():
         raise SolsCapabilityEvidenceError(
@@ -147,6 +206,7 @@ def load_sols_capability_evidence(
         source_sha=source_sha,
         governed_root=evidence_root,
         adapter_ids=adapter_ids,
+        adapter_descriptors=adapter_descriptors,
         records=records,
         runtime_evidence_root=runtime_root,
         sha256=digest,

@@ -50,11 +50,15 @@ from solslot_puzzles.vault_v2_driver import vault_v2_inner_mod_hash
 
 from solslot_api.public_artifact import PublicArtifactMissing
 from solslot_api.config import Settings
+from solslot_api.sols_capability_evidence import SolsCapabilityEvidence
 from solslot_api.sols_market import (
+    LIQUIDITY_INSTALLED_ADAPTERS,
     LiveCoin,
     SingletonTip,
     SolsMarketReader,
     StatutesSnapshot,
+    _activation_state,
+    _active_adapter_coverage,
     _decode_pool_state,
     _decode_statutes_state,
     _liquidity_venue,
@@ -609,7 +613,8 @@ async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None
         "governance": "READY",
         "network": "WAITING",
         "releaseEvidence": "WAITING",
-        "adapter": "WAITING",
+        "adapter": "READY",
+        "confirmationObserver": "WAITING",
         "operatorGate": "READY",
     }
     assert liquidity["mode"] == "PREVIEW"
@@ -659,6 +664,52 @@ async def test_feature_flags_cannot_bypass_missing_beta_adapter_evidence() -> No
     assert liquidity["venues"][0]["executable"] is False
     assert liquidity["activationState"] == "AWAITING_RELEASE_EVIDENCE"
     assert "release evidence" in liquidity["reason"]
+
+
+def test_active_adapter_coverage_rejects_uninstalled_tibet_wallet_execution() -> None:
+    venue_id = _hex(_b32(0x84))
+    evidence = SolsCapabilityEvidence(
+        capability="governed-liquidity",
+        release_tag="solslot-v2-beta-rc1",
+        source_sha="ab" * 20,
+        governed_root=_hex(_b32(0x82)),
+        adapter_ids=("tibet-v2",),
+        adapter_descriptors=(
+            {
+                "adapterId": "tibet-v2",
+                "recordId": venue_id,
+                "kind": "TIBETSWAP_V2",
+            },
+        ),
+        records=({"venueId": venue_id, "active": True},),
+        runtime_evidence_root=_hex(_b32(0x85)),
+        sha256="cd" * 32,
+    )
+
+    ready, detail = _active_adapter_coverage(
+        governed_records=[{"venueId": venue_id, "active": True}],
+        evidence=evidence,
+        installed_adapter_kinds=LIQUIDITY_INSTALLED_ADAPTERS,
+    )
+
+    assert ready is False
+    assert "TIBETSWAP_V2" in detail
+
+
+def test_bridge_activation_waits_for_reviewed_confirmation_observer() -> None:
+    checks = [
+        {"id": "governance", "status": "READY"},
+        {"id": "network", "status": "READY"},
+        {"id": "releaseEvidence", "status": "READY"},
+        {"id": "adapter", "status": "READY"},
+        {"id": "confirmationObserver", "status": "WAITING"},
+        {"id": "operatorGate", "status": "READY"},
+    ]
+
+    assert (
+        _activation_state("mainnet", False, checks)
+        == "AWAITING_CONFIRMATION_OBSERVER"
+    )
 
 
 def test_singleton_continuation_ignores_other_created_coins() -> None:

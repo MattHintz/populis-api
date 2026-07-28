@@ -795,6 +795,8 @@ def test_swap_routes_are_registered_in_public_api_contract() -> None:
     assert f"{base}/complete" in paths
     assert "/sols/swaps/{operation_hash}" in paths
     assert "/sols/vaults/{vault_launcher_id}/journey" in paths
+    assert "/sols/bridge-intents" in paths
+    assert "/sols/liquidity-intents" in paths
 
 
 def test_swap_authorization_keeps_alpha_and_network_ceiling(

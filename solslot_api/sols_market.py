@@ -6,6 +6,8 @@ Pool V4 and statutes singleton lineages on Testnet11.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, replace
 from time import time
 from typing import Annotated, Any, Literal, Mapping, Optional
@@ -23,6 +25,7 @@ from chia_rs import G1Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
 
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.mint_publish_driver import canonical_p2_pool_mod_hash
@@ -68,8 +71,18 @@ from .public_artifact import (
     load_signed_public_artifact,
 )
 from .sols_capability_evidence import (
+    SolsCapabilityEvidence,
     SolsCapabilityEvidenceError,
     load_sols_capability_evidence,
+)
+from .sols_capability_adapters import (
+    SolsCapabilityAdapterError,
+    build_aerodrome_liquidity_intent,
+    build_tibetswap_liquidity_intent,
+    build_uniswap_v3_liquidity_intent,
+    build_warp_bridge_intent,
+    descriptor_for_record,
+    public_adapter_profile,
 )
 from .vault_eligibility import require_current_approved_vault
 
@@ -86,10 +99,42 @@ STATUTES_SPEND_GOVERNANCE_EVIDENCE = 4
 # These constants are deliberately code-owned. A feature flag and an evidence
 # file cannot advertise a transaction surface that this release does not
 # actually implement.
-WARP_CAT_EXECUTION_SURFACE_INSTALLED = False
-LIQUIDITY_EXECUTION_SURFACE_INSTALLED = False
+WARP_CAT_EXECUTION_SURFACE_INSTALLED = True
+WARP_CAT_CONFIRMATION_OBSERVER_INSTALLED = False
+LIQUIDITY_EXECUTION_SURFACE_INSTALLED = True
+WARP_CAT_INSTALLED_ADAPTERS = frozenset({"WARP_CAT"})
+LIQUIDITY_INSTALLED_ADAPTERS = frozenset(
+    {
+        "AERODROME_V1",
+        "UNISWAP_V3",
+    }
+)
 DEED_SPEND_POOL_DEPOSIT = 0x64
 MAX_SINGLETON_DEPTH = 10_000
+
+
+class BridgeIntentRequest(BaseModel):
+    vaultLauncherId: str = Field(..., pattern=r"^0x[0-9a-fA-F]{64}$")
+    routeId: str = Field(..., pattern=r"^0x[0-9a-fA-F]{64}$")
+    direction: Literal["CHIA_TO_EVM", "EVM_TO_CHIA"]
+    amountMojos: str = Field(..., pattern=r"^[1-9][0-9]*$", max_length=78)
+    destination: str = Field(..., min_length=2, max_length=66)
+
+
+class LiquidityIntentRequest(BaseModel):
+    vaultLauncherId: str = Field(..., pattern=r"^0x[0-9a-fA-F]{64}$")
+    venueId: str = Field(..., pattern=r"^0x[0-9a-fA-F]{64}$")
+    action: Literal["ADD", "REMOVE", "COLLECT"]
+    account: str | None = Field(None, min_length=42, max_length=42)
+    amountA: str = Field("0", pattern=r"^[0-9]+$", max_length=78)
+    amountB: str = Field("0", pattern=r"^[0-9]+$", max_length=78)
+    liquidity: str = Field("0", pattern=r"^[0-9]+$", max_length=78)
+    minimumA: str = Field("0", pattern=r"^[0-9]+$", max_length=78)
+    minimumB: str = Field("0", pattern=r"^[0-9]+$", max_length=78)
+    tokenId: str | None = Field(None, pattern=r"^[1-9][0-9]*$", max_length=78)
+    tickLower: int | None = None
+    tickUpper: int | None = None
+    deadlineSeconds: int = Field(600, ge=60, le=1800)
 
 
 @dataclass(frozen=True)
@@ -1980,8 +2025,21 @@ async def bridge_routes(
             evidence_path=settings.sols_bridge_release_evidence_path,
             evidence_sha256=settings.sols_bridge_release_evidence_sha256,
             execution_surface_installed=WARP_CAT_EXECUTION_SURFACE_INSTALLED,
+            installed_adapter_kinds=WARP_CAT_INSTALLED_ADAPTERS,
+            confirmation_observer_installed=(
+                WARP_CAT_CONFIRMATION_OBSERVER_INSTALLED
+            ),
         )
         executable = all(item["status"] == "READY" for item in checks)
+        profiles = _capability_profiles(
+            evidence_ready=evidence_ready,
+            capability="warp-cat-bridge",
+            governed_root=str(statutes["routesRoot"]),
+            governed_records=governed_routes,
+            evidence_path=settings.sols_bridge_release_evidence_path,
+            evidence_sha256=settings.sols_bridge_release_evidence_sha256,
+            record_key="routeId",
+        )
         return {
             "schemaVersion": 2,
             "network": settings.network,
@@ -1990,10 +2048,7 @@ async def bridge_routes(
             "activationState": _activation_state(
                 settings.network,
                 executable,
-                governed_routes,
-                evidence_ready,
-                WARP_CAT_EXECUTION_SURFACE_INSTALLED,
-                settings.sols_bridge_enabled,
+                checks,
             ),
             "reason": None if executable else _first_incomplete_detail(checks),
             "readiness": checks,
@@ -2001,6 +2056,7 @@ async def bridge_routes(
             "routes": [
                 {
                     **item,
+                    **profiles.get(str(item.get("routeId", "")).lower(), {}),
                     "governedActive": bool(item.get("active")),
                     "executable": executable and bool(item.get("active")),
                 }
@@ -2058,8 +2114,18 @@ async def liquidity_venues(
             evidence_path=settings.sols_liquidity_release_evidence_path,
             evidence_sha256=settings.sols_liquidity_release_evidence_sha256,
             execution_surface_installed=LIQUIDITY_EXECUTION_SURFACE_INSTALLED,
+            installed_adapter_kinds=LIQUIDITY_INSTALLED_ADAPTERS,
         )
         executable = all(item["status"] == "READY" for item in checks)
+        profiles = _capability_profiles(
+            evidence_ready=evidence_ready,
+            capability="governed-liquidity",
+            governed_root=str(statutes["liquidityRoot"]),
+            governed_records=governed_venues,
+            evidence_path=settings.sols_liquidity_release_evidence_path,
+            evidence_sha256=settings.sols_liquidity_release_evidence_sha256,
+            record_key="venueId",
+        )
         return {
             "schemaVersion": 2,
             "network": settings.network,
@@ -2068,10 +2134,7 @@ async def liquidity_venues(
             "activationState": _activation_state(
                 settings.network,
                 executable,
-                governed_venues,
-                evidence_ready,
-                LIQUIDITY_EXECUTION_SURFACE_INSTALLED,
-                settings.sols_liquidity_enabled,
+                checks,
             ),
             "reason": None if executable else _first_incomplete_detail(checks),
             "readiness": checks,
@@ -2079,6 +2142,7 @@ async def liquidity_venues(
             "venues": [
                 {
                     **item,
+                    **profiles.get(str(item.get("venueId", "")).lower(), {}),
                     "governedActive": bool(item.get("active")),
                     "executable": executable and bool(item.get("active")),
                 }
@@ -2104,6 +2168,305 @@ async def liquidity_venues(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Liquidity venue verification failed closed: {exc}",
         ) from exc
+
+
+@router.post("/bridge-intents")
+async def create_bridge_intent(
+    body: BridgeIntentRequest,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    reader: Annotated[SolsMarketReader, Depends(_reader)],
+) -> dict[str, Any]:
+    session = verify_vault_session(settings, request, body.vaultLauncherId)
+    try:
+        statutes, records, evidence = await _execution_context(
+            settings=settings,
+            reader=reader,
+            capability="warp-cat-bridge",
+            records_key="bridgeRoutes",
+            root_key="routesRoot",
+            feature_enabled=settings.sols_bridge_enabled,
+            evidence_path=settings.sols_bridge_release_evidence_path,
+            evidence_sha256=settings.sols_bridge_release_evidence_sha256,
+            execution_surface_installed=WARP_CAT_EXECUTION_SURFACE_INSTALLED,
+            installed_adapter_kinds=WARP_CAT_INSTALLED_ADAPTERS,
+            confirmation_observer_installed=(
+                WARP_CAT_CONFIRMATION_OBSERVER_INSTALLED
+            ),
+        )
+        record = _active_record(records, "routeId", body.routeId)
+        descriptor = descriptor_for_record(
+            evidence.adapter_descriptors,
+            record_id=body.routeId,
+        )
+        intent = build_warp_bridge_intent(
+            descriptor=descriptor,
+            direction=body.direction,
+            amount_mojos=body.amountMojos,
+            destination=body.destination,
+        )
+        return _capability_intent_response(
+            network=settings.network,
+            vault_launcher_id=session.vault_launcher_id,
+            capability="warp-cat-bridge",
+            governed_root=str(statutes["routesRoot"]),
+            confirmed_height=int(statutes["confirmedHeight"]),
+            evidence_sha256=evidence.sha256,
+            governed_record=record,
+            intent=intent,
+            decision_receipt={
+                "title": (
+                    "Bridge Sols to an EVM wallet"
+                    if body.direction == "CHIA_TO_EVM"
+                    else "Return wSOLS to a Chia wallet"
+                ),
+                "amountMojos": body.amountMojos,
+                "destination": intent["destination"],
+                "reversible": False,
+                "customerImpact": (
+                    "The selected amount leaves this chain and becomes the "
+                    "corresponding asset on the destination chain."
+                ),
+            },
+        )
+    except HTTPException:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        SolsCapabilityAdapterError,
+        SolsCapabilityEvidenceError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Bridge intent is not ready: {exc}",
+        ) from exc
+
+
+@router.post("/liquidity-intents")
+async def create_liquidity_intent(
+    body: LiquidityIntentRequest,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    reader: Annotated[SolsMarketReader, Depends(_reader)],
+) -> dict[str, Any]:
+    session = verify_vault_session(settings, request, body.vaultLauncherId)
+    try:
+        statutes, records, evidence = await _execution_context(
+            settings=settings,
+            reader=reader,
+            capability="governed-liquidity",
+            records_key="liquidityVenues",
+            root_key="liquidityRoot",
+            feature_enabled=settings.sols_liquidity_enabled,
+            evidence_path=settings.sols_liquidity_release_evidence_path,
+            evidence_sha256=settings.sols_liquidity_release_evidence_sha256,
+            execution_surface_installed=LIQUIDITY_EXECUTION_SURFACE_INSTALLED,
+            installed_adapter_kinds=LIQUIDITY_INSTALLED_ADAPTERS,
+        )
+        record = _active_record(records, "venueId", body.venueId)
+        descriptor = descriptor_for_record(
+            evidence.adapter_descriptors,
+            record_id=body.venueId,
+        )
+        kind = descriptor.get("kind")
+        if kind == "AERODROME_V1":
+            if body.account is None:
+                raise SolsCapabilityAdapterError(
+                    "an EVM receiving account is required"
+                )
+            intent = build_aerodrome_liquidity_intent(
+                descriptor=descriptor,
+                action=body.action,
+                account=body.account,
+                amount_a=body.amountA,
+                amount_b=body.amountB,
+                liquidity=body.liquidity,
+                min_a=body.minimumA,
+                min_b=body.minimumB,
+                deadline_seconds=body.deadlineSeconds,
+            )
+        elif kind == "UNISWAP_V3":
+            if body.account is None:
+                raise SolsCapabilityAdapterError(
+                    "an EVM receiving account is required"
+                )
+            intent = build_uniswap_v3_liquidity_intent(
+                descriptor=descriptor,
+                action=body.action,
+                account=body.account,
+                amount_a=body.amountA,
+                amount_b=body.amountB,
+                liquidity=body.liquidity,
+                min_a=body.minimumA,
+                min_b=body.minimumB,
+                token_id=body.tokenId,
+                tick_lower=body.tickLower,
+                tick_upper=body.tickUpper,
+                deadline_seconds=body.deadlineSeconds,
+            )
+        elif kind == "TIBETSWAP_V2":
+            intent = build_tibetswap_liquidity_intent(
+                descriptor=descriptor,
+                action=body.action,
+                amount_xch_mojos=body.amountA,
+                amount_cat_mojos=body.amountB,
+                liquidity_mojos=body.liquidity,
+            )
+        else:
+            raise SolsCapabilityAdapterError(
+                "the governed venue has no reviewed native adapter"
+            )
+        return _capability_intent_response(
+            network=settings.network,
+            vault_launcher_id=session.vault_launcher_id,
+            capability="governed-liquidity",
+            governed_root=str(statutes["liquidityRoot"]),
+            confirmed_height=int(statutes["confirmedHeight"]),
+            evidence_sha256=evidence.sha256,
+            governed_record=record,
+            intent=intent,
+            decision_receipt={
+                "title": f"{body.action.title()} governed liquidity",
+                "amountA": body.amountA,
+                "amountB": body.amountB,
+                "liquidity": body.liquidity,
+                "minimumA": body.minimumA,
+                "minimumB": body.minimumB,
+                "reversible": False,
+                "customerImpact": (
+                    "This changes a liquidity position at the exact venue "
+                    "approved in protocol statutes."
+                ),
+            },
+        )
+    except HTTPException:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        SolsCapabilityAdapterError,
+        SolsCapabilityEvidenceError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Liquidity intent is not ready: {exc}",
+        ) from exc
+
+
+async def _execution_context(
+    *,
+    settings: Settings,
+    reader: SolsMarketReader,
+    capability: Literal["warp-cat-bridge", "governed-liquidity"],
+    records_key: Literal["bridgeRoutes", "liquidityVenues"],
+    root_key: Literal["routesRoot", "liquidityRoot"],
+    feature_enabled: bool,
+    evidence_path: str | None,
+    evidence_sha256: str | None,
+    execution_surface_installed: bool,
+    installed_adapter_kinds: frozenset[str],
+    confirmation_observer_installed: bool | None = None,
+) -> tuple[Mapping[str, Any], list[Mapping[str, Any]], Any]:
+    snapshot = await reader.snapshot()
+    statutes = snapshot.get("statutes")
+    if not isinstance(statutes, Mapping):
+        raise SolsCapabilityAdapterError("governed statutes are not confirmed")
+    raw_records = statutes.get(records_key)
+    if not isinstance(raw_records, list):
+        raise SolsCapabilityAdapterError("governed records are unavailable")
+    records = [value for value in raw_records if isinstance(value, Mapping)]
+    checks, _ = _capability_checks(
+        settings=settings,
+        capability=capability,
+        governed_root=str(statutes[root_key]),
+        governed_records=records,
+        governed_active=any(bool(value.get("active")) for value in records),
+        feature_enabled=feature_enabled,
+        evidence_path=evidence_path,
+        evidence_sha256=evidence_sha256,
+        execution_surface_installed=execution_surface_installed,
+        installed_adapter_kinds=installed_adapter_kinds,
+        confirmation_observer_installed=confirmation_observer_installed,
+    )
+    if any(value["status"] != "READY" for value in checks):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": _first_incomplete_detail(checks),
+                "readiness": checks,
+            },
+        )
+    evidence = load_sols_capability_evidence(
+        path_value=evidence_path,
+        expected_sha256=evidence_sha256,
+        capability=capability,
+        governed_root=str(statutes[root_key]),
+        governed_records=records,
+    )
+    return statutes, records, evidence
+
+
+def _active_record(
+    records: list[Mapping[str, Any]],
+    key: Literal["routeId", "venueId"],
+    selected_id: str,
+) -> Mapping[str, Any]:
+    matches = [
+        value
+        for value in records
+        if str(value.get(key, "")).lower() == selected_id.lower()
+    ]
+    if len(matches) != 1:
+        raise SolsCapabilityAdapterError("governed record was not found")
+    if not bool(matches[0].get("active")):
+        raise SolsCapabilityAdapterError("governed record is not active")
+    return matches[0]
+
+
+def _capability_intent_response(
+    *,
+    network: str,
+    vault_launcher_id: str,
+    capability: str,
+    governed_root: str,
+    confirmed_height: int,
+    evidence_sha256: str,
+    governed_record: Mapping[str, Any],
+    intent: Mapping[str, Any],
+    decision_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    binding = {
+        "network": network,
+        "vaultLauncherId": vault_launcher_id,
+        "capability": capability,
+        "governedRoot": governed_root,
+        "confirmedHeight": confirmed_height,
+        "releaseEvidenceSha256": evidence_sha256,
+        "governedRecord": dict(governed_record),
+        "intent": dict(intent),
+    }
+    operation_hash = "0x" + hashlib.sha256(
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return {
+        "schemaVersion": 1,
+        "operationHash": operation_hash,
+        **binding,
+        "decisionReceipt": {
+            **dict(decision_receipt),
+            "network": network,
+            "wallet": vault_launcher_id,
+            "operationHash": operation_hash,
+        },
+    }
 
 
 def _locked_capability_view(
@@ -2143,6 +2506,8 @@ def _capability_checks(
     evidence_path: str | None,
     evidence_sha256: str | None,
     execution_surface_installed: bool,
+    installed_adapter_kinds: frozenset[str],
+    confirmation_observer_installed: bool | None = None,
 ) -> tuple[list[dict[str, str]], bool]:
     checks: list[dict[str, str]] = [
         _readiness(
@@ -2168,10 +2533,11 @@ def _capability_checks(
     ]
 
     evidence_ready = False
+    loaded_evidence: SolsCapabilityEvidence | None = None
     evidence_detail = "Checksum-pinned reviewed release evidence is not configured."
     if evidence_path or evidence_sha256:
         try:
-            load_sols_capability_evidence(
+            loaded_evidence = load_sols_capability_evidence(
                 path_value=evidence_path,
                 expected_sha256=evidence_sha256,
                 capability=capability,
@@ -2192,34 +2558,134 @@ def _capability_checks(
             evidence_detail,
         )
     )
+    adapter_ready = execution_surface_installed
+    adapter_detail = (
+        "The reviewed transaction surface is installed in this release."
+        if execution_surface_installed
+        else (
+            "This release has no customer transaction builder for the "
+            "approved route or venue yet."
+        )
+    )
+    if adapter_ready and loaded_evidence is not None:
+        adapter_ready, adapter_detail = _active_adapter_coverage(
+            governed_records=governed_records,
+            evidence=loaded_evidence,
+            installed_adapter_kinds=installed_adapter_kinds,
+        )
     checks.extend(
         [
             _readiness(
                 "adapter",
                 "Transaction adapter",
-                "READY" if execution_surface_installed else "WAITING",
-                (
-                    "The reviewed transaction surface is installed in this release."
-                    if execution_surface_installed
-                    else (
-                        "This release has no customer transaction builder for the "
-                        "approved route or venue yet."
-                    )
-                ),
-            ),
-            _readiness(
-                "operatorGate",
-                "Runtime activation",
-                "READY" if feature_enabled else "WAITING",
-                (
-                    "The mainnet runtime gate is enabled."
-                    if feature_enabled
-                    else "The operator gate remains safely disabled."
-                ),
+                "READY" if adapter_ready else "WAITING",
+                adapter_detail,
             ),
         ]
     )
+    if confirmation_observer_installed is not None:
+        checks.append(
+            _readiness(
+                "confirmationObserver",
+                "Transfer confirmation",
+                "READY" if confirmation_observer_installed else "WAITING",
+                (
+                    "Destination completion is observed and resumable in Solslot."
+                    if confirmation_observer_installed
+                    else (
+                        "Official Warp initiation is wired, but Solslot does not "
+                        "yet have a reviewed watcher contract for pending, relayed, "
+                        "and completed transfers."
+                    )
+                ),
+            )
+        )
+    checks.append(
+        _readiness(
+            "operatorGate",
+            "Runtime activation",
+            "READY" if feature_enabled else "WAITING",
+            (
+                "The mainnet runtime gate is enabled."
+                if feature_enabled
+                else "The operator gate remains safely disabled."
+            ),
+        )
+    )
     return checks, evidence_ready
+
+
+def _active_adapter_coverage(
+    *,
+    governed_records: list[Mapping[str, Any]],
+    evidence: SolsCapabilityEvidence,
+    installed_adapter_kinds: frozenset[str],
+) -> tuple[bool, str]:
+    active_ids = {
+        str(record.get("routeId") or record.get("venueId") or "").lower()
+        for record in governed_records
+        if bool(record.get("active"))
+    }
+    descriptors_by_record = {
+        str(descriptor.get("recordId", "")).lower(): descriptor
+        for descriptor in evidence.adapter_descriptors
+    }
+    missing = sorted(active_ids - descriptors_by_record.keys())
+    unsupported = sorted(
+        {
+            str(descriptors_by_record[record_id].get("kind") or "UNKNOWN")
+            for record_id in active_ids
+            if record_id in descriptors_by_record
+            and descriptors_by_record[record_id].get("kind")
+            not in installed_adapter_kinds
+        }
+    )
+    if missing:
+        return (
+            False,
+            "An active governed record has no evidence-bound customer adapter.",
+        )
+    if unsupported:
+        return (
+            False,
+            "Active governed adapter execution is not installed: "
+            + ", ".join(unsupported)
+            + ".",
+        )
+    return (
+        True,
+        "Every active governed record has an evidence-bound customer executor.",
+    )
+
+
+def _capability_profiles(
+    *,
+    evidence_ready: bool,
+    capability: Literal["warp-cat-bridge", "governed-liquidity"],
+    governed_root: str,
+    governed_records: list[Mapping[str, Any]],
+    evidence_path: str | None,
+    evidence_sha256: str | None,
+    record_key: Literal["routeId", "venueId"],
+) -> dict[str, dict[str, Any]]:
+    if not evidence_ready:
+        return {}
+    evidence = load_sols_capability_evidence(
+        path_value=evidence_path,
+        expected_sha256=evidence_sha256,
+        capability=capability,
+        governed_root=governed_root,
+        governed_records=governed_records,
+    )
+    return {
+        str(descriptor["recordId"]).lower(): public_adapter_profile(descriptor)
+        for descriptor in evidence.adapter_descriptors
+        if str(descriptor.get("recordId", "")).lower()
+        in {
+            str(record.get(record_key, "")).lower()
+            for record in governed_records
+        }
+    }
 
 
 def _readiness(
@@ -2246,22 +2712,22 @@ def _first_incomplete_detail(checks: list[dict[str, str]]) -> str:
 def _activation_state(
     network: str,
     executable: bool,
-    records: list[Mapping[str, Any]],
-    evidence_ready: bool,
-    execution_surface_installed: bool,
-    feature_enabled: bool,
+    checks: list[dict[str, str]],
 ) -> str:
     if executable:
         return "LIVE"
     if network != "mainnet":
         return "MAINNET_ONLY"
-    if not any(bool(item.get("active")) for item in records):
+    readiness = {item["id"]: item["status"] for item in checks}
+    if readiness.get("governance") != "READY":
         return "AWAITING_GOVERNANCE"
-    if not evidence_ready:
+    if readiness.get("releaseEvidence") != "READY":
         return "AWAITING_RELEASE_EVIDENCE"
-    if not execution_surface_installed:
+    if readiness.get("adapter") != "READY":
         return "AWAITING_EXECUTION_SURFACE"
-    if not feature_enabled:
+    if readiness.get("confirmationObserver", "READY") != "READY":
+        return "AWAITING_CONFIRMATION_OBSERVER"
+    if readiness.get("operatorGate") != "READY":
         return "READY_DISABLED"
     return "BLOCKED"
 
