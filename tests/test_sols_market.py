@@ -28,9 +28,11 @@ from solslot_puzzles.protocol_statutes_driver import (
     protocol_statutes_inner_mod_hash,
 )
 from solslot_puzzles.protocol_statutes_v1 import (
+    BridgeRoute,
     CollectionStatute,
     LiquidityVenue,
     MutationKind,
+    OracleRound,
     PermanentRules,
     ProtocolParameters,
     build_record_mutation,
@@ -42,13 +44,15 @@ from solslot_puzzles.sols_pool_v4 import (
     inventory_root,
     prepare_deed_to_sols,
 )
-from solslot_puzzles.vault_driver import AUTH_TYPE_BLS
+from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, puzzle_for_p2_vault
 from solslot_puzzles.vault_v2_driver import vault_v2_inner_mod_hash
 
 from solslot_api.public_artifact import PublicArtifactMissing
+from solslot_api.config import Settings
 from solslot_api.sols_market import (
     LiveCoin,
     SingletonTip,
+    SolsMarketReader,
     StatutesSnapshot,
     _decode_pool_state,
     _decode_statutes_state,
@@ -57,6 +61,9 @@ from solslot_api.sols_market import (
     _singleton_child,
     _statutes_payload,
     _statutes_witnesses,
+    bridge_routes,
+    governance_summary,
+    liquidity_venues,
     sols_market,
 )
 
@@ -362,9 +369,14 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
         expected_permanent_rules=RULES,
         expected_governance_launcher_id=_hex(GOVERNANCE_LAUNCHER),
     )
-    _, collections, liquidity_venues, _ = _statutes_witnesses(
-        puzzle_solution
-    )
+    (
+        _,
+        collections,
+        oracle_rounds,
+        bridge_routes,
+        liquidity_venues,
+        _,
+    ) = _statutes_witnesses(puzzle_solution)
     provider = type(
         "Provider",
         (),
@@ -377,6 +389,8 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
     (
         resolved_parameters,
         resolved_collections,
+        resolved_oracle_rounds,
+        resolved_bridge_routes,
         resolved_liquidity_venues,
         resolved_pauses,
     ) = (
@@ -393,6 +407,8 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
     assert liquidity_venues is None
     assert resolved_parameters == PARAMETERS
     assert resolved_collections == (COLLECTION,)
+    assert resolved_oracle_rounds == ()
+    assert resolved_bridge_routes == ()
     assert resolved_liquidity_venues == ()
     assert resolved_pauses == ()
 
@@ -426,6 +442,8 @@ def test_statutes_payload_exposes_only_typed_chain_liquidity_venues() -> None:
         state=state,
         parameters=PARAMETERS,
         collections=(),
+        oracle_rounds=(),
+        bridge_routes=(),
         liquidity_venues=venues,
         pauses=(),
         registry_version=state.registry_version,
@@ -452,6 +470,79 @@ def test_statutes_payload_exposes_only_typed_chain_liquidity_venues() -> None:
     ]
 
 
+def test_statutes_payload_exposes_only_typed_chain_bridge_and_oracle_records() -> None:
+    initial = initial_state(
+        parameters=PARAMETERS,
+        permanent_rules=RULES,
+    )
+    oracle = OracleRound(
+        asset_id=_b32(0x60),
+        price_micro_usd=1_000_000,
+        observed_at=1_899_999_000,
+        valid_until=1_900_000_000,
+        round_id=1,
+        source_root=_b32(0x61),
+        source_count=3,
+        haircut_bps=0,
+        stable_min_bps=9_900,
+        stable_max_bps=10_100,
+    )
+    _, oracles, oracle_state = build_record_mutation(
+        state=initial,
+        kind=MutationKind.ORACLE,
+        current=(),
+        replacement=oracle,
+    )
+    route = BridgeRoute(
+        route_id=_b32(0x62),
+        source_chain_id=_b32(0x63),
+        destination_chain_id=_b32(0x64),
+        asset_id=RULES.sols_tail_hash,
+        remote_asset_id=_b32(0x65),
+        decimals=3,
+        active=1,
+    )
+    _, routes, state = build_record_mutation(
+        state=oracle_state,
+        kind=MutationKind.ROUTE,
+        current=(),
+        replacement=route,
+    )
+    snapshot = StatutesSnapshot(
+        live_coin_id=_hex(_b32(0x66)),
+        live_puzzle_hash=_hex(_b32(0x67)),
+        state=state,
+        parameters=PARAMETERS,
+        collections=(),
+        oracle_rounds=oracles,
+        bridge_routes=routes,
+        liquidity_venues=(),
+        pauses=(),
+        registry_version=state.registry_version,
+        confirmed_height=124,
+        lineage_depth=3,
+    )
+
+    payload = _statutes_payload(snapshot)
+
+    assert payload is not None
+    assert payload["oracleRoot"] == _hex(state.oracle_root)
+    assert payload["routesRoot"] == _hex(state.routes_root)
+    assert payload["oracleRounds"][0]["priceMicroUsd"] == "1000000"
+    assert payload["oracleRounds"][0]["sourceCount"] == 3
+    assert payload["bridgeRoutes"] == [
+        {
+            "routeId": _hex(route.route_id),
+            "sourceChainId": _hex(route.source_chain_id),
+            "destinationChainId": _hex(route.destination_chain_id),
+            "assetId": _hex(route.asset_id),
+            "remoteAssetId": _hex(route.remote_asset_id),
+            "decimals": 3,
+            "active": True,
+        }
+    ]
+
+
 async def _async_value(value):
     return value
 
@@ -464,6 +555,94 @@ class _Reader:
         if isinstance(self._snapshot, Exception):
             raise self._snapshot
         return self._snapshot
+
+
+@pytest.mark.asyncio
+async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None:
+    chain_snapshot = {
+        "statutes": {
+            "registryVersion": 4,
+            "contentHash": _hex(_b32(0x80)),
+            "routesRoot": _hex(_b32(0x81)),
+            "liquidityRoot": _hex(_b32(0x82)),
+            "bridgeRoutes": [
+                {
+                    "routeId": _hex(_b32(0x83)),
+                    "active": True,
+                }
+            ],
+            "liquidityVenues": [
+                {
+                    "venueId": _hex(_b32(0x84)),
+                    "active": True,
+                }
+            ],
+            "parameters": {
+                "votingWindowSeconds": 300,
+                "quorumBps": 5_000,
+                "minimumProposalStake": "10000",
+            },
+            "confirmedHeight": 123,
+        }
+    }
+    settings = Settings(
+        network="testnet11",
+        sols_bridge_enabled=True,
+        sols_liquidity_enabled=True,
+    )
+    reader = _Reader(chain_snapshot)
+
+    bridge = await bridge_routes(settings, reader)
+    liquidity = await liquidity_venues(settings, reader)
+    governance = await governance_summary(settings, reader)
+
+    assert bridge["mode"] == "PREVIEW"
+    assert bridge["routes"][0]["governedActive"] is True
+    assert bridge["routes"][0]["executable"] is False
+    assert liquidity["mode"] == "PREVIEW"
+    assert liquidity["venues"][0]["executable"] is False
+    assert governance["statutesVersion"] == 4
+    assert governance["minimumProposalStake"] == "10000"
+
+
+@pytest.mark.asyncio
+async def test_feature_flags_cannot_bypass_missing_beta_adapter_evidence() -> None:
+    chain_snapshot = {
+        "statutes": {
+            "registryVersion": 4,
+            "contentHash": _hex(_b32(0x80)),
+            "routesRoot": _hex(_b32(0x81)),
+            "liquidityRoot": _hex(_b32(0x82)),
+            "bridgeRoutes": [{"routeId": _hex(_b32(0x83)), "active": True}],
+            "liquidityVenues": [
+                {"venueId": _hex(_b32(0x84)), "active": True}
+            ],
+            "parameters": {
+                "votingWindowSeconds": 300,
+                "quorumBps": 5_000,
+                "minimumProposalStake": "10000",
+            },
+            "confirmedHeight": 123,
+        }
+    }
+    settings = Settings(
+        network="mainnet",
+        sols_bridge_enabled=True,
+        sols_liquidity_enabled=True,
+    )
+    reader = _Reader(chain_snapshot)
+
+    bridge = await bridge_routes(settings, reader)
+    liquidity = await liquidity_venues(settings, reader)
+
+    assert bridge["mode"] == "PREVIEW"
+    assert bridge["executable"] is False
+    assert bridge["routes"][0]["executable"] is False
+    assert "runtime evidence" in bridge["reason"]
+    assert liquidity["mode"] == "PREVIEW"
+    assert liquidity["executable"] is False
+    assert liquidity["venues"][0]["executable"] is False
+    assert "runtime code evidence" in liquidity["reason"]
 
 
 def test_singleton_continuation_ignores_other_created_coins() -> None:
@@ -532,3 +711,88 @@ async def test_missing_genesis_artifact_locks_market_without_inventory() -> None
     assert response["statutes"] is None
     assert response["opportunities"] == []
     assert response["verifiedOpportunityCount"] == 0
+
+
+class _HoldingStore:
+    def sols_market_candidates(self) -> list[dict]:
+        return [
+            {
+                "deedId": "EASTMORELAND-001",
+                "deedLauncherId": _hex(DEED_LAUNCHER),
+                "outputCoinId": _hex(DEED_PARENT),
+                "collectionId": "eastmoreland",
+                "collectionSlug": "127-eastmoreland",
+                "collectionTitle": "127 Eastmoreland",
+                "collectionSummary": "Testnet alpha property.",
+                "metadataRoot": _hex(_b32(0x91)),
+                "sharePpm": 40_000,
+                "parValueMojos": 100_000_000,
+            }
+        ]
+
+    def public_collection(self, _identifier: str) -> dict:
+        return {
+            "dossier": {
+                "classification": {"assetClass": "RWA-RE-RES"}
+            },
+            "verification": {"chainReconstructed": True},
+        }
+
+
+@pytest.mark.asyncio
+async def test_vault_holdings_require_exact_live_p2_vault_and_mint_lineage(
+    monkeypatch,
+) -> None:
+    live_hash = puzzle_for_singleton(
+        DEED_LAUNCHER,
+        puzzle_for_p2_vault(VAULT_LAUNCHER),
+    ).get_tree_hash()
+    tip = SingletonTip(
+        launcher_id=_hex(DEED_LAUNCHER),
+        live=LiveCoin(
+            coin_id=_hex(_b32(0x92)),
+            parent_coin_id=_hex(DEED_PARENT),
+            puzzle_hash=_hex(bytes32(live_hash)),
+            amount=1,
+            confirmed_height=130,
+            spent_height=None,
+        ),
+        latest_spent=None,
+        depth=2,
+        lineage=(
+            LiveCoin(
+                coin_id=_hex(DEED_PARENT),
+                parent_coin_id=_hex(_b32(0x93)),
+                puzzle_hash=_hex(_b32(0x94)),
+                amount=1,
+                confirmed_height=120,
+                spent_height=130,
+            ),
+        ),
+    )
+
+    async def singleton_tip(_provider, _launcher_id):
+        return tip
+
+    monkeypatch.setattr(
+        "solslot_api.sols_market.load_signed_public_artifact",
+        lambda _settings: {
+            "launcherIds": {"pool": _hex(POOL_LAUNCHER)}
+        },
+    )
+    monkeypatch.setattr(
+        "solslot_api.sols_market._singleton_tip",
+        singleton_tip,
+    )
+    reader = SolsMarketReader(
+        object(),
+        _HoldingStore(),
+        Settings(_env_file=None, network="testnet11"),
+    )
+
+    result = await reader.vault_holdings(_hex(VAULT_LAUNCHER))
+
+    assert result["verifiedHoldingCount"] == 1
+    assert result["rejectedHoldingCandidateCount"] == 0
+    assert result["holdings"][0]["custody"] == "P2_VAULT"
+    assert result["holdings"][0]["assetClass"] == 1

@@ -66,6 +66,7 @@ from .alpha_observability import router as alpha_observability_router
 from .alpha_metrics import router as alpha_metrics_router
 from .chia_proxy import router as chia_proxy_router
 from .sols_market import router as sols_market_router
+from .sols_journey import router as sols_journey_router
 from .sols_swaps import router as sols_swaps_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
@@ -404,6 +405,7 @@ app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)
 app.include_router(chia_proxy_router)
 app.include_router(sols_market_router)
+app.include_router(sols_journey_router)
 app.include_router(sols_swaps_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).

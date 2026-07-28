@@ -31,6 +31,7 @@ from solslot_api.config import Settings
 from solslot_api.faucet import AGG_SIG_ME_DATA
 from solslot_api.protocol_submission import ProtocolBundleSubmitter
 from solslot_api.sols_market import StatutesSnapshot
+from solslot_api.sols_swap_store import SolsSwapStore
 from solslot_api.sols_swaps import (
     CompleteSolsSwapRequest,
     PrepareSolsSwapRequest,
@@ -365,6 +366,8 @@ def _fixture() -> SwapFixture:
         state=STATUTES_STATE,
         parameters=PARAMETERS,
         collections=(COLLECTION,),
+        oracle_rounds=(),
+        bridge_routes=(),
         liquidity_venues=(),
         pauses=(),
         registry_version=STATUTES_STATE.registry_version,
@@ -443,6 +446,7 @@ def _request(
             state=SimpleNamespace(
                 coinset=node,
                 protocol_submitter=submitter,
+                sols_swap_store=SolsSwapStore(":memory:"),
             )
         )
     )
@@ -523,6 +527,8 @@ def test_swap_routes_are_registered_in_public_api_contract() -> None:
     base = "/sols/vaults/{vault_launcher_id}/swaps"
     assert f"{base}/prepare" in paths
     assert f"{base}/complete" in paths
+    assert "/sols/swaps/{operation_hash}" in paths
+    assert "/sols/vaults/{vault_launcher_id}/journey" in paths
 
 
 def test_swap_authorization_keeps_alpha_and_network_ceiling(
@@ -571,9 +577,11 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
     quote = fixture.context.receipt.sols_to_deed_quote
     assert quote is not None
     assert prepared.operation_hash == _hex32(fixture.context.receipt.operation_hash)
+    assert prepared.schema_version == 2
+    assert prepared.direction == "SOLS_TO_DEED"
     assert prepared.deed_launcher_id == _hex32(DEED_LAUNCHER)
     assert prepared.vault_auth_type == "chia_bls"
-    assert prepared.total_sols_mojos == quote.buyer_total_sols_mojos
+    assert prepared.total_sols_mojos == str(quote.buyer_total_sols_mojos)
     assert prepared.destination_p2_vault_hash == _hex32(
         puzzle_hash_for_p2_vault(VAULT_LAUNCHER)
     )
@@ -594,12 +602,42 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
     )
 
     assert completed.status == "MEMPOOL"
+    assert completed.schema_version == 2
+    assert completed.direction == "SOLS_TO_DEED"
     assert completed.transaction_id == "0x" + "99" * 32
-    assert completed.fee_mojos == 420
+    assert completed.fee_mojos == "420"
     assert completed.fee_target_seconds == 300
     assert completed.submission_provider == "primary"
     assert submitter.submitted is not None
     assert len(submitter.submitted["coin_spends"]) == 6
+
+
+@pytest.mark.asyncio
+async def test_reverse_swap_direction_fails_closed_before_chain_loading(
+    monkeypatch,
+) -> None:
+    node = FakeNode()
+    submitter = FakeProtocolSubmitter()
+    request = _request(node, submitter)
+    monkeypatch.setattr(
+        "solslot_api.sols_swaps._authorize_swap",
+        lambda *_: None,
+    )
+
+    with pytest.raises(HTTPException, match="atomic protocol assembler") as exc:
+        await prepare_sols_swap(
+            _hex32(VAULT_LAUNCHER),
+            PrepareSolsSwapRequest(
+                direction="DEED_TO_SOLS",
+                deedLauncherId=_hex32(DEED_LAUNCHER),
+                paymentPublicKeys=["0x" + OWNER_PK.hex()],
+            ),
+            request,
+            _settings(),
+        )
+
+    assert exc.value.status_code == 503
+    assert submitter.submitted is None
 
 
 @pytest.mark.asyncio
@@ -612,7 +650,7 @@ async def test_complete_rejects_stale_operation_before_submission(
     request = _request(node, submitter)
     prepared = await _prepare(monkeypatch, fixture, request)
 
-    with pytest.raises(HTTPException, match="no longer matches"):
+    with pytest.raises(HTTPException, match="Prepare this exact"):
         await complete_sols_swap(
             _hex32(VAULT_LAUNCHER),
             CompleteSolsSwapRequest(
@@ -626,6 +664,42 @@ async def test_complete_rejects_stale_operation_before_submission(
             _settings(),
         )
     assert submitter.submitted is None
+
+
+@pytest.mark.asyncio
+async def test_complete_is_idempotent_after_mempool_submission(
+    monkeypatch,
+) -> None:
+    fixture = _fixture()
+    node = FakeNode()
+    submitter = FakeProtocolSubmitter()
+    request = _request(node, submitter)
+    prepared = await _prepare(monkeypatch, fixture, request)
+    signature = _wallet_signature(fixture.context, prepared.buyer_offer)
+    body = CompleteSolsSwapRequest(
+        deedLauncherId=_hex32(DEED_LAUNCHER),
+        operationHash=prepared.operation_hash,
+        quoteExpiresAt=prepared.quote_expires_at,
+        buyerOffer=prepared.buyer_offer,
+        aggregatedSignature="0x" + signature.hex(),
+    )
+
+    first = await complete_sols_swap(
+        _hex32(VAULT_LAUNCHER),
+        body,
+        request,
+        _settings(),
+    )
+    submitted = submitter.submitted
+    second = await complete_sols_swap(
+        _hex32(VAULT_LAUNCHER),
+        body,
+        request,
+        _settings(),
+    )
+
+    assert first == second
+    assert submitter.submitted is submitted
 
 
 @pytest.mark.asyncio

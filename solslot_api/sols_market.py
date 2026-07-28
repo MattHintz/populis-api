@@ -13,10 +13,13 @@ from typing import Annotated, Any, Mapping, Optional
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
+from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
     SINGLETON_MOD_HASH,
+    puzzle_for_singleton,
 )
+from chia_rs import G1Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -29,9 +32,11 @@ from solslot_puzzles.protocol_statutes_driver import (
     protocol_statutes_inner_mod_hash,
 )
 from solslot_puzzles.protocol_statutes_v1 import (
+    BridgeRoute,
     CollectionStatute,
     LiquidityVenue,
     MutationKind,
+    OracleRound,
     PermanentRules,
     ProtocolParameters,
     ScopedPause,
@@ -39,6 +44,7 @@ from solslot_puzzles.protocol_statutes_v1 import (
     initial_state,
     keyed_root,
 )
+from solslot_puzzles.real_estate_profiles import ASSET_CLASS_CODES
 from solslot_puzzles.sols_economics_v3 import (
     SolsEconomicState,
     quote_sols_to_deed,
@@ -131,6 +137,8 @@ class StatutesSnapshot:
     state: StatutesState
     parameters: ProtocolParameters
     collections: tuple[CollectionStatute, ...]
+    oracle_rounds: tuple[OracleRound, ...]
+    bridge_routes: tuple[BridgeRoute, ...]
     liquidity_venues: tuple[LiquidityVenue, ...]
     pauses: tuple[ScopedPause, ...]
     registry_version: int
@@ -323,6 +331,42 @@ def _liquidity_venue(node: Program) -> LiquidityVenue:
         quote_asset_id=_bytes32_node(values[6], "liquidity quote asset id"),
         pool_code_hash=_bytes32_node(values[7], "liquidity pool code hash"),
         active=int(values[8].as_int()),
+    ).validate()
+
+
+def _oracle_round(node: Program) -> OracleRound:
+    values = list(node.as_iter())
+    if len(values) != 10:
+        raise ValueError("oracle round must have ten fields")
+    return OracleRound(
+        asset_id=_bytes32_node(values[0], "oracle asset id"),
+        price_micro_usd=int(values[1].as_int()),
+        observed_at=int(values[2].as_int()),
+        valid_until=int(values[3].as_int()),
+        round_id=int(values[4].as_int()),
+        source_root=_bytes32_node(values[5], "oracle source root"),
+        source_count=int(values[6].as_int()),
+        haircut_bps=int(values[7].as_int()),
+        stable_min_bps=int(values[8].as_int()),
+        stable_max_bps=int(values[9].as_int()),
+    ).validate()
+
+
+def _bridge_route(node: Program) -> BridgeRoute:
+    values = list(node.as_iter())
+    if len(values) != 7:
+        raise ValueError("bridge route must have seven fields")
+    return BridgeRoute(
+        route_id=_bytes32_node(values[0], "bridge route id"),
+        source_chain_id=_bytes32_node(values[1], "bridge source chain id"),
+        destination_chain_id=_bytes32_node(
+            values[2],
+            "bridge destination chain id",
+        ),
+        asset_id=_bytes32_node(values[3], "bridge asset id"),
+        remote_asset_id=_bytes32_node(values[4], "bridge remote asset id"),
+        decimals=int(values[5].as_int()),
+        active=int(values[6].as_int()),
     ).validate()
 
 
@@ -778,6 +822,18 @@ def _collections(node: Program) -> tuple[CollectionStatute, ...]:
     return values
 
 
+def _oracle_rounds(node: Program) -> tuple[OracleRound, ...]:
+    values = tuple(_oracle_round(item) for item in node.as_iter())
+    keyed_root(values)
+    return values
+
+
+def _bridge_routes(node: Program) -> tuple[BridgeRoute, ...]:
+    values = tuple(_bridge_route(item) for item in node.as_iter())
+    keyed_root(values)
+    return values
+
+
 def _pauses(node: Program) -> tuple[ScopedPause, ...]:
     values = tuple(_scoped_pause(item) for item in node.as_iter())
     keyed_root(values)
@@ -793,36 +849,36 @@ def _liquidity_venues(node: Program) -> tuple[LiquidityVenue, ...]:
 def _upsert_typed(
     current: (
         tuple[CollectionStatute, ...]
+        | tuple[OracleRound, ...]
+        | tuple[BridgeRoute, ...]
         | tuple[LiquidityVenue, ...]
         | tuple[ScopedPause, ...]
     ),
-    replacement: CollectionStatute | LiquidityVenue | ScopedPause,
+    replacement: (
+        CollectionStatute
+        | OracleRound
+        | BridgeRoute
+        | LiquidityVenue
+        | ScopedPause
+    ),
 ) -> (
     tuple[CollectionStatute, ...]
+    | tuple[OracleRound, ...]
+    | tuple[BridgeRoute, ...]
     | tuple[LiquidityVenue, ...]
     | tuple[ScopedPause, ...]
 ):
-    replacement_key = (
-        replacement.collection_id
-        if isinstance(replacement, CollectionStatute)
-        else (
-            replacement.venue_id
-            if isinstance(replacement, LiquidityVenue)
-            else replacement.scope_id
-        )
-    )
-    updated: list[CollectionStatute | LiquidityVenue | ScopedPause] = []
+    replacement_key = _statute_record_key(replacement)
+    updated: list[
+        CollectionStatute
+        | OracleRound
+        | BridgeRoute
+        | LiquidityVenue
+        | ScopedPause
+    ] = []
     found = False
     for item in current:
-        key = (
-            item.collection_id
-            if isinstance(item, CollectionStatute)
-            else (
-                item.venue_id
-                if isinstance(item, LiquidityVenue)
-                else item.scope_id
-            )
-        )
+        key = _statute_record_key(item)
         if key == replacement_key:
             updated.append(replacement)
             found = True
@@ -833,11 +889,33 @@ def _upsert_typed(
     return tuple(updated)  # type: ignore[return-value]
 
 
+def _statute_record_key(
+    item: (
+        CollectionStatute
+        | OracleRound
+        | BridgeRoute
+        | LiquidityVenue
+        | ScopedPause
+    ),
+) -> bytes32:
+    if isinstance(item, CollectionStatute):
+        return item.collection_id
+    if isinstance(item, OracleRound):
+        return item.asset_id
+    if isinstance(item, BridgeRoute):
+        return item.route_id
+    if isinstance(item, LiquidityVenue):
+        return item.venue_id
+    return item.scope_id
+
+
 def _statutes_witnesses(
     puzzle_solution: Mapping[str, Any],
 ) -> tuple[
     ProtocolParameters | None,
     tuple[CollectionStatute, ...] | None,
+    tuple[OracleRound, ...] | None,
+    tuple[BridgeRoute, ...] | None,
     tuple[LiquidityVenue, ...] | None,
     tuple[ScopedPause, ...] | None,
 ]:
@@ -850,6 +928,8 @@ def _statutes_witnesses(
     params = list(inner_solution[4].as_iter())
     parameters: ProtocolParameters | None = None
     collections: tuple[CollectionStatute, ...] | None = None
+    oracle_rounds: tuple[OracleRound, ...] | None = None
+    bridge_routes: tuple[BridgeRoute, ...] | None = None
     liquidity_venues: tuple[LiquidityVenue, ...] | None = None
     pauses: tuple[ScopedPause, ...] | None = None
     if action == STATUTES_SPEND_EVIDENCE:
@@ -860,6 +940,10 @@ def _statutes_witnesses(
             parameters = _protocol_parameters(params[2])
         elif kind == MutationKind.COLLECTION:
             collections = _collections(params[2])
+        elif kind == MutationKind.ORACLE:
+            oracle_rounds = _oracle_rounds(params[2])
+        elif kind == MutationKind.ROUTE:
+            bridge_routes = _bridge_routes(params[2])
         elif kind == MutationKind.LIQUIDITY:
             liquidity_venues = _liquidity_venues(params[2])
         elif kind == MutationKind.PAUSE:
@@ -878,6 +962,16 @@ def _statutes_witnesses(
             collections = _upsert_typed(
                 _collections(params[3]),
                 _collection_statute(params[2]),
+            )
+        elif kind == MutationKind.ORACLE:
+            oracle_rounds = _upsert_typed(
+                _oracle_rounds(params[3]),
+                _oracle_round(params[2]),
+            )
+        elif kind == MutationKind.ROUTE:
+            bridge_routes = _upsert_typed(
+                _bridge_routes(params[3]),
+                _bridge_route(params[2]),
             )
         elif kind == MutationKind.LIQUIDITY:
             liquidity_venues = _upsert_typed(
@@ -905,7 +999,14 @@ def _statutes_witnesses(
         parameters = _protocol_parameters(params[0])
     else:
         raise ValueError("unsupported statutes spend action")
-    return parameters, collections, liquidity_venues, pauses
+    return (
+        parameters,
+        collections,
+        oracle_rounds,
+        bridge_routes,
+        liquidity_venues,
+        pauses,
+    )
 
 
 async def _resolve_statutes_witnesses(
@@ -916,6 +1017,8 @@ async def _resolve_statutes_witnesses(
 ) -> tuple[
     ProtocolParameters,
     tuple[CollectionStatute, ...],
+    tuple[OracleRound, ...],
+    tuple[BridgeRoute, ...],
     tuple[LiquidityVenue, ...],
     tuple[ScopedPause, ...],
 ]:
@@ -930,6 +1033,12 @@ async def _resolve_statutes_witnesses(
     )
     collections: tuple[CollectionStatute, ...] | None = (
         () if state.collections_root == empty_root else None
+    )
+    oracle_rounds: tuple[OracleRound, ...] | None = (
+        () if state.oracle_root == empty_root else None
+    )
+    bridge_routes: tuple[BridgeRoute, ...] | None = (
+        () if state.routes_root == empty_root else None
     )
     liquidity_venues: tuple[LiquidityVenue, ...] | None = (
         () if state.liquidity_root == empty_root else None
@@ -952,6 +1061,8 @@ async def _resolve_statutes_witnesses(
         (
             candidate_parameters,
             candidate_collections,
+            candidate_oracle_rounds,
+            candidate_bridge_routes,
             candidate_liquidity_venues,
             candidate_pauses,
         ) = _statutes_witnesses(puzzle_solution)
@@ -973,6 +1084,18 @@ async def _resolve_statutes_witnesses(
         ):
             collections = candidate_collections
         if (
+            oracle_rounds is None
+            and candidate_oracle_rounds is not None
+            and keyed_root(candidate_oracle_rounds) == state.oracle_root
+        ):
+            oracle_rounds = candidate_oracle_rounds
+        if (
+            bridge_routes is None
+            and candidate_bridge_routes is not None
+            and keyed_root(candidate_bridge_routes) == state.routes_root
+        ):
+            bridge_routes = candidate_bridge_routes
+        if (
             liquidity_venues is None
             and candidate_liquidity_venues is not None
             and keyed_root(candidate_liquidity_venues)
@@ -988,6 +1111,8 @@ async def _resolve_statutes_witnesses(
         if (
             parameters is not None
             and collections is not None
+            and oracle_rounds is not None
+            and bridge_routes is not None
             and liquidity_venues is not None
             and pauses is not None
         ):
@@ -995,14 +1120,23 @@ async def _resolve_statutes_witnesses(
     if (
         parameters is None
         or collections is None
+        or oracle_rounds is None
+        or bridge_routes is None
         or liquidity_venues is None
         or pauses is None
     ):
         raise ValueError(
-            "current statutes parameters, collections, liquidity, or pauses "
-            "cannot be reconstructed"
+            "current statutes parameters, collections, oracles, routes, "
+            "liquidity, or pauses cannot be reconstructed"
         )
-    return parameters, collections, liquidity_venues, pauses
+    return (
+        parameters,
+        collections,
+        oracle_rounds,
+        bridge_routes,
+        liquidity_venues,
+        pauses,
+    )
 
 
 async def _statutes_snapshot(
@@ -1026,6 +1160,8 @@ async def _statutes_snapshot(
             permanent_rules=permanent_rules,
         )
         collections: tuple[CollectionStatute, ...] = ()
+        oracle_rounds: tuple[OracleRound, ...] = ()
+        bridge_routes: tuple[BridgeRoute, ...] = ()
         liquidity_venues: tuple[LiquidityVenue, ...] = ()
         pauses: tuple[ScopedPause, ...] = ()
         if tip.live.puzzle_hash.lower() != expected_initial:
@@ -1042,6 +1178,8 @@ async def _statutes_snapshot(
         (
             parameters,
             collections,
+            oracle_rounds,
+            bridge_routes,
             liquidity_venues,
             pauses,
         ) = await _resolve_statutes_witnesses(
@@ -1056,6 +1194,8 @@ async def _statutes_snapshot(
         state=state,
         parameters=parameters,
         collections=collections,
+        oracle_rounds=oracle_rounds,
+        bridge_routes=bridge_routes,
         liquidity_venues=liquidity_venues,
         pauses=pauses,
         registry_version=state.registry_version,
@@ -1248,10 +1388,19 @@ def _statutes_payload(
         "liquidityRoot": _hex(state.liquidity_root),
         "pausesRoot": _hex(state.pauses_root),
         "parameters": {
+            "votingWindowSeconds": statutes.parameters.voting_window_seconds,
+            "quorumBps": statutes.parameters.quorum_bps,
+            "minimumProposalStake": str(
+                statutes.parameters.min_proposal_stake
+            ),
             "navValiditySeconds": statutes.parameters.nav_validity_seconds,
+            "oracleMaxAgeSeconds": (
+                statutes.parameters.oracle_max_age_seconds
+            ),
             "exchangeFeeBps": statutes.parameters.exchange_fee_bps,
             "protocolFeeBps": statutes.parameters.protocol_fee_bps,
             "sgtRewardsFeeBps": statutes.parameters.sgt_rewards_fee_bps,
+            "rewardEpochSeconds": statutes.parameters.reward_epoch_seconds,
         },
         "collections": [
             {
@@ -1266,6 +1415,33 @@ def _statutes_payload(
                 "status": item.status,
             }
             for item in statutes.collections
+        ],
+        "oracleRounds": [
+            {
+                "assetId": _hex(item.asset_id),
+                "priceMicroUsd": str(item.price_micro_usd),
+                "observedAt": item.observed_at,
+                "validUntil": item.valid_until,
+                "roundId": item.round_id,
+                "sourceRoot": _hex(item.source_root),
+                "sourceCount": item.source_count,
+                "haircutBps": item.haircut_bps,
+                "stableMinBps": item.stable_min_bps,
+                "stableMaxBps": item.stable_max_bps,
+            }
+            for item in statutes.oracle_rounds
+        ],
+        "bridgeRoutes": [
+            {
+                "routeId": _hex(item.route_id),
+                "sourceChainId": _hex(item.source_chain_id),
+                "destinationChainId": _hex(item.destination_chain_id),
+                "assetId": _hex(item.asset_id),
+                "remoteAssetId": _hex(item.remote_asset_id),
+                "decimals": item.decimals,
+                "active": bool(item.active),
+            }
+            for item in statutes.bridge_routes
         ],
         "liquidityVenues": [
             {
@@ -1544,12 +1720,17 @@ class SolsMarketReader:
             "provider": self.provider.status(),
         }
 
-    async def vault_balance(
-        self, vault_launcher_id: str, pool_token_tail_hash: str
+    async def registered_bls_balance(
+        self,
+        owner_public_key: bytes,
+        pool_token_tail_hash: str,
     ) -> int:
-        inner = puzzle_for_p2_vault(
-            bytes32.fromhex(_hex32(vault_launcher_id, "vault launcher").removeprefix("0x"))
-        )
+        """Return Sols held by the vault's registered BLS payment key.
+
+        Sols CATs use ordinary wallet payment puzzles. They are not held by the
+        deed-only p2_vault puzzle.
+        """
+        inner = puzzle_for_pk(G1Element.from_bytes(owner_public_key))
         cat = construct_cat_puzzle(
             CAT_MOD,
             bytes32.fromhex(
@@ -1561,6 +1742,93 @@ class SolsMarketReader:
             _hex(cat.get_tree_hash()), include_spent=False
         )
         return sum(int(item["coin"]["amount"]) for item in records)
+
+    async def vault_holdings(
+        self,
+        vault_launcher_id: str,
+    ) -> dict[str, Any]:
+        """Return only SmartDeeds whose live singleton is held by this vault."""
+        artifact = load_signed_public_artifact(self.settings)
+        launcher_id = bytes32.fromhex(
+            _hex32(
+                vault_launcher_id,
+                "vault launcher",
+            ).removeprefix("0x")
+        )
+        holdings: list[dict[str, Any]] = []
+        rejected = 0
+        for candidate in self.store.sols_market_candidates():
+            try:
+                deed_launcher = _hex32(
+                    str(candidate["deedLauncherId"]),
+                    "deed launcher",
+                )
+                tip = await _singleton_tip(self.provider, deed_launcher)
+                if tip is None:
+                    raise ValueError("SmartDeed launcher is not confirmed")
+                # The singleton launcher is part of the full puzzle. Derive the
+                # exact expected hash per deed rather than trusting an index.
+                expected = _hex(
+                    puzzle_for_singleton(
+                        bytes32.fromhex(deed_launcher.removeprefix("0x")),
+                        puzzle_for_p2_vault(launcher_id),
+                    ).get_tree_hash()
+                )
+                if tip.live.puzzle_hash.lower() != expected.lower():
+                    continue
+                lineage_ids = {item.coin_id.lower() for item in tip.lineage}
+                if str(candidate["outputCoinId"]).lower() not in lineage_ids:
+                    raise ValueError(
+                        "executed mint output is not in the live deed lineage"
+                    )
+                collection = self.store.public_collection(
+                    str(candidate["collectionId"])
+                )
+                verification = collection.get("verification")
+                if (
+                    not isinstance(verification, Mapping)
+                    or not verification.get("chainReconstructed")
+                ):
+                    raise ValueError(
+                        "SmartDeed collection metadata is not reconstructed"
+                    )
+                holdings.append(
+                    {
+                        "deedId": candidate["deedId"],
+                        "deedLauncherId": deed_launcher,
+                        "deedCoinId": tip.live.coin_id,
+                        "collectionId": candidate["collectionId"],
+                        "collectionSlug": candidate["collectionSlug"],
+                        "collectionTitle": candidate["collectionTitle"],
+                        "collectionSummary": candidate["collectionSummary"],
+                        "metadataRoot": candidate["metadataRoot"],
+                        "sharePpm": int(candidate["sharePpm"]),
+                        "parValueMojos": str(candidate["parValueMojos"]),
+                        "assetClass": int(
+                            ASSET_CLASS_CODES[
+                                str(
+                                    collection["dossier"]["classification"][
+                                        "assetClass"
+                                    ]
+                                ).upper()
+                            ]
+                        ),
+                        "chainVerified": True,
+                        "confirmedHeight": tip.live.confirmed_height,
+                        "custody": "P2_VAULT",
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                rejected += 1
+        return {
+            "holdings": holdings,
+            "verifiedHoldingCount": len(holdings),
+            "rejectedHoldingCandidateCount": rejected,
+            "source": "chain-reconstructed-smartdeed-singletons",
+            "protocolPoolLauncherId": str(
+                artifact["launcherIds"]["pool"]
+            ),
+        }
 
 
 def _reader(
@@ -1600,6 +1868,206 @@ async def sols_market(
         ) from exc
 
 
+@router.get("/governance-summary")
+async def governance_summary(
+    settings: Annotated[Settings, Depends(get_settings)],
+    reader: Annotated[SolsMarketReader, Depends(_reader)],
+) -> dict[str, Any]:
+    try:
+        snapshot = await reader.snapshot()
+        statutes = snapshot.get("statutes")
+        if not isinstance(statutes, Mapping):
+            raise ValueError("governed statutes are not confirmed")
+        parameters = statutes.get("parameters")
+        if not isinstance(parameters, Mapping):
+            raise ValueError("governed parameters are unavailable")
+        return {
+            "schemaVersion": 1,
+            "network": settings.network,
+            "statutesVersion": int(statutes["registryVersion"]),
+            "statutesContentHash": str(statutes["contentHash"]),
+            "votingWindowSeconds": int(
+                parameters.get("votingWindowSeconds")
+                or 0
+            ),
+            "quorumBps": int(parameters.get("quorumBps") or 0),
+            "minimumProposalStake": str(
+                parameters.get("minimumProposalStake") or "0"
+            ),
+            "activeProposals": [],
+            "activeProposalCount": 0,
+            "votingUrl": "/protocol/committee",
+            "source": "chain-reconstructed-statutes",
+            "confirmedHeight": int(statutes["confirmedHeight"]),
+        }
+    except PublicArtifactMissing:
+        return {
+            "schemaVersion": 1,
+            "network": settings.network,
+            "statutesVersion": 0,
+            "statutesContentHash": None,
+            "votingWindowSeconds": 0,
+            "quorumBps": 0,
+            "minimumProposalStake": "0",
+            "activeProposals": [],
+            "activeProposalCount": 0,
+            "votingUrl": "/protocol/committee",
+            "source": "awaiting-signed-genesis",
+            "confirmedHeight": None,
+        }
+    except (
+        ChiaProviderError,
+        PublicArtifactError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Governance summary verification failed closed: {exc}",
+        ) from exc
+
+
+@router.get("/bridge-routes")
+async def bridge_routes(
+    settings: Annotated[Settings, Depends(get_settings)],
+    reader: Annotated[SolsMarketReader, Depends(_reader)],
+) -> dict[str, Any]:
+    try:
+        snapshot = await reader.snapshot()
+        statutes = snapshot.get("statutes")
+        if not isinstance(statutes, Mapping):
+            raise ValueError("governed statutes are not confirmed")
+        routes = statutes.get("bridgeRoutes")
+        if not isinstance(routes, list):
+            raise ValueError("governed bridge routes are unavailable")
+        # The governed record is necessary but not sufficient. Runtime Warp
+        # code/evidence verification and the transfer adapter are a separate
+        # beta release gate, so RC22 never advertises an executable bridge.
+        executable = False
+        return {
+            "schemaVersion": 1,
+            "network": settings.network,
+            "mode": "LIVE" if executable else "PREVIEW",
+            "executable": executable,
+            "reason": (
+                None
+                if executable
+                else (
+                    "Warp bridge actions remain preview-only until the "
+                    "official route adapter and runtime evidence are installed."
+                )
+            ),
+            "routesRoot": statutes["routesRoot"],
+            "routes": [
+                {
+                    **item,
+                    "governedActive": bool(item.get("active")),
+                    "executable": executable and bool(item.get("active")),
+                }
+                for item in routes
+                if isinstance(item, Mapping)
+            ],
+            "source": "chain-reconstructed-statutes",
+            "confirmedHeight": statutes["confirmedHeight"],
+        }
+    except PublicArtifactMissing:
+        return _locked_capability_view(
+            settings.network,
+            "routes",
+            "Signed genesis is not installed.",
+        )
+    except (
+        ChiaProviderError,
+        PublicArtifactError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Bridge route verification failed closed: {exc}",
+        ) from exc
+
+
+@router.get("/liquidity-venues")
+async def liquidity_venues(
+    settings: Annotated[Settings, Depends(get_settings)],
+    reader: Annotated[SolsMarketReader, Depends(_reader)],
+) -> dict[str, Any]:
+    try:
+        snapshot = await reader.snapshot()
+        statutes = snapshot.get("statutes")
+        if not isinstance(statutes, Mapping):
+            raise ValueError("governed statutes are not confirmed")
+        venues = statutes.get("liquidityVenues")
+        if not isinstance(venues, list):
+            raise ValueError("governed liquidity venues are unavailable")
+        # A statute authorizes identity only. It does not prove that adapter
+        # calldata or live factory bytecode has passed the beta release gate.
+        executable = False
+        return {
+            "schemaVersion": 1,
+            "network": settings.network,
+            "mode": "LIVE" if executable else "PREVIEW",
+            "executable": executable,
+            "reason": (
+                None
+                if executable
+                else (
+                    "Liquidity actions remain preview-only until reviewed "
+                    "venue adapters and runtime code evidence are installed."
+                )
+            ),
+            "liquidityRoot": statutes["liquidityRoot"],
+            "venues": [
+                {
+                    **item,
+                    "governedActive": bool(item.get("active")),
+                    "executable": executable and bool(item.get("active")),
+                }
+                for item in venues
+                if isinstance(item, Mapping)
+            ],
+            "source": "chain-reconstructed-statutes",
+            "confirmedHeight": statutes["confirmedHeight"],
+        }
+    except PublicArtifactMissing:
+        return _locked_capability_view(
+            settings.network,
+            "venues",
+            "Signed genesis is not installed.",
+        )
+    except (
+        ChiaProviderError,
+        PublicArtifactError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Liquidity venue verification failed closed: {exc}",
+        ) from exc
+
+
+def _locked_capability_view(
+    network: str,
+    collection_key: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "network": network,
+        "mode": "PREVIEW",
+        "executable": False,
+        "reason": reason,
+        collection_key: [],
+        "source": "awaiting-signed-genesis",
+        "confirmedHeight": None,
+    }
+
+
 @router.get("/vaults/{vault_launcher_id}/opportunities")
 async def vault_sols_opportunities(
     vault_launcher_id: str,
@@ -1616,7 +2084,14 @@ async def vault_sols_opportunities(
     try:
         snapshot = await reader.snapshot()
         tail_hash = str(snapshot["asset"]["tailHash"])
-        balance = await reader.vault_balance(approved.launcher_id, tail_hash)
+        balance = (
+            await reader.registered_bls_balance(
+                bytes(record.owner_pubkey),
+                tail_hash,
+            )
+            if record.auth_type == AUTH_TYPE_BLS
+            else 0
+        )
     except (
         ChiaProviderError,
         PublicArtifactError,
@@ -1636,6 +2111,7 @@ async def vault_sols_opportunities(
                 "eligible": False,
                 "reason": "SOLS swaps currently require a Chia or Google BLS vault.",
                 "balanceSolsMojos": str(balance),
+                "balanceCoverage": "UNAVAILABLE_FOR_EVM_VAULT",
                 "identityConfirmed": True,
             },
             "opportunities": [],
@@ -1648,6 +2124,7 @@ async def vault_sols_opportunities(
             "eligible": True,
             "reason": None,
             "balanceSolsMojos": str(balance),
+            "balanceCoverage": "REGISTERED_OWNER_KEY",
             "identityConfirmed": True,
         },
         "opportunities": [
