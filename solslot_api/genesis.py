@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal, Mapping
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .admin import require_admin_token
@@ -28,6 +28,7 @@ from .genesis_store import (
     GenesisStoreError,
 )
 from .genesis_evm import GenesisEvmEvidenceError, verify_genesis_evm_deployment
+from .protocol_submission import ProtocolSubmissionError
 from .validator_quorum import (
     ValidatorHealthResponse,
     ValidatorQuorumError,
@@ -95,11 +96,13 @@ class InvitationAcceptRequest(InvitationPrepareRequest):
 
 
 class FundingCoinIds(ApiModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     sgt: str
     pool: str
     did: str
     governance: str
-    nav_registry: str = Field(alias="navRegistry")
+    statutes: str
     protocol_config: str = Field(alias="protocolConfig")
     admin_authority: str = Field(alias="adminAuthority")
     vault_version_registry: str = Field(alias="vaultVersionRegistry")
@@ -107,22 +110,30 @@ class FundingCoinIds(ApiModel):
 
 
 class ProtocolParameters(ApiModel):
-    quorum_bps: int = Field(5000, alias="quorumBps", ge=1, le=10000)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     voting_window_seconds: int = Field(300, alias="votingWindowSeconds", ge=1)
-    sgt_total_supply: int = Field(1_000_000, alias="sgtTotalSupply", ge=1)
+    quorum_bps: int = Field(5000, alias="quorumBps", ge=1, le=10000)
     min_proposal_stake: int = Field(10_000, alias="minProposalStake", ge=1)
-    fp_scale: int = Field(1000, alias="fpScale", ge=1)
-    min_nav_registry_version: int = Field(1, alias="minNavRegistryVersion", ge=1)
-    initial_pool_status: int = Field(1, alias="initialPoolStatus", ge=0, le=1)
-    initial_total_pool_token_supply: int = Field(
-        0, alias="initialTotalPoolTokenSupply", ge=0
+    nav_validity_seconds: int = Field(
+        86_400, alias="navValiditySeconds", ge=60
     )
-    initial_treasury_reserve_tokens: int = Field(
-        0, alias="initialTreasuryReserveTokens", ge=0
+    oracle_max_age_seconds: int = Field(
+        600, alias="oracleMaxAgeSeconds", ge=30
+    )
+    exchange_fee_bps: int = Field(100, alias="exchangeFeeBps", ge=0, le=100)
+    protocol_fee_bps: int = Field(30, alias="protocolFeeBps", ge=0, le=100)
+    sgt_rewards_fee_bps: int = Field(
+        70, alias="sgtRewardsFeeBps", ge=0, le=100
+    )
+    reward_epoch_seconds: int = Field(
+        86_400, alias="rewardEpochSeconds", ge=60
     )
 
 
 class PlanRequest(ApiModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     evm_addresses: dict[str, str] = Field(alias="evmAddresses")
     funding_coin_ids: FundingCoinIds = Field(alias="fundingCoinIds")
     faucet_puzzle_hash: str = Field(alias="faucetPuzzleHash")
@@ -227,6 +238,9 @@ def _safe_state(record: dict[str, Any]) -> dict[str, Any]:
     """Return the operator view without invitation token hashes."""
     for invitation in record.get("invitations", []):
         invitation.pop("token_hash", None)
+    broadcast_receipt = record.get("broadcast")
+    if isinstance(broadcast_receipt, dict):
+        broadcast_receipt.pop("spendBundle", None)
     return record
 
 
@@ -570,7 +584,7 @@ async def _live_funding(
         "pool",
         "did",
         "governance",
-        "navRegistry",
+        "statutes",
         "protocolConfig",
         "adminAuthority",
         "vaultVersionRegistry",
@@ -839,6 +853,7 @@ async def preflight(
 @router.post("/{ceremony_id}/broadcast", dependencies=[Depends(require_admin_token)])
 async def broadcast(
     ceremony_id: str,
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
 ) -> dict[str, Any]:
@@ -850,9 +865,43 @@ async def broadcast(
         output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
         if output.exists() and any(output.iterdir()):
             raise GenesisConflict("ceremony output directory is not empty")
+        submitter = getattr(request.app.state, "protocol_submitter", None)
+        if submitter is None:
+            raise GenesisConflict(
+                "ceremony broadcast requires local-node medium-fee funding"
+            )
+        try:
+            receipt = await submitter.submit(bundle["spendBundle"])
+        except ProtocolSubmissionError as exc:
+            if exc.submission_attempted:
+                store.abandon(
+                    ceremony_id.lower(),
+                    "Ambiguous local-node ceremony broadcast failure",
+                )
+            raise GenesisConflict(
+                (
+                    "Ceremony broadcast was attempted but not observed in the "
+                    "local mempool; it was abandoned and must not be retried"
+                    if exc.submission_attempted
+                    else f"Ceremony fee preparation failed: {exc}"
+                )
+            ) from exc
+        broadcast_state = store.mark_broadcast(
+            ceremony_id.lower(),
+            spend_bundle_id=str(receipt["spendBundleId"]),
+            response=receipt,
+        )
         output.mkdir(parents=True, exist_ok=False)
         _atomic_json(output / "plan.json", plan)
-        _atomic_json(output / "spend_bundle.json", bundle["spendBundle"])
+        _atomic_json(output / "spend_bundle.json", receipt["spendBundle"])
+        _atomic_json(
+            output / "fee_receipt.json",
+            {
+                key: value
+                for key, value in receipt.items()
+                if key != "spendBundle"
+            },
+        )
         _atomic_json(output / "audit_approval.json", approval)
         _atomic_json(
             output / "validator_health.json",
@@ -861,27 +910,7 @@ async def broadcast(
                 "signers": [item.model_dump(mode="json") for item in validator_health],
             },
         )
-        try:
-            response = await _coinset().push_tx(bundle["spendBundle"])
-        except Exception as exc:
-            store.abandon(ceremony_id.lower(), "Ambiguous Coinset broadcast failure")
-            raise GenesisConflict(
-                "Coinset response was ambiguous; ceremony was abandoned and must not be retried"
-            ) from exc
-        accepted = response.get("success") is True or str(response.get("status", "")).upper() in {
-            "SUCCESS",
-            "PENDING",
-        }
-        if not accepted:
-            store.abandon(ceremony_id.lower(), "Coinset rejected the deterministic bundle")
-            raise GenesisConflict("Coinset rejected the bundle; ceremony was abandoned")
-        return _safe_state(
-            store.mark_broadcast(
-                ceremony_id.lower(),
-                spend_bundle_id=str(bundle["spendBundleId"]),
-                response=response,
-            )
-        )
+        return _safe_state(broadcast_state)
     except GenesisStoreError as exc:
         _raise_store_error(exc)
 
@@ -1079,9 +1108,9 @@ async def finalize(
 
         # The lock manifest is intentionally the final public file written.
         lock = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
-            "protocolVersion": "solslot-v2",
+            "protocolVersion": "solslot-v2-rc22",
             "reviewClass": artifact["reviewClass"],
             "testOnly": artifact["testOnly"],
             "auditStatus": artifact["auditStatus"],

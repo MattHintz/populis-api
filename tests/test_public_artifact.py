@@ -14,11 +14,13 @@ from solslot_api.admin_authority_v2 import build_admin_authority_v2_snapshot
 from solslot_api.genesis_worker import execute
 from solslot_api.protocol_artifacts import router
 from solslot_api.public_artifact import (
+    MAX_PUBLIC_ARTIFACT_BYTES,
     PublicArtifactError,
     load_signed_public_artifact,
     signed_admin_allowlist,
+    verify_signed_public_artifact_file,
 )
-from solslot_puzzles.artifact_schema_v2 import artifact_signing_typed_data
+from solslot_puzzles.artifact_schema_v3 import artifact_signing_typed_data
 from tests.test_genesis_api import _plan_body
 
 
@@ -68,6 +70,12 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
             "buildTimestamp": "2026-07-14T00:00:00+00:00",
         }
     )["artifact"]
+    assert artifact["schemaVersion"] == 3
+    assert artifact["protocolVersion"] == "solslot-v2-rc22"
+    assert artifact["genesisPlan"]["schema"] == "solslot-genesis-plan-v3"
+    assert artifact["statutes"]["roots"]["liquidityVenues"] == (
+        artifact["genesisPlan"]["state"]["statutesRoots"]["liquidityVenues"]
+    )
     typed_data = artifact_signing_typed_data(artifact)
     artifact["signatures"] = [
         {
@@ -86,7 +94,7 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
 
 
 def _settings(tmp_path, artifact: dict, **updates) -> Settings:
-    path = tmp_path / "public_artifact_v2.json"
+    path = tmp_path / "public_artifact_v3.json"
     path.write_text(json.dumps(artifact), encoding="utf-8")
     values = {
         "runtime_environment": "test",
@@ -160,6 +168,14 @@ def test_rejects_tampering_and_insufficient_signature_quorum(tmp_path) -> None:
         load_signed_public_artifact(_settings(tmp_path, one_signature))
 
 
+def test_rejects_oversized_public_artifact_before_worker_execution(tmp_path) -> None:
+    path = tmp_path / "oversized-artifact.json"
+    path.write_bytes(b" " * (MAX_PUBLIC_ARTIFACT_BYTES + 1))
+
+    with pytest.raises(PublicArtifactError, match="size limit"):
+        verify_signed_public_artifact_file(path)
+
+
 def test_rejects_runtime_coordinate_and_release_commit_drift(tmp_path) -> None:
     artifact = _signed_artifact()
     wrong_pool = _settings(tmp_path, artifact, pool_launcher_id="0x" + "fe" * 32)
@@ -221,4 +237,4 @@ def test_public_endpoint_returns_only_verified_artifact(tmp_path) -> None:
     api.dependency_overrides[get_settings] = lambda: settings
     response = TestClient(api).get("/protocol/artifact")
     assert response.status_code == 503
-    assert response.json()["detail"] == "The signed V2 public artifact failed verification."
+    assert response.json()["detail"] == "The signed RC22 public artifact failed verification."

@@ -1,20 +1,17 @@
-"""Load and verify the canonical signed Solslot V2 public artifact."""
+"""Load and verify the canonical signed Solslot RC22 public artifact."""
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
 from eth_keys import keys as eth_keys
 
-from solslot_puzzles.artifact_schema_v2 import (
-    artifact_signing_typed_data,
-    verify_public_artifact,
-)
-
 from .config import Settings
-from .evm_auth import recover_evm_signer
 from .release_metadata import load_release_metadata
 
 
@@ -23,23 +20,55 @@ class PublicArtifactError(ValueError):
 
 
 class PublicArtifactMissing(PublicArtifactError):
-    """No finalized V2 ceremony artifact exists yet."""
+    """No finalized RC22 ceremony artifact exists yet."""
 
 
-def _verify_admin_signature(
-    payload: Mapping[str, Any],
-    _index: int,
-    pubkey: bytes,
-    signature: bytes,
-) -> bool:
+MAX_PUBLIC_ARTIFACT_BYTES = 2 * 1024 * 1024
+ARTIFACT_WORKER_TIMEOUT_SECONDS = 15
+
+
+@lru_cache(maxsize=8)
+def _verify_artifact_in_worker(
+    path_text: str,
+    modified_ns: int,
+    size: int,
+) -> str:
+    del modified_ns, size
     try:
-        recovered = recover_evm_signer(
-            artifact_signing_typed_data(payload),
-            "0x" + signature.hex(),
+        raw = Path(path_text).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublicArtifactError(
+            "signed RC22 public artifact is unreadable"
+        ) from exc
+    try:
+        process = subprocess.run(
+            [sys.executable, "-m", "solslot_api.genesis_worker"],
+            input=json.dumps(
+                {"operation": "verifyArtifact", "artifact": payload},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=ARTIFACT_WORKER_TIMEOUT_SECONDS,
         )
-    except (TypeError, ValueError):
-        return False
-    return recovered.compressed_pubkey == pubkey
+    except subprocess.TimeoutExpired as exc:
+        raise PublicArtifactError(
+            "signed RC22 public artifact verification timed out"
+        ) from exc
+    if process.returncode != 0:
+        try:
+            failure = json.loads(process.stderr)
+            detail = str(failure.get("error", "worker rejected artifact"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            detail = "worker rejected artifact"
+        raise PublicArtifactError(
+            f"signed RC22 public artifact is invalid: {detail}"
+        )
+    return raw
 
 
 def _same_hex(left: object, right: object) -> bool:
@@ -142,7 +171,7 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
 
 
 def verify_signed_public_artifact_file(path_value: str | Path) -> dict[str, Any]:
-    """Read and cryptographically verify a V2 public artifact.
+    """Read and cryptographically verify an RC22 public artifact.
 
     Runtime services which do not share the coordinator's mutable settings
     (notably the isolated validator signers) use this narrower entry point.
@@ -152,22 +181,31 @@ def verify_signed_public_artifact_file(path_value: str | Path) -> dict[str, Any]
     """
     path = Path(path_value)
     if not path.is_file():
-        raise PublicArtifactMissing("signed V2 public artifact is unavailable")
+        raise PublicArtifactMissing("signed RC22 public artifact is unavailable")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise PublicArtifactError("signed V2 public artifact is unreadable") from exc
+        stat = path.stat()
+        if stat.st_size > MAX_PUBLIC_ARTIFACT_BYTES:
+            raise PublicArtifactError(
+                "signed RC22 public artifact exceeds the size limit"
+            )
+        payload = json.loads(
+            _verify_artifact_in_worker(
+                str(path.resolve()),
+                stat.st_mtime_ns,
+                stat.st_size,
+            )
+        )
+    except OSError as exc:
+        raise PublicArtifactError(
+            "signed RC22 public artifact is unreadable"
+        ) from exc
     if not isinstance(payload, dict):
-        raise PublicArtifactError("signed V2 public artifact must be an object")
-    try:
-        verify_public_artifact(payload, signature_verifier=_verify_admin_signature)
-    except (TypeError, ValueError) as exc:
-        raise PublicArtifactError(f"signed V2 public artifact is invalid: {exc}") from exc
+        raise PublicArtifactError("signed RC22 public artifact must be an object")
     return payload
 
 
 def load_signed_public_artifact(settings: Settings) -> dict[str, Any]:
-    """Read, cryptographically verify, and runtime-bind the V2 artifact."""
+    """Read, cryptographically verify, and runtime-bind the RC22 artifact."""
     payload = verify_signed_public_artifact_file(settings.public_artifact_path)
     _verify_runtime_bindings(settings, payload)
     return payload
@@ -191,7 +229,7 @@ def signed_admin_allowlist(settings: Settings) -> set[str]:
             public_key = eth_keys.PublicKey.from_compressed_bytes(raw)
         except (TypeError, ValueError) as exc:
             raise PublicArtifactError(
-                "signed V2 artifact contains an invalid administrator key"
+                "signed RC22 artifact contains an invalid administrator key"
             ) from exc
         identities.add(normalized)
         identities.add(public_key.to_checksum_address().lower())

@@ -6,6 +6,7 @@ from eth_account import Account
 from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from chia_rs import AugSchemeMPL
 
 import solslot_api.launch_control as launch_control_module
 from solslot_api.config import Settings, get_settings
@@ -39,7 +40,7 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
         "network": "testnet11",
         "testOnly": True,
         "completeReleaseManifest": True,
-        "releaseTag": "solslot-v2-alpha-rc21-20260725",
+        "releaseTag": "solslot-v2-alpha-rc22-20260727",
         "manifestHash": "0x" + "aa" * 32,
         "sourceManifest": {
             "sourceShas": {
@@ -69,6 +70,41 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_genesis_store] = lambda: store
     return TestClient(app), store, settings
+
+
+def _plan_template(kos_pubkey: bytes) -> dict:
+    validator_pubkeys = [
+        bytes(AugSchemeMPL.key_gen(bytes([index]) * 32).get_g1())
+        for index in (21, 22, 23)
+    ]
+    governance_pubkey = bytes(AugSchemeMPL.key_gen(b"g" * 32).get_g1())
+    return {
+        "evmAddresses": {
+            "forwarder": "0x" + "a1" * 20,
+            "verifierAdapter": "0x" + "a2" * 20,
+            "attestationEmitter": "0x" + "a3" * 20,
+        },
+        "faucetPuzzleHash": "0x" + "31" * 32,
+        "governanceBlsPubkey": "0x" + governance_pubkey.hex(),
+        "kosMintExecutePubkey": "0x" + kos_pubkey.hex(),
+        "validatorPubkeys": ["0x" + value.hex() for value in validator_pubkeys],
+        "trustedTreasuryReservePuzzleHash": "0x" + "41" * 32,
+        "trustedProtocolTreasuryPuzzleHash": "0x" + "42" * 32,
+        "trustedGovernanceRewardsPuzzleHash": "0x" + "43" * 32,
+        "trustedGovernanceRewardsRoot": "0x" + "44" * 32,
+        "retiredCoordinates": ["0x" + "51" * 32],
+        "protocolParameters": {
+            "votingWindowSeconds": 300,
+            "quorumBps": 5000,
+            "minProposalStake": 10_000,
+            "navValiditySeconds": 86_400,
+            "oracleMaxAgeSeconds": 600,
+            "exchangeFeeBps": 100,
+            "protocolFeeBps": 30,
+            "sgtRewardsFeeBps": 70,
+            "rewardEpochSeconds": 86_400,
+        },
+    }
 
 
 def _claim_and_enroll_owner(client: TestClient):
@@ -190,6 +226,11 @@ def test_enrolled_wallet_resumes_without_token_or_ceremony_id(tmp_path) -> None:
     assert body["launch"]["ceremonyId"] == ceremony_id
     assert body["launch"]["administrators"][0]["enrolled"] is True
     assert body["notice"] == "TESTNET, NO REAL INVESTMENT OR LEGAL RIGHT."
+    plan_readiness = next(
+        item for item in body["readiness"] if item["id"] == "planInputs"
+    )
+    assert plan_readiness["status"] == "Blocked"
+    assert plan_readiness["action"] == "replacePlanEvidence"
 
     attacker = Account.create("wrong-wallet")
     rejected = client.post(
@@ -197,6 +238,34 @@ def test_enrolled_wallet_resumes_without_token_or_ceremony_id(tmp_path) -> None:
     )
     assert rejected.status_code == 403
     assert owner.address.lower() not in rejected.text.lower()
+
+
+def test_plan_template_rejects_fixture_kos_key_and_accepts_release_key(tmp_path) -> None:
+    _, _, settings = _client(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    settings.launch_plan_template_path = str(plan_path)
+
+    plan_path.write_text(
+        json.dumps(
+            _plan_template(launch_control_module.TEST_KOS_MINT_EXECUTE_PUBKEY)
+        ),
+        encoding="utf-8",
+    )
+    try:
+        launch_control_module._plan_template_evidence(settings)
+    except Exception as exc:  # noqa: BLE001
+        assert "public test fixture key" in str(exc)
+    else:
+        raise AssertionError("fixture KoS key must not pass release readiness")
+
+    release_key = bytes(AugSchemeMPL.key_gen(b"release-kos-key" * 3).get_g1())
+    plan_path.write_text(
+        json.dumps(_plan_template(release_key)),
+        encoding="utf-8",
+    )
+    evidence = launch_control_module._plan_template_evidence(settings)
+    assert evidence["kosMintExecutePubkey"] == "0x" + release_key.hex()
+    assert evidence["validatorCount"] == 3
 
 
 def test_owner_creates_named_coadmin_link_without_exposing_stored_secret(tmp_path) -> None:

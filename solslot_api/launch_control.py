@@ -24,6 +24,7 @@ from eth_account.messages import encode_typed_data
 from eth_utils import keccak
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from solslot_puzzles.sgt_driver import TEST_KOS_MINT_EXECUTE_PUBKEY
 
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
@@ -104,6 +105,10 @@ SOURCE_KEYS = (
 GATE_NAMES = ("ceremonyBroadcast", "minting", "presale", "purchases")
 CREATE_COIN = 51
 MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
+PLACEHOLDER_FUNDING_IDS = {
+    name: "0x" + f"{index:02x}" * 32
+    for index, name in enumerate(FUNDING_NAMES, start=1)
+}
 
 
 class ApiModel(BaseModel):
@@ -365,37 +370,70 @@ def _read_json_file(path_value: str | None, label: str) -> tuple[dict[str, Any],
 
 def _load_release_evidence(settings: Settings) -> dict[str, Any]:
     evidence, digest = _read_json_file(
-        settings.launch_source_evidence_path, "RC21 source evidence"
+        settings.launch_source_evidence_path, "RC22 source evidence"
     )
     if settings.launch_source_evidence_sha256:
         expected = settings.launch_source_evidence_sha256.removeprefix("0x").lower()
         if not secrets.compare_digest(digest, expected):
-            raise GenesisConflict("RC21 source evidence checksum changed")
+            raise GenesisConflict("RC22 source evidence checksum changed")
     if (
         evidence.get("network") != "testnet11"
         or evidence.get("releaseTag") != settings.launch_release_tag
         or evidence.get("completeReleaseManifest") is not True
         or evidence.get("testOnly") is not True
     ):
-        raise GenesisConflict("RC21 source evidence is incomplete or targets another release")
+        raise GenesisConflict("RC22 source evidence is incomplete or targets another release")
     source_manifest = evidence.get("sourceManifest")
     shas = source_manifest.get("sourceShas") if isinstance(source_manifest, Mapping) else None
     if not isinstance(shas, Mapping) or set(shas) != set(SOURCE_KEYS):
-        raise GenesisConflict("RC21 evidence does not freeze all nine source commits")
+        raise GenesisConflict("RC22 evidence does not freeze all nine source commits")
     for key in SOURCE_KEYS:
         value = str(shas[key]).lower()
         if len(value) != 40:
-            raise GenesisConflict(f"RC21 source commit {key} is not a full SHA")
+            raise GenesisConflict(f"RC22 source commit {key} is not a full SHA")
         try:
             int(value, 16)
         except ValueError as exc:
-            raise GenesisConflict(f"RC21 source commit {key} is invalid") from exc
+            raise GenesisConflict(f"RC22 source commit {key} is invalid") from exc
     return {
         "releaseTag": evidence["releaseTag"],
         "manifestHash": evidence.get("manifestHash"),
         "fileSha256": "0x" + digest,
         "sourceShas": {key: str(shas[key]).lower() for key in SOURCE_KEYS},
         "evidence": evidence,
+    }
+
+
+def _plan_template_evidence(settings: Settings) -> dict[str, Any]:
+    template, digest = _read_json_file(
+        settings.launch_plan_template_path, "RC22 launch plan template"
+    )
+    template["fundingCoinIds"] = PLACEHOLDER_FUNDING_IDS
+    plan = PlanRequest.model_validate(template)
+
+    kos_pubkey = bytes.fromhex(plan.kos_mint_execute_pubkey.removeprefix("0x"))
+    if len(kos_pubkey) != 48 or kos_pubkey == b"\x00" * 48:
+        raise GenesisConflict("KoS MINT co-signer public key is missing")
+    if secrets.compare_digest(kos_pubkey, TEST_KOS_MINT_EXECUTE_PUBKEY):
+        raise GenesisConflict(
+            "KoS MINT co-signer still uses the public test fixture key"
+        )
+
+    validator_pubkeys = [
+        bytes.fromhex(value.removeprefix("0x")) for value in plan.validator_pubkeys
+    ]
+    if (
+        any(len(value) != 48 or value == b"\x00" * 48 for value in validator_pubkeys)
+        or len(set(validator_pubkeys)) != 3
+    ):
+        raise GenesisConflict(
+            "RC22 plan must contain three unique nonzero validator public keys"
+        )
+
+    return {
+        "fileSha256": "0x" + digest,
+        "kosMintExecutePubkey": plan.kos_mint_execute_pubkey.lower(),
+        "validatorCount": len(validator_pubkeys),
     }
 
 
@@ -774,7 +812,7 @@ async def _readiness(
         items.append(
             {
                 "id": "release",
-                "title": "RC21 release identity",
+                "title": "RC22 release identity",
                 "status": "Healthy",
                 "impact": f"{release['releaseTag']} is pinned to all nine source commits.",
                 "assignedRole": "system",
@@ -793,6 +831,33 @@ async def _readiness(
                 "impact": str(exc),
                 "assignedRole": "technical-coadmin",
                 "action": "replaceReleaseEvidence",
+            }
+        )
+
+    try:
+        plan_evidence = _plan_template_evidence(settings)
+        items.append(
+            {
+                "id": "planInputs",
+                "title": "Fixed launch coordinates",
+                "status": "Healthy",
+                "impact": (
+                    "The reviewed EVM, validator, treasury, and KoS coordinates "
+                    "are ready for the signed launch plan."
+                ),
+                "assignedRole": "system",
+                "evidence": plan_evidence,
+            }
+        )
+    except (GenesisStoreError, ValueError) as exc:
+        items.append(
+            {
+                "id": "planInputs",
+                "title": "Complete the fixed launch coordinates",
+                "status": "Blocked",
+                "impact": str(exc),
+                "assignedRole": "technical-coadmin",
+                "action": "replacePlanEvidence",
             }
         )
 
@@ -827,6 +892,34 @@ async def _readiness(
                 "action": "restoreChiaNode",
             }
         )
+
+    fee_submitter = getattr(request.app.state, "protocol_submitter", None)
+    fee_funding_healthy = (
+        settings.protocol_fee_funding_enabled
+        and fee_submitter is not None
+    )
+    items.append(
+        {
+            "id": "networkFee",
+            "title": "Network fee funding",
+            "status": "Healthy" if fee_funding_healthy else "Blocked",
+            "impact": (
+                "The fountain till will add the current medium Testnet11 fee "
+                "and confirm the launch in the local mempool."
+                if fee_funding_healthy
+                else "Enable the bounded fountain fee till before launch; "
+                "the 530-mojo bridge coin includes the required one-mojo safety buffer."
+            ),
+            "assignedRole": "technical-coadmin",
+            "action": None if fee_funding_healthy else "configureFeeTill",
+            "evidence": {
+                "targetSeconds": settings.protocol_medium_fee_target_seconds,
+                "minimumMojos": settings.protocol_minimum_fee_mojos,
+                "maximumMojos": settings.protocol_maximum_fee_mojos,
+                "source": "local-full-node",
+            },
+        }
+    )
 
     try:
         ownership_store = get_ownership_activation_store(settings)
@@ -870,7 +963,7 @@ async def _readiness(
         lanes = rehearsal.get("lanes")
         healthy = (
             rehearsal.get("schemaVersion") == 2
-            and rehearsal.get("kind") == "solslot-rc21-settlement-rehearsal"
+            and rehearsal.get("kind") == "solslot-rc22-settlement-rehearsal"
             and rehearsal.get("releaseTag") == settings.launch_release_tag
             and rehearsal.get("network") == "testnet11-base-sepolia"
             and rehearsal.get("success") is True
@@ -1449,7 +1542,7 @@ async def guided_start_settlement_rehearsal(
         record = store.get(session.ceremony_id)
         release_hash = str(record["draft"].get("releaseEvidenceHash") or "")
         if not HEX32_RE.fullmatch(release_hash):
-            raise GenesisConflict("the RC21 release evidence hash is unavailable")
+            raise GenesisConflict("the RC22 release evidence hash is unavailable")
         remote = await start_rehearsal(
             settings,
             ceremony_id=session.ceremony_id,
@@ -1902,7 +1995,7 @@ async def build_guided_plan(
         if not funding or funding["state"] != "confirmed":
             raise GenesisConflict("confirm the fixed ceremony funding first")
         template, _ = _read_json_file(
-            settings.launch_plan_template_path, "RC21 launch plan template"
+            settings.launch_plan_template_path, "RC22 launch plan template"
         )
         template["fundingCoinIds"] = dict(funding["plan"]["fundingCoinIds"])
         body = PlanRequest.model_validate(template)

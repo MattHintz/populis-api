@@ -34,6 +34,7 @@ from solslot_api.native_purchases import (
     _proposal_rejection_reasons,
 )
 from solslot_api.payment_purchase_store import StoredPaymentPurchase
+from solslot_api.protocol_submission import ProtocolBundleSubmitter
 from solslot_api.validator_quorum import ValidatorQuorumResult
 from solslot_puzzles.mint_publish_driver import (
     deed_launcher_puzzle_hash,
@@ -56,8 +57,6 @@ def _b32(seed: int) -> bytes32:
 class FakeNode:
     def __init__(self, payment_coin: Coin) -> None:
         self.payment_coin = payment_coin
-        self.submitted = None
-
     async def get_coin_records_by_puzzle_hash(self, puzzle_hash, include_spent=False):
         assert puzzle_hash == "0x" + self.payment_coin.puzzle_hash.hex()
         assert include_spent is False
@@ -67,10 +66,6 @@ class FakeNode:
         if coin_id == "0x" + self.payment_coin.name().hex():
             return self.payment_record()
         return None
-
-    async def push_tx(self, bundle):
-        self.submitted = bundle
-        return {"success": True, "status": "SUCCESS"}
 
     def payment_record(self):
         return {
@@ -82,6 +77,22 @@ class FakeNode:
             "confirmed_block_index": 123,
             "spent_block_index": 0,
             "spent": False,
+        }
+
+
+class FakeProtocolSubmitter(ProtocolBundleSubmitter):
+    def __init__(self) -> None:
+        self.submitted = None
+
+    async def submit(self, bundle):
+        self.submitted = bundle
+        return {
+            "status": "MEMPOOL",
+            "spendBundleId": "0x" + "99" * 32,
+            "feeMojos": "420",
+            "feeTargetSeconds": 300,
+            "submissionProvider": "primary",
+            "mempoolObservedAt": "2026-07-27T14:30:00Z",
         }
 
 
@@ -230,7 +241,15 @@ async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(monkey
     )
     context, payment_coin = _context(payment_key, validator_keys)
     node = FakeNode(payment_coin)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(coinset=node)))
+    submitter = FakeProtocolSubmitter()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                coinset=node,
+                protocol_submitter=submitter,
+            )
+        )
+    )
     settings = Settings(
         _env_file=None,
         runtime_environment="test",
@@ -314,7 +333,11 @@ async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(monkey
         "Bearer test-token",
     )
 
-    assert completed.status == "SUCCESS"
+    assert completed.status == "MEMPOOL"
     assert completed.signer_indices == [0, 1]
-    assert completed.transaction_id.startswith("0x")
-    assert node.submitted is not None
+    assert completed.transaction_id == "0x" + "99" * 32
+    assert completed.fee_mojos == 420
+    assert completed.fee_target_seconds == 300
+    assert completed.submission_provider == "primary"
+    assert completed.mempool_observed_at == "2026-07-27T14:30:00Z"
+    assert submitter.submitted is not None

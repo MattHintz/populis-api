@@ -105,6 +105,31 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "Chia primary mTLS requires CA, client certificate, and client key paths."
         )
+    if settings.protocol_fee_funding_enabled:
+        if not settings.chia_primary_url:
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires "
+                "SOLSLOT_CHIA_PRIMARY_URL."
+            )
+        if not any(
+            (
+                settings.faucet_master_sk_hex,
+                settings.faucet_seed_hex,
+                settings.faucet_mnemonic,
+            )
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires one existing "
+                "SOLSLOT_FAUCET_* credential."
+            )
+        if (
+            settings.protocol_minimum_fee_mojos
+            > settings.protocol_maximum_fee_mojos
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_MINIMUM_FEE_MOJOS cannot exceed "
+                "SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS."
+            )
 
     if settings.minting_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
@@ -125,6 +150,45 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         )
     if settings.voucher_issuance_worker_enabled and settings.network != "testnet11":
         raise RuntimeError("RC20 voucher issuance is restricted to testnet11.")
+    for capability, capability_id, enabled, path_value, digest in (
+        (
+            "SOLS bridge",
+            "warp-cat-bridge",
+            settings.sols_bridge_enabled,
+            settings.sols_bridge_release_evidence_path,
+            settings.sols_bridge_release_evidence_sha256,
+        ),
+        (
+            "SOLS liquidity",
+            "governed-liquidity",
+            settings.sols_liquidity_enabled,
+            settings.sols_liquidity_release_evidence_path,
+            settings.sols_liquidity_release_evidence_sha256,
+        ),
+    ):
+        if not enabled:
+            continue
+        if settings.network != "mainnet":
+            raise RuntimeError(f"{capability} execution is mainnet-only.")
+        if not path_value or not digest or len(digest.removeprefix("0x")) != 64:
+            raise RuntimeError(
+                f"{capability} execution requires checksum-pinned release evidence."
+            )
+        from .sols_capability_evidence import (
+            SolsCapabilityEvidenceError,
+            load_sols_capability_evidence,
+        )
+
+        try:
+            load_sols_capability_evidence(
+                path_value=path_value,
+                expected_sha256=digest,
+                capability=capability_id,
+            )
+        except SolsCapabilityEvidenceError as exc:
+            raise RuntimeError(
+                f"{capability} execution requires valid reviewed release evidence: {exc}"
+            ) from exc
     if settings.ceremony_mode_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_CEREMONY_MODE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
@@ -408,7 +472,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "Ceremony mode must be same-origin and cannot configure CORS origins."
             )
     # Post-ceremony authority is validated cryptographically from the signed
-    # V2 artifact by ``validate_admin_config_at_startup``. Keeping that check
+    # RC22 V3 artifact by ``validate_admin_config_at_startup``. Keeping that check
     # out of this HTTP-posture validator avoids a second mutable coordinate
     # source and a circular trust dependency.
 
@@ -580,16 +644,35 @@ class Settings(BaseSettings):
     chia_primary_ca_cert_path: Optional[str] = None
     chia_primary_client_cert_path: Optional[str] = None
     chia_primary_client_key_path: Optional[str] = None
+    # Server-funded protocol submissions use the local node's native fee
+    # estimator. The existing faucet wallet acts as a bounded fee till.
+    protocol_fee_funding_enabled: bool = False
+    protocol_medium_fee_target_seconds: int = Field(300, ge=60, le=1800)
+    protocol_minimum_fee_mojos: int = Field(1, ge=0)
+    protocol_maximum_fee_mojos: int = Field(10_000_000, ge=1)
+    protocol_mempool_timeout_seconds: float = Field(20.0, ge=2.0, le=120.0)
+    protocol_mempool_poll_seconds: float = Field(0.5, ge=0.1, le=5.0)
 
     def effective_chia_fallback_url(self) -> str:
         return self.chia_fallback_url or self.coinset_base_url
 
-    # High-risk protocol writes remain locked until the frozen V2 artifact
+    # High-risk protocol writes remain locked until the frozen RC22 V3 artifact
     # bundle has passed ceremony preflight. Read-only health, protocol, vault,
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
     presale_enabled: bool = False
+    # Bridge and governed-liquidity adapters ship dark. A statutes record is
+    # necessary but never sufficient to make either customer action live.
+    sols_bridge_enabled: bool = False
+    sols_liquidity_enabled: bool = False
+    # Mainnet capability evidence is a reviewed JSON package whose exact
+    # checksum is pinned by deployment. The API also binds its governed root
+    # and records to reconstructed statutes before advertising execution.
+    sols_bridge_release_evidence_path: Optional[str] = None
+    sols_bridge_release_evidence_sha256: Optional[str] = None
+    sols_liquidity_release_evidence_path: Optional[str] = None
+    sols_liquidity_release_evidence_sha256: Optional[str] = None
     # Automatic paid-reservation -> Chia voucher reconciliation. This is a
     # separate opt-in because it spends faucet coins and requests validator
     # quorum. Presale endpoints may be rehearsed while this remains disabled.
@@ -647,9 +730,9 @@ class Settings(BaseSettings):
     pool_launcher_id: Optional[str] = None
     governance_launcher_id: Optional[str] = None
     # Retained only as an offline evidence/recovery input. Active runtime
-    # coordinates come exclusively from the signed V2 public artifact.
+    # coordinates come exclusively from the signed RC22 V3 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
-    public_artifact_path: str = "./state/public_artifact_v2.json"
+    public_artifact_path: str = "./state/public_artifact_v3.json"
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
@@ -665,14 +748,14 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc21-20260725"
+    launch_release_tag: str = "solslot-v2-alpha-rc22-20260727"
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc21.json"
+        "./state/source-freeze-evidence-rc22.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
-    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc21.json"
+    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc22.json"
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc21.json"
+        "./state/settlement-rehearsal-rc22.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None
@@ -707,7 +790,7 @@ class Settings(BaseSettings):
     # on ``/protocol`` so frontends can independently verify the
     # operator's published config matches the on-chain singleton state.
     #
-    # The value must come from the signed V2 ceremony artifact.
+    # The value must come from the signed RC22 V3 ceremony artifact.
     protocol_config_launcher_id: Optional[str] = None
     # Monotonically increasing version stamped into the singleton's
     # curried state.  Bumped by the operator on every config update;

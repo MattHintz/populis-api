@@ -65,6 +65,9 @@ from .payment_purchase_store import get_payment_purchase_store
 from .alpha_observability import router as alpha_observability_router
 from .alpha_metrics import router as alpha_metrics_router
 from .chia_proxy import router as chia_proxy_router
+from .sols_market import router as sols_market_router
+from .sols_journey import router as sols_journey_router
+from .sols_swaps import router as sols_swaps_router
 from .zkpassport_relay import router as zkpassport_relay_router
 from .zkpassport_enrollments import router as zkpassport_enrollments_router
 from .challenges import (
@@ -88,6 +91,7 @@ from .config import (
 )
 from .credential_auth import require_alpha_writes
 from .protocol_config import build_snapshot as build_protocol_config_snapshot
+from .protocol_submission import ProtocolBundleSubmitter, ProtocolFeePolicy
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
@@ -261,6 +265,40 @@ async def lifespan(app: FastAPI):
             app.state.faucet.address_hex,
         )
 
+    app.state.protocol_submitter = None
+    if settings.protocol_fee_funding_enabled:
+        if app.state.faucet is None:
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires the existing "
+                "SOLSLOT_FAUCET_* fee-till credential."
+            )
+        if not settings.chia_primary_url:
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED requires "
+                "SOLSLOT_CHIA_PRIMARY_URL."
+            )
+        if (
+            settings.protocol_minimum_fee_mojos
+            > settings.protocol_maximum_fee_mojos
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PROTOCOL_MINIMUM_FEE_MOJOS cannot exceed "
+                "SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS."
+            )
+        app.state.protocol_submitter = ProtocolBundleSubmitter(
+            provider=app.state.coinset,
+            faucet=app.state.faucet,
+            policy=ProtocolFeePolicy(
+                enabled=True,
+                target_seconds=settings.protocol_medium_fee_target_seconds,
+                minimum_mojos=settings.protocol_minimum_fee_mojos,
+                maximum_mojos=settings.protocol_maximum_fee_mojos,
+                maximum_funding_coin_mojos=settings.faucet_max_spend_mojos,
+                mempool_timeout_seconds=settings.protocol_mempool_timeout_seconds,
+                mempool_poll_seconds=settings.protocol_mempool_poll_seconds,
+            ),
+        )
+
     app.state.voucher_issuance_worker = None
     if settings.voucher_issuance_worker_enabled:
         if app.state.faucet is None:
@@ -366,6 +404,9 @@ app.include_router(presale_router)
 app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)
 app.include_router(chia_proxy_router)
+app.include_router(sols_market_router)
+app.include_router(sols_journey_router)
+app.include_router(sols_swaps_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)
