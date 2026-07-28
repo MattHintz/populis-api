@@ -203,7 +203,7 @@ def test_three_admin_http_flow_reaches_plan_approval(tmp_path) -> None:
     assert final["plan"]["protocolVersion"] == "solslot-v2-rc22"
     assert "statutes" in final["plan"]["launcherIds"]
     assert "navRegistry" not in final["plan"]["launcherIds"]
-    assert final["plan"]["bridgeBatch"]["fundingAmount"] == 529
+    assert final["plan"]["bridgeBatch"]["fundingAmount"] == 530
 
 
 def test_plan_rejects_retired_nav_registry_and_rc21_parameters(tmp_path) -> None:
@@ -233,7 +233,7 @@ def test_broadcast_requires_fee_funded_local_mempool_submission(
     ceremony_id, accounts = _create_and_enroll(client)
     _approve_plan(client, ceremony_id, accounts)
     protocol_bundle = {
-        "coin_spends": [{"coin": {"amount": 529}}],
+        "coin_spends": [{"coin": {"amount": 530}}],
         "aggregated_signature": "0xc0",
     }
 
