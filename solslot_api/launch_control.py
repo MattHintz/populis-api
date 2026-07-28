@@ -365,31 +365,31 @@ def _read_json_file(path_value: str | None, label: str) -> tuple[dict[str, Any],
 
 def _load_release_evidence(settings: Settings) -> dict[str, Any]:
     evidence, digest = _read_json_file(
-        settings.launch_source_evidence_path, "RC21 source evidence"
+        settings.launch_source_evidence_path, "RC22 source evidence"
     )
     if settings.launch_source_evidence_sha256:
         expected = settings.launch_source_evidence_sha256.removeprefix("0x").lower()
         if not secrets.compare_digest(digest, expected):
-            raise GenesisConflict("RC21 source evidence checksum changed")
+            raise GenesisConflict("RC22 source evidence checksum changed")
     if (
         evidence.get("network") != "testnet11"
         or evidence.get("releaseTag") != settings.launch_release_tag
         or evidence.get("completeReleaseManifest") is not True
         or evidence.get("testOnly") is not True
     ):
-        raise GenesisConflict("RC21 source evidence is incomplete or targets another release")
+        raise GenesisConflict("RC22 source evidence is incomplete or targets another release")
     source_manifest = evidence.get("sourceManifest")
     shas = source_manifest.get("sourceShas") if isinstance(source_manifest, Mapping) else None
     if not isinstance(shas, Mapping) or set(shas) != set(SOURCE_KEYS):
-        raise GenesisConflict("RC21 evidence does not freeze all nine source commits")
+        raise GenesisConflict("RC22 evidence does not freeze all nine source commits")
     for key in SOURCE_KEYS:
         value = str(shas[key]).lower()
         if len(value) != 40:
-            raise GenesisConflict(f"RC21 source commit {key} is not a full SHA")
+            raise GenesisConflict(f"RC22 source commit {key} is not a full SHA")
         try:
             int(value, 16)
         except ValueError as exc:
-            raise GenesisConflict(f"RC21 source commit {key} is invalid") from exc
+            raise GenesisConflict(f"RC22 source commit {key} is invalid") from exc
     return {
         "releaseTag": evidence["releaseTag"],
         "manifestHash": evidence.get("manifestHash"),
@@ -774,7 +774,7 @@ async def _readiness(
         items.append(
             {
                 "id": "release",
-                "title": "RC21 release identity",
+                "title": "RC22 release identity",
                 "status": "Healthy",
                 "impact": f"{release['releaseTag']} is pinned to all nine source commits.",
                 "assignedRole": "system",
@@ -898,7 +898,7 @@ async def _readiness(
         lanes = rehearsal.get("lanes")
         healthy = (
             rehearsal.get("schemaVersion") == 2
-            and rehearsal.get("kind") == "solslot-rc21-settlement-rehearsal"
+            and rehearsal.get("kind") == "solslot-rc22-settlement-rehearsal"
             and rehearsal.get("releaseTag") == settings.launch_release_tag
             and rehearsal.get("network") == "testnet11-base-sepolia"
             and rehearsal.get("success") is True
@@ -1477,7 +1477,7 @@ async def guided_start_settlement_rehearsal(
         record = store.get(session.ceremony_id)
         release_hash = str(record["draft"].get("releaseEvidenceHash") or "")
         if not HEX32_RE.fullmatch(release_hash):
-            raise GenesisConflict("the RC21 release evidence hash is unavailable")
+            raise GenesisConflict("the RC22 release evidence hash is unavailable")
         remote = await start_rehearsal(
             settings,
             ceremony_id=session.ceremony_id,

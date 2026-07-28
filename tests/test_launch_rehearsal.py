@@ -34,8 +34,8 @@ def _settings(tmp_path) -> Settings:
 def _evidence() -> dict:
     return {
         "schemaVersion": 2,
-        "kind": "solslot-rc21-settlement-rehearsal",
-        "releaseTag": "solslot-v2-alpha-rc21-20260725",
+        "kind": "solslot-rc22-settlement-rehearsal",
+        "releaseTag": "solslot-v2-alpha-rc22-20260727",
         "configHash": CONFIG_HASH,
         "network": "testnet11-base-sepolia",
         "success": True,

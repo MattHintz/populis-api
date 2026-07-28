@@ -433,7 +433,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "Ceremony mode must be same-origin and cannot configure CORS origins."
             )
     # Post-ceremony authority is validated cryptographically from the signed
-    # V2 artifact by ``validate_admin_config_at_startup``. Keeping that check
+    # RC22 V3 artifact by ``validate_admin_config_at_startup``. Keeping that check
     # out of this HTTP-posture validator avoids a second mutable coordinate
     # source and a circular trust dependency.
 
@@ -617,12 +617,16 @@ class Settings(BaseSettings):
     def effective_chia_fallback_url(self) -> str:
         return self.chia_fallback_url or self.coinset_base_url
 
-    # High-risk protocol writes remain locked until the frozen V2 artifact
+    # High-risk protocol writes remain locked until the frozen RC22 V3 artifact
     # bundle has passed ceremony preflight. Read-only health, protocol, vault,
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
     presale_enabled: bool = False
+    # Bridge and governed-liquidity adapters ship dark. A statutes record is
+    # necessary but never sufficient to make either customer action live.
+    sols_bridge_enabled: bool = False
+    sols_liquidity_enabled: bool = False
     # Automatic paid-reservation -> Chia voucher reconciliation. This is a
     # separate opt-in because it spends faucet coins and requests validator
     # quorum. Presale endpoints may be rehearsed while this remains disabled.
@@ -680,9 +684,9 @@ class Settings(BaseSettings):
     pool_launcher_id: Optional[str] = None
     governance_launcher_id: Optional[str] = None
     # Retained only as an offline evidence/recovery input. Active runtime
-    # coordinates come exclusively from the signed V2 public artifact.
+    # coordinates come exclusively from the signed RC22 V3 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
-    public_artifact_path: str = "./state/public_artifact_v2.json"
+    public_artifact_path: str = "./state/public_artifact_v3.json"
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
@@ -698,14 +702,14 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc21-20260725"
+    launch_release_tag: str = "solslot-v2-alpha-rc22-20260727"
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc21.json"
+        "./state/source-freeze-evidence-rc22.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
     launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc22.json"
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc21.json"
+        "./state/settlement-rehearsal-rc22.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None
@@ -740,7 +744,7 @@ class Settings(BaseSettings):
     # on ``/protocol`` so frontends can independently verify the
     # operator's published config matches the on-chain singleton state.
     #
-    # The value must come from the signed V2 ceremony artifact.
+    # The value must come from the signed RC22 V3 ceremony artifact.
     protocol_config_launcher_id: Optional[str] = None
     # Monotonically increasing version stamped into the singleton's
     # curried state.  Bumped by the operator on every config update;

@@ -73,6 +73,9 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
     assert artifact["schemaVersion"] == 3
     assert artifact["protocolVersion"] == "solslot-v2-rc22"
     assert artifact["genesisPlan"]["schema"] == "solslot-genesis-plan-v3"
+    assert artifact["statutes"]["roots"]["liquidityVenues"] == (
+        artifact["genesisPlan"]["state"]["statutesRoots"]["liquidityVenues"]
+    )
     typed_data = artifact_signing_typed_data(artifact)
     artifact["signatures"] = [
         {

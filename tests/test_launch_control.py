@@ -39,7 +39,7 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
         "network": "testnet11",
         "testOnly": True,
         "completeReleaseManifest": True,
-        "releaseTag": "solslot-v2-alpha-rc21-20260725",
+        "releaseTag": "solslot-v2-alpha-rc22-20260727",
         "manifestHash": "0x" + "aa" * 32,
         "sourceManifest": {
             "sourceShas": {
