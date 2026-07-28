@@ -30,6 +30,7 @@ from solslot_puzzles.protocol_statutes_driver import (
 )
 from solslot_puzzles.protocol_statutes_v1 import (
     CollectionStatute,
+    LiquidityVenue,
     MutationKind,
     PermanentRules,
     ProtocolParameters,
@@ -130,6 +131,7 @@ class StatutesSnapshot:
     state: StatutesState
     parameters: ProtocolParameters
     collections: tuple[CollectionStatute, ...]
+    liquidity_venues: tuple[LiquidityVenue, ...]
     pauses: tuple[ScopedPause, ...]
     registry_version: int
     confirmed_height: int
@@ -307,6 +309,23 @@ def _scoped_pause(node: Program) -> ScopedPause:
     ).validate()
 
 
+def _liquidity_venue(node: Program) -> LiquidityVenue:
+    values = list(node.as_iter())
+    if len(values) != 9:
+        raise ValueError("liquidity venue must have nine fields")
+    return LiquidityVenue(
+        venue_id=_bytes32_node(values[0], "liquidity venue id"),
+        chain_id=_bytes32_node(values[1], "liquidity chain id"),
+        protocol_id=_bytes32_node(values[2], "liquidity protocol id"),
+        factory_id=_bytes32_node(values[3], "liquidity factory id"),
+        pool_id=_bytes32_node(values[4], "liquidity pool id"),
+        base_asset_id=_bytes32_node(values[5], "liquidity base asset id"),
+        quote_asset_id=_bytes32_node(values[6], "liquidity quote asset id"),
+        pool_code_hash=_bytes32_node(values[7], "liquidity pool code hash"),
+        active=int(values[8].as_int()),
+    ).validate()
+
+
 def _pool_inventory_record(node: Program) -> PoolInventoryRecord:
     values = list(node.as_iter())
     if len(values) != 9:
@@ -384,9 +403,9 @@ def _decode_pool_state(
     spend_case = int(inner_solution[3].as_int())
     params = list(inner_solution[4].as_iter())
     expected_params = (
-        38
+        39
         if spend_case == POOL_SPEND_DEED_TO_SOLS
-        else 32
+        else 33
         if spend_case == POOL_SPEND_SOLS_TO_DEED
         else -1
     )
@@ -396,12 +415,12 @@ def _decode_pool_state(
     previous = _pool_state_from_args(inner_args, previous_inventory)
 
     if spend_case == POOL_SPEND_DEED_TO_SOLS:
-        record = _pool_inventory_record(params[29])
+        record = _pool_inventory_record(params[30])
         current_inventory = canonical_inventory(
             (*previous_inventory, record)
         )
         current = SolsPoolStateV4(
-            inventory_root=_bytes32_node(params[33], "next inventory root"),
+            inventory_root=_bytes32_node(params[34], "next inventory root"),
             economics=SolsEconomicState(
                 bootstrap_complete=True,
                 inventory_nav_micro_usd=(
@@ -417,19 +436,19 @@ def _decode_pool_state(
                 deed_count=previous.economics.deed_count + 1,
                 total_sols_mojos=(
                     previous.economics.total_sols_mojos
-                    + int(params[32].as_int())
+                    + int(params[33].as_int())
                 ),
                 reserve_sols_mojos=(
                     previous.economics.reserve_sols_mojos
-                    - int(params[31].as_int())
+                    - int(params[32].as_int())
                 ),
             ),
             state_version=previous.state_version + 1,
         ).validate(current_inventory)
-        current_commitment = params[34]
-        next_commitment = params[35]
+        current_commitment = params[35]
+        next_commitment = params[36]
     else:
-        deed_launcher_id = _bytes32_node(params[10], "deed launcher id")
+        deed_launcher_id = _bytes32_node(params[11], "deed launcher id")
         matches = [
             item
             for item in previous_inventory
@@ -438,7 +457,7 @@ def _decode_pool_state(
         if len(matches) != 1:
             raise ValueError("Pool V4 release deed is not in inventory")
         record = matches[0]
-        if _pool_inventory_record(params[19]) != record:
+        if _pool_inventory_record(params[20]) != record:
             raise ValueError("Pool V4 release record does not match inventory")
         current_inventory = tuple(
             item
@@ -446,7 +465,7 @@ def _decode_pool_state(
             if item.deed_launcher_id != deed_launcher_id
         )
         current = SolsPoolStateV4(
-            inventory_root=_bytes32_node(params[27], "next inventory root"),
+            inventory_root=_bytes32_node(params[28], "next inventory root"),
             economics=SolsEconomicState(
                 bootstrap_complete=True,
                 inventory_nav_micro_usd=(
@@ -463,13 +482,13 @@ def _decode_pool_state(
                 total_sols_mojos=previous.economics.total_sols_mojos,
                 reserve_sols_mojos=(
                     previous.economics.reserve_sols_mojos
-                    + int(params[24].as_int())
+                    + int(params[25].as_int())
                 ),
             ),
             state_version=previous.state_version + 1,
         ).validate(current_inventory)
-        current_commitment = params[28]
-        next_commitment = params[29]
+        current_commitment = params[29]
+        next_commitment = params[30]
     if _bytes32_node(current_commitment, "current pool state commitment") != (
         previous.commitment_hash
     ):
@@ -537,8 +556,9 @@ def _statutes_state_from_args(
         collections_root=_bytes32_node(inner_args[10], "collections root"),
         oracle_root=_bytes32_node(inner_args[11], "oracle root"),
         routes_root=_bytes32_node(inner_args[12], "routes root"),
-        pauses_root=_bytes32_node(inner_args[13], "pauses root"),
-        registry_version=int(inner_args[14].as_int()),
+        liquidity_root=_bytes32_node(inner_args[13], "liquidity root"),
+        pauses_root=_bytes32_node(inner_args[14], "pauses root"),
+        registry_version=int(inner_args[15].as_int()),
         permanent_rules_hash=permanent_rules.commitment_hash,
     ).validate()
 
@@ -600,6 +620,7 @@ def _apply_statutes_transition(
         MutationKind.COLLECTION: state.collections_root,
         MutationKind.ORACLE: state.oracle_root,
         MutationKind.ROUTE: state.routes_root,
+        MutationKind.LIQUIDITY: state.liquidity_root,
         MutationKind.PAUSE: state.pauses_root,
     }[kind]
     if bytes32(params[3].get_tree_hash()) != old_root:
@@ -627,6 +648,7 @@ def _apply_statutes_transition(
         MutationKind.COLLECTION: "collections_root",
         MutationKind.ORACLE: "oracle_root",
         MutationKind.ROUTE: "routes_root",
+        MutationKind.LIQUIDITY: "liquidity_root",
         MutationKind.PAUSE: "pauses_root",
     }[kind]
     return replace(
@@ -658,7 +680,7 @@ def _decode_statutes_state(
     inner_mod, inner_args_program = inner_uncurried
     inner_args = list(inner_args_program.as_iter())
     if (
-        len(inner_args) != 15
+        len(inner_args) != 16
         or inner_mod.get_tree_hash() != protocol_statutes_inner_mod_hash()
     ):
         raise ValueError("statutes inner puzzle is not RC22 V1")
@@ -693,6 +715,7 @@ def _decode_statutes_state(
         current.collections_root,
         current.oracle_root,
         current.routes_root,
+        current.liquidity_root,
         current.pauses_root,
         current.registry_version,
     )
@@ -761,22 +784,44 @@ def _pauses(node: Program) -> tuple[ScopedPause, ...]:
     return values
 
 
+def _liquidity_venues(node: Program) -> tuple[LiquidityVenue, ...]:
+    values = tuple(_liquidity_venue(item) for item in node.as_iter())
+    keyed_root(values)
+    return values
+
+
 def _upsert_typed(
-    current: tuple[CollectionStatute, ...] | tuple[ScopedPause, ...],
-    replacement: CollectionStatute | ScopedPause,
-) -> tuple[CollectionStatute, ...] | tuple[ScopedPause, ...]:
+    current: (
+        tuple[CollectionStatute, ...]
+        | tuple[LiquidityVenue, ...]
+        | tuple[ScopedPause, ...]
+    ),
+    replacement: CollectionStatute | LiquidityVenue | ScopedPause,
+) -> (
+    tuple[CollectionStatute, ...]
+    | tuple[LiquidityVenue, ...]
+    | tuple[ScopedPause, ...]
+):
     replacement_key = (
         replacement.collection_id
         if isinstance(replacement, CollectionStatute)
-        else replacement.scope_id
+        else (
+            replacement.venue_id
+            if isinstance(replacement, LiquidityVenue)
+            else replacement.scope_id
+        )
     )
-    updated: list[CollectionStatute | ScopedPause] = []
+    updated: list[CollectionStatute | LiquidityVenue | ScopedPause] = []
     found = False
     for item in current:
         key = (
             item.collection_id
             if isinstance(item, CollectionStatute)
-            else item.scope_id
+            else (
+                item.venue_id
+                if isinstance(item, LiquidityVenue)
+                else item.scope_id
+            )
         )
         if key == replacement_key:
             updated.append(replacement)
@@ -793,6 +838,7 @@ def _statutes_witnesses(
 ) -> tuple[
     ProtocolParameters | None,
     tuple[CollectionStatute, ...] | None,
+    tuple[LiquidityVenue, ...] | None,
     tuple[ScopedPause, ...] | None,
 ]:
     _, inner_solution = _solution_parts(
@@ -804,6 +850,7 @@ def _statutes_witnesses(
     params = list(inner_solution[4].as_iter())
     parameters: ProtocolParameters | None = None
     collections: tuple[CollectionStatute, ...] | None = None
+    liquidity_venues: tuple[LiquidityVenue, ...] | None = None
     pauses: tuple[ScopedPause, ...] | None = None
     if action == STATUTES_SPEND_EVIDENCE:
         if len(params) != 3:
@@ -813,6 +860,8 @@ def _statutes_witnesses(
             parameters = _protocol_parameters(params[2])
         elif kind == MutationKind.COLLECTION:
             collections = _collections(params[2])
+        elif kind == MutationKind.LIQUIDITY:
+            liquidity_venues = _liquidity_venues(params[2])
         elif kind == MutationKind.PAUSE:
             pauses = _pauses(params[2])
     elif action == STATUTES_SPEND_UPDATE:
@@ -829,6 +878,11 @@ def _statutes_witnesses(
             collections = _upsert_typed(
                 _collections(params[3]),
                 _collection_statute(params[2]),
+            )
+        elif kind == MutationKind.LIQUIDITY:
+            liquidity_venues = _upsert_typed(
+                _liquidity_venues(params[3]),
+                _liquidity_venue(params[2]),
             )
         elif kind == MutationKind.PAUSE:
             pauses = _upsert_typed(
@@ -851,7 +905,7 @@ def _statutes_witnesses(
         parameters = _protocol_parameters(params[0])
     else:
         raise ValueError("unsupported statutes spend action")
-    return parameters, collections, pauses
+    return parameters, collections, liquidity_venues, pauses
 
 
 async def _resolve_statutes_witnesses(
@@ -862,6 +916,7 @@ async def _resolve_statutes_witnesses(
 ) -> tuple[
     ProtocolParameters,
     tuple[CollectionStatute, ...],
+    tuple[LiquidityVenue, ...],
     tuple[ScopedPause, ...],
 ]:
     empty_root = bytes32(Program.to([]).get_tree_hash())
@@ -875,6 +930,9 @@ async def _resolve_statutes_witnesses(
     )
     collections: tuple[CollectionStatute, ...] | None = (
         () if state.collections_root == empty_root else None
+    )
+    liquidity_venues: tuple[LiquidityVenue, ...] | None = (
+        () if state.liquidity_root == empty_root else None
     )
     pauses: tuple[ScopedPause, ...] | None = (
         () if state.pauses_root == empty_root else None
@@ -891,9 +949,12 @@ async def _resolve_statutes_witnesses(
         )
         if puzzle_solution is None:
             raise ValueError("statutes lineage solution is unavailable")
-        candidate_parameters, candidate_collections, candidate_pauses = (
-            _statutes_witnesses(puzzle_solution)
-        )
+        (
+            candidate_parameters,
+            candidate_collections,
+            candidate_liquidity_venues,
+            candidate_pauses,
+        ) = _statutes_witnesses(puzzle_solution)
         if (
             parameters is None
             and candidate_parameters is not None
@@ -912,19 +973,36 @@ async def _resolve_statutes_witnesses(
         ):
             collections = candidate_collections
         if (
+            liquidity_venues is None
+            and candidate_liquidity_venues is not None
+            and keyed_root(candidate_liquidity_venues)
+            == state.liquidity_root
+        ):
+            liquidity_venues = candidate_liquidity_venues
+        if (
             pauses is None
             and candidate_pauses is not None
             and keyed_root(candidate_pauses) == state.pauses_root
         ):
             pauses = candidate_pauses
-        if parameters is not None and collections is not None and pauses is not None:
+        if (
+            parameters is not None
+            and collections is not None
+            and liquidity_venues is not None
+            and pauses is not None
+        ):
             break
-    if parameters is None or collections is None or pauses is None:
+    if (
+        parameters is None
+        or collections is None
+        or liquidity_venues is None
+        or pauses is None
+    ):
         raise ValueError(
-            "current statutes parameters, collections, or pauses "
+            "current statutes parameters, collections, liquidity, or pauses "
             "cannot be reconstructed"
         )
-    return parameters, collections, pauses
+    return parameters, collections, liquidity_venues, pauses
 
 
 async def _statutes_snapshot(
@@ -948,6 +1026,7 @@ async def _statutes_snapshot(
             permanent_rules=permanent_rules,
         )
         collections: tuple[CollectionStatute, ...] = ()
+        liquidity_venues: tuple[LiquidityVenue, ...] = ()
         pauses: tuple[ScopedPause, ...] = ()
         if tip.live.puzzle_hash.lower() != expected_initial:
             raise ValueError("initial statutes coin does not match artifact")
@@ -960,7 +1039,12 @@ async def _statutes_snapshot(
                 artifact["launcherIds"]["governance"]
             ),
         )
-        parameters, collections, pauses = await _resolve_statutes_witnesses(
+        (
+            parameters,
+            collections,
+            liquidity_venues,
+            pauses,
+        ) = await _resolve_statutes_witnesses(
             provider,
             tip,
             state,
@@ -972,6 +1056,7 @@ async def _statutes_snapshot(
         state=state,
         parameters=parameters,
         collections=collections,
+        liquidity_venues=liquidity_venues,
         pauses=pauses,
         registry_version=state.registry_version,
         confirmed_height=tip.live.confirmed_height,
@@ -1158,6 +1243,9 @@ def _statutes_payload(
         "contentHash": _hex(state.content_hash),
         "parametersRoot": _hex(state.parameters_root),
         "collectionsRoot": _hex(state.collections_root),
+        "oracleRoot": _hex(state.oracle_root),
+        "routesRoot": _hex(state.routes_root),
+        "liquidityRoot": _hex(state.liquidity_root),
         "pausesRoot": _hex(state.pauses_root),
         "parameters": {
             "navValiditySeconds": statutes.parameters.nav_validity_seconds,
@@ -1178,6 +1266,20 @@ def _statutes_payload(
                 "status": item.status,
             }
             for item in statutes.collections
+        ],
+        "liquidityVenues": [
+            {
+                "venueId": _hex(item.venue_id),
+                "chainId": _hex(item.chain_id),
+                "protocolId": _hex(item.protocol_id),
+                "factoryId": _hex(item.factory_id),
+                "poolId": _hex(item.pool_id),
+                "baseAssetId": _hex(item.base_asset_id),
+                "quoteAssetId": _hex(item.quote_asset_id),
+                "poolCodeHash": _hex(item.pool_code_hash),
+                "active": bool(item.active),
+            }
+            for item in statutes.liquidity_venues
         ],
         "pauses": [
             {

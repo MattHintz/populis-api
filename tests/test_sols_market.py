@@ -29,6 +29,7 @@ from solslot_puzzles.protocol_statutes_driver import (
 )
 from solslot_puzzles.protocol_statutes_v1 import (
     CollectionStatute,
+    LiquidityVenue,
     MutationKind,
     PermanentRules,
     ProtocolParameters,
@@ -48,10 +49,13 @@ from solslot_api.public_artifact import PublicArtifactMissing
 from solslot_api.sols_market import (
     LiveCoin,
     SingletonTip,
+    StatutesSnapshot,
     _decode_pool_state,
     _decode_statutes_state,
+    _liquidity_venue,
     _resolve_statutes_witnesses,
     _singleton_child,
+    _statutes_payload,
     _statutes_witnesses,
     sols_market,
 )
@@ -272,7 +276,7 @@ def test_pool_v4_reader_rejects_tampered_next_commitment() -> None:
     puzzle_solution, tip = _pool_transition_fixture()
     outer = Program.from_bytes(bytes.fromhex(puzzle_solution["solution"]))
     values = outer.as_python()
-    values[2][4][35] = bytes(_b32(99))
+    values[2][4][36] = bytes(_b32(99))
     puzzle_solution["solution"] = bytes(Program.to(values)).hex()
 
     with pytest.raises(ValueError, match="next state commitment"):
@@ -358,7 +362,9 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
         expected_permanent_rules=RULES,
         expected_governance_launcher_id=_hex(GOVERNANCE_LAUNCHER),
     )
-    _, collections, _ = _statutes_witnesses(puzzle_solution)
+    _, collections, liquidity_venues, _ = _statutes_witnesses(
+        puzzle_solution
+    )
     provider = type(
         "Provider",
         (),
@@ -368,7 +374,12 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
             )
         },
     )()
-    resolved_parameters, resolved_collections, resolved_pauses = (
+    (
+        resolved_parameters,
+        resolved_collections,
+        resolved_liquidity_venues,
+        resolved_pauses,
+    ) = (
         await _resolve_statutes_witnesses(
             provider,
             tip,
@@ -379,9 +390,66 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
 
     assert decoded == next_state
     assert collections == (COLLECTION,)
+    assert liquidity_venues is None
     assert resolved_parameters == PARAMETERS
     assert resolved_collections == (COLLECTION,)
+    assert resolved_liquidity_venues == ()
     assert resolved_pauses == ()
+
+
+def test_statutes_payload_exposes_only_typed_chain_liquidity_venues() -> None:
+    initial = initial_state(
+        parameters=PARAMETERS,
+        permanent_rules=RULES,
+    )
+    venue = LiquidityVenue(
+        venue_id=_b32(0x70),
+        chain_id=_b32(0x71),
+        protocol_id=_b32(0x72),
+        factory_id=_b32(0x73),
+        pool_id=_b32(0x74),
+        base_asset_id=RULES.sols_tail_hash,
+        quote_asset_id=_b32(0x75),
+        pool_code_hash=_b32(0x76),
+        active=1,
+    )
+    _, venues, state = build_record_mutation(
+        state=initial,
+        kind=MutationKind.LIQUIDITY,
+        current=(),
+        replacement=venue,
+    )
+    decoded = _liquidity_venue(Program.to(venue.as_program_value()))
+    snapshot = StatutesSnapshot(
+        live_coin_id=_hex(_b32(0x77)),
+        live_puzzle_hash=_hex(_b32(0x78)),
+        state=state,
+        parameters=PARAMETERS,
+        collections=(),
+        liquidity_venues=venues,
+        pauses=(),
+        registry_version=state.registry_version,
+        confirmed_height=123,
+        lineage_depth=2,
+    )
+    payload = _statutes_payload(snapshot)
+
+    assert decoded == venue
+    assert payload is not None
+    assert payload["liquidityRoot"] == _hex(state.liquidity_root)
+    assert payload["liquidityVenues"] == [
+        {
+            "venueId": _hex(venue.venue_id),
+            "chainId": _hex(venue.chain_id),
+            "protocolId": _hex(venue.protocol_id),
+            "factoryId": _hex(venue.factory_id),
+            "poolId": _hex(venue.pool_id),
+            "baseAssetId": _hex(venue.base_asset_id),
+            "quoteAssetId": _hex(venue.quote_asset_id),
+            "poolCodeHash": _hex(venue.pool_code_hash),
+            "active": True,
+        }
+    ]
 
 
 async def _async_value(value):
