@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 
 from .config import Settings
 from .genesis_store import GenesisConflict, GenesisStore
+from .launch_rehearsal import require_completed_rehearsal
 
 
 def require_operation_gate(settings: Settings, gate_name: str) -> None:
@@ -27,9 +28,17 @@ def require_operation_gate(settings: Settings, gate_name: str) -> None:
             active = history[0] if history else None
         if active is None:
             raise GenesisConflict("no signed alpha launch exists")
+        if gate_name != "ceremonyBroadcast" and active["state"] != "locked":
+            raise GenesisConflict("the signed alpha launch is not complete")
         gate = store.gates(str(active["ceremony_id"])).get(gate_name)
         if not gate or gate["state"] != "open":
             raise GenesisConflict(f"the signed {gate_name} window is closed")
+        if gate_name in {"presale", "purchases"}:
+            require_completed_rehearsal(
+                settings,
+                store,
+                str(active["ceremony_id"]),
+            )
     except (GenesisConflict, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

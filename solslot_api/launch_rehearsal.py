@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import httpx
 
 from .config import Settings
+from .genesis_store import GenesisConflict, GenesisStore
 
 
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -26,6 +27,16 @@ STATES = {
     "VALIDATING",
     "SUCCEEDED",
     "FAILED",
+}
+PHASES = {
+    "PREPARE",
+    "APPROVE_DELIVERY",
+    "PAY_DELIVERY",
+    "VERIFY_DELIVERY",
+    "APPROVE_REFUND",
+    "PAY_REFUND",
+    "VERIFY_REFUND",
+    "COMPLETE",
 }
 
 
@@ -184,10 +195,23 @@ def validate_status(
         or str(value.get("configHash") or "").lower() != config_hash
     ):
         raise LaunchRehearsalError("Settlement rehearsal status changed unexpectedly.")
+    phase = str(value.get("phase") or ("COMPLETE" if state == "SUCCEEDED" else "PREPARE"))
+    completed_steps = value.get("completedSteps", 4 if state == "SUCCEEDED" else 0)
+    if (
+        phase not in PHASES
+        or isinstance(completed_steps, bool)
+        or not isinstance(completed_steps, int)
+        or completed_steps < 0
+        or completed_steps > 4
+        or (state == "SUCCEEDED" and (phase != "COMPLETE" or completed_steps != 4))
+    ):
+        raise LaunchRehearsalError("Settlement rehearsal progress changed unexpectedly.")
     result: dict[str, Any] = {
         "jobId": job_id,
         "state": state,
         "configHash": config_hash,
+        "phase": phase,
+        "completedSteps": completed_steps,
         "step": str(value.get("step") or ""),
         "message": str(value.get("message") or ""),
         "walletTransaction": _validate_transaction(value.get("walletTransaction")),
@@ -208,8 +232,13 @@ async def start_rehearsal(
     *,
     ceremony_id: str,
     release_evidence_hash: str,
+    wallet_address: str,
 ) -> dict[str, Any]:
     _, _, config_hash, _ = _configuration(settings)
+    if not ADDRESS_RE.fullmatch(wallet_address):
+        raise LaunchRehearsalError(
+            "The settlement rehearsal wallet address is invalid."
+        )
     value = await _request(
         settings,
         "POST",
@@ -221,6 +250,7 @@ async def start_rehearsal(
             "configHash": config_hash,
             "network": "testnet11-base-sepolia",
             "requiredLanes": ["delivery", "refund"],
+            "walletAddress": wallet_address,
         },
     )
     return validate_status(value, settings=settings)
@@ -275,9 +305,109 @@ def persist_evidence(settings: Settings, evidence: Mapping[str, Any]) -> str:
     return "0x" + hashlib.sha256(encoded).hexdigest()
 
 
+def require_completed_rehearsal(
+    settings: Settings,
+    store: GenesisStore,
+    ceremony_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Load the write-once rehearsal proof bound to one completed launch.
+
+    This is the shared activation boundary for presales and purchases. Genesis
+    itself does not depend on inventory that can only exist after genesis.
+    """
+
+    job = store.settlement_rehearsal(ceremony_id)
+    if not job or job["state"] != "SUCCEEDED":
+        state = str(job["state"]).lower() if job else "not started"
+        raise GenesisConflict(f"settlement rehearsal is {state}")
+    config_hash = str(settings.launch_rehearsal_config_hash or "").lower()
+    if (
+        not HEX32_RE.fullmatch(config_hash)
+        or not hmac.compare_digest(
+            str(job.get("configHash") or "").lower(),
+            config_hash,
+        )
+    ):
+        raise GenesisConflict("settlement rehearsal configuration changed")
+    path_value = settings.launch_settlement_rehearsal_path
+    if not path_value:
+        raise GenesisConflict("settlement rehearsal evidence path is unavailable")
+    path = Path(path_value)
+    try:
+        stat = path.lstat()
+        encoded = path.read_bytes()
+    except OSError as exc:
+        raise GenesisConflict("settlement rehearsal evidence is unavailable") from exc
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or stat.st_size <= 0
+        or stat.st_size > MAX_RESPONSE_BYTES
+    ):
+        raise GenesisConflict("settlement rehearsal evidence path is invalid")
+    try:
+        evidence = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GenesisConflict("settlement rehearsal evidence is invalid JSON") from exc
+    if not isinstance(evidence, dict):
+        raise GenesisConflict("settlement rehearsal evidence must be an object")
+    canonical = (canonical_json(evidence) + "\n").encode("ascii")
+    if not hmac.compare_digest(encoded, canonical):
+        raise GenesisConflict("settlement rehearsal evidence is not canonical")
+    digest = "0x" + hashlib.sha256(encoded).hexdigest()
+    payload = job.get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or not hmac.compare_digest(
+            str(payload.get("evidenceDigest") or "").lower(),
+            digest,
+        )
+    ):
+        raise GenesisConflict("settlement rehearsal evidence digest changed")
+    validators = evidence.get("validators")
+    lanes = evidence.get("lanes")
+    validator_ids = (
+        [str(item.get("id") or "") for item in validators]
+        if isinstance(validators, list)
+        and all(isinstance(item, Mapping) for item in validators)
+        else []
+    )
+    healthy = (
+        evidence.get("schemaVersion") == 2
+        and evidence.get("kind") == "solslot-rc22-settlement-rehearsal"
+        and evidence.get("releaseTag") == settings.launch_release_tag
+        and hmac.compare_digest(
+            str(evidence.get("configHash") or "").lower(),
+            config_hash,
+        )
+        and evidence.get("network") == "testnet11-base-sepolia"
+        and evidence.get("success") is True
+        and evidence.get("validatorThreshold") == 2
+        and isinstance(validators, list)
+        and len(validators) == 3
+        and all(validator_ids)
+        and len(set(validator_ids)) == 3
+        and len({canonical_json(item) for item in validators}) == 3
+        and isinstance(lanes, Mapping)
+        and set(lanes) == {"delivery", "refund"}
+        and isinstance(lanes.get("delivery"), Mapping)
+        and lanes["delivery"].get("success") is True
+        and isinstance(lanes.get("refund"), Mapping)
+        and lanes["refund"].get("success") is True
+        and lanes["refund"].get("exactRefund") is True
+    )
+    if not healthy:
+        raise GenesisConflict(
+            "settlement rehearsal does not prove delivery and exact refund"
+        )
+    return evidence, digest
+
+
 __all__ = [
     "LaunchRehearsalError",
+    "PHASES",
     "persist_evidence",
+    "require_completed_rehearsal",
     "rehearsal_status",
     "start_rehearsal",
     "submit_rehearsal_transaction",
