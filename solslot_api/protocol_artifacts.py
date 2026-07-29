@@ -716,7 +716,6 @@ def _ingest_verified_presale_payment(
         _external_escrow_contract,
         get_presale_store,
     )
-    from .credential_auth import require_presale_writes
     from .vault_eligibility import require_current_approved_vault
 
     store = get_presale_store(settings)
@@ -726,7 +725,10 @@ def _ingest_verified_presale_payment(
         return None
     if series["state"] != "PRESALE":
         return None
-    require_presale_writes(settings)
+    # A closed customer sales window prevents new purchase artifacts. It must
+    # not strand a payment that was already confirmed by the configured escrow
+    # while its artifact was valid. The callback remains authenticated and all
+    # artifact, vault, price, deed, and chain evidence checks still apply.
     body = payload.escrow_message
     source = payload.source
     record = get_payment_purchase_store(settings.payment_purchase_db_path).get(

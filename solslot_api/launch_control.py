@@ -711,9 +711,9 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
             "state": "NOT_STARTED",
             "phase": "PREPARE",
             "completedSteps": 0,
-            "step": "Ready after the first governed test deeds are confirmed.",
+            "step": "Ready after the governed test SmartDeed is confirmed.",
             "message": (
-                "A coadministrator will use faucet USDC to prove one delivery "
+                "A coadministrator will use test USDC to prove one delivery "
                 "and one exact refund before customer payments open."
             ),
             "assignedRole": "coadmin",
@@ -738,7 +738,7 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
     amount_label = (
         str(review.get("amountLabel"))
         if isinstance(review, Mapping)
-        else "a fixed amount of faucet USDC"
+        else "a fixed amount of test USDC"
     )
     expected_outcome = (
         str(review.get("expectedOutcome"))
