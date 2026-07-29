@@ -41,7 +41,7 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
         "network": "testnet11",
         "testOnly": True,
         "completeReleaseManifest": True,
-        "releaseTag": "solslot-v2-alpha-rc22.2-20260729",
+        "releaseTag": "solslot-v2-alpha-rc22.3-20260729",
         "manifestHash": "0x" + "aa" * 32,
         "sourceManifest": {
             "sourceShas": {
@@ -263,6 +263,26 @@ def test_enrolled_wallet_resumes_without_token_or_ceremony_id(tmp_path) -> None:
     )
     assert plan_readiness["status"] == "Blocked"
     assert plan_readiness["action"] == "replacePlanEvidence"
+    assert "browser" in plan_readiness["impact"]
+    assert "plan-input-template" not in plan_readiness["impact"]
+
+    evm_readiness = next(
+        item for item in body["readiness"] if item["id"] == "evmEvidence"
+    )
+    assert evm_readiness["status"] == "Blocked"
+    assert evm_readiness["action"] == "installEvmEvidence"
+    assert evm_readiness["evidence"]["deploymentEvidenceInstalled"] is False
+    assert evm_readiness["evidence"]["auditApprovalInstalled"] is False
+
+    validator_readiness = next(
+        item for item in body["readiness"] if item["id"] == "validators"
+    )
+    assert validator_readiness["status"] == "Blocked"
+    assert validator_readiness["action"] == "configureValidators"
+    assert validator_readiness["evidence"]["requiredValidators"] == 3
+    assert validator_readiness["evidence"]["configuredValidators"] == 0
+    assert body["nextTask"]["action"] == "enrollment"
+    assert body["nextTask"]["title"] == "Finish administrator enrollment"
 
     attacker = Account.create("wrong-wallet")
     rejected = client.post(

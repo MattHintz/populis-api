@@ -781,6 +781,14 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
 def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dict[str, Any]:
     state = str(record["state"])
     ceremony_complete = state == "locked"
+    enrolled = sum(bool(item.get("consumed_at")) for item in record["invitations"])
+    if enrolled < 3:
+        return {
+            "title": "Finish administrator enrollment",
+            "body": f"{enrolled} of 3 administrators are enrolled.",
+            "assignedRole": "owner" if enrolled == 0 else "administrator",
+            "action": "enrollment",
+        }
     blocked = next(
         (
             item
@@ -796,14 +804,6 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             "body": blocked["impact"],
             "assignedRole": blocked["assignedRole"],
             "action": blocked.get("action"),
-        }
-    enrolled = sum(bool(item.get("consumed_at")) for item in record["invitations"])
-    if enrolled < 3:
-        return {
-            "title": "Finish administrator enrollment",
-            "body": f"{enrolled} of 3 administrators are enrolled.",
-            "assignedRole": "owner" if enrolled == 0 else "administrator",
-            "action": "enrollment",
         }
     unfinished = next(
         (
@@ -850,7 +850,7 @@ async def _readiness(
         items.append(
             {
                 "id": "release",
-                "title": "RC22 release identity",
+                "title": "Reviewed release",
                 "status": "Healthy",
                 "impact": f"{release['releaseTag']} is pinned to all nine source commits.",
                 "assignedRole": "system",
@@ -866,9 +866,13 @@ async def _readiness(
                 "id": "release",
                 "title": "Release package needs attention",
                 "status": "Blocked",
-                "impact": str(exc),
+                "impact": (
+                    "The reviewed release package is not installed correctly. "
+                    "A technical coadministrator must repair it before launch."
+                ),
                 "assignedRole": "technical-coadmin",
                 "action": "replaceReleaseEvidence",
+                "evidence": {"technicalReason": str(exc)},
             }
         )
 
@@ -891,13 +895,93 @@ async def _readiness(
         items.append(
             {
                 "id": "planInputs",
-                "title": "Complete the fixed launch coordinates",
+                "title": "Finish the fixed launch coordinates",
                 "status": "Blocked",
-                "impact": str(exc),
+                "impact": (
+                    "The validator, treasury, EVM, and protected mint-signer "
+                    "coordinates are not all installed yet. No administrator "
+                    "should enter or paste them in the browser."
+                ),
                 "assignedRole": "technical-coadmin",
                 "action": "replacePlanEvidence",
+                "evidence": {"technicalReason": str(exc)},
             }
         )
+
+    deployment_path = Path(settings.genesis_evm_deployment_path)
+    approval_path = Path(settings.genesis_audit_approval_path)
+    evm_evidence_ready = deployment_path.is_file() and approval_path.is_file()
+    items.append(
+        {
+            "id": "evmEvidence",
+            "title": "Sepolia identity contracts",
+            "status": "Healthy" if evm_evidence_ready else "Blocked",
+            "impact": (
+                "The reviewed deployment and audit evidence are installed. "
+                "The wizard will recheck receipts and contract code before launch."
+                if evm_evidence_ready
+                else (
+                    "The reviewed Sepolia deployment evidence is not installed. "
+                    "A technical coadministrator must finish this protected server step."
+                )
+            ),
+            "assignedRole": "technical-coadmin",
+            "action": None if evm_evidence_ready else "installEvmEvidence",
+            "evidence": {
+                "deploymentEvidenceInstalled": deployment_path.is_file(),
+                "auditApprovalInstalled": approval_path.is_file(),
+                "requiredConfirmations": settings.genesis_sepolia_confirmations,
+            },
+        }
+    )
+
+    validator_pubkeys: list[bytes] = []
+    for value in settings.zkpassport_validator_pubkeys:
+        try:
+            validator_pubkeys.append(bytes.fromhex(value.removeprefix("0x")))
+        except ValueError:
+            validator_pubkeys.append(b"")
+    validator_credentials = (
+        settings.zkpassport_validator_mtls_ca_path,
+        settings.zkpassport_validator_mtls_cert_path,
+        settings.zkpassport_validator_mtls_key_path,
+    )
+    validators_configured = (
+        len(settings.zkpassport_validator_urls) == 3
+        and len(validator_pubkeys) == 3
+        and len(set(validator_pubkeys)) == 3
+        and all(len(value) == 48 and value != b"\x00" * 48 for value in validator_pubkeys)
+        and all(value and Path(value).is_file() for value in validator_credentials)
+    )
+    items.append(
+        {
+            "id": "validators",
+            "title": "Independent validator team",
+            "status": "Healthy" if validators_configured else "Blocked",
+            "impact": (
+                "Three distinct validator identities and their private connections "
+                "are configured. Live health is checked again before launch."
+                if validators_configured
+                else (
+                    "Three distinct validators are not fully connected to this "
+                    "release. A technical coadministrator must finish their private setup."
+                )
+            ),
+            "assignedRole": "technical-coadmin",
+            "action": None if validators_configured else "configureValidators",
+            "evidence": {
+                "configuredValidators": min(
+                    len(settings.zkpassport_validator_urls),
+                    len(validator_pubkeys),
+                ),
+                "requiredValidators": 3,
+                "threshold": settings.zkpassport_validator_threshold,
+                "privateCredentialsInstalled": all(
+                    value and Path(value).is_file() for value in validator_credentials
+                ),
+            },
+        }
+    )
 
     try:
         provider = getattr(request.app.state, "coinset", None)
@@ -911,7 +995,8 @@ async def _readiness(
                 "title": "Local Chia node",
                 "status": "Needs action" if fallback else "Healthy",
                 "impact": (
-                    "The fallback provider is active; launching should wait for the local node."
+                    "The backup chain-data service is active. Launching should wait "
+                    "for the primary Testnet11 node."
                     if fallback
                     else "The primary Testnet11 provider is available."
                 ),
@@ -925,9 +1010,13 @@ async def _readiness(
                 "id": "chiaNode",
                 "title": "Local Chia node unavailable",
                 "status": "Blocked",
-                "impact": str(exc),
+                "impact": (
+                    "The primary Testnet11 node cannot be reached. A technical "
+                    "coadministrator must restore it before launch."
+                ),
                 "assignedRole": "technical-coadmin",
                 "action": "restoreChiaNode",
+                "evidence": {"technicalReason": str(exc)},
             }
         )
 
@@ -945,8 +1034,10 @@ async def _readiness(
                 "The fountain till will add the current medium Testnet11 fee "
                 "and confirm the launch in the local mempool."
                 if fee_funding_healthy
-                else "Enable the bounded fountain fee till before launch; "
-                "the 530-mojo bridge coin includes the required one-mojo safety buffer."
+                else (
+                    "The protected fee account is not ready. A technical "
+                    "coadministrator must finish it before launch."
+                )
             ),
             "assignedRole": "technical-coadmin",
             "action": None if fee_funding_healthy else "configureFeeTill",
@@ -963,6 +1054,16 @@ async def _readiness(
         ownership_store = get_ownership_activation_store(settings)
         ownership = _rail_phase_status(settings, ownership_store)
         done = ownership["state"] == "DONE"
+        rail_state_message = {
+            "AWAITING_APPROVALS": "The fixed handoff is waiting for owner-plus-one approval.",
+            "READY_TO_BROADCAST": "The reviewed handoff is ready to submit.",
+            "BROADCAST_PENDING": "The handoff was submitted and is being tracked.",
+            "CONFIRMING": "The handoff is confirming on Base Sepolia.",
+            "SCHEDULED": "The 24-hour safety delay is active.",
+            "WAITING_FOR_SCHEDULE": "The wizard is waiting for the safety delay to appear.",
+            "WAITING_FOR_DELAY": "The 24-hour safety delay is active.",
+            "READY_TO_EXECUTE": "Fresh owner-plus-one approval is ready.",
+        }.get(str(ownership["state"]), "The fixed handoff still needs administrator action.")
         items.append(
             {
                 "id": "railOwnership",
@@ -971,9 +1072,9 @@ async def _readiness(
                 "impact": (
                     "Safe and timelock ownership is active."
                     if done
-                    else f"Rail ownership is {ownership['state'].lower().replace('_', ' ')}."
+                    else rail_state_message
                 ),
-                "assignedRole": "technical-coadmin",
+                "assignedRole": "administrator",
                 "action": None if done else "railOwnership",
                 "evidence": ownership,
             }
@@ -984,9 +1085,15 @@ async def _readiness(
                 "id": "railOwnership",
                 "title": "Base Sepolia rail ownership",
                 "status": "Blocked",
-                "impact": str(getattr(exc, "detail", exc)),
-                "assignedRole": "technical-coadmin",
+                "impact": (
+                    "The fixed Safe and timelock handoff is not ready for "
+                    "administrator review. No payment rail is active."
+                ),
+                "assignedRole": "administrator",
                 "action": "railOwnership",
+                "evidence": {
+                    "technicalReason": str(getattr(exc, "detail", exc)),
+                },
             }
         )
 
@@ -1022,7 +1129,10 @@ async def _readiness(
                 ),
                 "status": "Waiting",
                 "impact": (
-                    str(exc)
+                    (
+                        "The required test delivery and exact refund have not passed. "
+                        "Customer presales and purchases remain closed."
+                    )
                     if ceremony_complete
                     else (
                         "After genesis and the first governed test deed exist, a "
@@ -1033,6 +1143,7 @@ async def _readiness(
                 "assignedRole": "technical-coadmin",
                 "action": "settlementRehearsal" if ceremony_complete else None,
                 "blocksCeremony": False,
+                "evidence": {"technicalReason": str(exc)} if ceremony_complete else None,
             }
         )
 
@@ -1044,9 +1155,10 @@ async def _readiness(
             "title": "Ceremony funding",
             "status": "Healthy" if funding_healthy else "Waiting",
             "impact": (
-                "All nine fixed funding coins are confirmed, including the 530-mojo bridge batch."
+                "All nine fixed ceremony inputs are confirmed, including the "
+                "required bridge reserve."
                 if funding_healthy
-                else "Create and confirm the fixed nine-output funding transaction."
+                else "Create and confirm the fixed ceremony funding transaction."
             ),
             "assignedRole": "owner",
             "action": None if funding_healthy else "funding",
