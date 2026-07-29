@@ -485,6 +485,85 @@ def test_broadcast_receipt_is_recorded_only_after_timelock_schedule(
     assert response.json()["broadcast"]["confirmations"] == 12
 
 
+def test_exact_pending_broadcast_is_resumable_and_reconciles_after_confirmation(
+    tmp_path, monkeypatch
+) -> None:
+    owner = Account.create()
+    coadmin = Account.create()
+    package_path = tmp_path / "operation.json"
+    raw = _write_package(
+        package_path,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_activation_enabled=True,
+        payment_omnichain_ownership_safe_operation_path=str(package_path),
+        payment_omnichain_ownership_safe_operation_hash=raw["artifactHash"],
+        payment_omnichain_rpc_url="https://base-sepolia.example.invalid",
+        admin_db_path=str(tmp_path / "admin.db"),
+    )
+    store = OwnershipActivationStore(settings.admin_db_path)
+    package = load_authority_operation(settings)
+    descriptors = {
+        value["role"]: value for value in package["authorityOperation"]["approvals"]
+    }
+    for role, account in (("owner_identity", owner), ("coadmin", coadmin)):
+        store.add_approval(
+            package_hash=raw["artifactHash"],
+            role=role,
+            signer_address=account.address,
+            signature=_signature(account, descriptors[role]["typedData"]),
+            now=1,
+        )
+    app = _test_app(settings, store)
+    client = TestClient(app)
+    transaction_hash = "0x" + "98" * 32
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._verify_broadcast",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            OwnershipActivationError(
+                "ownership broadcast is waiting for Base Sepolia confirmation"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._verify_submission",
+        lambda **_kwargs: owner.address,
+    )
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._chain_state",
+        lambda *_args, **_kwargs: _current_chain_state(),
+    )
+
+    submitted = client.post(
+        "/admin/omnichain/ownership-activation/broadcast",
+        json={"transactionHash": transaction_hash},
+    )
+
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["state"] == "BROADCAST_PENDING"
+    assert submitted.json()["submission"]["transactionHash"] == transaction_hash
+    assert store.broadcast(raw["artifactHash"]) is None
+
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._verify_broadcast",
+        lambda **_kwargs: (101, 12, owner.address),
+    )
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._chain_state",
+        lambda *_args, **_kwargs: _scheduled_chain_state(),
+    )
+
+    confirmed = client.get("/admin/omnichain/ownership-activation")
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["state"] == "SCHEDULED"
+    assert confirmed.json()["broadcast"]["transactionHash"] == transaction_hash
+    assert confirmed.json()["broadcast"]["confirmations"] == 12
+
+
 def test_package_hash_and_feature_flag_fail_closed(tmp_path) -> None:
     owner = Account.create()
     coadmin = Account.create()

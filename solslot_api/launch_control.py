@@ -711,9 +711,9 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
             "state": "NOT_STARTED",
             "phase": "PREPARE",
             "completedSteps": 0,
-            "step": "Ready after the first governed test deeds are confirmed.",
+            "step": "Ready after the governed test SmartDeed is confirmed.",
             "message": (
-                "A coadministrator will use faucet USDC to prove one delivery "
+                "A coadministrator will use test USDC to prove one delivery "
                 "and one exact refund before customer payments open."
             ),
             "assignedRole": "coadmin",
@@ -730,9 +730,21 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
             "step": details.get("step") or "",
             "message": details.get("message") or "",
             "walletTransaction": details.get("walletTransaction"),
+            "review": details.get("review"),
             "evidenceDigest": details.get("evidenceDigest"),
             "updatedAt": record.get("updatedAt"),
         }
+    review = status_value.get("review")
+    amount_label = (
+        str(review.get("amountLabel"))
+        if isinstance(review, Mapping)
+        else "a fixed amount of test USDC"
+    )
+    expected_outcome = (
+        str(review.get("expectedOutcome"))
+        if isinstance(review, Mapping)
+        else "DELIVERED or REFUND"
+    )
     return {
         "status": status_value,
         "decisionReceipt": {
@@ -743,7 +755,8 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
             ),
             "network": "Base Sepolia",
             "financialEffect": (
-                "Uses test gas and faucet USDC only. No real funds or customer funds move."
+                f"Uses {amount_label} and test gas only. "
+                "No real funds or customer funds move."
             ),
             "customerImpact": (
                 "Proves the reviewed payment, validator delivery, SmartDeed delivery, "
@@ -757,8 +770,8 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
                 "One enrolled coadministrator submits each clearly labeled test-wallet step"
             ),
             "expectedResult": (
-                "Three validators produce 2-of-3 evidence for both successful delivery "
-                "and exact refund."
+                f"This step expects {expected_outcome}. Three validators produce "
+                "2-of-3 evidence before the full check can pass."
             ),
         },
     }

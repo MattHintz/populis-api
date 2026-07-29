@@ -24,6 +24,7 @@ from eth_utils import keccak
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from web3 import Web3
+from web3.exceptions import TransactionNotFound
 
 from .admin_auth import require_admin_jwt
 from .config import Settings, get_settings
@@ -166,6 +167,12 @@ class OwnershipActivationStore:
                     block_number INTEGER NOT NULL,
                     confirmed_at INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS omnichain_safe_submissions (
+                    package_hash TEXT PRIMARY KEY,
+                    transaction_hash TEXT NOT NULL UNIQUE,
+                    submitted_by TEXT NOT NULL,
+                    submitted_at INTEGER NOT NULL
+                );
                 """
             )
 
@@ -290,6 +297,53 @@ class OwnershipActivationStore:
                     block_number,
                     confirmed_at,
                 ),
+            )
+
+    def submission(self, package_hash: str) -> Optional[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT transaction_hash, submitted_by, submitted_at
+                FROM omnichain_safe_submissions
+                WHERE package_hash = ?
+                """,
+                (package_hash,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "transactionHash": row["transaction_hash"],
+            "submittedBy": row["submitted_by"],
+            "submittedAt": int(row["submitted_at"]),
+        }
+
+    def record_submission(
+        self,
+        *,
+        package_hash: str,
+        transaction_hash: str,
+        submitted_by: str,
+        now: int,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT transaction_hash
+                FROM omnichain_safe_submissions
+                WHERE package_hash = ?
+                """,
+                (package_hash,),
+            ).fetchone()
+            if existing and existing["transaction_hash"].lower() != transaction_hash.lower():
+                raise ValueError("a different ownership transaction is already submitted")
+            connection.execute(
+                """
+                INSERT INTO omnichain_safe_submissions
+                    (package_hash, transaction_hash, submitted_by, submitted_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(package_hash) DO NOTHING
+                """,
+                (package_hash, transaction_hash, submitted_by, now),
             )
 
 
@@ -735,13 +789,10 @@ def _verify_broadcast(
     w3 = _web3(settings)
     try:
         transaction = w3.eth.get_transaction(transaction_hash)
-        receipt = w3.eth.get_transaction_receipt(transaction_hash)
-        latest_block = int(w3.eth.block_number)
     except Exception as exc:  # noqa: BLE001
         raise OwnershipActivationError(
             "ownership broadcast is not yet available from Base Sepolia"
         ) from exc
-    block_number = int(receipt.get("blockNumber") or 0)
     input_data = transaction.get("input") or transaction.get("data") or "0x"
     input_hex = (
         _require_hex_bytes(input_data, "broadcast transaction input")
@@ -749,11 +800,9 @@ def _verify_broadcast(
         else Web3.to_hex(input_data).lower()
     )
     if (
-        int(receipt.get("status") or 0) != 1
-        or str(transaction.get("to") or "").lower() != expected["to"].lower()
+        str(transaction.get("to") or "").lower() != expected["to"].lower()
         or int(transaction.get("value") or 0) != 0
         or input_hex != expected["data"].lower()
-        or block_number <= 0
     ):
         raise OwnershipActivationError(
             "ownership broadcast does not match the sealed Root Safe transaction"
@@ -762,7 +811,54 @@ def _verify_broadcast(
         transaction.get("from"),
         "broadcast transaction sender",
     )
+    try:
+        receipt = w3.eth.get_transaction_receipt(transaction_hash)
+    except TransactionNotFound as exc:
+        raise OwnershipActivationError(
+            "ownership broadcast is waiting for Base Sepolia confirmation"
+        ) from exc
+    latest_block = int(w3.eth.block_number)
+    block_number = int(receipt.get("blockNumber") or 0)
+    if int(receipt.get("status") or 0) != 1 or block_number <= 0:
+        raise OwnershipActivationError(
+            "ownership broadcast does not match the sealed Root Safe transaction"
+        )
     return block_number, max(0, latest_block - block_number + 1), submitted_by
+
+
+def _verify_submission(
+    *,
+    settings: Settings,
+    package: Mapping[str, Any],
+    approvals: Mapping[str, Mapping[str, Any]],
+    transaction_hash: str,
+) -> str:
+    """Verify the exact Root Safe transaction while it is still in the mempool."""
+
+    transaction_hash = _require_hash(transaction_hash, "transactionHash")
+    expected = _build_exec_transaction(package, approvals)
+    w3 = _web3(settings)
+    try:
+        transaction = w3.eth.get_transaction(transaction_hash)
+    except Exception as exc:  # noqa: BLE001
+        raise OwnershipActivationError(
+            "ownership transaction is not yet visible on Base Sepolia"
+        ) from exc
+    input_data = transaction.get("input") or transaction.get("data") or "0x"
+    input_hex = (
+        _require_hex_bytes(input_data, "submitted transaction input")
+        if isinstance(input_data, str)
+        else Web3.to_hex(input_data).lower()
+    )
+    if (
+        str(transaction.get("to") or "").lower() != expected["to"].lower()
+        or int(transaction.get("value") or 0) != 0
+        or input_hex != expected["data"].lower()
+    ):
+        raise OwnershipActivationError(
+            "submitted transaction does not match the sealed Root Safe transaction"
+        )
+    return _require_address(transaction.get("from"), "submitted transaction sender")
 
 
 def _require_enabled(settings: Settings) -> None:
@@ -779,9 +875,44 @@ def _public_status(
     package: Mapping[str, Any],
     store: OwnershipActivationStore,
 ) -> dict[str, Any]:
-    chain = _chain_state(settings, package)
     stored = store.approvals(package["artifactHash"])
     descriptors = package["authorityOperation"]["approvals"]
+    complete = all(role in stored for role in REQUIRED_ROLES)
+    submission = store.submission(package["artifactHash"])
+    broadcast = store.broadcast(package["artifactHash"])
+    if complete and submission and not broadcast:
+        try:
+            block_number, confirmations, submitted_by = _verify_broadcast(
+                settings=settings,
+                package=package,
+                approvals=stored,
+                transaction_hash=submission["transactionHash"],
+            )
+        except OwnershipActivationError as exc:
+            if "waiting for Base Sepolia confirmation" not in str(exc):
+                raise
+        else:
+            observed = _chain_state(settings, package)
+            if package["phase"] == "schedule":
+                valid_result = observed.operation_exists and observed.operation_timestamp > 0
+            else:
+                valid_result = observed.operation_done
+            if not valid_result:
+                raise OwnershipActivationError(
+                    "confirmed Root Safe transaction did not produce the expected timelock state"
+                )
+            store.record_broadcast(
+                package_hash=package["artifactHash"],
+                transaction_hash=submission["transactionHash"],
+                submitted_by=submitted_by,
+                block_number=block_number,
+                confirmations=confirmations,
+                minimum_confirmations=settings.payment_omnichain_ownership_min_confirmations,
+                now=int(time.time()),
+            )
+            broadcast = store.broadcast(package["artifactHash"])
+
+    chain = _chain_state(settings, package)
     approvals = [
         {
             "role": descriptor["role"],
@@ -803,8 +934,6 @@ def _public_status(
         }
         for descriptor in descriptors
     ]
-    complete = all(role in stored for role in REQUIRED_ROLES)
-    broadcast = store.broadcast(package["artifactHash"])
     if broadcast:
         broadcast["confirmations"] = max(
             0, chain.latest_block - int(broadcast["blockNumber"]) + 1
@@ -812,8 +941,37 @@ def _public_status(
         broadcast["minimumConfirmations"] = (
             settings.payment_omnichain_ownership_min_confirmations
         )
-    if chain.operation_done:
+        if (
+            broadcast["confirmedAt"] is None
+            and broadcast["confirmations"] >= broadcast["minimumConfirmations"]
+        ):
+            store.record_broadcast(
+                package_hash=package["artifactHash"],
+                transaction_hash=broadcast["transactionHash"],
+                submitted_by=broadcast["submittedBy"],
+                block_number=int(broadcast["blockNumber"]),
+                confirmations=int(broadcast["confirmations"]),
+                minimum_confirmations=int(broadcast["minimumConfirmations"]),
+                now=int(time.time()),
+            )
+            broadcast = store.broadcast(package["artifactHash"])
+            assert broadcast is not None
+            broadcast["confirmations"] = max(
+                0, chain.latest_block - int(broadcast["blockNumber"]) + 1
+            )
+            broadcast["minimumConfirmations"] = (
+                settings.payment_omnichain_ownership_min_confirmations
+            )
+    if (
+        chain.operation_done
+        and broadcast
+        and broadcast["confirmations"] >= broadcast["minimumConfirmations"]
+    ):
         state = "DONE"
+    elif chain.operation_done:
+        state = "CONFIRMING"
+    elif submission and not broadcast:
+        state = "BROADCAST_PENDING"
     elif package["phase"] == "execute":
         if not chain.operation_exists:
             state = "WAITING_FOR_SCHEDULE"
@@ -863,6 +1021,7 @@ def _public_status(
             else None
         ),
         "broadcast": broadcast,
+        "submission": submission,
     }
 
 
@@ -946,15 +1105,38 @@ def record_ownership_activation_broadcast(
         approvals = store.approvals(package["artifactHash"])
         if any(role not in approvals for role in REQUIRED_ROLES):
             raise ValueError("both Safe administrator approvals are required")
-        block_number, confirmations, submitted_by = _verify_broadcast(
-            settings=settings,
-            package=package,
-            approvals=approvals,
-            transaction_hash=body.transaction_hash,
-        )
+        try:
+            block_number, confirmations, submitted_by = _verify_broadcast(
+                settings=settings,
+                package=package,
+                approvals=approvals,
+                transaction_hash=body.transaction_hash,
+            )
+        except OwnershipActivationError as exc:
+            if "waiting for Base Sepolia confirmation" not in str(exc):
+                raise
+            submitted_by = _verify_submission(
+                settings=settings,
+                package=package,
+                approvals=approvals,
+                transaction_hash=body.transaction_hash,
+            )
+            store.record_submission(
+                package_hash=package["artifactHash"],
+                transaction_hash=body.transaction_hash.lower(),
+                submitted_by=submitted_by,
+                now=int(time.time()),
+            )
+            return _public_status(settings=settings, package=package, store=store)
         chain = _chain_state(settings, package)
         if not chain.operation_exists or chain.operation_timestamp <= 0:
             raise ValueError("timelock did not record the sealed ownership schedule")
+        store.record_submission(
+            package_hash=package["artifactHash"],
+            transaction_hash=body.transaction_hash.lower(),
+            submitted_by=submitted_by,
+            now=int(time.time()),
+        )
         store.record_broadcast(
             package_hash=package["artifactHash"],
             transaction_hash=body.transaction_hash.lower(),
@@ -1051,15 +1233,38 @@ def record_ownership_execution_broadcast(
         before = _chain_state(settings, package)
         if not before.operation_ready or before.operation_done:
             raise ValueError("ownership operation is not ready for execution")
-        block_number, confirmations, submitted_by = _verify_broadcast(
-            settings=settings,
-            package=package,
-            approvals=approvals,
-            transaction_hash=body.transaction_hash,
-        )
+        try:
+            block_number, confirmations, submitted_by = _verify_broadcast(
+                settings=settings,
+                package=package,
+                approvals=approvals,
+                transaction_hash=body.transaction_hash,
+            )
+        except OwnershipActivationError as exc:
+            if "waiting for Base Sepolia confirmation" not in str(exc):
+                raise
+            submitted_by = _verify_submission(
+                settings=settings,
+                package=package,
+                approvals=approvals,
+                transaction_hash=body.transaction_hash,
+            )
+            store.record_submission(
+                package_hash=package["artifactHash"],
+                transaction_hash=body.transaction_hash.lower(),
+                submitted_by=submitted_by,
+                now=int(time.time()),
+            )
+            return _public_status(settings=settings, package=package, store=store)
         after = _chain_state(settings, package)
         if not after.operation_done:
             raise ValueError("timelock execution did not complete ownership acceptance")
+        store.record_submission(
+            package_hash=package["artifactHash"],
+            transaction_hash=body.transaction_hash.lower(),
+            submitted_by=submitted_by,
+            now=int(time.time()),
+        )
         store.record_broadcast(
             package_hash=package["artifactHash"],
             transaction_hash=body.transaction_hash.lower(),

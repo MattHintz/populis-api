@@ -14,6 +14,7 @@ import httpx
 
 from .config import Settings
 from .genesis_store import GenesisConflict, GenesisStore
+from .service_urls import valid_internal_service_url
 
 
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -56,7 +57,7 @@ def _configuration(settings: Settings) -> tuple[str, str, str, str]:
     config_hash = str(settings.launch_rehearsal_config_hash or "").lower()
     evidence_secret = str(settings.launch_rehearsal_evidence_hmac_secret or "")
     if (
-        not url.startswith("https://")
+        not valid_internal_service_url(url)
         or len(token) < 32
         or not HEX32_RE.fullmatch(config_hash)
         or len(evidence_secret) < 32
@@ -133,6 +134,48 @@ def _validate_transaction(value: object) -> dict[str, Any] | None:
         "to": str(value["to"]),
         "value": "0x0",
         "data": str(value["data"]).lower(),
+    }
+
+
+def _validate_review(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    expected = {
+        "action",
+        "lane",
+        "asset",
+        "amountMinor",
+        "amountLabel",
+        "escrow",
+        "destinationVault",
+        "deedLauncherId",
+        "expectedOutcome",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise LaunchRehearsalError("The rehearsal review summary shape changed.")
+    amount_minor = str(value["amountMinor"])
+    if (
+        str(value["action"]) not in {"approve", "pay", "verify"}
+        or str(value["lane"]) not in {"delivery", "refund"}
+        or str(value["asset"]) != "USDC"
+        or not re.fullmatch(r"^[1-9][0-9]{0,15}$", amount_minor)
+        or not ADDRESS_RE.fullmatch(str(value["escrow"]))
+        or not HEX32_RE.fullmatch(str(value["destinationVault"]))
+        or not HEX32_RE.fullmatch(str(value["deedLauncherId"]))
+        or str(value["expectedOutcome"]) not in {"DELIVERED", "REFUND"}
+        or len(str(value["amountLabel"])) > 64
+    ):
+        raise LaunchRehearsalError("The rehearsal review summary is invalid.")
+    return {
+        "action": str(value["action"]),
+        "lane": str(value["lane"]),
+        "asset": "USDC",
+        "amountMinor": amount_minor,
+        "amountLabel": str(value["amountLabel"]),
+        "escrow": str(value["escrow"]),
+        "destinationVault": str(value["destinationVault"]).lower(),
+        "deedLauncherId": str(value["deedLauncherId"]).lower(),
+        "expectedOutcome": str(value["expectedOutcome"]),
     }
 
 
@@ -215,6 +258,7 @@ def validate_status(
         "step": str(value.get("step") or ""),
         "message": str(value.get("message") or ""),
         "walletTransaction": _validate_transaction(value.get("walletTransaction")),
+        "review": _validate_review(value.get("review")),
     }
     if state == "SUCCEEDED":
         result["evidence"] = _validate_evidence(

@@ -43,6 +43,7 @@ from solslot_api.presale_endpoints import (
     VoucherSeriesPhaseChainEvidence,
     _authorize_native_voucher_request,
     _public_presale,
+    _require_ingest,
     _verify_base_settlement_relay_evidence,
     _voucher_commitment,
 )
@@ -117,6 +118,24 @@ def evm_address(value: int) -> str:
 
 def evm_payer(value: int) -> bytes32:
     return bytes32(b"\x00" * 12 + bytes([value]) * 20)
+
+
+def test_terminal_settlement_ingest_remains_available_when_sales_are_closed() -> None:
+    token = "settlement-service-token-that-is-long-enough"
+    settings = Settings(
+        runtime_environment="test",
+        network="testnet11",
+        alpha_writes_enabled=False,
+        minting_enabled=False,
+        presale_enabled=False,
+        launch_control_enabled=True,
+        payment_omnichain_ingest_token=token,
+    )
+
+    _require_ingest(settings, f"Bearer {token}")
+    with pytest.raises(HTTPException) as rejected:
+        _require_ingest(settings, "Bearer wrong-token")
+    assert rejected.value.status_code == 401
 
 
 def test_base_settlement_relay_evidence_is_independently_verified(

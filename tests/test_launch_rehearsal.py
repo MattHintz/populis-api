@@ -15,6 +15,7 @@ from solslot_api.launch_rehearsal import (
     require_completed_rehearsal,
     validate_status,
 )
+from solslot_api.service_urls import valid_internal_service_url
 
 
 CONFIG_HASH = "0x" + "ab" * 32
@@ -31,6 +32,15 @@ def _settings(tmp_path) -> Settings:
         launch_rehearsal_evidence_hmac_secret=EVIDENCE_SECRET,
         launch_settlement_rehearsal_path=str(tmp_path / "settlement.json"),
     )
+
+
+def test_rehearsal_service_url_allows_only_tls_or_loopback() -> None:
+    assert valid_internal_service_url("https://rehearsal.example/internal")
+    assert valid_internal_service_url("http://127.0.0.1:8793")
+    assert valid_internal_service_url("http://[::1]:8793")
+    assert not valid_internal_service_url("http://rehearsal.example")
+    assert not valid_internal_service_url("http://localhost:8793")
+    assert not valid_internal_service_url("https://user:secret@rehearsal.example")
 
 
 def _evidence() -> dict:

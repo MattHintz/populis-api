@@ -18,6 +18,8 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .service_urls import valid_internal_service_url
+
 
 SECRET_ENV_FILE_KEYS = frozenset(
     {
@@ -218,10 +220,13 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 )
         if (
             settings.launch_rehearsal_service_url
-            and not settings.launch_rehearsal_service_url.startswith("https://")
+            and not valid_internal_service_url(
+                settings.launch_rehearsal_service_url
+            )
         ):
             raise RuntimeError(
-                "SOLSLOT_LAUNCH_REHEARSAL_SERVICE_URL must use HTTPS."
+                "SOLSLOT_LAUNCH_REHEARSAL_SERVICE_URL must use HTTPS or "
+                "loopback-only HTTP."
             )
     if settings.collection_minting_enabled and not settings.collection_metadata_enabled:
         raise RuntimeError(

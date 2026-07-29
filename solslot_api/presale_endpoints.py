@@ -3257,8 +3257,9 @@ async def _submit_series_phase_transition(
 
 
 def _require_ingest(settings: Settings, authorization: Optional[str]) -> None:
-    require_presale_writes(settings)
-    require_operation_gate(settings, "presale")
+    # Customer gates stop new reservations. They must never strand a payment
+    # that already needs voucher issuance, delivery, reconciliation, or refund.
+    # These endpoints remain restricted to the settlement-service credential.
     token = settings.payment_omnichain_ingest_token
     if not token or authorization != f"Bearer {token}":
         raise HTTPException(
