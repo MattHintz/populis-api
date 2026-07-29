@@ -16,6 +16,7 @@ from solslot_api.launch_control import router
 
 
 ADMIN_TOKEN = "deployment-owner-link-token-that-is-long-enough"
+LEGACY_ADMIN_TOKEN = "legacy-operator-token-that-is-also-long-enough"
 SOURCE_KEYS = (
     "protocol",
     "evm",
@@ -40,7 +41,7 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
         "network": "testnet11",
         "testOnly": True,
         "completeReleaseManifest": True,
-        "releaseTag": "solslot-v2-alpha-rc22-20260727",
+        "releaseTag": "solslot-v2-alpha-rc22.2-20260729",
         "manifestHash": "0x" + "aa" * 32,
         "sourceManifest": {
             "sourceShas": {
@@ -58,9 +59,10 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
         launch_source_evidence_path=str(evidence_path),
         launch_source_evidence_sha256=None,
         launch_session_secret="launch-session-secret-for-tests!",
+        launch_owner_claim_token=ADMIN_TOKEN,
         launch_cookie_path="/admin/launch",
         bootstrap_cookie_secure=False,
-        admin_token=ADMIN_TOKEN,
+        admin_token=LEGACY_ADMIN_TOKEN,
         genesis_db_path=str(tmp_path / "genesis.db"),
         genesis_output_dir=str(tmp_path / "ceremonies"),
     )
@@ -218,6 +220,12 @@ def _mark_launch_locked(store: GenesisStore, ceremony_id: str) -> None:
 
 def test_owner_link_is_single_use_and_scrubbed_into_http_only_session(tmp_path) -> None:
     client, store, _ = _client(tmp_path)
+    legacy_credential = client.post(
+        "/admin/launch/claim",
+        json={"token": LEGACY_ADMIN_TOKEN, "displayName": "Owner Admin"},
+    )
+    assert legacy_credential.status_code == 403
+
     claimed = client.post(
         "/admin/launch/claim",
         json={"token": ADMIN_TOKEN, "displayName": "Owner Admin"},

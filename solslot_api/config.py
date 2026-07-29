@@ -31,6 +31,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_CHALLENGE_SECRET",
         "SOLSLOT_BOOTSTRAP_SESSION_SECRET",
         "SOLSLOT_LAUNCH_SESSION_SECRET",
+        "SOLSLOT_LAUNCH_OWNER_CLAIM_TOKEN",
         "SOLSLOT_LAUNCH_REHEARSAL_SERVICE_TOKEN",
         "SOLSLOT_LAUNCH_REHEARSAL_EVIDENCE_HMAC_SECRET",
         "SOLSLOT_SMTP_PASSWORD",
@@ -214,9 +215,13 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 raise RuntimeError(
                     "Guided launch control requires a persistent 32-byte session secret."
                 )
-            if not settings.admin_token or len(settings.admin_token) < 32:
+            if (
+                not settings.launch_owner_claim_token
+                or len(settings.launch_owner_claim_token) < 32
+            ):
                 raise RuntimeError(
-                    "Guided launch control requires a one-time owner claim token."
+                    "Guided launch control requires a separate one-time owner "
+                    "claim token."
                 )
         if (
             settings.launch_rehearsal_service_url
@@ -583,6 +588,7 @@ class Settings(BaseSettings):
         "payment_omnichain_ownership_execute_operation_path",
         "payment_omnichain_ownership_execute_operation_hash",
         "launch_source_evidence_path",
+        "launch_owner_claim_token",
         "launch_settlement_rehearsal_path",
         "launch_rehearsal_service_url",
         "launch_rehearsal_service_token",
@@ -753,7 +759,8 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc22-20260727"
+    launch_release_tag: str = "solslot-v2-alpha-rc22.2-20260729"
+    launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
         "./state/source-freeze-evidence-rc22.json"
     )

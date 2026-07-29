@@ -22,6 +22,7 @@ from solslot_api.omnichain_ownership_activation import (
     _verify_broadcast,
     get_ownership_activation_store,
     load_authority_operation,
+    load_execution_authority_operation,
     router,
 )
 
@@ -657,6 +658,116 @@ def test_execute_phase_requires_fresh_approvals_after_24_hour_delay(
     assert signed.json()["state"] == "READY_TO_BROADCAST"
     assert len(store.approvals(execute["artifactHash"])) == 2
     assert store.approvals(schedule["artifactHash"]) == {}
+
+
+def test_execute_package_is_derived_once_from_the_confirmed_schedule(
+    tmp_path, monkeypatch
+) -> None:
+    owner = Account.create()
+    coadmin = Account.create()
+    schedule_path = tmp_path / "schedule.json"
+    schedule = _write_package(
+        schedule_path,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_activation_enabled=True,
+        payment_omnichain_ownership_safe_operation_path=str(schedule_path),
+        payment_omnichain_ownership_safe_operation_hash=schedule["artifactHash"],
+        payment_omnichain_rpc_url="https://base-sepolia.example.invalid",
+        admin_db_path=str(tmp_path / "admin.db"),
+    )
+    store = OwnershipActivationStore(settings.admin_db_path)
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._chain_state",
+        lambda *_args, **_kwargs: _ready_chain_state(),
+    )
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def call(self):
+            return self.value
+
+    class SafeFunctions:
+        @staticmethod
+        def getTransactionHash(*_args):
+            return Result(bytes.fromhex("35" * 32))
+
+        @staticmethod
+        def encodeTransactionData(*_args):
+            return Result(bytes.fromhex("1901" + "33" * 64))
+
+    class Safe:
+        functions = SafeFunctions()
+
+    class Eth:
+        @staticmethod
+        def contract(**_kwargs):
+            return Safe()
+
+    class FakeWeb3:
+        eth = Eth()
+
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._web3",
+        lambda _settings: FakeWeb3(),
+    )
+
+    first = load_execution_authority_operation(settings, store)
+    second = load_execution_authority_operation(settings, store)
+
+    assert first == second
+    assert first["phase"] == "execute"
+    assert first["derivedFromScheduleArtifactHash"] == schedule["artifactHash"]
+    assert first["authorityOperation"]["transaction"]["nonce"] == "1"
+    assert (
+        first["authorityOperation"]["transaction"]["data"]
+        == _execute_calldata().lower()
+    )
+    assert first["authorityOperation"]["review"]["action"] == "executeAcceptOwnership"
+    stored = store.derived_package(
+        parent_package_hash=schedule["artifactHash"],
+        phase="execute",
+    )
+    assert stored is not None
+    assert stored["artifactHash"] == first["artifactHash"]
+    assert "review" not in stored["authorityOperation"]
+
+
+def test_execute_package_is_not_derived_before_schedule_confirmation(
+    tmp_path, monkeypatch
+) -> None:
+    owner = Account.create()
+    coadmin = Account.create()
+    schedule_path = tmp_path / "schedule.json"
+    schedule = _write_package(
+        schedule_path,
+        owner_address=owner.address,
+        coadmin_addresses=[coadmin.address],
+    )
+    settings = Settings(
+        runtime_environment="test",
+        payment_omnichain_ownership_safe_operation_path=str(schedule_path),
+        payment_omnichain_ownership_safe_operation_hash=schedule["artifactHash"],
+        payment_omnichain_rpc_url="https://base-sepolia.example.invalid",
+        admin_db_path=str(tmp_path / "admin.db"),
+    )
+    store = OwnershipActivationStore(settings.admin_db_path)
+    monkeypatch.setattr(
+        "solslot_api.omnichain_ownership_activation._chain_state",
+        lambda *_args, **_kwargs: _current_chain_state(),
+    )
+
+    try:
+        load_execution_authority_operation(settings, store)
+    except OwnershipActivationError as exc:
+        assert "after the schedule confirms" in str(exc)
+    else:
+        raise AssertionError("ownership execution was prepared before scheduling")
 
 
 def test_execute_package_cannot_change_the_scheduled_batch(tmp_path) -> None:

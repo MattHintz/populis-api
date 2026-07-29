@@ -85,6 +85,24 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
 
 
+def test_guided_launch_requires_a_separate_owner_claim_token() -> None:
+    common = {
+        "launch_control_enabled": True,
+        "launch_source_evidence_sha256": "11" * 32,
+        "launch_session_secret": "session-secret-that-is-long-enough",
+        "admin_token": "legacy-admin-token-that-is-long-enough",
+    }
+    with pytest.raises(RuntimeError, match="separate one-time owner claim token"):
+        validate_server_hardening_at_startup(_staging(**common))
+
+    validate_server_hardening_at_startup(
+        _staging(
+            **common,
+            launch_owner_claim_token="owner-claim-token-that-is-long-enough",
+        )
+    )
+
+
 def test_customer_bridge_and_liquidity_cannot_execute_on_testnet() -> None:
     with pytest.raises(RuntimeError, match="bridge execution is mainnet-only"):
         validate_server_hardening_at_startup(
