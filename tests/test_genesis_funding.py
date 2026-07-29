@@ -7,7 +7,9 @@ from chia_rs.sized_ints import uint64
 
 from solslot_api.genesis_funding import (
     FUNDING_NAMES,
+    GENESIS_ADMIN_AUTHORITY_V3_FUNDING_AMOUNT,
     GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT,
+    GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT,
     plan_genesis_funding_fanout,
 )
 
@@ -24,8 +26,8 @@ def test_funding_plan_derives_nine_distinct_confirmable_coin_ids() -> None:
         network="testnet11",
     )
     outputs = result.plan["outputs"]
-    assert result.plan["schemaVersion"] == 3
-    assert result.plan["protocolVersion"] == "solslot-v2-rc22"
+    assert result.plan["schemaVersion"] == 4
+    assert result.plan["protocolVersion"] == "solslot-v2-rc23"
     assert [item["name"] for item in outputs] == list(FUNDING_NAMES)
     assert "statutes" in result.plan["fundingCoinIds"]
     assert "navRegistry" not in result.plan["fundingCoinIds"]
@@ -34,9 +36,12 @@ def test_funding_plan_derives_nine_distinct_confirmable_coin_ids() -> None:
     assert outputs[0]["amount"] == 1_000_000
     pool = next(item for item in outputs if item["name"] == "pool")
     assert pool["amount"] == 2
+    authority = next(item for item in outputs if item["name"] == "adminAuthority")
+    assert authority["amount"] == GENESIS_ADMIN_AUTHORITY_V3_FUNDING_AMOUNT == 16
     bridge_batch = next(item for item in outputs if item["name"] == "bridgeBatch")
     assert bridge_batch["amount"] == GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT == 530
     assert result.plan["fundingCoinIds"]["bridgeBatch"] == bridge_batch["coinId"]
+    assert sum(item["amount"] for item in outputs) == GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT
     assert result.digest.startswith("0x") and len(result.digest) == 66
 
 

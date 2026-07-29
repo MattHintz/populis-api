@@ -1,4 +1,4 @@
-"""Deterministic nine-coin funding fan-out for the RC22 ceremony."""
+"""Deterministic nine-coin funding fan-out for the RC23 ceremony."""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT = (
     + GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT
     + GENESIS_BRIDGE_BATCH_BUFFER_AMOUNT
 )
+GENESIS_ADMIN_AUTHORITY_V3_FUNDING_AMOUNT = 16
+GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT = 1_000_567
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,9 @@ def plan_genesis_funding_fanout(
         "governance": 1,
         "statutes": 1,
         "protocolConfig": 1,
-        "adminAuthority": 1,
+        # Authority V3 launches one authority singleton plus three identity
+        # singletons at the unique odd amounts 1, 3, 5, and 7.
+        "adminAuthority": GENESIS_ADMIN_AUTHORITY_V3_FUNDING_AMOUNT,
         "vaultVersionRegistry": 1,
         "bridgeBatch": GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT,
     }
@@ -111,8 +115,8 @@ def plan_genesis_funding_fanout(
             }
         )
     plan = {
-        "schemaVersion": 3,
-        "protocolVersion": "solslot-v2-rc22",
+        "schemaVersion": 4,
+        "protocolVersion": "solslot-v2-rc23",
         "network": network,
         "sourceCoinId": "0x" + bytes(source_id).hex(),
         "sourceAmount": int(source_coin.amount),
@@ -128,10 +132,12 @@ def plan_genesis_funding_fanout(
 
 __all__ = [
     "FUNDING_NAMES",
+    "GENESIS_ADMIN_AUTHORITY_V3_FUNDING_AMOUNT",
     "GENESIS_BRIDGE_BATCH_BUFFER_AMOUNT",
     "GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT",
     "GENESIS_BRIDGE_PARENT_TOTAL",
     "GENESIS_PROPERTY_REGISTRY_LAUNCHER_AMOUNT",
+    "GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT",
     "GenesisFundingFanout",
     "plan_genesis_funding_fanout",
 ]

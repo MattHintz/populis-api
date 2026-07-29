@@ -52,6 +52,7 @@ from .genesis import (
 from .genesis_funding import (
     FUNDING_NAMES,
     GENESIS_BRIDGE_BATCH_FUNDING_AMOUNT,
+    GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT,
     plan_genesis_funding_fanout,
 )
 from .genesis_store import (
@@ -574,7 +575,7 @@ def _decision_receipt(action_type: str, payload_hash: str) -> dict[str, Any]:
     labels = {
         "funding": (
             "Create the nine ceremony funding coins",
-            "Moves 1,000,558 testnet mojos into nine fixed ceremony inputs. No fee.",
+            "Moves 1,000,567 testnet mojos into nine fixed ceremony inputs. No fee.",
             "Creates fixed Testnet11 outputs; it cannot redirect funds.",
         ),
         "gate:ceremonyBroadcast": (
@@ -1766,13 +1767,13 @@ async def prepare_fixed_funding(
         )
         source = faucet.select_coin(
             records,
-            min_amount=1_000_558,
+            min_amount=GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT,
             max_amount=settings.faucet_max_spend_mojos,
         )
         if source is None:
             raise GenesisConflict(
                 "The configured faucet needs one confirmed coin of at least "
-                "1,000,558 mojos for the fixed ceremony funding."
+                "1,000,567 mojos for the fixed ceremony funding."
             )
         fanout = plan_genesis_funding_fanout(
             source_coin=source,
