@@ -596,6 +596,9 @@ class Settings(BaseSettings):
         "launch_rehearsal_evidence_hmac_secret",
         "launch_plan_template_path",
         "launch_source_evidence_sha256",
+        "authority_v3_governance_evidence_path",
+        "authority_v3_evm_rpc_url",
+        "authority_v3_independent_review_path",
         "smtp_host",
         "smtp_username",
         "smtp_password",
@@ -775,6 +778,15 @@ class Settings(BaseSettings):
     launch_rehearsal_evidence_hmac_secret: Optional[str] = None
     launch_rehearsal_timeout_seconds: int = Field(20, ge=5, le=60)
     launch_gate_max_seconds: int = Field(3600, ge=300, le=86400)
+
+    # Recovery-aware Authority V3. Coordinates are accepted only from the
+    # checksummed deployment evidence produced by the pinned Omnichain
+    # release. The independent-review receipt is a hard ceremony-readiness
+    # requirement, not a runtime authority override.
+    authority_v3_governance_evidence_path: Optional[str] = None
+    authority_v3_evm_rpc_url: Optional[str] = None
+    authority_v3_evm_min_confirmations: int = Field(12, ge=12)
+    authority_v3_independent_review_path: Optional[str] = None
 
     # Provider-neutral reminders. Email is advisory; the persisted task inbox
     # remains authoritative when SMTP is absent or delivery fails.

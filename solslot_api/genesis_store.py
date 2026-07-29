@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
 OWNER_SLOT = 1
@@ -311,6 +311,135 @@ class GenesisStore:
                     );
 
                     PRAGMA user_version = 3;
+                    COMMIT;
+                    """
+                )
+                version = 3
+            if version < 4:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE admin_recovery_drills (
+                        challenge_id TEXT PRIMARY KEY,
+                        ceremony_id TEXT NOT NULL,
+                        slot INTEGER NOT NULL,
+                        challenge_hash TEXT NOT NULL UNIQUE,
+                        public_json TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        consumed_at INTEGER,
+                        created_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (slot IN (1, 2, 3))
+                    );
+                    CREATE INDEX admin_recovery_drills_expiry_idx
+                        ON admin_recovery_drills(expires_at, consumed_at);
+
+                    CREATE TABLE admin_recovery_kits (
+                        ceremony_id TEXT NOT NULL,
+                        slot INTEGER NOT NULL,
+                        revision INTEGER NOT NULL,
+                        evm_guardian TEXT NOT NULL,
+                        recovery_bls_pubkey TEXT NOT NULL,
+                        recovery_bls_commitment TEXT NOT NULL,
+                        drill_challenge_hash TEXT NOT NULL,
+                        drill_verified_at INTEGER NOT NULL,
+                        offline_copy_confirmed INTEGER NOT NULL,
+                        second_device_confirmed INTEGER NOT NULL,
+                        backup_status TEXT NOT NULL,
+                        backup_revision INTEGER,
+                        backup_ciphertext_hash TEXT,
+                        backup_verified_at INTEGER,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (ceremony_id, slot),
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (slot IN (1, 2, 3)),
+                        CHECK (revision >= 1),
+                        CHECK (offline_copy_confirmed = 1),
+                        CHECK (second_device_confirmed = 1),
+                        CHECK (backup_status IN ('NOT_CONFIGURED', 'VERIFIED'))
+                    );
+
+                    CREATE TABLE admin_recovery_cases (
+                        case_id TEXT PRIMARY KEY,
+                        ceremony_id TEXT NOT NULL,
+                        authority_slot INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        intent_hash TEXT NOT NULL UNIQUE,
+                        intent_json TEXT NOT NULL,
+                        execute_after INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        prepared_by TEXT NOT NULL,
+                        chia_transaction_id TEXT,
+                        evm_transaction_hash TEXT,
+                        chia_receipt_hash TEXT,
+                        evm_receipt_hash TEXT,
+                        failure_reason TEXT,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (authority_slot IN (0, 1, 2)),
+                        CHECK (kind IN ('ROUTINE', 'LOST')),
+                        CHECK (state IN (
+                            'PREPARED', 'AWAITING_APPROVALS', 'READY',
+                            'SUBMITTED', 'PARTIAL', 'COMPLETED',
+                            'CANCELLED', 'FAILED'
+                        )),
+                        CHECK (expires_at > execute_after)
+                    );
+                    CREATE INDEX admin_recovery_cases_active_idx
+                        ON admin_recovery_cases(ceremony_id, state, created_at);
+
+                    CREATE TABLE admin_recovery_approvals (
+                        case_id TEXT NOT NULL,
+                        actor_role TEXT NOT NULL,
+                        actor_id TEXT NOT NULL,
+                        signer_slot INTEGER,
+                        signer_address TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        message_hash TEXT NOT NULL,
+                        submitted_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, actor_role, actor_id),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (actor_role IN (
+                            'PREPARER', 'AUTHORITY', 'PEER',
+                            'REPLACEMENT', 'OLD_KEY_VETO'
+                        )),
+                        CHECK (signer_slot IS NULL OR signer_slot IN (0, 1, 2))
+                    );
+
+                    CREATE TABLE admin_recovery_receipts (
+                        case_id TEXT NOT NULL,
+                        chain TEXT NOT NULL,
+                        transaction_id TEXT NOT NULL,
+                        receipt_hash TEXT NOT NULL,
+                        receipt_json TEXT NOT NULL,
+                        observed_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, chain),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (chain IN ('CHIA', 'EVM'))
+                    );
+
+                    CREATE TABLE admin_notification_outbox (
+                        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ceremony_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        recipient TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (state IN ('PENDING', 'SENT', 'FAILED'))
+                    );
+                    CREATE INDEX admin_notification_outbox_state_idx
+                        ON admin_notification_outbox(state, notification_id);
+
+                    PRAGMA user_version = 4;
                     COMMIT;
                     """
                 )
@@ -1492,6 +1621,649 @@ class GenesisStore:
             "createdAt": int(row["created_at"]),
             "updatedAt": int(row["updated_at"]),
         }
+
+    def create_recovery_drill(
+        self,
+        ceremony_id: str,
+        *,
+        challenge_id: str,
+        slot: int,
+        challenge_hash: str,
+        public_payload: dict[str, Any],
+        expires_at: int,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if slot not in ADMIN_SLOTS:
+            raise ValueError("slot must be 1, 2, or 3")
+        timestamp = int(time.time()) if now is None else now
+        if expires_at <= timestamp:
+            raise GenesisExpired("recovery drill challenge must expire in the future")
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            connection.execute(
+                "DELETE FROM admin_recovery_drills "
+                "WHERE expires_at < ? OR consumed_at IS NOT NULL",
+                (timestamp,),
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_drills(
+                        challenge_id,ceremony_id,slot,challenge_hash,public_json,
+                        expires_at,created_at
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (
+                        challenge_id,
+                        ceremony_id,
+                        slot,
+                        challenge_hash.lower(),
+                        canonical_json(public_payload),
+                        expires_at,
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict(
+                    "recovery drill challenge was already issued"
+                ) from exc
+            self._event(
+                connection,
+                ceremony_id,
+                "admin_recovery_drill_prepared",
+                {
+                    "slot": slot - 1,
+                    "challengeId": challenge_id,
+                    "expiresAt": expires_at,
+                },
+                timestamp,
+            )
+        return self.recovery_drill(challenge_id)
+
+    def recovery_drill(self, challenge_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM admin_recovery_drills WHERE challenge_id=?",
+                (challenge_id,),
+            ).fetchone()
+        if row is None:
+            raise GenesisNotFound("recovery drill challenge not found")
+        return {
+            "challengeId": str(row["challenge_id"]),
+            "ceremonyId": str(row["ceremony_id"]),
+            "slot": int(row["slot"]),
+            "challengeHash": str(row["challenge_hash"]),
+            "public": json.loads(str(row["public_json"])),
+            "expiresAt": int(row["expires_at"]),
+            "consumedAt": (
+                int(row["consumed_at"])
+                if row["consumed_at"] is not None
+                else None
+            ),
+            "createdAt": int(row["created_at"]),
+        }
+
+    def complete_recovery_drill(
+        self,
+        challenge_id: str,
+        *,
+        expected_challenge_hash: str,
+        backup_status: str,
+        backup_revision: int | None,
+        backup_ciphertext_hash: str | None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if backup_status not in {"NOT_CONFIGURED", "VERIFIED"}:
+            raise ValueError("invalid recovery backup status")
+        if backup_status == "VERIFIED" and (
+            backup_revision is None
+            or backup_revision < 1
+            or not backup_ciphertext_hash
+        ):
+            raise ValueError("verified backup requires revision and ciphertext hash")
+        if backup_status == "NOT_CONFIGURED" and (
+            backup_revision is not None or backup_ciphertext_hash is not None
+        ):
+            raise ValueError("unconfigured backup cannot carry backup evidence")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            drill = connection.execute(
+                "SELECT * FROM admin_recovery_drills WHERE challenge_id=?",
+                (challenge_id,),
+            ).fetchone()
+            if drill is None:
+                raise GenesisNotFound("recovery drill challenge not found")
+            if drill["consumed_at"] is not None:
+                raise GenesisConflict("recovery drill challenge was already used")
+            if int(drill["expires_at"]) < timestamp:
+                raise GenesisExpired("recovery drill challenge expired")
+            if str(drill["challenge_hash"]).lower() != expected_challenge_hash.lower():
+                raise GenesisConflict("recovery drill challenge hash changed")
+            public = json.loads(str(drill["public_json"]))
+            ceremony_id = str(drill["ceremony_id"])
+            slot = int(drill["slot"])
+            existing = connection.execute(
+                "SELECT revision FROM admin_recovery_kits "
+                "WHERE ceremony_id=? AND slot=?",
+                (ceremony_id, slot),
+            ).fetchone()
+            revision = int(public["revision"])
+            if existing is not None and revision <= int(existing["revision"]):
+                raise GenesisConflict(
+                    "recovery kit revision must increase monotonically"
+                )
+            connection.execute(
+                "UPDATE admin_recovery_drills SET consumed_at=? "
+                "WHERE challenge_id=? AND consumed_at IS NULL",
+                (timestamp, challenge_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO admin_recovery_kits(
+                    ceremony_id,slot,revision,evm_guardian,recovery_bls_pubkey,
+                    recovery_bls_commitment,drill_challenge_hash,
+                    drill_verified_at,offline_copy_confirmed,
+                    second_device_confirmed,backup_status,backup_revision,
+                    backup_ciphertext_hash,backup_verified_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,1,1,?,?,?,?,?,?)
+                ON CONFLICT(ceremony_id,slot) DO UPDATE SET
+                    revision=excluded.revision,
+                    evm_guardian=excluded.evm_guardian,
+                    recovery_bls_pubkey=excluded.recovery_bls_pubkey,
+                    recovery_bls_commitment=excluded.recovery_bls_commitment,
+                    drill_challenge_hash=excluded.drill_challenge_hash,
+                    drill_verified_at=excluded.drill_verified_at,
+                    offline_copy_confirmed=1,
+                    second_device_confirmed=1,
+                    backup_status=excluded.backup_status,
+                    backup_revision=excluded.backup_revision,
+                    backup_ciphertext_hash=excluded.backup_ciphertext_hash,
+                    backup_verified_at=excluded.backup_verified_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ceremony_id,
+                    slot,
+                    revision,
+                    str(public["evmGuardian"]).lower(),
+                    str(public["recoveryBlsPubkey"]).lower(),
+                    str(public["recoveryBlsCommitment"]).lower(),
+                    expected_challenge_hash.lower(),
+                    timestamp,
+                    backup_status,
+                    backup_revision,
+                    (
+                        backup_ciphertext_hash.lower()
+                        if backup_ciphertext_hash
+                        else None
+                    ),
+                    timestamp if backup_status == "VERIFIED" else None,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "admin_recovery_drill_completed",
+                {
+                    "slot": slot - 1,
+                    "revision": revision,
+                    "backupStatus": backup_status,
+                },
+                timestamp,
+            )
+        return self.recovery_kit(ceremony_id, slot)
+
+    def recovery_kit(self, ceremony_id: str, slot: int) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM admin_recovery_kits "
+                "WHERE ceremony_id=? AND slot=?",
+                (ceremony_id, slot),
+            ).fetchone()
+        if row is None:
+            raise GenesisNotFound("administrator recovery kit not found")
+        return {
+            "ceremonyId": str(row["ceremony_id"]),
+            "slot": int(row["slot"]) - 1,
+            "revision": int(row["revision"]),
+            "evmGuardian": str(row["evm_guardian"]),
+            "recoveryBlsPubkey": str(row["recovery_bls_pubkey"]),
+            "recoveryBlsCommitment": str(row["recovery_bls_commitment"]),
+            "drillVerifiedAt": int(row["drill_verified_at"]),
+            "offlineCopyConfirmed": bool(row["offline_copy_confirmed"]),
+            "secondDeviceConfirmed": bool(row["second_device_confirmed"]),
+            "backupStatus": str(row["backup_status"]),
+            "backupRevision": (
+                int(row["backup_revision"])
+                if row["backup_revision"] is not None
+                else None
+            ),
+            "backupCiphertextHash": row["backup_ciphertext_hash"],
+            "backupVerifiedAt": (
+                int(row["backup_verified_at"])
+                if row["backup_verified_at"] is not None
+                else None
+            ),
+            "updatedAt": int(row["updated_at"]),
+        }
+
+    def recovery_kits(self, ceremony_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT slot FROM admin_recovery_kits "
+                "WHERE ceremony_id=? ORDER BY slot",
+                (ceremony_id,),
+            ).fetchall()
+        return [
+            self.recovery_kit(ceremony_id, int(row["slot"])) for row in rows
+        ]
+
+    def create_recovery_case(
+        self,
+        ceremony_id: str,
+        *,
+        case_id: str,
+        authority_slot: int,
+        kind: str,
+        intent_hash: str,
+        intent: dict[str, Any],
+        execute_after: int,
+        expires_at: int,
+        prepared_by: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if authority_slot not in (0, 1, 2):
+            raise ValueError("authority slot must be 0, 1, or 2")
+        if kind not in {"ROUTINE", "LOST"}:
+            raise ValueError("invalid recovery kind")
+        timestamp = int(time.time()) if now is None else now
+        if execute_after <= timestamp or expires_at <= execute_after:
+            raise ValueError("recovery timing is invalid")
+        encoded = canonical_json(intent)
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            active = connection.execute(
+                "SELECT case_id FROM admin_recovery_cases WHERE ceremony_id=? "
+                "AND state NOT IN ('COMPLETED','CANCELLED','FAILED') LIMIT 1",
+                (ceremony_id,),
+            ).fetchone()
+            if active is not None:
+                raise GenesisConflict("another administrator key change is active")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_cases(
+                        case_id,ceremony_id,authority_slot,kind,state,intent_hash,
+                        intent_json,execute_after,expires_at,prepared_by,
+                        created_at,updated_at
+                    ) VALUES(?,?,?,?,'AWAITING_APPROVALS',?,?,?,?,?,?,?)
+                    """,
+                    (
+                        case_id,
+                        ceremony_id,
+                        authority_slot,
+                        kind,
+                        intent_hash.lower(),
+                        encoded,
+                        execute_after,
+                        expires_at,
+                        prepared_by.lower(),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict(
+                    "administrator key-change intent was already used"
+                ) from exc
+            self._event(
+                connection,
+                ceremony_id,
+                "admin_key_change_prepared",
+                {
+                    "caseId": case_id,
+                    "intentHash": intent_hash.lower(),
+                    "kind": kind,
+                    "slot": authority_slot,
+                    "executeAfter": execute_after,
+                },
+                timestamp,
+            )
+        return self.recovery_case(case_id)
+
+    def add_recovery_approval(
+        self,
+        case_id: str,
+        *,
+        actor_role: str,
+        actor_id: str,
+        signer_slot: int | None,
+        signer_address: str,
+        signature: str,
+        message_hash: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            case = connection.execute(
+                "SELECT * FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if str(case["state"]) in {"COMPLETED", "CANCELLED", "FAILED"}:
+                raise GenesisConflict("administrator recovery case is terminal")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_approvals(
+                        case_id,actor_role,actor_id,signer_slot,signer_address,
+                        signature,message_hash,submitted_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        case_id,
+                        actor_role,
+                        actor_id,
+                        signer_slot,
+                        signer_address.lower(),
+                        signature.lower(),
+                        message_hash.lower(),
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict(
+                    "this recovery approval was already submitted"
+                ) from exc
+            self._event(
+                connection,
+                str(case["ceremony_id"]),
+                "admin_key_change_approval_recorded",
+                {
+                    "caseId": case_id,
+                    "actorRole": actor_role,
+                    "actorId": actor_id,
+                    "signerSlot": signer_slot,
+                },
+                timestamp,
+            )
+        return self.recovery_case(case_id)
+
+    def update_recovery_case(
+        self,
+        case_id: str,
+        *,
+        state: str,
+        chia_transaction_id: str | None = None,
+        evm_transaction_hash: str | None = None,
+        chia_receipt_hash: str | None = None,
+        evm_receipt_hash: str | None = None,
+        failure_reason: str | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        allowed = {
+            "PREPARED",
+            "AWAITING_APPROVALS",
+            "READY",
+            "SUBMITTED",
+            "PARTIAL",
+            "COMPLETED",
+            "CANCELLED",
+            "FAILED",
+        }
+        if state not in allowed:
+            raise ValueError("invalid administrator recovery state")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            case = connection.execute(
+                "SELECT * FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            existing_state = str(case["state"])
+            if existing_state in {"COMPLETED", "CANCELLED", "FAILED"}:
+                if existing_state == state:
+                    return self.recovery_case(case_id)
+                raise GenesisConflict("administrator recovery case is terminal")
+            connection.execute(
+                """
+                UPDATE admin_recovery_cases SET
+                    state=?,
+                    chia_transaction_id=COALESCE(?,chia_transaction_id),
+                    evm_transaction_hash=COALESCE(?,evm_transaction_hash),
+                    chia_receipt_hash=COALESCE(?,chia_receipt_hash),
+                    evm_receipt_hash=COALESCE(?,evm_receipt_hash),
+                    failure_reason=COALESCE(?,failure_reason),
+                    updated_at=?
+                WHERE case_id=?
+                """,
+                (
+                    state,
+                    chia_transaction_id,
+                    evm_transaction_hash,
+                    chia_receipt_hash,
+                    evm_receipt_hash,
+                    failure_reason,
+                    timestamp,
+                    case_id,
+                ),
+            )
+            self._event(
+                connection,
+                str(case["ceremony_id"]),
+                "admin_key_change_state_updated",
+                {"caseId": case_id, "state": state},
+                timestamp,
+            )
+        return self.recovery_case(case_id)
+
+    def add_recovery_receipt(
+        self,
+        case_id: str,
+        *,
+        chain: str,
+        transaction_id: str,
+        receipt_hash: str,
+        receipt: dict[str, Any],
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if chain not in {"CHIA", "EVM"}:
+            raise ValueError("recovery receipt chain must be CHIA or EVM")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            case = connection.execute(
+                "SELECT ceremony_id FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_receipts(
+                        case_id,chain,transaction_id,receipt_hash,receipt_json,
+                        observed_at
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        case_id,
+                        chain,
+                        transaction_id.lower(),
+                        receipt_hash.lower(),
+                        canonical_json(receipt),
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict(
+                    f"{chain} recovery receipt was already recorded"
+                ) from exc
+            self._event(
+                connection,
+                str(case["ceremony_id"]),
+                "admin_key_change_receipt_recorded",
+                {
+                    "caseId": case_id,
+                    "chain": chain,
+                    "transactionId": transaction_id.lower(),
+                },
+                timestamp,
+            )
+        return self.recovery_case(case_id)
+
+    def recovery_case(self, case_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if row is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            approvals = connection.execute(
+                "SELECT * FROM admin_recovery_approvals "
+                "WHERE case_id=? ORDER BY submitted_at,actor_role,actor_id",
+                (case_id,),
+            ).fetchall()
+            receipts = connection.execute(
+                "SELECT * FROM admin_recovery_receipts "
+                "WHERE case_id=? ORDER BY chain",
+                (case_id,),
+            ).fetchall()
+        return {
+            "caseId": str(row["case_id"]),
+            "ceremonyId": str(row["ceremony_id"]),
+            "slot": int(row["authority_slot"]),
+            "kind": str(row["kind"]),
+            "state": str(row["state"]),
+            "intentHash": str(row["intent_hash"]),
+            "intent": json.loads(str(row["intent_json"])),
+            "executeAfter": int(row["execute_after"]),
+            "expiresAt": int(row["expires_at"]),
+            "preparedBy": str(row["prepared_by"]),
+            "chiaTransactionId": row["chia_transaction_id"],
+            "evmTransactionHash": row["evm_transaction_hash"],
+            "chiaReceiptHash": row["chia_receipt_hash"],
+            "evmReceiptHash": row["evm_receipt_hash"],
+            "failureReason": row["failure_reason"],
+            "approvals": [
+                {
+                    "actorRole": str(item["actor_role"]),
+                    "actorId": str(item["actor_id"]),
+                    "signerSlot": (
+                        int(item["signer_slot"])
+                        if item["signer_slot"] is not None
+                        else None
+                    ),
+                    "signerAddress": str(item["signer_address"]),
+                    "messageHash": str(item["message_hash"]),
+                    "submittedAt": int(item["submitted_at"]),
+                }
+                for item in approvals
+            ],
+            "receipts": [
+                {
+                    "chain": str(item["chain"]),
+                    "transactionId": str(item["transaction_id"]),
+                    "receiptHash": str(item["receipt_hash"]),
+                    "receipt": json.loads(str(item["receipt_json"])),
+                    "observedAt": int(item["observed_at"]),
+                }
+                for item in receipts
+            ],
+            "createdAt": int(row["created_at"]),
+            "updatedAt": int(row["updated_at"]),
+        }
+
+    def recovery_cases(self, ceremony_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT case_id FROM admin_recovery_cases "
+                "WHERE ceremony_id=? ORDER BY created_at DESC",
+                (ceremony_id,),
+            ).fetchall()
+        return [self.recovery_case(str(row["case_id"])) for row in rows]
+
+    def enqueue_admin_notification(
+        self,
+        ceremony_id: str,
+        *,
+        event_type: str,
+        recipient: str,
+        subject: str,
+        body: str,
+        now: int | None = None,
+    ) -> int:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            self._require_ceremony(connection, ceremony_id)
+            cursor = connection.execute(
+                """
+                INSERT INTO admin_notification_outbox(
+                    ceremony_id,event_type,recipient,subject,body,state,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,'PENDING',?,?)
+                """,
+                (
+                    ceremony_id,
+                    event_type,
+                    recipient.lower(),
+                    subject,
+                    body,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def pending_admin_notifications(
+        self, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 250:
+            raise ValueError("notification limit must be between 1 and 250")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM admin_notification_outbox "
+                "WHERE state IN ('PENDING','FAILED') "
+                "ORDER BY notification_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_admin_notification(
+        self,
+        notification_id: int,
+        *,
+        sent: bool,
+        error: str | None = None,
+        now: int | None = None,
+    ) -> None:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM admin_notification_outbox "
+                "WHERE notification_id=?",
+                (notification_id,),
+            ).fetchone()
+            if row is None:
+                raise GenesisNotFound("administrator notification not found")
+            attempts = int(row["attempts"]) + 1
+            state = "SENT" if sent else "FAILED"
+            connection.execute(
+                "UPDATE admin_notification_outbox "
+                "SET state=?,attempts=?,last_error=?,updated_at=? "
+                "WHERE notification_id=?",
+                (
+                    state,
+                    attempts,
+                    None if sent else (error or "delivery failed")[:1000],
+                    timestamp,
+                    notification_id,
+                ),
+            )
 
     def get(self, ceremony_id: str) -> dict[str, Any]:
         with self._connect() as connection:

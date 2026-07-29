@@ -46,6 +46,8 @@ from .admin_auth import (
     validate_admin_config_at_startup,
 )
 from .admin_operations import router as admin_operations_router
+from .admin_key_changes import router as admin_key_changes_router
+from .admin_security import router as admin_security_router
 from .omnichain_ownership_activation import (
     router as omnichain_ownership_activation_router,
 )
@@ -169,7 +171,7 @@ def _warm_chia_puzzle_templates() -> None:
     # request handlers is safe.  Without this, /protocol's call to
     # build_singletons_snapshot or build_vault_version_registry_snapshot
     # panics on the second hit.
-    from solslot_puzzles.admin_authority_v2_driver import admin_authority_v2_inner_mod
+    from solslot_puzzles.admin_authority_v3_driver import admin_authority_v3_inner_mod
     from solslot_puzzles.mint_proposal_v2_driver import mint_proposal_inner_v2_mod
     from solslot_puzzles.property_registry_driver import (
         property_registry_inner_mod,
@@ -179,7 +181,7 @@ def _warm_chia_puzzle_templates() -> None:
         vault_version_registry_inner_mod,
     )
     for mod in (
-        admin_authority_v2_inner_mod(),
+        admin_authority_v3_inner_mod(),
         mint_proposal_inner_v2_mod(),
         property_registry_inner_mod(),
         protocol_config_inner_mod(),
@@ -393,6 +395,8 @@ app.include_router(launch_control_router)
 # records committed by the current admin-authority singleton.
 app.include_router(admin_auth_router)
 app.include_router(admin_operations_router)
+app.include_router(admin_key_changes_router)
+app.include_router(admin_security_router)
 app.include_router(omnichain_ownership_activation_router)
 if admin_roster_update_router is not None:
     app.include_router(admin_roster_update_router)
