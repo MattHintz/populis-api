@@ -192,6 +192,30 @@ def _enroll_coadmin(client: TestClient, slot: int = 2):
     return coadmin
 
 
+def _login(client: TestClient, account) -> None:
+    challenge = client.post(
+        "/admin/launch/auth/challenge", json={"wallet": account.address}
+    )
+    assert challenge.status_code == 200, challenge.text
+    login = client.post(
+        "/admin/launch/auth/login",
+        json={
+            "wallet": account.address,
+            "nonce": challenge.json()["nonce"],
+            "signature": _sign(account, challenge.json()["typedData"]),
+        },
+    )
+    assert login.status_code == 200, login.text
+
+
+def _mark_launch_locked(store: GenesisStore, ceremony_id: str) -> None:
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE ceremonies SET state='locked' WHERE ceremony_id=?",
+            (ceremony_id,),
+        )
+
+
 def test_owner_link_is_single_use_and_scrubbed_into_http_only_session(tmp_path) -> None:
     client, store, _ = _client(tmp_path)
     claimed = client.post(
@@ -340,15 +364,28 @@ def test_settlement_rehearsal_is_coadmin_only_and_exposes_fixed_transaction(
     assert rejected.status_code == 403
     assert "coadministrator" in rejected.json()["detail"]
 
-    _enroll_coadmin(client)
+    coadmin = _enroll_coadmin(client)
+    before_genesis = client.post("/admin/launch/settlement-rehearsal/start")
+    assert before_genesis.status_code == 409
+    assert "Complete genesis first" in before_genesis.json()["detail"]
+    _mark_launch_locked(store, ceremony_id)
 
-    async def fake_start(_settings, *, ceremony_id, release_evidence_hash):
+    async def fake_start(
+        _settings,
+        *,
+        ceremony_id,
+        release_evidence_hash,
+        wallet_address,
+    ):
         assert ceremony_id
         assert release_evidence_hash.startswith("0x")
+        assert wallet_address == coadmin.address.lower()
         return {
             "jobId": "rehearsal_job_0001",
             "state": "AWAITING_WALLET",
             "configHash": "0x" + "ab" * 32,
+            "phase": "APPROVE_DELIVERY",
+            "completedSteps": 0,
             "step": "Review the fixed test purchase",
             "message": "No real funds move.",
             "walletTransaction": {
@@ -364,9 +401,54 @@ def test_settlement_rehearsal_is_coadmin_only_and_exposes_fixed_transaction(
     assert started.status_code == 200, started.text
     result = started.json()
     assert result["status"]["state"] == "AWAITING_WALLET"
+    assert result["status"]["phase"] == "APPROVE_DELIVERY"
     assert result["status"]["walletTransaction"]["chainId"] == 84532
     assert result["decisionReceipt"]["requiredApprovers"].startswith("One enrolled")
     assert store.settlement_rehearsal(ceremony_id)["state"] == "AWAITING_WALLET"
+
+
+def test_purchase_gate_stays_locked_until_delivery_and_refund_are_proven(
+    tmp_path,
+) -> None:
+    client, store, _ = _client(tmp_path)
+    owner, ceremony_id = _claim_and_enroll_owner(client)
+    coadmin = _enroll_coadmin(client)
+    _mark_launch_locked(store, ceremony_id)
+    now = 2_000_000_000
+    payload_hash = "0x" + "ab" * 32
+    store.upsert_gate(
+        ceremony_id,
+        gate_name="purchases",
+        opens_at=now - 60,
+        closes_at=now + 600,
+        payload_hash=payload_hash,
+        state="pending",
+        now=now - 120,
+    )
+    action_id, _ = launch_control_module._gate_payload(
+        store, ceremony_id, "purchases"
+    )
+    for slot, account in ((1, owner), (2, coadmin)):
+        store.add_action_approval(
+            ceremony_id,
+            action_id=action_id,
+            action_type="gate:purchases",
+            payload_hash=payload_hash,
+            slot=slot,
+            signer_address=account.address,
+            signature="0x" + f"{slot:02x}" * 65,
+            now=now - 100 + slot,
+        )
+    _login(client, owner)
+
+    activated = client.post("/admin/launch/gates/purchases/activate")
+
+    assert activated.status_code == 409
+    assert "delivery and exact-refund test" in activated.json()["detail"]
+    assert (
+        store.gates(ceremony_id, now=now)["purchases"]["configuredState"]
+        == "pending"
+    )
 
 
 def test_settlement_rehearsal_submission_is_bound_to_persisted_job(
@@ -375,6 +457,7 @@ def test_settlement_rehearsal_submission_is_bound_to_persisted_job(
     client, store, _ = _client(tmp_path)
     _, ceremony_id = _claim_and_enroll_owner(client)
     _enroll_coadmin(client)
+    _mark_launch_locked(store, ceremony_id)
     store.set_settlement_rehearsal(
         ceremony_id,
         job_id="rehearsal_job_0001",
@@ -405,3 +488,27 @@ def test_settlement_rehearsal_submission_is_bound_to_persisted_job(
     assert submitted.status_code == 200, submitted.text
     assert submitted.json()["status"]["state"] == "VALIDATING"
     assert store.settlement_rehearsal(ceremony_id)["state"] == "VALIDATING"
+
+
+def test_post_genesis_settlement_does_not_block_ceremony_task_selection() -> None:
+    readiness = [
+        {
+            "id": "settlement",
+            "title": "Customer payment test follows launch",
+            "status": "Waiting",
+            "impact": "Run after genesis.",
+            "assignedRole": "technical-coadmin",
+            "blocksCeremony": False,
+        }
+    ]
+    before_genesis = launch_control_module._task_for(
+        {"state": "roster_frozen", "invitations": [{"consumed_at": 1}] * 3},
+        readiness,
+    )
+    assert before_genesis["action"] == "buildPlan"
+
+    after_genesis = launch_control_module._task_for(
+        {"state": "locked", "invitations": [{"consumed_at": 1}] * 3},
+        readiness,
+    )
+    assert after_genesis["title"] == "Customer payment test follows launch"

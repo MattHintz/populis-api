@@ -67,6 +67,7 @@ from .launch_rehearsal import (
     HEX32_RE,
     LaunchRehearsalError,
     persist_evidence,
+    require_completed_rehearsal,
     rehearsal_status,
     start_rehearsal,
     submit_rehearsal_transaction,
@@ -708,8 +709,13 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
     if record is None:
         status_value: dict[str, Any] = {
             "state": "NOT_STARTED",
-            "step": "Ready to prepare the fixed delivery and refund rehearsal.",
-            "message": "A technical coadministrator starts this check from a test wallet.",
+            "phase": "PREPARE",
+            "completedSteps": 0,
+            "step": "Ready after the first governed test deeds are confirmed.",
+            "message": (
+                "A coadministrator will use faucet USDC to prove one delivery "
+                "and one exact refund before customer payments open."
+            ),
             "assignedRole": "coadmin",
             "walletTransaction": None,
         }
@@ -719,6 +725,8 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
         status_value = {
             "jobId": record.get("jobId"),
             "state": record.get("state"),
+            "phase": details.get("phase") or "PREPARE",
+            "completedSteps": details.get("completedSteps") or 0,
             "step": details.get("step") or "",
             "message": details.get("message") or "",
             "walletTransaction": details.get("walletTransaction"),
@@ -728,20 +736,26 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
         "status": status_value,
         "decisionReceipt": {
-            "title": "Submit the fixed Base Sepolia test purchase",
+            "title": (
+                "Approve test USDC"
+                if status_value.get("phase") in {"APPROVE_DELIVERY", "APPROVE_REFUND"}
+                else "Send the fixed Base Sepolia test payment"
+            ),
             "network": "Base Sepolia",
             "financialEffect": (
                 "Uses test gas and faucet USDC only. No real funds or customer funds move."
             ),
             "customerImpact": (
                 "Proves the reviewed payment, validator delivery, SmartDeed delivery, "
-                "and exact-refund paths before launch."
+                "and exact-refund paths before customer payments open."
             ),
             "reversibility": (
                 "This is a bounded test purchase. The rehearsal must prove delivery "
                 "or an exact automated refund."
             ),
-            "requiredApprovers": "One enrolled technical coadministrator submits the test wallet transaction",
+            "requiredApprovers": (
+                "One enrolled coadministrator submits each clearly labeled test-wallet step"
+            ),
             "expectedResult": (
                 "Three validators produce 2-of-3 evidence for both successful delivery "
                 "and exact refund."
@@ -751,7 +765,17 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dict[str, Any]:
-    blocked = next((item for item in readiness if item["status"] == "Blocked"), None)
+    state = str(record["state"])
+    ceremony_complete = state == "locked"
+    blocked = next(
+        (
+            item
+            for item in readiness
+            if item["status"] == "Blocked"
+            and (item.get("blocksCeremony", True) or ceremony_complete)
+        ),
+        None,
+    )
     if blocked:
         return {
             "title": blocked["title"],
@@ -759,7 +783,6 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             "assignedRole": blocked["assignedRole"],
             "action": blocked.get("action"),
         }
-    state = str(record["state"])
     enrolled = sum(bool(item.get("consumed_at")) for item in record["invitations"])
     if enrolled < 3:
         return {
@@ -773,6 +796,7 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             item
             for item in readiness
             if item["status"] in {"Needs action", "Waiting"}
+            and (item.get("blocksCeremony", True) or ceremony_complete)
         ),
         None,
     )
@@ -953,51 +977,48 @@ async def _readiness(
         )
 
     try:
-        rehearsal_job = store.settlement_rehearsal(str(record["ceremony_id"]))
-        if not rehearsal_job or rehearsal_job["state"] != "SUCCEEDED":
-            state = rehearsal_job["state"] if rehearsal_job else "not started"
-            raise GenesisConflict(f"settlement rehearsal is {state.lower()}")
-        rehearsal, digest = _read_json_file(
-            settings.launch_settlement_rehearsal_path, "settlement rehearsal evidence"
+        _rehearsal, digest = require_completed_rehearsal(
+            settings,
+            store,
+            str(record["ceremony_id"]),
         )
-        lanes = rehearsal.get("lanes")
-        healthy = (
-            rehearsal.get("schemaVersion") == 2
-            and rehearsal.get("kind") == "solslot-rc22-settlement-rehearsal"
-            and rehearsal.get("releaseTag") == settings.launch_release_tag
-            and rehearsal.get("network") == "testnet11-base-sepolia"
-            and rehearsal.get("success") is True
-            and rehearsal.get("validatorThreshold") == 2
-            and len(rehearsal.get("validators") or []) == 3
-            and isinstance(lanes, Mapping)
-            and lanes.get("delivery", {}).get("success") is True
-            and lanes.get("refund", {}).get("success") is True
-            and lanes.get("refund", {}).get("exactRefund") is True
-            and rehearsal_job["payload"].get("evidenceDigest") == "0x" + digest
-        )
-        if not healthy:
-            raise GenesisConflict(
-                "settlement rehearsal evidence does not prove delivery and exact refund"
-            )
         items.append(
             {
                 "id": "settlement",
-                "title": "Settlement rehearsal",
+                "title": "Customer payment activation",
                 "status": "Healthy",
-                "impact": "Test payment, SmartDeed delivery, and return evidence passed.",
+                "impact": (
+                    "Test payment, SmartDeed delivery, and exact-refund evidence passed. "
+                    "Presale and purchase windows may now be proposed."
+                ),
                 "assignedRole": "technical-coadmin",
-                "evidence": {"fileSha256": "0x" + digest},
+                "evidence": {"fileSha256": digest},
+                "blocksCeremony": False,
             }
         )
     except (GenesisStoreError, AttributeError) as exc:
+        ceremony_complete = str(record["state"]) == "locked"
         items.append(
             {
                 "id": "settlement",
-                "title": "Complete the settlement rehearsal",
+                "title": (
+                    "Activate customer payments"
+                    if ceremony_complete
+                    else "Customer payment test follows launch"
+                ),
                 "status": "Waiting",
-                "impact": str(exc),
+                "impact": (
+                    str(exc)
+                    if ceremony_complete
+                    else (
+                        "After genesis and the first governed test deed exist, a "
+                        "coadministrator will prove delivery and an exact refund. "
+                        "Presales and purchases stay locked until it passes."
+                    )
+                ),
                 "assignedRole": "technical-coadmin",
-                "action": "settlementRehearsal",
+                "action": "settlementRehearsal" if ceremony_complete else None,
+                "blocksCeremony": False,
             }
         )
 
@@ -1535,6 +1556,15 @@ async def guided_start_settlement_rehearsal(
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_coadmin(session)
+    launch = store.get(session.ceremony_id)
+    if launch["state"] != "locked":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Complete genesis first. The payment test requires the signed "
+                "genesis artifact, an approved test vault, and a governed test deed."
+            ),
+        )
     current = store.settlement_rehearsal(session.ceremony_id)
     if current and current["state"] != "FAILED":
         return _rehearsal_result(current)
@@ -1547,6 +1577,7 @@ async def guided_start_settlement_rehearsal(
             settings,
             ceremony_id=session.ceremony_id,
             release_evidence_hash=release_hash,
+            wallet_address=session.wallet,
         )
         return _rehearsal_result(
             _store_rehearsal_status(
@@ -1565,6 +1596,12 @@ async def guided_submit_settlement_rehearsal_transaction(
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_coadmin(session)
+    launch = store.get(session.ceremony_id)
+    if launch["state"] != "locked":
+        raise HTTPException(
+            status_code=409,
+            detail="Complete genesis before submitting payment-test transactions.",
+        )
     current = store.settlement_rehearsal(session.ceremony_id)
     if not current:
         raise HTTPException(status_code=409, detail="Start the settlement rehearsal first.")
@@ -1818,12 +1855,19 @@ async def execute_launch_abandonment(
 @router.post("/gates/{gate_name}/activate")
 async def activate_gate(
     gate_name: str,
+    settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_owner(session)
     if gate_name not in GATE_NAMES:
         raise HTTPException(status_code=404, detail="Unknown launch gate.")
+    launch = store.get(session.ceremony_id)
+    if gate_name != "ceremonyBroadcast" and launch["state"] != "locked":
+        raise HTTPException(
+            status_code=409,
+            detail="Complete and archive genesis before opening operational windows.",
+        )
     action_id, _ = _gate_payload(store, session.ceremony_id, gate_name)
     approval = store.action_approvals(session.ceremony_id, action_id)
     if not approval["approved"]:
@@ -1831,6 +1875,17 @@ async def activate_gate(
     gate = store.gates(session.ceremony_id).get(gate_name)
     if not gate:
         raise HTTPException(status_code=409, detail="Gate proposal is missing.")
+    if gate_name in {"presale", "purchases"}:
+        try:
+            require_completed_rehearsal(settings, store, session.ceremony_id)
+        except GenesisStoreError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Customer payments remain locked until the guided delivery "
+                    f"and exact-refund test passes: {exc}"
+                ),
+            ) from exc
     return store.upsert_gate(
         session.ceremony_id,
         gate_name=gate_name,
@@ -2051,7 +2106,11 @@ async def guided_preflight(
     _require_wallet_session(session)
     record = store.get(session.ceremony_id)
     readiness = await _readiness(request, settings, store, record)
-    failures = [item for item in readiness if item["status"] != "Healthy"]
+    failures = [
+        item
+        for item in readiness
+        if item["status"] != "Healthy" and item.get("blocksCeremony", True)
+    ]
     if failures:
         raise HTTPException(
             status_code=409,
