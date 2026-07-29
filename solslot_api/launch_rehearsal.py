@@ -136,6 +136,48 @@ def _validate_transaction(value: object) -> dict[str, Any] | None:
     }
 
 
+def _validate_review(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    expected = {
+        "action",
+        "lane",
+        "asset",
+        "amountMinor",
+        "amountLabel",
+        "escrow",
+        "destinationVault",
+        "deedLauncherId",
+        "expectedOutcome",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise LaunchRehearsalError("The rehearsal review summary shape changed.")
+    amount_minor = str(value["amountMinor"])
+    if (
+        str(value["action"]) not in {"approve", "pay", "verify"}
+        or str(value["lane"]) not in {"delivery", "refund"}
+        or str(value["asset"]) != "USDC"
+        or not re.fullmatch(r"^[1-9][0-9]{0,15}$", amount_minor)
+        or not ADDRESS_RE.fullmatch(str(value["escrow"]))
+        or not HEX32_RE.fullmatch(str(value["destinationVault"]))
+        or not HEX32_RE.fullmatch(str(value["deedLauncherId"]))
+        or str(value["expectedOutcome"]) not in {"DELIVERED", "REFUND"}
+        or len(str(value["amountLabel"])) > 64
+    ):
+        raise LaunchRehearsalError("The rehearsal review summary is invalid.")
+    return {
+        "action": str(value["action"]),
+        "lane": str(value["lane"]),
+        "asset": "USDC",
+        "amountMinor": amount_minor,
+        "amountLabel": str(value["amountLabel"]),
+        "escrow": str(value["escrow"]),
+        "destinationVault": str(value["destinationVault"]).lower(),
+        "deedLauncherId": str(value["deedLauncherId"]).lower(),
+        "expectedOutcome": str(value["expectedOutcome"]),
+    }
+
+
 def _validate_evidence(
     evidence: object,
     signature: object,
@@ -215,6 +257,7 @@ def validate_status(
         "step": str(value.get("step") or ""),
         "message": str(value.get("message") or ""),
         "walletTransaction": _validate_transaction(value.get("walletTransaction")),
+        "review": _validate_review(value.get("review")),
     }
     if state == "SUCCEEDED":
         result["evidence"] = _validate_evidence(
