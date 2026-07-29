@@ -32,6 +32,7 @@ from .evm_auth import normalize_evm_address, recover_evm_signer
 from .timelock_operation import (
     TimelockOperationError,
     decode_ownership_schedule,
+    encode_ownership_execute,
     validate_ownership_execute,
 )
 
@@ -69,6 +70,24 @@ _SAFE_ABI = [
             {"name": "_nonce", "type": "uint256"},
         ],
         "outputs": [{"name": "", "type": "bytes32"}],
+    },
+    {
+        "type": "function",
+        "name": "encodeTransactionData",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data", "type": "bytes"},
+            {"name": "operation", "type": "uint8"},
+            {"name": "safeTxGas", "type": "uint256"},
+            {"name": "baseGas", "type": "uint256"},
+            {"name": "gasPrice", "type": "uint256"},
+            {"name": "gasToken", "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "_nonce", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bytes"}],
     },
 ]
 _TIMELOCK_ABI = [
@@ -172,6 +191,14 @@ class OwnershipActivationStore:
                     transaction_hash TEXT NOT NULL UNIQUE,
                     submitted_by TEXT NOT NULL,
                     submitted_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS omnichain_safe_derived_packages (
+                    parent_package_hash TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    package_hash TEXT NOT NULL UNIQUE,
+                    package_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (parent_package_hash, phase)
                 );
                 """
             )
@@ -344,6 +371,79 @@ class OwnershipActivationStore:
                 ON CONFLICT(package_hash) DO NOTHING
                 """,
                 (package_hash, transaction_hash, submitted_by, now),
+            )
+
+    def derived_package(
+        self, *, parent_package_hash: str, phase: str
+    ) -> Optional[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT package_hash, package_json
+                FROM omnichain_safe_derived_packages
+                WHERE parent_package_hash = ? AND phase = ?
+                """,
+                (parent_package_hash, phase),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            package = json.loads(row["package_json"])
+        except json.JSONDecodeError as exc:
+            raise OwnershipActivationError(
+                "stored ownership execute package is invalid"
+            ) from exc
+        if (
+            not isinstance(package, dict)
+            or package.get("artifactHash") != row["package_hash"]
+        ):
+            raise OwnershipActivationError(
+                "stored ownership execute package hash mismatches"
+            )
+        return package
+
+    def record_derived_package(
+        self,
+        *,
+        parent_package_hash: str,
+        phase: str,
+        package: Mapping[str, Any],
+        now: int,
+    ) -> None:
+        package_hash = _require_hash(
+            package.get("artifactHash"), "derived package artifactHash"
+        )
+        encoded = json.dumps(
+            dict(package),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        with self._lock, self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT package_hash, package_json
+                FROM omnichain_safe_derived_packages
+                WHERE parent_package_hash = ? AND phase = ?
+                """,
+                (parent_package_hash, phase),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["package_hash"] == package_hash
+                    and existing["package_json"] == encoded
+                ):
+                    return
+                raise ValueError(
+                    "a different ownership execute package is already sealed"
+                )
+            connection.execute(
+                """
+                INSERT INTO omnichain_safe_derived_packages
+                    (parent_package_hash, phase, package_hash, package_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (parent_package_hash, phase, package_hash, encoded, now),
             )
 
 
@@ -681,6 +781,294 @@ def _chain_state(settings: Settings, package: Mapping[str, Any]) -> ChainState:
         live_nonce=live_nonce,
         live_transaction_hash=live_hash_hex,
         latest_block=latest_block,
+    )
+
+
+def _validate_derived_execute_package(
+    package_value: Mapping[str, Any],
+    *,
+    schedule_package: Mapping[str, Any],
+) -> dict[str, Any]:
+    package = dict(package_value)
+    declared_hash = _require_hash(
+        package.pop("artifactHash", None), "ownership execution artifactHash"
+    )
+    if _canonical_hash(package) != declared_hash:
+        raise OwnershipActivationError(
+            "stored ownership execute package hash mismatches"
+        )
+    package["artifactHash"] = declared_hash
+    matching_fields = (
+        "schemaVersion",
+        "kind",
+        "deploymentArtifactHash",
+        "ownershipIntentArtifactHash",
+        "governanceArtifactHash",
+        "sourceSha",
+        "network",
+        "chainId",
+        "operationId",
+        "rootSafe",
+        "timelock",
+    )
+    if (
+        package.get("phase") != "execute"
+        or package.get("derivedFromScheduleArtifactHash")
+        != schedule_package["artifactHash"]
+        or any(package.get(field) != schedule_package.get(field) for field in matching_fields)
+    ):
+        raise OwnershipActivationError(
+            "stored ownership execute package does not match the reviewed schedule"
+        )
+    schedule = decode_ownership_schedule(
+        schedule_package["authorityOperation"]["transaction"]["data"],
+        expected_operation_id=schedule_package["operationId"],
+    )
+    authority = package.get("authorityOperation")
+    if not isinstance(authority, Mapping):
+        raise OwnershipActivationError("authorityOperation is invalid")
+    transaction = authority.get("transaction")
+    if not isinstance(transaction, Mapping):
+        raise OwnershipActivationError("authorityOperation.transaction is invalid")
+    validated_transaction = {
+        "to": _require_address(transaction.get("to"), "transaction.to"),
+        "value": str(_require_decimal(transaction.get("value"), "transaction.value")),
+        "data": _require_hex_bytes(transaction.get("data"), "transaction.data"),
+        "operation": transaction.get("operation"),
+        "safeTxGas": str(
+            _require_decimal(transaction.get("safeTxGas"), "transaction.safeTxGas")
+        ),
+        "baseGas": str(_require_decimal(transaction.get("baseGas"), "transaction.baseGas")),
+        "gasPrice": str(
+            _require_decimal(transaction.get("gasPrice"), "transaction.gasPrice")
+        ),
+        "gasToken": _require_address(transaction.get("gasToken"), "transaction.gasToken"),
+        "refundReceiver": _require_address(
+            transaction.get("refundReceiver"), "transaction.refundReceiver"
+        ),
+        "nonce": str(_require_decimal(transaction.get("nonce"), "transaction.nonce")),
+    }
+    if (
+        authority.get("phase") != "execute"
+        or _require_address(
+            authority.get("rootSafe"), "authorityOperation.rootSafe"
+        ).lower()
+        != str(package["rootSafe"]).lower()
+        or validated_transaction["to"].lower() != str(package["timelock"]).lower()
+        or validated_transaction["value"] != "0"
+        or validated_transaction["operation"] != 0
+        or validated_transaction["safeTxGas"] != "0"
+        or validated_transaction["baseGas"] != "0"
+        or validated_transaction["gasPrice"] != "0"
+        or validated_transaction["gasToken"].lower() != ZERO_ADDRESS
+        or validated_transaction["refundReceiver"].lower() != ZERO_ADDRESS
+    ):
+        raise OwnershipActivationError("Root Safe transaction terms are not alpha-safe")
+    try:
+        validate_ownership_execute(validated_transaction["data"], schedule=schedule)
+    except TimelockOperationError as exc:
+        raise OwnershipActivationError(str(exc)) from exc
+    transaction_data = _require_hex_bytes(
+        authority.get("transactionData"), "authorityOperation.transactionData"
+    )
+    transaction_hash = _require_hash(
+        authority.get("transactionHash"), "authorityOperation.transactionHash"
+    )
+    approvals_raw = authority.get("approvals")
+    if not isinstance(approvals_raw, list) or len(approvals_raw) != 2:
+        raise OwnershipActivationError("exactly two nested Safe approvals are required")
+    approvals = [
+        _validate_approval(
+            value,
+            chain_id=BASE_SEPOLIA_CHAIN_ID,
+            transaction_data=transaction_data,
+        )
+        for value in approvals_raw
+    ]
+    if {value["role"] for value in approvals} != set(REQUIRED_ROLES):
+        raise OwnershipActivationError("owner identity and coadmin approvals are required")
+    schedule_approvals = {
+        value["role"]: value
+        for value in schedule_package["authorityOperation"]["approvals"]
+    }
+    for approval in approvals:
+        expected = schedule_approvals.get(approval["role"])
+        if (
+            expected is None
+            or approval["safe"].lower() != expected["safe"].lower()
+            or [value.lower() for value in approval["allowedSigners"]]
+            != [value.lower() for value in expected["allowedSigners"]]
+        ):
+            raise OwnershipActivationError(
+                "ownership execute signer authority changed after scheduling"
+            )
+    authority = dict(authority)
+    authority["transaction"] = validated_transaction
+    authority["transactionData"] = transaction_data
+    authority["transactionHash"] = transaction_hash
+    authority["approvals"] = approvals
+    authority["review"] = {
+        "action": "executeAcceptOwnership",
+        "targets": list(schedule.targets),
+        "delaySeconds": schedule.delay_seconds,
+        "operationId": schedule.operation_id,
+    }
+    package["authorityOperation"] = authority
+    return package
+
+
+def _build_derived_execute_package(
+    settings: Settings,
+    *,
+    schedule_package: Mapping[str, Any],
+) -> dict[str, Any]:
+    chain = _chain_state(settings, schedule_package)
+    if not chain.operation_exists:
+        raise OwnershipActivationError(
+            "ownership execution will be prepared after the schedule confirms"
+        )
+    if chain.operation_done:
+        raise OwnershipActivationError(
+            "ownership execution completed outside the reviewed administrator flow"
+        )
+    schedule = decode_ownership_schedule(
+        schedule_package["authorityOperation"]["transaction"]["data"],
+        expected_operation_id=schedule_package["operationId"],
+    )
+    transaction = {
+        "to": schedule_package["timelock"],
+        "value": "0",
+        "data": encode_ownership_execute(schedule),
+        "operation": 0,
+        "safeTxGas": "0",
+        "baseGas": "0",
+        "gasPrice": "0",
+        "gasToken": ZERO_ADDRESS,
+        "refundReceiver": ZERO_ADDRESS,
+        "nonce": str(chain.live_nonce),
+    }
+    w3 = _web3(settings)
+    try:
+        root_safe = w3.eth.contract(
+            address=Web3.to_checksum_address(schedule_package["rootSafe"]),
+            abi=_SAFE_ABI,
+        )
+        arguments = [
+            transaction["to"],
+            0,
+            bytes.fromhex(transaction["data"][2:]),
+            0,
+            0,
+            0,
+            0,
+            ZERO_ADDRESS,
+            ZERO_ADDRESS,
+            chain.live_nonce,
+        ]
+        transaction_hash = Web3.to_hex(
+            root_safe.functions.getTransactionHash(*arguments).call()
+        ).lower()
+        transaction_data = Web3.to_hex(
+            root_safe.functions.encodeTransactionData(*arguments).call()
+        ).lower()
+    except Exception as exc:  # noqa: BLE001
+        raise OwnershipActivationError(
+            "the reviewed Root Safe execution could not be prepared"
+        ) from exc
+    approvals = []
+    for descriptor in schedule_package["authorityOperation"]["approvals"]:
+        typed_data = {
+            "domain": {
+                "chainId": BASE_SEPOLIA_CHAIN_ID,
+                "verifyingContract": descriptor["safe"],
+            },
+            "types": {"SafeMessage": [{"name": "message", "type": "bytes"}]},
+            "primaryType": "SafeMessage",
+            "message": {"message": transaction_data},
+        }
+        approvals.append(
+            {
+                "role": descriptor["role"],
+                "safe": descriptor["safe"],
+                "allowedSigners": list(descriptor["allowedSigners"]),
+                "messageHash": _typed_data_digest(typed_data),
+                "typedData": typed_data,
+            }
+        )
+    package = {
+        **{
+            field: schedule_package[field]
+            for field in (
+                "schemaVersion",
+                "kind",
+                "deploymentArtifactHash",
+                "ownershipIntentArtifactHash",
+                "governanceArtifactHash",
+                "sourceSha",
+                "network",
+                "chainId",
+                "operationId",
+                "rootSafe",
+                "timelock",
+            )
+        },
+        "phase": "execute",
+        "derivedFromScheduleArtifactHash": schedule_package["artifactHash"],
+        "authorityOperation": {
+            "phase": "execute",
+            "rootSafe": schedule_package["rootSafe"],
+            "transaction": transaction,
+            "transactionHash": transaction_hash,
+            "transactionData": transaction_data,
+            "approvals": approvals,
+        },
+    }
+    package["artifactHash"] = _canonical_hash(package)
+    _validate_derived_execute_package(
+        package,
+        schedule_package=schedule_package,
+    )
+    return package
+
+
+def load_execution_authority_operation(
+    settings: Settings,
+    store: OwnershipActivationStore,
+) -> dict[str, Any]:
+    """Load release evidence or seal the canonical live-nonce execute action."""
+
+    configured_path = settings.payment_omnichain_ownership_execute_operation_path
+    configured_hash = settings.payment_omnichain_ownership_execute_operation_hash
+    if bool(configured_path) != bool(configured_hash):
+        raise OwnershipActivationError(
+            "ownership execution package configuration is incomplete"
+        )
+    if configured_path and configured_hash:
+        return load_authority_operation(settings, phase="execute")
+
+    schedule_package = load_authority_operation(settings, phase="schedule")
+    stored = store.derived_package(
+        parent_package_hash=schedule_package["artifactHash"],
+        phase="execute",
+    )
+    if stored is not None:
+        return _validate_derived_execute_package(
+            stored,
+            schedule_package=schedule_package,
+        )
+    package = _build_derived_execute_package(
+        settings,
+        schedule_package=schedule_package,
+    )
+    store.record_derived_package(
+        parent_package_hash=schedule_package["artifactHash"],
+        phase="execute",
+        package=package,
+        now=int(time.time()),
+    )
+    return _validate_derived_execute_package(
+        package,
+        schedule_package=schedule_package,
     )
 
 
@@ -1162,7 +1550,7 @@ def get_ownership_execution(
 ) -> dict[str, Any]:
     _require_enabled(settings)
     try:
-        package = load_authority_operation(settings, phase="execute")
+        package = load_execution_authority_operation(settings, store)
         return _public_status(settings=settings, package=package, store=store)
     except OwnershipActivationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1178,7 +1566,7 @@ def sign_ownership_execution(
 ) -> dict[str, Any]:
     _require_enabled(settings)
     try:
-        package = load_authority_operation(settings, phase="execute")
+        package = load_execution_authority_operation(settings, store)
         chain = _chain_state(settings, package)
         if not chain.operation_exists:
             raise ValueError("ownership schedule is not on Base Sepolia")
@@ -1226,7 +1614,7 @@ def record_ownership_execution_broadcast(
 ) -> dict[str, Any]:
     _require_enabled(settings)
     try:
-        package = load_authority_operation(settings, phase="execute")
+        package = load_execution_authority_operation(settings, store)
         approvals = store.approvals(package["artifactHash"])
         if any(role not in approvals for role in REQUIRED_ROLES):
             raise ValueError("fresh owner and coadministrator signatures are required")

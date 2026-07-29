@@ -81,6 +81,7 @@ from .omnichain_ownership_activation import (
     _public_status,
     get_ownership_activation_store,
     load_authority_operation,
+    load_execution_authority_operation,
     record_ownership_activation_broadcast,
     record_ownership_execution_broadcast,
     sign_ownership_activation,
@@ -622,7 +623,7 @@ def _rail_phase_status(
         settings=settings, package=schedule_package, store=store
     )
     if schedule["state"] in {"SCHEDULED", "READY_TO_EXECUTE", "DONE"}:
-        execute_package = load_authority_operation(settings, phase="execute")
+        execute_package = load_execution_authority_operation(settings, store)
         execute = _public_status(
             settings=settings, package=execute_package, store=store
         )
@@ -1112,7 +1113,9 @@ async def claim_owner_link(
 ) -> dict[str, Any]:
     if not settings.launch_control_enabled:
         raise HTTPException(status_code=503, detail="Alpha launch control is disabled.")
-    if not settings.admin_token or not secrets.compare_digest(body.token, settings.admin_token):
+    if not settings.launch_owner_claim_token or not secrets.compare_digest(
+        body.token, settings.launch_owner_claim_token
+    ):
         raise HTTPException(status_code=403, detail="Owner launch link is invalid.")
     try:
         if store.owner_claim_used(_token_hash(body.token)):

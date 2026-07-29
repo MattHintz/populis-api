@@ -163,10 +163,29 @@ def validate_ownership_execute(
         )
 
 
+def encode_ownership_execute(schedule: OwnershipSchedule) -> str:
+    """Encode the only executeBatch call accepted for a reviewed schedule."""
+
+    return "0x" + (
+        keccak(text=EXECUTE_BATCH_SIGNATURE)[:4]
+        + abi_encode(
+            _BATCH_TYPES,
+            [
+                list(schedule.targets),
+                [0, 0],
+                [ACCEPT_OWNERSHIP_CALLDATA, ACCEPT_OWNERSHIP_CALLDATA],
+                schedule.predecessor,
+                schedule.salt,
+            ],
+        )
+    ).hex()
+
+
 __all__ = [
     "ACCEPT_OWNERSHIP_CALLDATA",
     "OwnershipSchedule",
     "TimelockOperationError",
     "decode_ownership_schedule",
+    "encode_ownership_execute",
     "validate_ownership_execute",
 ]
