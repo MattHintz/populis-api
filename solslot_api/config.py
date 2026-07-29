@@ -759,7 +759,7 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc22.2-20260729"
+    launch_release_tag: str = "solslot-v2-alpha-rc22.3-20260729"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
         "./state/source-freeze-evidence-rc22.json"
