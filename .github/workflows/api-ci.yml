@@ -14,9 +14,9 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # Primary purchase artifacts are introduced by the coordinated alpha rail
-  # release. Keep CI reproducible without advancing staging/production pins.
-  PROTOCOL_REF: 2751c22582c3be20aba343d71ab72a5458fb6ebc
+  # Authority V3 recovery imports are introduced by the coordinated RC23
+  # release. Keep CI reproducible without advancing deployment pins.
+  PROTOCOL_REF: a3e88cc4636d9c42203979bf3c2070587365f0fd
 
 jobs:
   verify:
