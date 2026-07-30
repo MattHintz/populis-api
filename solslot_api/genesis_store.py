@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 9
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
 OWNER_SLOT = 1
@@ -440,6 +440,262 @@ class GenesisStore:
                         ON admin_notification_outbox(state, notification_id);
 
                     PRAGMA user_version = 4;
+                    COMMIT;
+                    """
+                )
+                version = 4
+            if version < 5:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE admin_recovery_receipts
+                        RENAME TO admin_recovery_receipts_v4;
+
+                    CREATE TABLE admin_recovery_receipts (
+                        case_id TEXT NOT NULL,
+                        chain TEXT NOT NULL,
+                        phase TEXT NOT NULL,
+                        transaction_id TEXT NOT NULL,
+                        receipt_hash TEXT NOT NULL,
+                        receipt_json TEXT NOT NULL,
+                        observed_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, chain, phase),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (chain IN ('CHIA', 'EVM')),
+                        CHECK (phase IN (
+                            'PREPARE', 'APPROVE', 'EXECUTE',
+                            'CANCEL', 'COMPLETE', 'ROLLBACK'
+                        ))
+                    );
+
+                    INSERT INTO admin_recovery_receipts(
+                        case_id,chain,phase,transaction_id,receipt_hash,
+                        receipt_json,observed_at
+                    )
+                    SELECT
+                        case_id,chain,'COMPLETE',transaction_id,receipt_hash,
+                        receipt_json,observed_at
+                    FROM admin_recovery_receipts_v4;
+
+                    DROP TABLE admin_recovery_receipts_v4;
+                    PRAGMA user_version = 5;
+                    COMMIT;
+                    """
+                )
+                version = 5
+            if version < 6:
+                connection.executescript(
+                    """
+                    PRAGMA foreign_keys = OFF;
+                    BEGIN IMMEDIATE;
+
+                    DROP INDEX admin_recovery_cases_active_idx;
+                    ALTER TABLE admin_recovery_approvals
+                        RENAME TO admin_recovery_approvals_v5;
+                    ALTER TABLE admin_recovery_receipts
+                        RENAME TO admin_recovery_receipts_v5;
+                    ALTER TABLE admin_recovery_cases
+                        RENAME TO admin_recovery_cases_v5;
+
+                    CREATE TABLE admin_recovery_cases (
+                        case_id TEXT PRIMARY KEY,
+                        ceremony_id TEXT NOT NULL,
+                        authority_slot INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        intent_hash TEXT NOT NULL UNIQUE,
+                        intent_json TEXT NOT NULL,
+                        execute_after INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        prepared_by TEXT NOT NULL,
+                        chia_transaction_id TEXT,
+                        evm_transaction_hash TEXT,
+                        chia_receipt_hash TEXT,
+                        evm_receipt_hash TEXT,
+                        failure_reason TEXT,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (authority_slot IN (0, 1, 2)),
+                        CHECK (kind IN ('ROUTINE', 'LOST', 'RECOVERY_KIT')),
+                        CHECK (state IN (
+                            'PREPARED', 'AWAITING_APPROVALS', 'READY',
+                            'SUBMITTED', 'PARTIAL', 'COMPLETED',
+                            'CANCELLED', 'FAILED'
+                        )),
+                        CHECK (expires_at > execute_after)
+                    );
+                    INSERT INTO admin_recovery_cases
+                    SELECT * FROM admin_recovery_cases_v5;
+
+                    CREATE TABLE admin_recovery_approvals (
+                        case_id TEXT NOT NULL,
+                        actor_role TEXT NOT NULL,
+                        actor_id TEXT NOT NULL,
+                        signer_slot INTEGER,
+                        signer_address TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        message_hash TEXT NOT NULL,
+                        submitted_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, actor_role, actor_id),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (actor_role IN (
+                            'PREPARER', 'AUTHORITY', 'PEER',
+                            'REPLACEMENT', 'OLD_KEY_VETO'
+                        )),
+                        CHECK (signer_slot IS NULL OR signer_slot IN (0, 1, 2))
+                    );
+                    INSERT INTO admin_recovery_approvals
+                    SELECT * FROM admin_recovery_approvals_v5;
+
+                    CREATE TABLE admin_recovery_receipts (
+                        case_id TEXT NOT NULL,
+                        chain TEXT NOT NULL,
+                        phase TEXT NOT NULL,
+                        transaction_id TEXT NOT NULL,
+                        receipt_hash TEXT NOT NULL,
+                        receipt_json TEXT NOT NULL,
+                        observed_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, chain, phase),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (chain IN ('CHIA', 'EVM')),
+                        CHECK (phase IN (
+                            'PREPARE', 'APPROVE', 'EXECUTE',
+                            'CANCEL', 'COMPLETE', 'ROLLBACK'
+                        ))
+                    );
+                    INSERT INTO admin_recovery_receipts
+                    SELECT * FROM admin_recovery_receipts_v5;
+
+                    DROP TABLE admin_recovery_approvals_v5;
+                    DROP TABLE admin_recovery_receipts_v5;
+                    DROP TABLE admin_recovery_cases_v5;
+                    CREATE INDEX admin_recovery_cases_active_idx
+                        ON admin_recovery_cases(ceremony_id, state, created_at);
+
+                    CREATE TABLE admin_recovery_kit_candidates (
+                        challenge_id TEXT PRIMARY KEY,
+                        ceremony_id TEXT NOT NULL,
+                        slot INTEGER NOT NULL,
+                        revision INTEGER NOT NULL,
+                        evm_guardian TEXT NOT NULL,
+                        recovery_bls_pubkey TEXT NOT NULL,
+                        recovery_bls_commitment TEXT NOT NULL,
+                        drill_challenge_hash TEXT NOT NULL,
+                        drill_verified_at INTEGER NOT NULL,
+                        offline_copy_confirmed INTEGER NOT NULL,
+                        second_device_confirmed INTEGER NOT NULL,
+                        backup_status TEXT NOT NULL,
+                        backup_revision INTEGER,
+                        backup_ciphertext_hash TEXT,
+                        backup_verified_at INTEGER,
+                        state TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        FOREIGN KEY (challenge_id) REFERENCES admin_recovery_drills(challenge_id),
+                        CHECK (slot IN (1, 2, 3)),
+                        CHECK (revision >= 2),
+                        CHECK (offline_copy_confirmed = 1),
+                        CHECK (second_device_confirmed = 1),
+                        CHECK (backup_status IN ('NOT_CONFIGURED', 'VERIFIED')),
+                        CHECK (state IN ('PENDING', 'ACTIVATED', 'CANCELLED'))
+                    );
+                    CREATE UNIQUE INDEX admin_recovery_kit_candidate_pending_idx
+                        ON admin_recovery_kit_candidates(ceremony_id, slot)
+                        WHERE state = 'PENDING';
+
+                    PRAGMA user_version = 6;
+                    COMMIT;
+                    PRAGMA foreign_keys = ON;
+                    """
+                )
+                version = 6
+            if version < 7:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE admin_recovery_chia_signatures (
+                        case_id TEXT NOT NULL,
+                        phase TEXT NOT NULL,
+                        action_id TEXT NOT NULL,
+                        signer_kind TEXT NOT NULL,
+                        signer_slot INTEGER,
+                        signer_public_key TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        message_hash TEXT NOT NULL,
+                        submitted_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, phase, action_id),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (phase IN ('PREPARE', 'CANCEL')),
+                        CHECK (signer_kind IN ('EIP712_DAILY', 'BLS_RECOVERY')),
+                        CHECK (signer_slot IS NULL OR signer_slot IN (0, 1, 2))
+                    );
+                    CREATE INDEX admin_recovery_chia_signatures_case_idx
+                        ON admin_recovery_chia_signatures(
+                            case_id, phase, submitted_at
+                        );
+
+                    PRAGMA user_version = 7;
+                    COMMIT;
+                    """
+                )
+                version = 7
+            if version < 8:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE admin_recovery_evm_safe_signatures (
+                        case_id TEXT NOT NULL,
+                        action_id TEXT NOT NULL,
+                        package_hash TEXT NOT NULL,
+                        safe_nonce INTEGER NOT NULL,
+                        coadmin_slot INTEGER,
+                        signer_slot INTEGER NOT NULL,
+                        signer_role TEXT NOT NULL,
+                        signer_address TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        message_hash TEXT NOT NULL,
+                        submitted_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, action_id, signer_slot),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (safe_nonce >= 0),
+                        CHECK (coadmin_slot IS NULL OR coadmin_slot IN (1, 2)),
+                        CHECK (signer_slot IN (0, 1, 2)),
+                        CHECK (signer_role IN ('OWNER', 'COADMIN', 'PEER'))
+                    );
+                    CREATE INDEX admin_recovery_evm_safe_signatures_package_idx
+                        ON admin_recovery_evm_safe_signatures(
+                            case_id, action_id, package_hash, submitted_at
+                        );
+
+                    PRAGMA user_version = 8;
+                    COMMIT;
+                    """
+                )
+                version = 8
+            if version < 9:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE admin_recovery_evm_submissions (
+                        case_id TEXT NOT NULL,
+                        action_id TEXT NOT NULL,
+                        transaction_hash TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL,
+                        submitted_by TEXT NOT NULL,
+                        submitted_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (case_id, action_id),
+                        FOREIGN KEY (case_id) REFERENCES admin_recovery_cases(case_id),
+                        CHECK (state IN ('PENDING', 'CONFIRMED'))
+                    );
+                    CREATE INDEX admin_recovery_evm_submissions_state_idx
+                        ON admin_recovery_evm_submissions(
+                            case_id, state, submitted_at
+                        );
+
+                    PRAGMA user_version = 9;
                     COMMIT;
                     """
                 )
@@ -1748,60 +2004,74 @@ class GenesisStore:
                 (ceremony_id, slot),
             ).fetchone()
             revision = int(public["revision"])
-            if existing is not None and revision <= int(existing["revision"]):
+            if existing is not None and revision != int(existing["revision"]) + 1:
                 raise GenesisConflict(
-                    "recovery kit revision must increase monotonically"
+                    "replacement recovery kit must be the next revision"
                 )
             connection.execute(
                 "UPDATE admin_recovery_drills SET consumed_at=? "
                 "WHERE challenge_id=? AND consumed_at IS NULL",
                 (timestamp, challenge_id),
             )
-            connection.execute(
-                """
-                INSERT INTO admin_recovery_kits(
-                    ceremony_id,slot,revision,evm_guardian,recovery_bls_pubkey,
-                    recovery_bls_commitment,drill_challenge_hash,
-                    drill_verified_at,offline_copy_confirmed,
-                    second_device_confirmed,backup_status,backup_revision,
-                    backup_ciphertext_hash,backup_verified_at,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,1,1,?,?,?,?,?,?)
-                ON CONFLICT(ceremony_id,slot) DO UPDATE SET
-                    revision=excluded.revision,
-                    evm_guardian=excluded.evm_guardian,
-                    recovery_bls_pubkey=excluded.recovery_bls_pubkey,
-                    recovery_bls_commitment=excluded.recovery_bls_commitment,
-                    drill_challenge_hash=excluded.drill_challenge_hash,
-                    drill_verified_at=excluded.drill_verified_at,
-                    offline_copy_confirmed=1,
-                    second_device_confirmed=1,
-                    backup_status=excluded.backup_status,
-                    backup_revision=excluded.backup_revision,
-                    backup_ciphertext_hash=excluded.backup_ciphertext_hash,
-                    backup_verified_at=excluded.backup_verified_at,
-                    updated_at=excluded.updated_at
-                """,
+            values = (
+                ceremony_id,
+                slot,
+                revision,
+                str(public["evmGuardian"]).lower(),
+                str(public["recoveryBlsPubkey"]).lower(),
+                str(public["recoveryBlsCommitment"]).lower(),
+                expected_challenge_hash.lower(),
+                timestamp,
+                backup_status,
+                backup_revision,
                 (
-                    ceremony_id,
-                    slot,
-                    revision,
-                    str(public["evmGuardian"]).lower(),
-                    str(public["recoveryBlsPubkey"]).lower(),
-                    str(public["recoveryBlsCommitment"]).lower(),
-                    expected_challenge_hash.lower(),
-                    timestamp,
-                    backup_status,
-                    backup_revision,
-                    (
-                        backup_ciphertext_hash.lower()
-                        if backup_ciphertext_hash
-                        else None
-                    ),
-                    timestamp if backup_status == "VERIFIED" else None,
-                    timestamp,
-                    timestamp,
+                    backup_ciphertext_hash.lower()
+                    if backup_ciphertext_hash
+                    else None
                 ),
+                timestamp if backup_status == "VERIFIED" else None,
+                timestamp,
+                timestamp,
             )
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_kits(
+                        ceremony_id,slot,revision,evm_guardian,
+                        recovery_bls_pubkey,recovery_bls_commitment,
+                        drill_challenge_hash,drill_verified_at,
+                        offline_copy_confirmed,second_device_confirmed,
+                        backup_status,backup_revision,backup_ciphertext_hash,
+                        backup_verified_at,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,1,1,?,?,?,?,?,?)
+                    """,
+                    values,
+                )
+            else:
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO admin_recovery_kit_candidates(
+                            challenge_id,ceremony_id,slot,revision,
+                            evm_guardian,recovery_bls_pubkey,
+                            recovery_bls_commitment,drill_challenge_hash,
+                            drill_verified_at,offline_copy_confirmed,
+                            second_device_confirmed,backup_status,
+                            backup_revision,backup_ciphertext_hash,
+                            backup_verified_at,state,created_at,updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,1,1,?,?,?,?, 'PENDING',?,?)
+                        """,
+                        (
+                            challenge_id,
+                            *values[:8],
+                            *values[8:12],
+                            *values[12:],
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise GenesisConflict(
+                        "a replacement recovery kit is already pending"
+                    ) from exc
             self._event(
                 connection,
                 ceremony_id,
@@ -1810,10 +2080,13 @@ class GenesisStore:
                     "slot": slot - 1,
                     "revision": revision,
                     "backupStatus": backup_status,
+                    "activationRequired": existing is not None,
                 },
                 timestamp,
             )
-        return self.recovery_kit(ceremony_id, slot)
+        if existing is None:
+            return self.recovery_kit(ceremony_id, slot)
+        return self.recovery_kit_candidate(challenge_id)
 
     def recovery_kit(self, ceremony_id: str, slot: int) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1831,6 +2104,7 @@ class GenesisStore:
             "evmGuardian": str(row["evm_guardian"]),
             "recoveryBlsPubkey": str(row["recovery_bls_pubkey"]),
             "recoveryBlsCommitment": str(row["recovery_bls_commitment"]),
+            "drillChallengeHash": str(row["drill_challenge_hash"]),
             "drillVerifiedAt": int(row["drill_verified_at"]),
             "offlineCopyConfirmed": bool(row["offline_copy_confirmed"]),
             "secondDeviceConfirmed": bool(row["second_device_confirmed"]),
@@ -1860,6 +2134,182 @@ class GenesisStore:
             self.recovery_kit(ceremony_id, int(row["slot"])) for row in rows
         ]
 
+    @staticmethod
+    def _recovery_kit_candidate_payload(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        return {
+            "challengeId": str(row["challenge_id"]),
+            "ceremonyId": str(row["ceremony_id"]),
+            "slot": int(row["slot"]) - 1,
+            "revision": int(row["revision"]),
+            "evmGuardian": str(row["evm_guardian"]),
+            "recoveryBlsPubkey": str(row["recovery_bls_pubkey"]),
+            "recoveryBlsCommitment": str(row["recovery_bls_commitment"]),
+            "drillChallengeHash": str(row["drill_challenge_hash"]),
+            "drillVerifiedAt": int(row["drill_verified_at"]),
+            "offlineCopyConfirmed": bool(row["offline_copy_confirmed"]),
+            "secondDeviceConfirmed": bool(row["second_device_confirmed"]),
+            "backupStatus": str(row["backup_status"]),
+            "backupRevision": (
+                int(row["backup_revision"])
+                if row["backup_revision"] is not None
+                else None
+            ),
+            "backupCiphertextHash": row["backup_ciphertext_hash"],
+            "backupVerifiedAt": (
+                int(row["backup_verified_at"])
+                if row["backup_verified_at"] is not None
+                else None
+            ),
+            "state": str(row["state"]),
+            "updatedAt": int(row["updated_at"]),
+        }
+
+    def recovery_kit_candidate(
+        self,
+        challenge_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM admin_recovery_kit_candidates "
+                "WHERE challenge_id=?",
+                (challenge_id,),
+            ).fetchone()
+        if row is None:
+            raise GenesisNotFound("replacement recovery kit not found")
+        return self._recovery_kit_candidate_payload(row)
+
+    def pending_recovery_kit_candidate(
+        self,
+        ceremony_id: str,
+        slot: int,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM admin_recovery_kit_candidates "
+                "WHERE ceremony_id=? AND slot=? AND state='PENDING'",
+                (ceremony_id, slot),
+            ).fetchone()
+        return (
+            self._recovery_kit_candidate_payload(row)
+            if row is not None
+            else None
+        )
+
+    def activate_recovery_kit_candidate(
+        self,
+        challenge_id: str,
+        *,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            candidate = connection.execute(
+                "SELECT * FROM admin_recovery_kit_candidates "
+                "WHERE challenge_id=? AND state='PENDING'",
+                (challenge_id,),
+            ).fetchone()
+            if candidate is None:
+                raise GenesisConflict(
+                    "replacement recovery kit is not pending"
+                )
+            current = connection.execute(
+                "SELECT revision FROM admin_recovery_kits "
+                "WHERE ceremony_id=? AND slot=?",
+                (candidate["ceremony_id"], candidate["slot"]),
+            ).fetchone()
+            if (
+                current is None
+                or int(candidate["revision"]) != int(current["revision"]) + 1
+            ):
+                raise GenesisConflict(
+                    "replacement recovery kit revision is stale"
+                )
+            connection.execute(
+                """
+                UPDATE admin_recovery_kits SET
+                    revision=?,evm_guardian=?,recovery_bls_pubkey=?,
+                    recovery_bls_commitment=?,drill_challenge_hash=?,
+                    drill_verified_at=?,offline_copy_confirmed=1,
+                    second_device_confirmed=1,backup_status=?,
+                    backup_revision=?,backup_ciphertext_hash=?,
+                    backup_verified_at=?,updated_at=?
+                WHERE ceremony_id=? AND slot=?
+                """,
+                (
+                    candidate["revision"],
+                    candidate["evm_guardian"],
+                    candidate["recovery_bls_pubkey"],
+                    candidate["recovery_bls_commitment"],
+                    candidate["drill_challenge_hash"],
+                    candidate["drill_verified_at"],
+                    candidate["backup_status"],
+                    candidate["backup_revision"],
+                    candidate["backup_ciphertext_hash"],
+                    candidate["backup_verified_at"],
+                    timestamp,
+                    candidate["ceremony_id"],
+                    candidate["slot"],
+                ),
+            )
+            connection.execute(
+                "UPDATE admin_recovery_kit_candidates "
+                "SET state='ACTIVATED',updated_at=? WHERE challenge_id=?",
+                (timestamp, challenge_id),
+            )
+            self._event(
+                connection,
+                str(candidate["ceremony_id"]),
+                "admin_recovery_kit_activated",
+                {
+                    "slot": int(candidate["slot"]) - 1,
+                    "revision": int(candidate["revision"]),
+                    "challengeId": challenge_id,
+                },
+                timestamp,
+            )
+            ceremony_id = str(candidate["ceremony_id"])
+            slot = int(candidate["slot"])
+        return self.recovery_kit(ceremony_id, slot)
+
+    def cancel_recovery_kit_candidate(
+        self,
+        challenge_id: str,
+        *,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            candidate = connection.execute(
+                "SELECT * FROM admin_recovery_kit_candidates "
+                "WHERE challenge_id=?",
+                (challenge_id,),
+            ).fetchone()
+            if candidate is None:
+                raise GenesisNotFound("replacement recovery kit not found")
+            if str(candidate["state"]) == "ACTIVATED":
+                raise GenesisConflict(
+                    "active recovery kit cannot be canceled"
+                )
+            connection.execute(
+                "UPDATE admin_recovery_kit_candidates "
+                "SET state='CANCELLED',updated_at=? WHERE challenge_id=?",
+                (timestamp, challenge_id),
+            )
+            self._event(
+                connection,
+                str(candidate["ceremony_id"]),
+                "admin_recovery_kit_candidate_cancelled",
+                {
+                    "slot": int(candidate["slot"]) - 1,
+                    "revision": int(candidate["revision"]),
+                    "challengeId": challenge_id,
+                },
+                timestamp,
+            )
+        return self.recovery_kit_candidate(challenge_id)
+
     def create_recovery_case(
         self,
         ceremony_id: str,
@@ -1876,7 +2326,7 @@ class GenesisStore:
     ) -> dict[str, Any]:
         if authority_slot not in (0, 1, 2):
             raise ValueError("authority slot must be 0, 1, or 2")
-        if kind not in {"ROUTINE", "LOST"}:
+        if kind not in {"ROUTINE", "LOST", "RECOVERY_KIT"}:
             raise ValueError("invalid recovery kind")
         timestamp = int(time.time()) if now is None else now
         if execute_after <= timestamp or expires_at <= execute_after:
@@ -1992,6 +2442,488 @@ class GenesisStore:
             )
         return self.recovery_case(case_id)
 
+    def add_recovery_chia_signature(
+        self,
+        case_id: str,
+        *,
+        phase: str,
+        action_id: str,
+        signer_kind: str,
+        signer_slot: int | None,
+        signer_public_key: str,
+        signature: str,
+        message_hash: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        if phase not in {"PREPARE", "CANCEL"}:
+            raise ValueError("Chia recovery signature phase is invalid")
+        if signer_kind not in {"EIP712_DAILY", "BLS_RECOVERY"}:
+            raise ValueError("Chia recovery signer kind is invalid")
+        if signer_slot is not None and signer_slot not in (0, 1, 2):
+            raise ValueError("Chia recovery signer slot is invalid")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            case = connection.execute(
+                "SELECT * FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if str(case["state"]) in {"COMPLETED", "CANCELLED", "FAILED"}:
+                raise GenesisConflict("administrator recovery case is terminal")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_chia_signatures(
+                        case_id,phase,action_id,signer_kind,signer_slot,
+                        signer_public_key,signature,message_hash,submitted_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        case_id,
+                        phase,
+                        action_id.lower(),
+                        signer_kind,
+                        signer_slot,
+                        signer_public_key.lower(),
+                        signature.lower(),
+                        message_hash.lower(),
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict(
+                    "this Chia recovery action was already signed"
+                ) from exc
+            self._event(
+                connection,
+                str(case["ceremony_id"]),
+                "admin_key_change_chia_signature_recorded",
+                {
+                    "caseId": case_id,
+                    "phase": phase,
+                    "actionId": action_id.lower(),
+                    "signerKind": signer_kind,
+                    "signerSlot": signer_slot,
+                    "messageHash": message_hash.lower(),
+                },
+                timestamp,
+            )
+        return self.recovery_case(case_id)
+
+    def recovery_chia_signatures(
+        self,
+        case_id: str,
+        *,
+        phase: str | None = None,
+        include_signatures: bool = False,
+    ) -> list[dict[str, Any]]:
+        if phase is not None and phase not in {"PREPARE", "CANCEL"}:
+            raise ValueError("Chia recovery signature phase is invalid")
+        with self._connect() as connection:
+            case = connection.execute(
+                "SELECT case_id FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if phase is None:
+                rows = connection.execute(
+                    "SELECT * FROM admin_recovery_chia_signatures "
+                    "WHERE case_id=? ORDER BY submitted_at,phase,action_id",
+                    (case_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM admin_recovery_chia_signatures "
+                    "WHERE case_id=? AND phase=? "
+                    "ORDER BY submitted_at,action_id",
+                    (case_id, phase),
+                ).fetchall()
+        return [
+            {
+                "phase": str(row["phase"]),
+                "actionId": str(row["action_id"]),
+                "signerKind": str(row["signer_kind"]),
+                "signerSlot": (
+                    int(row["signer_slot"])
+                    if row["signer_slot"] is not None
+                    else None
+                ),
+                "signerPublicKey": str(row["signer_public_key"]),
+                "messageHash": str(row["message_hash"]),
+                "submittedAt": int(row["submitted_at"]),
+                **(
+                    {"signature": str(row["signature"])}
+                    if include_signatures
+                    else {}
+                ),
+            }
+            for row in rows
+        ]
+
+    def add_recovery_evm_safe_signature(
+        self,
+        case_id: str,
+        *,
+        action_id: str,
+        package_hash: str,
+        safe_nonce: int,
+        coadmin_slot: int | None,
+        signer_slot: int,
+        signer_role: str,
+        signer_address: str,
+        signature: str,
+        message_hash: str,
+        now: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if safe_nonce < 0:
+            raise ValueError("Safe nonce must not be negative")
+        if coadmin_slot is not None and coadmin_slot not in (1, 2):
+            raise ValueError("Safe coadministrator slot is invalid")
+        if signer_slot not in (0, 1, 2):
+            raise ValueError("Safe signer slot is invalid")
+        if signer_role not in {"OWNER", "COADMIN", "PEER"}:
+            raise ValueError("Safe signer role is invalid")
+        timestamp = int(time.time()) if now is None else now
+        normalized_action = action_id.lower()
+        normalized_package = package_hash.lower()
+        normalized_signer = signer_address.lower()
+        normalized_signature = signature.lower()
+        normalized_message = message_hash.lower()
+        with self._transaction() as connection:
+            case = connection.execute(
+                "SELECT * FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if str(case["state"]) in {"COMPLETED", "CANCELLED", "FAILED"}:
+                raise GenesisConflict("administrator recovery case is terminal")
+            existing = connection.execute(
+                "SELECT * FROM admin_recovery_evm_safe_signatures "
+                "WHERE case_id=? AND action_id=?",
+                (case_id, normalized_action),
+            ).fetchall()
+            if existing and any(
+                str(row["package_hash"]).lower() != normalized_package
+                or int(row["safe_nonce"]) != safe_nonce
+                or (
+                    int(row["coadmin_slot"])
+                    if row["coadmin_slot"] is not None
+                    else None
+                )
+                != coadmin_slot
+                for row in existing
+            ):
+                connection.execute(
+                    "DELETE FROM admin_recovery_evm_safe_signatures "
+                    "WHERE case_id=? AND action_id=?",
+                    (case_id, normalized_action),
+                )
+                self._event(
+                    connection,
+                    str(case["ceremony_id"]),
+                    "admin_key_change_evm_safe_package_invalidated",
+                    {
+                        "caseId": case_id,
+                        "actionId": normalized_action,
+                        "replacementPackageHash": normalized_package,
+                        "safeNonce": safe_nonce,
+                    },
+                    timestamp,
+                )
+                existing = []
+            duplicate = next(
+                (
+                    row
+                    for row in existing
+                    if int(row["signer_slot"]) == signer_slot
+                ),
+                None,
+            )
+            if duplicate is not None:
+                if (
+                    str(duplicate["signer_role"]) != signer_role
+                    or str(duplicate["signer_address"]).lower()
+                    != normalized_signer
+                    or str(duplicate["signature"]).lower()
+                    != normalized_signature
+                    or str(duplicate["message_hash"]).lower()
+                    != normalized_message
+                ):
+                    raise GenesisConflict(
+                        "this Safe approval conflicts with the recorded signature"
+                    )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_evm_safe_signatures(
+                        case_id,action_id,package_hash,safe_nonce,coadmin_slot,
+                        signer_slot,signer_role,signer_address,signature,
+                        message_hash,submitted_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        case_id,
+                        normalized_action,
+                        normalized_package,
+                        safe_nonce,
+                        coadmin_slot,
+                        signer_slot,
+                        signer_role,
+                        normalized_signer,
+                        normalized_signature,
+                        normalized_message,
+                        timestamp,
+                    ),
+                )
+                self._event(
+                    connection,
+                    str(case["ceremony_id"]),
+                    "admin_key_change_evm_safe_signature_recorded",
+                    {
+                        "caseId": case_id,
+                        "actionId": normalized_action,
+                        "packageHash": normalized_package,
+                        "safeNonce": safe_nonce,
+                        "coadminSlot": coadmin_slot,
+                        "signerSlot": signer_slot,
+                        "signerRole": signer_role,
+                        "messageHash": normalized_message,
+                    },
+                    timestamp,
+                )
+        return self.recovery_evm_safe_signatures(
+            case_id,
+            action_id=normalized_action,
+            package_hash=normalized_package,
+            include_signatures=True,
+        )
+
+    def recovery_evm_safe_signatures(
+        self,
+        case_id: str,
+        *,
+        action_id: str,
+        package_hash: str | None = None,
+        include_signatures: bool = False,
+    ) -> list[dict[str, Any]]:
+        normalized_action = action_id.lower()
+        with self._connect() as connection:
+            case = connection.execute(
+                "SELECT case_id FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if package_hash is None:
+                rows = connection.execute(
+                    "SELECT * FROM admin_recovery_evm_safe_signatures "
+                    "WHERE case_id=? AND action_id=? "
+                    "ORDER BY submitted_at,signer_slot",
+                    (case_id, normalized_action),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM admin_recovery_evm_safe_signatures "
+                    "WHERE case_id=? AND action_id=? AND package_hash=? "
+                    "ORDER BY submitted_at,signer_slot",
+                    (case_id, normalized_action, package_hash.lower()),
+                ).fetchall()
+        return [
+            {
+                "actionId": str(row["action_id"]),
+                "packageHash": str(row["package_hash"]),
+                "safeNonce": int(row["safe_nonce"]),
+                "coadminSlot": (
+                    int(row["coadmin_slot"])
+                    if row["coadmin_slot"] is not None
+                    else None
+                ),
+                "signerSlot": int(row["signer_slot"]),
+                "signerRole": str(row["signer_role"]),
+                "signerAddress": str(row["signer_address"]),
+                "messageHash": str(row["message_hash"]),
+                "submittedAt": int(row["submitted_at"]),
+                **(
+                    {"signature": str(row["signature"])}
+                    if include_signatures
+                    else {}
+                ),
+            }
+            for row in rows
+        ]
+
+    def add_recovery_evm_submission(
+        self,
+        case_id: str,
+        *,
+        action_id: str,
+        transaction_hash: str,
+        submitted_by: str,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
+        normalized_action = action_id.lower()
+        normalized_transaction = transaction_hash.lower()
+        normalized_submitter = submitted_by.lower()
+        with self._transaction() as connection:
+            case = connection.execute(
+                "SELECT * FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if str(case["state"]) in {"COMPLETED", "CANCELLED", "FAILED"}:
+                raise GenesisConflict("administrator recovery case is terminal")
+            existing = connection.execute(
+                "SELECT * FROM admin_recovery_evm_submissions "
+                "WHERE case_id=? AND action_id=?",
+                (case_id, normalized_action),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["transaction_hash"]).lower()
+                    != normalized_transaction
+                    or str(existing["submitted_by"]).lower()
+                    != normalized_submitter
+                ):
+                    raise GenesisConflict(
+                        "this Base Sepolia action already has a different transaction"
+                    )
+                return self._recovery_evm_submission_row(existing)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO admin_recovery_evm_submissions(
+                        case_id,action_id,transaction_hash,state,submitted_by,
+                        submitted_at,updated_at
+                    ) VALUES(?,?,?,'PENDING',?,?,?)
+                    """,
+                    (
+                        case_id,
+                        normalized_action,
+                        normalized_transaction,
+                        normalized_submitter,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict(
+                    "this Base Sepolia transaction is already assigned"
+                ) from exc
+            self._event(
+                connection,
+                str(case["ceremony_id"]),
+                "admin_key_change_evm_submission_recorded",
+                {
+                    "caseId": case_id,
+                    "actionId": normalized_action,
+                    "transactionHash": normalized_transaction,
+                    "submittedBy": normalized_submitter,
+                },
+                timestamp,
+            )
+        return self.recovery_evm_submission(case_id, normalized_action)
+
+    def confirm_recovery_evm_submission(
+        self,
+        case_id: str,
+        *,
+        transaction_hash: str,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = int(time.time()) if now is None else now
+        normalized_transaction = transaction_hash.lower()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT s.*,c.ceremony_id FROM admin_recovery_evm_submissions s "
+                "JOIN admin_recovery_cases c ON c.case_id=s.case_id "
+                "WHERE s.case_id=? AND s.transaction_hash=?",
+                (case_id, normalized_transaction),
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["state"]) != "CONFIRMED":
+                connection.execute(
+                    "UPDATE admin_recovery_evm_submissions "
+                    "SET state='CONFIRMED',updated_at=? "
+                    "WHERE case_id=? AND transaction_hash=?",
+                    (timestamp, case_id, normalized_transaction),
+                )
+                self._event(
+                    connection,
+                    str(row["ceremony_id"]),
+                    "admin_key_change_evm_submission_confirmed",
+                    {
+                        "caseId": case_id,
+                        "actionId": str(row["action_id"]),
+                        "transactionHash": normalized_transaction,
+                    },
+                    timestamp,
+                )
+        return self.recovery_evm_submission(case_id, str(row["action_id"]))
+
+    def recovery_evm_submission(
+        self,
+        case_id: str,
+        action_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM admin_recovery_evm_submissions "
+                "WHERE case_id=? AND action_id=?",
+                (case_id, action_id.lower()),
+            ).fetchone()
+            if row is None:
+                raise GenesisNotFound(
+                    "Base Sepolia recovery submission not found"
+                )
+        return self._recovery_evm_submission_row(row)
+
+    def recovery_evm_submissions(
+        self,
+        case_id: str,
+        *,
+        pending_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            case = connection.execute(
+                "SELECT case_id FROM admin_recovery_cases WHERE case_id=?",
+                (case_id,),
+            ).fetchone()
+            if case is None:
+                raise GenesisNotFound("administrator recovery case not found")
+            if pending_only:
+                rows = connection.execute(
+                    "SELECT * FROM admin_recovery_evm_submissions "
+                    "WHERE case_id=? AND state='PENDING' "
+                    "ORDER BY submitted_at,action_id",
+                    (case_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM admin_recovery_evm_submissions "
+                    "WHERE case_id=? ORDER BY submitted_at,action_id",
+                    (case_id,),
+                ).fetchall()
+        return [self._recovery_evm_submission_row(row) for row in rows]
+
+    @staticmethod
+    def _recovery_evm_submission_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        return {
+            "actionId": str(row["action_id"]),
+            "transactionHash": str(row["transaction_hash"]),
+            "state": str(row["state"]),
+            "submittedBy": str(row["submitted_by"]),
+            "submittedAt": int(row["submitted_at"]),
+            "updatedAt": int(row["updated_at"]),
+        }
+
     def update_recovery_case(
         self,
         case_id: str,
@@ -2066,6 +2998,7 @@ class GenesisStore:
         case_id: str,
         *,
         chain: str,
+        phase: str,
         transaction_id: str,
         receipt_hash: str,
         receipt: dict[str, Any],
@@ -2073,6 +3006,15 @@ class GenesisStore:
     ) -> dict[str, Any]:
         if chain not in {"CHIA", "EVM"}:
             raise ValueError("recovery receipt chain must be CHIA or EVM")
+        if phase not in {
+            "PREPARE",
+            "APPROVE",
+            "EXECUTE",
+            "CANCEL",
+            "COMPLETE",
+            "ROLLBACK",
+        }:
+            raise ValueError("recovery receipt phase is invalid")
         timestamp = int(time.time()) if now is None else now
         with self._transaction() as connection:
             case = connection.execute(
@@ -2085,13 +3027,14 @@ class GenesisStore:
                 connection.execute(
                     """
                     INSERT INTO admin_recovery_receipts(
-                        case_id,chain,transaction_id,receipt_hash,receipt_json,
-                        observed_at
-                    ) VALUES(?,?,?,?,?,?)
+                        case_id,chain,phase,transaction_id,receipt_hash,
+                        receipt_json,observed_at
+                    ) VALUES(?,?,?,?,?,?,?)
                     """,
                     (
                         case_id,
                         chain,
+                        phase,
                         transaction_id.lower(),
                         receipt_hash.lower(),
                         canonical_json(receipt),
@@ -2109,6 +3052,7 @@ class GenesisStore:
                 {
                     "caseId": case_id,
                     "chain": chain,
+                    "phase": phase,
                     "transactionId": transaction_id.lower(),
                 },
                 timestamp,
@@ -2130,7 +3074,19 @@ class GenesisStore:
             ).fetchall()
             receipts = connection.execute(
                 "SELECT * FROM admin_recovery_receipts "
-                "WHERE case_id=? ORDER BY chain",
+                "WHERE case_id=? ORDER BY observed_at,chain,phase",
+                (case_id,),
+            ).fetchall()
+            chia_signatures = connection.execute(
+                "SELECT phase,action_id,signer_kind,signer_slot,"
+                "signer_public_key,message_hash,submitted_at "
+                "FROM admin_recovery_chia_signatures "
+                "WHERE case_id=? ORDER BY submitted_at,phase,action_id",
+                (case_id,),
+            ).fetchall()
+            evm_submissions = connection.execute(
+                "SELECT * FROM admin_recovery_evm_submissions "
+                "WHERE case_id=? ORDER BY submitted_at,action_id",
                 (case_id,),
             ).fetchall()
         return {
@@ -2167,12 +3123,33 @@ class GenesisStore:
             "receipts": [
                 {
                     "chain": str(item["chain"]),
+                    "phase": str(item["phase"]),
                     "transactionId": str(item["transaction_id"]),
                     "receiptHash": str(item["receipt_hash"]),
                     "receipt": json.loads(str(item["receipt_json"])),
                     "observedAt": int(item["observed_at"]),
                 }
                 for item in receipts
+            ],
+            "chiaSignatures": [
+                {
+                    "phase": str(item["phase"]),
+                    "actionId": str(item["action_id"]),
+                    "signerKind": str(item["signer_kind"]),
+                    "signerSlot": (
+                        int(item["signer_slot"])
+                        if item["signer_slot"] is not None
+                        else None
+                    ),
+                    "signerPublicKey": str(item["signer_public_key"]),
+                    "messageHash": str(item["message_hash"]),
+                    "submittedAt": int(item["submitted_at"]),
+                }
+                for item in chia_signatures
+            ],
+            "evmSubmissions": [
+                self._recovery_evm_submission_row(item)
+                for item in evm_submissions
             ],
             "createdAt": int(row["created_at"]),
             "updatedAt": int(row["updated_at"]),
@@ -2184,6 +3161,15 @@ class GenesisStore:
                 "SELECT case_id FROM admin_recovery_cases "
                 "WHERE ceremony_id=? ORDER BY created_at DESC",
                 (ceremony_id,),
+            ).fetchall()
+        return [self.recovery_case(str(row["case_id"])) for row in rows]
+
+    def active_recovery_cases(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT case_id FROM admin_recovery_cases "
+                "WHERE state NOT IN ('COMPLETED','CANCELLED','FAILED') "
+                "ORDER BY created_at"
             ).fetchall()
         return [self.recovery_case(str(row["case_id"])) for row in rows]
 

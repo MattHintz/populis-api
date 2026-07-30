@@ -57,7 +57,7 @@ def _v2_manifest() -> dict:
 def _signed_artifact(manifest: dict) -> dict:
     return {
         "artifactHash": "0x" + "ab" * 32,
-        "sourceManifestVersion": 3,
+        "sourceManifestVersion": 4,
         "sourceShas": {
             "protocol": "1" * 40,
             "evm": "2" * 40,

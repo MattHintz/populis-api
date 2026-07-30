@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
@@ -36,19 +37,64 @@ def _sign(account, typed_data: dict) -> str:
 
 
 def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
+    release_tag = "solslot-v2-alpha-rc23-20260729"
+    release_branch = "release/testnet-alpha-rc23-20260729"
+    source_shas = {
+        name: f"{index:x}" * 40
+        for index, name in enumerate(SOURCE_KEYS, start=1)
+    }
+    source_manifest = {
+        "schemaVersion": 4,
+        "kind": "solslot-release-source-manifest",
+        "releaseId": release_tag,
+        "network": "testnet11",
+        "testOnly": True,
+        "sourceShas": source_shas,
+        "dependencies": {
+            "administratorRecovery": {
+                "repository": (
+                    launch_control_module.PINNED_CNI_WALLET_SDK_REPOSITORY
+                ),
+                "commit": (
+                    launch_control_module.PINNED_CNI_WALLET_SDK_COMMIT
+                ),
+                "license": (
+                    launch_control_module.PINNED_CNI_WALLET_SDK_LICENSE
+                ),
+                "manifestHash": (
+                    launch_control_module
+                    .RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX
+                ),
+            }
+        },
+        "authoritySourceCommitment": (
+            launch_control_module._authority_source_commitment(
+                source_shas
+            )
+        ),
+        "sources": {
+            name: {
+                "repository": f"https://github.com/solslot/{name}",
+                "branch": release_branch,
+                "commit": source_shas[name],
+            }
+            for name in SOURCE_KEYS
+        },
+    }
+    source_manifest["manifestHash"] = (
+        launch_control_module._source_manifest_hash(source_manifest)
+    )
     evidence = {
-        "schemaVersion": 8,
+        "schemaVersion": 5,
+        "kind": "solslot-rc23-launch-source-evidence",
         "network": "testnet11",
         "testOnly": True,
         "completeReleaseManifest": True,
-        "releaseTag": "solslot-v2-alpha-rc22.3-20260729",
-        "manifestHash": "0x" + "aa" * 32,
-        "sourceManifest": {
-            "sourceShas": {
-                name: f"{index:x}" * 40
-                for index, name in enumerate(SOURCE_KEYS, start=1)
-            }
-        },
+        "releaseRefsVerified": True,
+        "releaseTag": release_tag,
+        "releaseId": release_tag,
+        "manifestHash": source_manifest["manifestHash"],
+        "sourceManifest": source_manifest,
     }
     evidence_path = tmp_path / "source-freeze.json"
     evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
@@ -107,6 +153,53 @@ def _plan_template(kos_pubkey: bytes) -> dict:
             "rewardEpochSeconds": 86_400,
         },
     }
+
+
+def test_release_evidence_binds_recovery_sdk_and_authority_source(
+    tmp_path,
+) -> None:
+    _, _, settings = _client(tmp_path)
+    loaded = launch_control_module._load_release_evidence(settings)
+    assert loaded["recoveryDependencyManifestHash"] == (
+        launch_control_module.RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX
+    )
+
+    path = settings.launch_source_evidence_path
+    assert path is not None
+    payload = json.loads(open(path, encoding="utf-8").read())
+    manifest = payload["sourceManifest"]
+    manifest["dependencies"]["administratorRecovery"]["commit"] = (
+        "f" * 40
+    )
+    manifest["manifestHash"] = (
+        launch_control_module._source_manifest_hash(manifest)
+    )
+    payload["manifestHash"] = manifest["manifestHash"]
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+    with pytest.raises(Exception, match="pinned recovery SDK"):
+        launch_control_module._load_release_evidence(settings)
+
+
+def test_release_evidence_rejects_authority_commitment_drift(
+    tmp_path,
+) -> None:
+    _, _, settings = _client(tmp_path)
+    path = settings.launch_source_evidence_path
+    assert path is not None
+    payload = json.loads(open(path, encoding="utf-8").read())
+    manifest = payload["sourceManifest"]
+    manifest["authoritySourceCommitment"] = "0x" + "ff" * 32
+    manifest["manifestHash"] = (
+        launch_control_module._source_manifest_hash(manifest)
+    )
+    payload["manifestHash"] = manifest["manifestHash"]
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+    with pytest.raises(Exception, match="source commitment"):
+        launch_control_module._load_release_evidence(settings)
 
 
 def _claim_and_enroll_owner(client: TestClient):

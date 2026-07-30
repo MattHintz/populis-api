@@ -1,4 +1,4 @@
-"""Load and verify the canonical signed Solslot RC22 public artifact."""
+"""Load and verify the canonical signed Solslot RC23 public artifact."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ class PublicArtifactError(ValueError):
 
 
 class PublicArtifactMissing(PublicArtifactError):
-    """No finalized RC22 ceremony artifact exists yet."""
+    """No finalized RC23 ceremony artifact exists yet."""
 
 
 MAX_PUBLIC_ARTIFACT_BYTES = 2 * 1024 * 1024
@@ -39,7 +39,7 @@ def _verify_artifact_in_worker(
         payload = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise PublicArtifactError(
-            "signed RC22 public artifact is unreadable"
+            "signed RC23 public artifact is unreadable"
         ) from exc
     try:
         process = subprocess.run(
@@ -57,7 +57,7 @@ def _verify_artifact_in_worker(
         )
     except subprocess.TimeoutExpired as exc:
         raise PublicArtifactError(
-            "signed RC22 public artifact verification timed out"
+            "signed RC23 public artifact verification timed out"
         ) from exc
     if process.returncode != 0:
         try:
@@ -66,7 +66,7 @@ def _verify_artifact_in_worker(
         except (json.JSONDecodeError, TypeError, ValueError):
             detail = "worker rejected artifact"
         raise PublicArtifactError(
-            f"signed RC22 public artifact is invalid: {detail}"
+            f"signed RC23 public artifact is invalid: {detail}"
         )
     return raw
 
@@ -171,7 +171,7 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
 
 
 def verify_signed_public_artifact_file(path_value: str | Path) -> dict[str, Any]:
-    """Read and cryptographically verify an RC22 public artifact.
+    """Read and cryptographically verify an RC23 public artifact.
 
     Runtime services which do not share the coordinator's mutable settings
     (notably the isolated validator signers) use this narrower entry point.
@@ -181,12 +181,12 @@ def verify_signed_public_artifact_file(path_value: str | Path) -> dict[str, Any]
     """
     path = Path(path_value)
     if not path.is_file():
-        raise PublicArtifactMissing("signed RC22 public artifact is unavailable")
+        raise PublicArtifactMissing("signed RC23 public artifact is unavailable")
     try:
         stat = path.stat()
         if stat.st_size > MAX_PUBLIC_ARTIFACT_BYTES:
             raise PublicArtifactError(
-                "signed RC22 public artifact exceeds the size limit"
+                "signed RC23 public artifact exceeds the size limit"
             )
         payload = json.loads(
             _verify_artifact_in_worker(
@@ -197,15 +197,15 @@ def verify_signed_public_artifact_file(path_value: str | Path) -> dict[str, Any]
         )
     except OSError as exc:
         raise PublicArtifactError(
-            "signed RC22 public artifact is unreadable"
+            "signed RC23 public artifact is unreadable"
         ) from exc
     if not isinstance(payload, dict):
-        raise PublicArtifactError("signed RC22 public artifact must be an object")
+        raise PublicArtifactError("signed RC23 public artifact must be an object")
     return payload
 
 
 def load_signed_public_artifact(settings: Settings) -> dict[str, Any]:
-    """Read, cryptographically verify, and runtime-bind the RC22 artifact."""
+    """Read, cryptographically verify, and runtime-bind the RC23 artifact."""
     payload = verify_signed_public_artifact_file(settings.public_artifact_path)
     _verify_runtime_bindings(settings, payload)
     return payload
@@ -229,7 +229,7 @@ def signed_admin_allowlist(settings: Settings) -> set[str]:
             public_key = eth_keys.PublicKey.from_compressed_bytes(raw)
         except (TypeError, ValueError) as exc:
             raise PublicArtifactError(
-                "signed RC22 artifact contains an invalid administrator key"
+                "signed RC23 artifact contains an invalid administrator key"
             ) from exc
         identities.add(normalized)
         identities.add(public_key.to_checksum_address().lower())

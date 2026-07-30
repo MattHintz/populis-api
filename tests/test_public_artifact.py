@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from chia_rs import AugSchemeMPL
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_keys import keys
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from solslot_api.config import Settings, get_settings
-from solslot_api.admin_authority_v2 import build_admin_authority_v2_snapshot
+from solslot_api.admin_authority_v3 import build_admin_authority_v3_snapshot
 from solslot_api.genesis_worker import execute
 from solslot_api.protocol_artifacts import router
 from solslot_api.public_artifact import (
@@ -20,7 +21,7 @@ from solslot_api.public_artifact import (
     signed_admin_allowlist,
     verify_signed_public_artifact_file,
 )
-from solslot_puzzles.artifact_schema_v3 import artifact_signing_typed_data
+from solslot_puzzles.artifact_schema_v4 import artifact_signing_typed_data
 from tests.test_genesis_api import _plan_body
 
 
@@ -45,9 +46,21 @@ SOURCE_SHAS = {
 
 def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
     accounts = [Account.create(f"public-artifact-admin-{slot}") for slot in range(3)]
+    recovery_accounts = [
+        Account.create(f"public-artifact-recovery-{slot}")
+        for slot in range(3)
+    ]
+    recovery_bls_keys = [
+        bytes(
+            AugSchemeMPL.key_gen(
+                bytes([0xD0 + slot]) * 32
+            ).get_g1()
+        )
+        for slot in range(3)
+    ]
     ceremony = {
         "ceremony_id": "0x" + "91" * 32,
-        "draft": {"sourceManifestVersion": 3, "sourceShas": SOURCE_SHAS},
+        "draft": {"sourceManifestVersion": 4, "sourceShas": SOURCE_SHAS},
         "invitations": [
             {
                 "slot": slot + 1,
@@ -59,20 +72,32 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
             for slot, account in enumerate(accounts)
         ],
     }
+    plan_input = _plan_body()
+    plan_input["adminRecoveryKits"] = [
+        {
+            "slot": slot,
+            "revision": 1,
+            "evmGuardian": recovery_accounts[slot].address,
+            "recoveryBlsPubkey": "0x" + recovery_bls_keys[slot].hex(),
+            "drillChallengeHash": "0x"
+            + bytes([0xA0 + slot] * 32).hex(),
+        }
+        for slot in range(3)
+    ]
     artifact = execute(
         {
             "operation": "artifact",
             "ceremony": ceremony,
-            "planInput": _plan_body(),
+            "planInput": plan_input,
             "expiresAt": 1_999_999_999,
             "spendBundleId": "0x" + "92" * 32,
             "confirmedBlockIndex": 1234,
             "buildTimestamp": "2026-07-14T00:00:00+00:00",
         }
     )["artifact"]
-    assert artifact["schemaVersion"] == 3
-    assert artifact["protocolVersion"] == "solslot-v2-rc22"
-    assert artifact["genesisPlan"]["schema"] == "solslot-genesis-plan-v3"
+    assert artifact["schemaVersion"] == 4
+    assert artifact["protocolVersion"] == "solslot-v2-rc23"
+    assert artifact["genesisPlan"]["schema"] == "solslot-genesis-plan-v4"
     assert artifact["statutes"]["roots"]["liquidityVenues"] == (
         artifact["genesisPlan"]["state"]["statutesRoots"]["liquidityVenues"]
     )
@@ -94,7 +119,7 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
 
 
 def _settings(tmp_path, artifact: dict, **updates) -> Settings:
-    path = tmp_path / "public_artifact_v3.json"
+    path = tmp_path / "public_artifact_v4.json"
     path.write_text(json.dumps(artifact), encoding="utf-8")
     values = {
         "runtime_environment": "test",
@@ -145,16 +170,22 @@ def test_signed_artifact_is_the_complete_admin_login_roster(tmp_path) -> None:
     assert allowlist == expected_pubkeys | expected_addresses
 
 
-def test_authority_snapshot_uses_the_same_signed_artifact(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_authority_snapshot_uses_the_same_signed_artifact(
+    tmp_path,
+) -> None:
     artifact = _signed_artifact()
-    settings = _settings(tmp_path, artifact, runtime_environment="development")
-    snapshot = build_admin_authority_v2_snapshot(settings)
+    _settings(tmp_path, artifact, runtime_environment="development")
+    snapshot = await build_admin_authority_v3_snapshot(artifact=artifact)
 
-    assert snapshot.launcher_id_hex == artifact["launcherIds"]["adminAuthority"]
-    assert snapshot.mips_root_hash_hex == artifact["adminAuthority"]["mipsRootHash"]
-    assert snapshot.admins_hash_hex == artifact["adminAuthority"]["rosterHash"]
+    assert snapshot.launcher_id == artifact["launcherIds"]["adminAuthority"]
+    assert (
+        snapshot.operational_mips_root_hash
+        == artifact["adminAuthority"]["operationalMipsRootHash"]
+    )
+    assert snapshot.authority_rule == "slot0_and_one_of_slot1_slot2"
     assert snapshot.authority_version == artifact["stateVersions"]["adminAuthority"]
-    assert snapshot.phase == "gating-source"
+    assert snapshot.chain_verified is False
 
 
 def test_rejects_tampering_and_insufficient_signature_quorum(tmp_path) -> None:
@@ -237,4 +268,4 @@ def test_public_endpoint_returns_only_verified_artifact(tmp_path) -> None:
     api.dependency_overrides[get_settings] = lambda: settings
     response = TestClient(api).get("/protocol/artifact")
     assert response.status_code == 503
-    assert response.json()["detail"] == "The signed RC22 public artifact failed verification."
+    assert response.json()["detail"] == "The signed RC23 public artifact failed verification."

@@ -482,7 +482,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "Ceremony mode must be same-origin and cannot configure CORS origins."
             )
     # Post-ceremony authority is validated cryptographically from the signed
-    # RC22 V3 artifact by ``validate_admin_config_at_startup``. Keeping that check
+    # RC23 V4 artifact by ``validate_admin_config_at_startup``. Keeping that check
     # out of this HTTP-posture validator avoids a second mutable coordinate
     # source and a circular trust dependency.
 
@@ -599,6 +599,7 @@ class Settings(BaseSettings):
         "authority_v3_governance_evidence_path",
         "authority_v3_evm_rpc_url",
         "authority_v3_independent_review_path",
+        "authority_v3_independent_review_sha256",
         "smtp_host",
         "smtp_username",
         "smtp_password",
@@ -670,7 +671,7 @@ class Settings(BaseSettings):
     def effective_chia_fallback_url(self) -> str:
         return self.chia_fallback_url or self.coinset_base_url
 
-    # High-risk protocol writes remain locked until the frozen RC22 V3 artifact
+    # High-risk protocol writes remain locked until the frozen RC23 V4 artifact
     # bundle has passed ceremony preflight. Read-only health, protocol, vault,
     # and credential receipt recovery remain available while this is false.
     alpha_writes_enabled: bool = False
@@ -744,9 +745,9 @@ class Settings(BaseSettings):
     pool_launcher_id: Optional[str] = None
     governance_launcher_id: Optional[str] = None
     # Retained only as an offline evidence/recovery input. Active runtime
-    # coordinates come exclusively from the signed RC22 V3 public artifact.
+    # coordinates come exclusively from the signed RC23 V4 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
-    public_artifact_path: str = "./state/public_artifact_v3.json"
+    public_artifact_path: str = "./state/public_artifact_v4.json"
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
@@ -762,15 +763,15 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc22.3-20260729"
+    launch_release_tag: str = "solslot-v2-alpha-rc23-20260729"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc22.json"
+        "./state/source-freeze-evidence-rc23.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
-    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc22.json"
+    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc23.json"
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc22.json"
+        "./state/settlement-rehearsal-rc23.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None
@@ -787,6 +788,7 @@ class Settings(BaseSettings):
     authority_v3_evm_rpc_url: Optional[str] = None
     authority_v3_evm_min_confirmations: int = Field(12, ge=12)
     authority_v3_independent_review_path: Optional[str] = None
+    authority_v3_independent_review_sha256: Optional[str] = None
 
     # Provider-neutral reminders. Email is advisory; the persisted task inbox
     # remains authoritative when SMTP is absent or delivery fails.
@@ -814,7 +816,7 @@ class Settings(BaseSettings):
     # on ``/protocol`` so frontends can independently verify the
     # operator's published config matches the on-chain singleton state.
     #
-    # The value must come from the signed RC22 V3 ceremony artifact.
+    # The value must come from the signed RC23 V4 ceremony artifact.
     protocol_config_launcher_id: Optional[str] = None
     # Monotonically increasing version stamped into the singleton's
     # curried state.  Bumped by the operator on every config update;

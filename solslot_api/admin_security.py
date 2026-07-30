@@ -16,12 +16,15 @@ from typing import Annotated, Any, Literal, Mapping, Optional
 
 from clvm.casts import int_to_bytes
 from chia_rs import AugSchemeMPL, G1Element, G2Element
-from eth_keys import keys as eth_keys
 from eth_utils import keccak
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .admin_auth import require_admin_jwt
+from .admin_roster import (
+    artifact_ceremony_id,
+    current_artifact_admins,
+)
 from .admin_authority_v3 import build_admin_authority_v3_snapshot
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
@@ -50,7 +53,6 @@ RECOVERY_EVM_PATH = "m/44'/60'/0'/0/0"
 HEX32_LENGTH = 64
 BLS_PUBLIC_KEY_LENGTH = 96
 BLS_SIGNATURE_LENGTH = 192
-COMPRESSED_SECP256K1_LENGTH = 66
 
 
 class ApiModel(BaseModel):
@@ -156,54 +158,6 @@ def _canonical_hash(payload: Mapping[str, Any]) -> str:
     return "0x" + hashlib.sha256(encoded).hexdigest()
 
 
-def _address_from_compressed_pubkey(value: str) -> str:
-    normalized = _hex_value(
-        value,
-        COMPRESSED_SECP256K1_LENGTH,
-        "administrator compressed public key",
-    )
-    try:
-        return eth_keys.PublicKey.from_compressed_bytes(
-            bytes.fromhex(normalized[2:])
-        ).to_checksum_address()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("administrator compressed public key is invalid") from exc
-
-
-def _artifact_admins(
-    artifact: Mapping[str, Any],
-) -> list[tuple[str, str]]:
-    authority = artifact.get("adminAuthority")
-    if not isinstance(authority, Mapping) or authority.get("version") != 3:
-        raise ValueError("signed artifact does not contain Admin Authority V3")
-    identities = authority.get("identityVaults")
-    if not isinstance(identities, list) or len(identities) != 3:
-        raise ValueError("signed artifact must contain three identity vaults")
-    result: list[tuple[str, str]] = []
-    for slot, identity in enumerate(identities):
-        if not isinstance(identity, Mapping) or identity.get("slot") != slot:
-            raise ValueError("signed identity-vault slots are not canonical")
-        compressed = str(identity.get("dailyCompressedPubkey") or "").lower()
-        result.append(
-            (
-                _address_from_compressed_pubkey(compressed).lower(),
-                compressed,
-            )
-        )
-    return result
-
-
-def _artifact_ceremony_id(artifact: Mapping[str, Any]) -> str:
-    ceremony = artifact.get("ceremony")
-    if not isinstance(ceremony, Mapping):
-        raise ValueError("signed artifact ceremony binding is missing")
-    return _hex_value(
-        str(ceremony.get("ceremonyId") or ""),
-        HEX32_LENGTH,
-        "ceremonyId",
-    )
-
-
 def require_security_actor(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
@@ -228,14 +182,14 @@ def require_security_actor(
     claims = require_admin_jwt(settings, authorization)
     try:
         artifact = load_signed_public_artifact(settings)
-        administrators = _artifact_admins(artifact)
+        administrators = current_artifact_admins(artifact, store)
         subject = claims.sub.lower()
         authority_slot = next(
             slot
             for slot, (address, compressed) in enumerate(administrators)
             if subject in {address, compressed}
         )
-        ceremony_id = _artifact_ceremony_id(artifact)
+        ceremony_id = artifact_ceremony_id(artifact)
         store.get(ceremony_id)
     except StopIteration as exc:
         raise HTTPException(
@@ -366,6 +320,12 @@ def _assert_recovery_identity_is_unique(
         if item.get("wallet_address")
     }
     daily_wallets.add(actor.wallet.lower())
+    for case in store.recovery_cases(actor.ceremony_id):
+        if case["state"] != "COMPLETED" or case["kind"] == "RECOVERY_KIT":
+            continue
+        intent = case.get("intent")
+        if isinstance(intent, Mapping) and intent.get("newDailyEvmKey"):
+            daily_wallets.add(str(intent["newDailyEvmKey"]).lower())
     if guardian.lower() in daily_wallets:
         raise HTTPException(
             status_code=409,
@@ -375,6 +335,20 @@ def _assert_recovery_identity_is_unique(
         if (
             int(kit["slot"]) != actor.authority_slot
             and str(kit["evmGuardian"]).lower() == guardian.lower()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Each administrator needs a distinct recovery wallet.",
+            )
+    for slot in (1, 2, 3):
+        candidate = store.pending_recovery_kit_candidate(
+            actor.ceremony_id,
+            slot,
+        )
+        if (
+            candidate is not None
+            and int(candidate["slot"]) != actor.authority_slot
+            and str(candidate["evmGuardian"]).lower() == guardian.lower()
         ):
             raise HTTPException(
                 status_code=409,
@@ -417,6 +391,7 @@ async def security_status(
     return {
         "schemaVersion": 1,
         "actor": {
+            "ceremonyId": actor.ceremony_id,
             "slot": actor.authority_slot,
             "role": "Owner" if actor.authority_slot == 0 else "Coadministrator",
             "wallet": actor.wallet,
@@ -433,6 +408,10 @@ async def security_status(
                 if int(kit["slot"]) == actor.authority_slot
             ),
             None,
+        ),
+        "pendingRecoveryKit": store.pending_recovery_kit_candidate(
+            actor.ceremony_id,
+            actor.ceremony_slot,
         ),
         "activeRecovery": active_case,
         "operationsFrozen": bool(
@@ -460,7 +439,7 @@ async def prepare_recovery_drill(
             "evmGuardian",
         )
         _assert_recovery_identity_is_unique(store, actor, guardian)
-        ceremony = store.get(actor.ceremony_id)
+        store.get(actor.ceremony_id)
         existing = next(
             (
                 item
@@ -469,12 +448,19 @@ async def prepare_recovery_drill(
             ),
             None,
         )
-        if ceremony["state"] == "locked" and existing is not None:
+        if (
+            existing is not None
+            and store.pending_recovery_kit_candidate(
+                actor.ceremony_id,
+                actor.ceremony_slot,
+            )
+            is not None
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "On-chain recovery-kit rotation is not enabled in this "
-                    "release. Existing recovery authority was not changed."
+                    "A tested replacement recovery kit is already waiting "
+                    "for on-chain approval."
                 ),
             )
         revision = int(existing["revision"]) + 1 if existing else 1
@@ -579,10 +565,20 @@ async def complete_recovery_drill(
         )
         return {
             "verified": True,
-            "recoveryKit": kit,
+            (
+                "recoveryKitCandidate"
+                if kit.get("state") == "PENDING"
+                else "recoveryKit"
+            ): kit,
             "notice": (
                 "Recovery proof passed. Solslot did not receive your phrase, "
-                "backup password, or private keys."
+                "backup password, or private keys. "
+                + (
+                    "The current recovery kit remains active until both "
+                    "chains confirm this replacement."
+                    if kit.get("state") == "PENDING"
+                    else ""
+                )
             ),
         }
     except (

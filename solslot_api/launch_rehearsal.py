@@ -1,4 +1,4 @@
-"""Fail-closed client for the fixed RC22 settlement rehearsal coordinator."""
+"""Fail-closed client for the fixed RC23 settlement rehearsal coordinator."""
 
 from __future__ import annotations
 
@@ -199,7 +199,7 @@ def _validate_evidence(
     lanes = evidence.get("lanes")
     if (
         evidence.get("schemaVersion") != 2
-        or evidence.get("kind") != "solslot-rc22-settlement-rehearsal"
+        or evidence.get("kind") != "solslot-rc23-settlement-rehearsal"
         or evidence.get("releaseTag") != settings.launch_release_tag
         or str(evidence.get("configHash", "")).lower() != config_hash
         or evidence.get("network") != "testnet11-base-sepolia"
@@ -418,7 +418,7 @@ def require_completed_rehearsal(
     )
     healthy = (
         evidence.get("schemaVersion") == 2
-        and evidence.get("kind") == "solslot-rc22-settlement-rehearsal"
+        and evidence.get("kind") == "solslot-rc23-settlement-rehearsal"
         and evidence.get("releaseTag") == settings.launch_release_tag
         and hmac.compare_digest(
             str(evidence.get("configHash") or "").lower(),

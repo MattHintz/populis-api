@@ -423,6 +423,10 @@ class TestLogin:
         assert out["jwt"].count(".") == 2
         assert out["expires_at"] > int(time.time())
         assert out["owner"] == _TEST_ADDRESS_LOWER
+        assert out["authority_slot"] == 0
+        assert out["compressed_pubkey"] == (
+            "0x" + _TEST_ACCT._key_obj.public_key.to_compressed_bytes().hex()
+        )
 
     def test_returned_jwt_verifies(self, client, settings_with_admin):
         body = self._challenge_and_sign(client)
@@ -430,6 +434,8 @@ class TestLogin:
         claims = verify_jwt(out["jwt"], settings_with_admin)
         assert claims.sub == _TEST_ADDRESS_LOWER
         assert claims.auth_type == "evm"
+        assert claims.authority_slot == 0
+        assert claims.compressed_pubkey == out["compressed_pubkey"]
 
     def test_unknown_nonce_404(self, client):
         body = self._challenge_and_sign(client)
@@ -528,6 +534,8 @@ class TestRefresh:
         # The new token must verify under the same secret.
         claims = verify_jwt(out["jwt"], settings_with_admin)
         assert claims.sub == _TEST_ADDRESS_LOWER
+        assert out["authority_slot"] == 0
+        assert out["compressed_pubkey"] == claims.compressed_pubkey
 
     def test_missing_header_returns_401(self, client):
         resp = client.post("/admin/auth/refresh")

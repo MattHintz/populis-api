@@ -46,8 +46,8 @@ def test_rehearsal_service_url_allows_only_tls_or_loopback() -> None:
 def _evidence() -> dict:
     return {
         "schemaVersion": 2,
-        "kind": "solslot-rc22-settlement-rehearsal",
-        "releaseTag": "solslot-v2-alpha-rc22.3-20260729",
+        "kind": "solslot-rc23-settlement-rehearsal",
+        "releaseTag": "solslot-v2-alpha-rc23-20260729",
         "configHash": CONFIG_HASH,
         "network": "testnet11-base-sepolia",
         "success": True,

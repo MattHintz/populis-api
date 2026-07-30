@@ -25,7 +25,7 @@ class KosMintExecuteSignerSettings(BaseSettings):
 
     private_key_file: str
     ledger_db_path: str = "./state/kos_mint_execute_signatures.db"
-    public_artifact_path: str = "./state/public_artifact_v3.json"
+    public_artifact_path: str = "./state/public_artifact_v4.json"
     release_metadata_path: str = "./release.json"
 
     network: Literal["testnet11"] = "testnet11"

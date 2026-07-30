@@ -32,7 +32,7 @@ class ValidatorSettings(BaseSettings):
     signer_index: int = Field(..., ge=0, le=2)
     seed_file: str
     ledger_db_path: str = "./state/validator_signatures_v2.db"
-    public_artifact_path: str = "./state/public_artifact_v3.json"
+    public_artifact_path: str = "./state/public_artifact_v4.json"
     release_metadata_path: str = "./release.json"
 
     network: Literal["testnet11"] = "testnet11"

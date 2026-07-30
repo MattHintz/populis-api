@@ -76,7 +76,7 @@ atomically:
 
 ```bash
 sudo bash /opt/solslot/validator/current/scripts/install_validator_artifact.sh \
-  /secure/ceremony/public_artifact_v3.json
+  /secure/ceremony/public_artifact_v4.json
 ```
 
 Run the fleet check after all three hosts report the same artifact hash. Never

@@ -8,6 +8,10 @@
     "newDailyEvmKey": "0x2222222222222222222222222222222222222222",
     "oldDailyChiaKey": "0x023333333333333333333333333333333333333333333333333333333333333333",
     "newDailyChiaKey": "0x034444444444444444444444444444444444444444444444444444444444444444",
+    "oldRecoveryGuardian": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "newRecoveryGuardian": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "oldRecoveryBlsKey": "0x8f336467f057b373bb3c43815a10ec131119d1bf50c14fa3f9ad86c0ec074f920f936a5315a8365a37fee0afa34c32c6",
+    "newRecoveryBlsKey": "0x8f336467f057b373bb3c43815a10ec131119d1bf50c14fa3f9ad86c0ec074f920f936a5315a8365a37fee0afa34c32c6",
     "identityLauncherIds": [
       "0x0101010101010101010101010101010101010101010101010101010101010101",
       "0x0202020202020202020202020202020202020202020202020202020202020202",
@@ -29,9 +33,9 @@
     "recoveryKeyRevision": 1
   },
   "expected": {
-    "intentHash": "0x06ce98dfd74922936045575c0216c4180e10d07325a10a2f7ac84175617afdce",
-    "prepareRoutineSelector": "0x7874bb93",
-    "prepareRoutineCalldataBytes": 964,
-    "recoveryBlsDigest": "0x10ef5e13be3c9a86fd19354ccb360862de6ed0e856307144673bb9ab0d0e913d"
+    "intentHash": "0x7340fd68f52984e3ac038f8d21aff57dc8f0ca205e017382521d4c46adb6a329",
+    "prepareRoutineSelector": "0x5ee08cb0",
+    "prepareRoutineCalldataBytes": 1284,
+    "recoveryBlsDigest": "0xb6026a2619c3b2d0fbe207ceb41e2f2d9d1d9520843a08390db214df907e1988"
   }
 }

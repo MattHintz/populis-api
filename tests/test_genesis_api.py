@@ -8,6 +8,7 @@ from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from chia_rs import AugSchemeMPL
+from eth_utils import keccak
 
 import solslot_api.genesis as genesis_module
 from solslot_api.config import Settings, get_settings
@@ -66,7 +67,45 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
-def _create_and_enroll(client: TestClient) -> tuple[str, list]:
+def _install_recovery_kits(
+    store: GenesisStore,
+    ceremony_id: str,
+) -> None:
+    for slot in (1, 2, 3):
+        recovery_key = AugSchemeMPL.key_gen(bytes([slot + 40]) * 32)
+        recovery_pubkey = bytes(recovery_key.get_g1())
+        challenge_hash = "0x" + bytes([slot + 60] * 32).hex()
+        challenge_id = "0x" + bytes([slot + 70] * 32).hex()
+        store.create_recovery_drill(
+            ceremony_id,
+            challenge_id=challenge_id,
+            slot=slot,
+            challenge_hash=challenge_hash,
+            public_payload={
+                "revision": 1,
+                "evmGuardian": "0x"
+                + bytes([slot + 80] * 20).hex(),
+                "recoveryBlsPubkey": "0x" + recovery_pubkey.hex(),
+                "recoveryBlsCommitment": "0x"
+                + keccak(recovery_pubkey).hex(),
+            },
+            expires_at=2_000_000_000,
+            now=1_900_000_000,
+        )
+        store.complete_recovery_drill(
+            challenge_id,
+            expected_challenge_hash=challenge_hash,
+            backup_status="NOT_CONFIGURED",
+            backup_revision=None,
+            backup_ciphertext_hash=None,
+            now=1_900_000_001,
+        )
+
+
+def _create_and_enroll(
+    client: TestClient,
+    store: GenesisStore,
+) -> tuple[str, list]:
     commits = _source_shas()
     response = client.post(
         "/admin/genesis/drafts",
@@ -79,7 +118,7 @@ def _create_and_enroll(client: TestClient) -> tuple[str, list]:
     assert response.status_code == 200, response.text
     ceremony_id = response.json()["ceremony_id"]
     assert response.json()["draft"]["reviewClass"] == "internal-engineering-testnet"
-    assert response.json()["draft"]["sourceManifestVersion"] == 3
+    assert response.json()["draft"]["sourceManifestVersion"] == 4
     accounts = [Account.create(f"admin-{slot}") for slot in (1, 2, 3)]
     for slot, account in enumerate(accounts, start=1):
         issued = client.post(
@@ -107,6 +146,7 @@ def _create_and_enroll(client: TestClient) -> tuple[str, list]:
     )
     assert frozen.status_code == 200, frozen.text
     assert frozen.json()["state"] == "roster_frozen"
+    _install_recovery_kits(store, ceremony_id)
     return ceremony_id, accounts
 
 
@@ -194,21 +234,22 @@ def _approve_plan(
 
 def test_three_admin_http_flow_reaches_plan_approval(tmp_path) -> None:
     client, store, _ = _client(tmp_path)
-    ceremony_id, accounts = _create_and_enroll(client)
+    ceremony_id, accounts = _create_and_enroll(client, store)
     _approve_plan(client, ceremony_id, accounts)
     final = store.get(ceremony_id)
     assert final["state"] == "plan_approved"
     assert len(final["plan_signatures"]) == 2
-    assert final["plan"]["schema"] == "solslot-genesis-plan-v3"
-    assert final["plan"]["protocolVersion"] == "solslot-v2-rc22"
+    assert final["plan"]["schema"] == "solslot-genesis-plan-v4"
+    assert final["plan"]["protocolVersion"] == "solslot-v2-rc23"
+    assert len(final["plan"]["adminRecoveryKits"]) == 3
     assert "statutes" in final["plan"]["launcherIds"]
     assert "navRegistry" not in final["plan"]["launcherIds"]
     assert final["plan"]["bridgeBatch"]["fundingAmount"] == 530
 
 
 def test_plan_rejects_retired_nav_registry_and_rc21_parameters(tmp_path) -> None:
-    client, _, _ = _client(tmp_path)
-    ceremony_id, _ = _create_and_enroll(client)
+    client, store, _ = _client(tmp_path)
+    ceremony_id, _ = _create_and_enroll(client, store)
     body = _plan_body()
     body["fundingCoinIds"]["navRegistry"] = body["fundingCoinIds"].pop(
         "statutes"
@@ -229,9 +270,15 @@ def test_plan_rejects_retired_nav_registry_and_rc21_parameters(tmp_path) -> None
 def test_broadcast_requires_fee_funded_local_mempool_submission(
     tmp_path, monkeypatch
 ) -> None:
-    client, store, _ = _client(tmp_path)
-    ceremony_id, accounts = _create_and_enroll(client)
+    client, store, settings = _client(tmp_path)
+    ceremony_id, accounts = _create_and_enroll(client, store)
     _approve_plan(client, ceremony_id, accounts)
+    review_receipt = b'{"review":"authority-v3"}\n'
+    review_path = tmp_path / "authority-v3-review.json"
+    review_path.write_bytes(review_receipt)
+    review_sha256 = hashlib.sha256(review_receipt).hexdigest()
+    settings.authority_v3_independent_review_path = str(review_path)
+    settings.authority_v3_independent_review_sha256 = review_sha256
     protocol_bundle = {
         "coin_spends": [{"coin": {"amount": 530}}],
         "aggregated_signature": "0xc0",
@@ -245,7 +292,12 @@ def test_broadcast_requires_fee_funded_local_mempool_submission(
                 "spendCount": 49,
                 "spendBundle": protocol_bundle,
             },
-            {"reviewClass": "internal-engineering-testnet"},
+            {
+                "reviewClass": "internal-engineering-testnet",
+                "authorityV3Review": {
+                    "fileSha256": "0x" + review_sha256,
+                },
+            },
             (),
         )
 
@@ -311,13 +363,16 @@ def test_broadcast_requires_fee_funded_local_mempool_submission(
     )
     assert fee_receipt["feeMojos"] == "7"
     assert "spendBundle" not in fee_receipt
+    assert (
+        output / "authority_v3_review.json"
+    ).read_bytes() == review_receipt
 
 
 def test_preflight_returns_canonical_review_approval_for_offline_gate(
     tmp_path, monkeypatch
 ) -> None:
     client, store, _ = _client(tmp_path)
-    ceremony_id, accounts = _create_and_enroll(client)
+    ceremony_id, accounts = _create_and_enroll(client, store)
     created = client.post(
         f"/admin/genesis/{ceremony_id}/plan",
         json=_plan_body(),
@@ -340,7 +395,7 @@ def test_preflight_returns_canonical_review_approval_for_offline_gate(
 
     approval = {
         "schemaVersion": 2,
-        "sourceManifestVersion": 3,
+        "sourceManifestVersion": 4,
         "reviewClass": "internal-engineering-testnet",
         "auditStatus": "unaudited",
         "testOnly": True,
@@ -373,8 +428,8 @@ def test_preflight_returns_canonical_review_approval_for_offline_gate(
 
 
 def test_wrong_admin_cannot_sign_frozen_plan(tmp_path) -> None:
-    client, _, _ = _client(tmp_path)
-    ceremony_id, _ = _create_and_enroll(client)
+    client, store, _ = _client(tmp_path)
+    ceremony_id, _ = _create_and_enroll(client, store)
     created = client.post(
         f"/admin/genesis/{ceremony_id}/plan",
         json=_plan_body(),

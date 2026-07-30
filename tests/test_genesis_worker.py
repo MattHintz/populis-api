@@ -37,6 +37,18 @@ def test_expected_outputs_include_property_registry_current_coin() -> None:
         statutes=_surface(40),
         protocol_config=_surface(50),
         admin_authority=_surface(60),
+        admin_authority_v3=SimpleNamespace(
+            identity_vaults=tuple(
+                SimpleNamespace(
+                    launcher_id=bytes32(bytes([90 + index]) * 32),
+                    full_puzzle_hash=bytes32(
+                        bytes([100 + index]) * 32
+                    ),
+                    launcher_amount=amount,
+                )
+                for index, amount in enumerate((3, 5, 7))
+            )
+        ),
         vault_version_registry=_surface(70),
         property_registry=property_registry,
         bridge_batch=SimpleNamespace(
@@ -61,4 +73,4 @@ def test_expected_outputs_include_property_registry_current_coin() -> None:
     ).hex()
 
     assert property_registry_coin_id in coin_ids
-    assert len(coin_ids) == 42
+    assert len(coin_ids) == 45

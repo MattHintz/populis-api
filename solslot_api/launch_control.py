@@ -24,8 +24,22 @@ from eth_account.messages import encode_typed_data
 from eth_utils import keccak
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from solslot_puzzles.recovery_dependencies import (
+    PINNED_CNI_WALLET_SDK_COMMIT,
+    PINNED_CNI_WALLET_SDK_LICENSE,
+    PINNED_CNI_WALLET_SDK_REPOSITORY,
+    RECOVERY_DEPENDENCY_MANIFEST_HASH,
+)
 from solslot_puzzles.sgt_driver import TEST_KOS_MINT_EXECUTE_PUBKEY
 
+from .authority_v3_evidence import (
+    load_governance_evidence,
+    validate_governance_roster,
+)
+from .authority_v3_review import (
+    AuthorityV3ReviewError,
+    load_authority_v3_review,
+)
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
 from .genesis import (
@@ -35,6 +49,7 @@ from .genesis import (
     SignatureRequest,
     _invitation_typed_data,
     _prepare_bundle,
+    _run_worker,
     _token_hash,
     accept_invitation,
     broadcast,
@@ -104,6 +119,10 @@ SOURCE_KEYS = (
     "samuel",
     "customerWeb",
     "adminPortal",
+)
+SOURCE_MANIFEST_VERSION = 4
+RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX = (
+    "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
 )
 GATE_NAMES = ("ceremonyBroadcast", "minting", "presale", "purchases")
 CREATE_COIN = 51
@@ -217,6 +236,30 @@ def _hash_json(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")
     return "0x" + hashlib.sha256(encoded).hexdigest()
+
+
+def _source_manifest_hash(value: Mapping[str, Any]) -> str:
+    return _hash_json(
+        {
+            key: item
+            for key, item in value.items()
+            if key != "manifestHash"
+        }
+    )
+
+
+def _authority_source_commitment(source_shas: Mapping[str, str]) -> str:
+    return _hash_json(
+        {
+            "version": SOURCE_MANIFEST_VERSION,
+            "sources": dict(source_shas),
+            "dependencies": {
+                "administratorRecovery": (
+                    RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX
+                )
+            },
+        }
+    )
 
 
 def _secret(settings: Settings) -> str:
@@ -373,43 +416,132 @@ def _read_json_file(path_value: str | None, label: str) -> tuple[dict[str, Any],
 
 def _load_release_evidence(settings: Settings) -> dict[str, Any]:
     evidence, digest = _read_json_file(
-        settings.launch_source_evidence_path, "RC22 source evidence"
+        settings.launch_source_evidence_path, "RC23 source evidence"
     )
     if settings.launch_source_evidence_sha256:
         expected = settings.launch_source_evidence_sha256.removeprefix("0x").lower()
         if not secrets.compare_digest(digest, expected):
-            raise GenesisConflict("RC22 source evidence checksum changed")
+            raise GenesisConflict("RC23 source evidence checksum changed")
     if (
-        evidence.get("network") != "testnet11"
+        evidence.get("schemaVersion") != 5
+        or evidence.get("kind") != "solslot-rc23-launch-source-evidence"
+        or evidence.get("network") != "testnet11"
         or evidence.get("releaseTag") != settings.launch_release_tag
+        or evidence.get("releaseId") != settings.launch_release_tag
         or evidence.get("completeReleaseManifest") is not True
+        or evidence.get("releaseRefsVerified") is not True
         or evidence.get("testOnly") is not True
     ):
-        raise GenesisConflict("RC22 source evidence is incomplete or targets another release")
+        raise GenesisConflict(
+            "RC23 source evidence is incomplete or targets another release"
+        )
     source_manifest = evidence.get("sourceManifest")
-    shas = source_manifest.get("sourceShas") if isinstance(source_manifest, Mapping) else None
+    if (
+        not isinstance(source_manifest, Mapping)
+        or source_manifest.get("schemaVersion")
+        != SOURCE_MANIFEST_VERSION
+        or source_manifest.get("kind")
+        != "solslot-release-source-manifest"
+        or source_manifest.get("releaseId")
+        != settings.launch_release_tag
+        or source_manifest.get("network") != "testnet11"
+        or source_manifest.get("testOnly") is not True
+        or source_manifest.get("manifestHash")
+        != evidence.get("manifestHash")
+        or source_manifest.get("manifestHash")
+        != _source_manifest_hash(source_manifest)
+    ):
+        raise GenesisConflict(
+            "RC23 source manifest checksum or release binding is invalid"
+        )
+    shas = source_manifest.get("sourceShas")
     if not isinstance(shas, Mapping) or set(shas) != set(SOURCE_KEYS):
-        raise GenesisConflict("RC22 evidence does not freeze all nine source commits")
+        raise GenesisConflict(
+            "RC23 evidence does not freeze all nine source commits"
+        )
+    normalized_shas: dict[str, str] = {}
     for key in SOURCE_KEYS:
         value = str(shas[key]).lower()
         if len(value) != 40:
-            raise GenesisConflict(f"RC22 source commit {key} is not a full SHA")
+            raise GenesisConflict(
+                f"RC23 source commit {key} is not a full SHA"
+            )
         try:
             int(value, 16)
         except ValueError as exc:
-            raise GenesisConflict(f"RC22 source commit {key} is invalid") from exc
+            raise GenesisConflict(
+                f"RC23 source commit {key} is invalid"
+            ) from exc
+        normalized_shas[key] = value
+    dependencies = source_manifest.get("dependencies")
+    recovery = (
+        dependencies.get("administratorRecovery")
+        if isinstance(dependencies, Mapping)
+        else None
+    )
+    if (
+        not isinstance(recovery, Mapping)
+        or recovery.get("repository")
+        != PINNED_CNI_WALLET_SDK_REPOSITORY
+        or recovery.get("commit") != PINNED_CNI_WALLET_SDK_COMMIT
+        or recovery.get("license") != PINNED_CNI_WALLET_SDK_LICENSE
+        or recovery.get("manifestHash")
+        != RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX
+    ):
+        raise GenesisConflict(
+            "RC23 source manifest does not bind the pinned recovery SDK"
+        )
+    if source_manifest.get(
+        "authoritySourceCommitment"
+    ) != _authority_source_commitment(normalized_shas):
+        raise GenesisConflict(
+            "RC23 Authority V3 source commitment is invalid"
+        )
+    sources = source_manifest.get("sources")
+    if not isinstance(sources, Mapping) or set(sources) != set(
+        SOURCE_KEYS
+    ):
+        raise GenesisConflict(
+            "RC23 source records are incomplete"
+        )
+    release_branch = (
+        "release/testnet-alpha-"
+        + settings.launch_release_tag.removeprefix(
+            "solslot-v2-alpha-"
+        )
+    )
+    for key in SOURCE_KEYS:
+        source = sources.get(key)
+        if (
+            not isinstance(source, Mapping)
+            or str(source.get("commit", "")).lower()
+            != normalized_shas[key]
+            or source.get("branch") != release_branch
+            or not str(source.get("repository", "")).startswith(
+                "https://github.com/"
+            )
+        ):
+            raise GenesisConflict(
+                f"RC23 source record {key} is not release-bound"
+            )
     return {
         "releaseTag": evidence["releaseTag"],
         "manifestHash": evidence.get("manifestHash"),
         "fileSha256": "0x" + digest,
-        "sourceShas": {key: str(shas[key]).lower() for key in SOURCE_KEYS},
+        "sourceShas": normalized_shas,
+        "authoritySourceCommitment": source_manifest[
+            "authoritySourceCommitment"
+        ],
+        "recoveryDependencyManifestHash": (
+            RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX
+        ),
         "evidence": evidence,
     }
 
 
 def _plan_template_evidence(settings: Settings) -> dict[str, Any]:
     template, digest = _read_json_file(
-        settings.launch_plan_template_path, "RC22 launch plan template"
+        settings.launch_plan_template_path, "RC23 launch plan template"
     )
     template["fundingCoinIds"] = PLACEHOLDER_FUNDING_IDS
     plan = PlanRequest.model_validate(template)
@@ -430,7 +562,7 @@ def _plan_template_evidence(settings: Settings) -> dict[str, Any]:
         or len(set(validator_pubkeys)) != 3
     ):
         raise GenesisConflict(
-            "RC22 plan must contain three unique nonzero validator public keys"
+            "RC23 plan must contain three unique nonzero validator public keys"
         )
 
     return {
@@ -846,6 +978,7 @@ async def _readiness(
     record: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    release: dict[str, Any] | None = None
     try:
         release = _load_release_evidence(settings)
         items.append(
@@ -935,6 +1068,149 @@ async def _readiness(
             },
         }
     )
+
+    recovery_kits = store.recovery_kits(str(record["ceremony_id"]))
+    recovery_ready = (
+        [int(item["slot"]) for item in recovery_kits] == [0, 1, 2]
+        and all(
+            item["offlineCopyConfirmed"]
+            and item["secondDeviceConfirmed"]
+            for item in recovery_kits
+        )
+    )
+    items.append(
+        {
+            "id": "adminRecoveryKits",
+            "title": "Administrator recovery kits",
+            "status": "Healthy" if recovery_ready else "Needs action",
+            "impact": (
+                "All three administrators proved an offline recovery copy "
+                "on a second device. Optional Drive backups are recorded "
+                "separately."
+                if recovery_ready
+                else (
+                    "Each administrator must make an offline recovery copy "
+                    "and prove it works on a second device before launch."
+                )
+            ),
+            "assignedRole": "administrator",
+            "action": None if recovery_ready else "securityAccess",
+            "evidence": {
+                "completed": len(recovery_kits),
+                "required": 3,
+                "driveBackups": sum(
+                    item["backupStatus"] == "VERIFIED"
+                    for item in recovery_kits
+                ),
+                "driveBackupRequired": False,
+            },
+        }
+    )
+
+    authority_evidence: dict[str, Any] | None = None
+    try:
+        authority_evidence = load_governance_evidence(settings)
+        validate_governance_roster(
+            record,
+            recovery_kits,
+            authority_evidence,
+        )
+        items.append(
+            {
+                "id": "authorityV3Evm",
+                "title": "Protected administrator authority",
+                "status": "Healthy",
+                "impact": (
+                    "The three identity Safes, owner-plus-one root, "
+                    "recovery coordinator, guards, and delays match the "
+                    "administrator recovery roster."
+                ),
+                "assignedRole": "system",
+                "evidence": {
+                    "artifactHash": authority_evidence[
+                        "artifactHash"
+                    ],
+                    "authorityRule": "Owner plus either coadministrator",
+                    "identitySafes": 3,
+                    "routineDelaySeconds": 86_400,
+                    "lostKeyDelaySeconds": 604_800,
+                },
+            }
+        )
+    except (GenesisStoreError, KeyError, TypeError, ValueError) as exc:
+        items.append(
+            {
+                "id": "authorityV3Evm",
+                "title": "Finish administrator protection",
+                "status": "Blocked",
+                "impact": (
+                    "The protected Safe hierarchy and recovery roster are "
+                    "not installed as one matching Authority V3 release."
+                ),
+                "assignedRole": "technical-coadmin",
+                "action": "installAuthorityV3",
+                "evidence": {"technicalReason": str(exc)},
+            }
+        )
+
+    try:
+        if release is None:
+            raise AuthorityV3ReviewError(
+                "reviewed release evidence is unavailable"
+            )
+        if authority_evidence is None:
+            raise AuthorityV3ReviewError(
+                "Authority V3 EVM evidence is unavailable"
+            )
+        inventory = await _run_worker(
+            {"operation": "authorityV3Inventory"}
+        )
+        review = load_authority_v3_review(
+            settings,
+            source_shas=release["sourceShas"],
+            authority_inner_mod_hash=str(
+                inventory["adminAuthorityInnerModHash"]
+            ),
+            governance_evidence_hash=str(
+                authority_evidence["artifactHash"]
+            ),
+        )
+        items.append(
+            {
+                "id": "authorityV3Review",
+                "title": "Independent recovery review",
+                "status": "Healthy",
+                "impact": (
+                    "An independent reviewer approved the Chialisp "
+                    "wrapper, MIPS composition, Safe recovery module, "
+                    "and authority guards for this exact release."
+                ),
+                "assignedRole": "system",
+                "evidence": review,
+            }
+        )
+    except (
+        AuthorityV3ReviewError,
+        GenesisStoreError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        items.append(
+            {
+                "id": "authorityV3Review",
+                "title": "Independent recovery review required",
+                "status": "Blocked",
+                "impact": (
+                    "A focused independent review of all four recovery "
+                    "trust boundaries must approve this exact release "
+                    "before launch."
+                ),
+                "assignedRole": "technical-coadmin",
+                "action": "installAuthorityReview",
+                "evidence": {"technicalReason": str(exc)},
+            }
+        )
 
     validator_pubkeys: list[bytes] = []
     for value in settings.zkpassport_validator_pubkeys:
@@ -1241,7 +1517,7 @@ async def claim_owner_link(
                 ceremony_id,
                 {
                     "schemaVersion": 2,
-                    "sourceManifestVersion": 3,
+                    "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
                     "network": "testnet11",
                     "evmChainId": 11155111,
                     "reviewClass": INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
@@ -1701,7 +1977,7 @@ async def guided_start_settlement_rehearsal(
         record = store.get(session.ceremony_id)
         release_hash = str(record["draft"].get("releaseEvidenceHash") or "")
         if not HEX32_RE.fullmatch(release_hash):
-            raise GenesisConflict("the RC22 release evidence hash is unavailable")
+            raise GenesisConflict("the RC23 release evidence hash is unavailable")
         remote = await start_rehearsal(
             settings,
             ceremony_id=session.ceremony_id,
@@ -2179,7 +2455,7 @@ async def build_guided_plan(
         if not funding or funding["state"] != "confirmed":
             raise GenesisConflict("confirm the fixed ceremony funding first")
         template, _ = _read_json_file(
-            settings.launch_plan_template_path, "RC22 launch plan template"
+            settings.launch_plan_template_path, "RC23 launch plan template"
         )
         template["fundingCoinIds"] = dict(funding["plan"]["fundingCoinIds"])
         body = PlanRequest.model_validate(template)

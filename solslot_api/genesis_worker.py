@@ -46,15 +46,26 @@ def _build_plan(
     ceremony: Mapping[str, Any], body: Mapping[str, Any], expires_at: int
 ) -> Any:
     from chia_rs.sized_bytes import bytes32
-    from solslot_puzzles.genesis_ceremony_rc22 import (
-        RC22GenesisFundingCoinIds,
-        build_rc22_genesis_ceremony_plan,
+    from solslot_puzzles.genesis_ceremony_rc23 import (
+        RC23GenesisFundingCoinIds,
+        build_rc23_genesis_ceremony_plan,
     )
     from solslot_puzzles.protocol_statutes_v1 import ProtocolParameters
 
     funding = body["fundingCoinIds"]
     parameters = body["protocolParameters"]
-    ids = RC22GenesisFundingCoinIds(
+    recovery_kits = body.get("adminRecoveryKits")
+    if not isinstance(recovery_kits, list) or len(recovery_kits) != 3:
+        raise ValueError(
+            "three server-verified administrator recovery kits are required"
+        )
+    ordered_kits = sorted(
+        recovery_kits,
+        key=lambda item: int(item["slot"]),
+    )
+    if [int(item["slot"]) for item in ordered_kits] != [0, 1, 2]:
+        raise ValueError("administrator recovery-kit slots are incomplete")
+    ids = RC23GenesisFundingCoinIds(
         sgt=bytes32(_hex_bytes(funding["sgt"], 32, "fundingCoinIds.sgt")),
         pool=bytes32(_hex_bytes(funding["pool"], 32, "fundingCoinIds.pool")),
         did=bytes32(_hex_bytes(funding["did"], 32, "fundingCoinIds.did")),
@@ -85,7 +96,7 @@ def _build_plan(
             _hex_bytes(funding["bridgeBatch"], 32, "fundingCoinIds.bridgeBatch")
         ),
     )
-    return build_rc22_genesis_ceremony_plan(
+    return build_rc23_genesis_ceremony_plan(
         ceremony_id=bytes32(
             _hex_bytes(str(ceremony["ceremony_id"]), 32, "ceremonyId")
         ),
@@ -103,6 +114,30 @@ def _build_plan(
             body["kosMintExecutePubkey"], 48, "kosMintExecutePubkey"
         ),
         admin_compressed_pubkeys=_admin_pubkeys(ceremony),
+        admin_recovery_bls_pubkeys=[
+            _hex_bytes(
+                str(item["recoveryBlsPubkey"]),
+                48,
+                "adminRecoveryKits.recoveryBlsPubkey",
+            )
+            for item in ordered_kits
+        ],
+        admin_recovery_evm_guardians=[
+            str(item["evmGuardian"]) for item in ordered_kits
+        ],
+        admin_recovery_revisions=[
+            int(item["revision"]) for item in ordered_kits
+        ],
+        admin_recovery_drill_hashes=[
+            bytes32(
+                _hex_bytes(
+                    str(item["drillChallengeHash"]),
+                    32,
+                    "adminRecoveryKits.drillChallengeHash",
+                )
+            )
+            for item in ordered_kits
+        ],
         validator_pubkeys=[
             _hex_bytes(value, 48, "validatorPubkey")
             for value in body["validatorPubkeys"]
@@ -178,11 +213,11 @@ def _coin(value: Mapping[str, Any], field: str) -> Any:
 
 
 def _funding_coins(values: Mapping[str, Mapping[str, Any]]) -> Any:
-    from solslot_puzzles.genesis_ceremony_rc22 import (
-        RC22GenesisFundingCoins,
+    from solslot_puzzles.genesis_ceremony_rc23 import (
+        RC23GenesisFundingCoins,
     )
 
-    return RC22GenesisFundingCoins(
+    return RC23GenesisFundingCoins(
         sgt=_coin(values["sgt"], "sgt"),
         pool=_coin(values["pool"], "pool"),
         did=_coin(values["did"], "did"),
@@ -210,28 +245,55 @@ def _expected_outputs(plan: Any) -> list[str]:
             ).name()
         )
     ]
-    surfaces = (
-        (plan.protocol.pool_launcher_id, plan.protocol.pool_full_puzzle_hash),
-        (plan.protocol.did_launcher_id, plan.protocol.did_full_puzzle_hash),
+    surfaces = [
+        (
+            plan.protocol.pool_launcher_id,
+            plan.protocol.pool_full_puzzle_hash,
+            1,
+        ),
+        (
+            plan.protocol.did_launcher_id,
+            plan.protocol.did_full_puzzle_hash,
+            1,
+        ),
         (
             plan.protocol.governance_launcher_id,
             plan.protocol.governance_full_puzzle_hash,
+            1,
         ),
-        (plan.statutes.launcher_id, plan.statutes.full_puzzle_hash),
-        (plan.protocol_config.launcher_id, plan.protocol_config.full_puzzle_hash),
-        (plan.admin_authority.launcher_id, plan.admin_authority.full_puzzle_hash),
+        (plan.statutes.launcher_id, plan.statutes.full_puzzle_hash, 1),
+        (
+            plan.protocol_config.launcher_id,
+            plan.protocol_config.full_puzzle_hash,
+            1,
+        ),
+        (
+            plan.admin_authority.launcher_id,
+            plan.admin_authority.full_puzzle_hash,
+            1,
+        ),
         (
             plan.vault_version_registry.launcher_id,
             plan.vault_version_registry.full_puzzle_hash,
+            1,
         ),
         (
             plan.property_registry.launcher_id,
             plan.property_registry.full_puzzle_hash,
+            1,
         ),
+    ]
+    surfaces.extend(
+        (
+            identity.launcher_id,
+            identity.full_puzzle_hash,
+            identity.launcher_amount,
+        )
+        for identity in plan.admin_authority_v3.identity_vaults
     )
     outputs.extend(
-        _hex(Coin(parent, puzzle_hash, uint64(1)).name())
-        for parent, puzzle_hash in surfaces
+        _hex(Coin(parent, puzzle_hash, uint64(amount)).name())
+        for parent, puzzle_hash, amount in surfaces
     )
     outputs.append(_hex(plan.protocol.sols_reserve_seed_coin_id))
     outputs.extend(_hex(coin.name()) for coin in plan.bridge_batch.bridge_coins)
@@ -239,7 +301,7 @@ def _expected_outputs(plan: Any) -> list[str]:
 
 
 def _verify_artifact(artifact: Mapping[str, Any]) -> None:
-    from solslot_puzzles.artifact_schema_v3 import (
+    from solslot_puzzles.artifact_schema_v4 import (
         artifact_signing_typed_data,
         verify_public_artifact,
     )
@@ -263,6 +325,17 @@ def _verify_artifact(artifact: Mapping[str, Any]) -> None:
 
 def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
     operation = payload.get("operation")
+    if operation == "authorityV3Inventory":
+        from solslot_puzzles.admin_authority_v3_driver import (
+            admin_authority_v3_inner_mod_hash,
+        )
+
+        return {
+            "protocolVersion": "solslot-v2-rc23",
+            "adminAuthorityInnerModHash": _hex(
+                admin_authority_v3_inner_mod_hash()
+            ),
+        }
     if operation == "roster":
         from solslot_puzzles.admin_authority_v2_driver import (
             build_genesis_eip712_admin_quorum,
@@ -299,7 +372,7 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
             "coinIds": _expected_outputs(plan),
         }
     if operation == "artifact":
-        from solslot_puzzles.artifact_schema_v3 import build_public_artifact
+        from solslot_puzzles.artifact_schema_v4 import build_public_artifact
 
         artifact = build_public_artifact(
             plan=plan,
@@ -314,8 +387,8 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
         return {"plan": canonical_plan, "artifact": artifact}
 
-    from solslot_puzzles.genesis_ceremony_rc22 import (
-        build_rc22_genesis_ceremony_bundle,
+    from solslot_puzzles.genesis_ceremony_rc23 import (
+        build_rc23_genesis_ceremony_bundle,
     )
 
     from .faucet import Faucet
@@ -324,7 +397,7 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
         str(payload["faucetMasterPrivateKey"]), str(payload["network"])
     )
     funding = _funding_coins(payload["fundingCoins"])
-    bundle = build_rc22_genesis_ceremony_bundle(
+    bundle = build_rc23_genesis_ceremony_bundle(
         plan=plan, faucet=faucet, funding_coins=funding
     )
     return {

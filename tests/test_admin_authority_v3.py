@@ -4,6 +4,7 @@ from copy import deepcopy
 
 import pytest
 from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
 from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
@@ -11,10 +12,18 @@ from chia_rs.sized_ints import uint64
 from eth_keys import keys
 
 from solslot_api.admin_authority_v3 import (
+    _state_after_solution,
     build_admin_authority_v3_snapshot,
 )
 from solslot_puzzles.admin_authority_v3_driver import (
+    AUTHORITY_LAUNCHER_AMOUNT,
+    PENDING_RECOVERY_KIT,
+    SPEND_COMPLETE,
+    SPEND_PREPARE_KIT,
+    build_complete_solution,
     build_genesis_admin_authority_v3,
+    build_identity_vault_transition,
+    build_prepare_solution,
 )
 
 
@@ -59,7 +68,10 @@ def _artifact() -> tuple[dict, object]:
             "operationalMipsRootHash": (
                 "0x" + authority.operational_root_hash.hex()
             ),
-            "recoveryMipsRootHash": "0x" + authority.recovery_root_hash.hex(),
+            "lostRecoveryMipsRootHashes": [
+                "0x" + value.hex()
+                for value in authority.lost_recovery_root_hashes
+            ],
             "routineDelaySeconds": 86_400,
             "lostKeyDelaySeconds": 604_800,
             "identityVaults": [
@@ -208,3 +220,78 @@ async def test_chain_puzzle_mismatch_fails_closed() -> None:
             artifact=deepcopy(artifact),
             provider=provider,  # type: ignore[arg-type]
         )
+
+
+def _outer_solution(inner_solution: Program) -> Program:
+    return Program.to([None, AUTHORITY_LAUNCHER_AMOUNT, inner_solution])
+
+
+def test_reader_tracks_recovery_kit_prepare_and_completed_custody() -> None:
+    _artifact_payload, authority = _artifact()
+    target = authority.identity_vaults[1]
+    replacement_recovery = bytes(
+        AugSchemeMPL.key_gen(b"replacement recovery key" * 2).get_g1()
+    )
+    transition = build_identity_vault_transition(
+        identity=target,
+        authority_current_inner_puzzle=authority.inner_puzzle,
+        network="testnet11",
+        kind=PENDING_RECOVERY_KIT,
+        intent_hash=bytes32(b"\x81" * 32),
+        current_identity_coin_id=bytes32(b"\x82" * 32),
+        replacement_daily_compressed_pubkey=(
+            target.daily_compressed_pubkey
+        ),
+        replacement_recovery_bls_pubkey=replacement_recovery,
+    )
+    identity_coin_ids = tuple(
+        bytes32(bytes([0x90 + slot]) * 32) for slot in range(3)
+    )
+    prepare = build_prepare_solution(
+        transition=transition,
+        my_amount=AUTHORITY_LAUNCHER_AMOUNT,
+        new_authority_version=2,
+        mips_reveal=Program.to(1),
+        mips_solution=Program.to(None),
+        replacement_member_solution=Program.to(None),
+        identity_records=((0, identity_coin_ids[0]), (1, identity_coin_ids[1])),
+    )
+
+    _parsed, pending, spend_tag = _state_after_solution(
+        authority.inner_puzzle,
+        _outer_solution(prepare),
+    )
+    assert spend_tag == SPEND_PREPARE_KIT
+    assert pending.pending_kind == PENDING_RECOVERY_KIT
+    assert pending.pending_slot == 1
+    assert pending.pending_original_custody_hash == target.custody_hash
+    assert (
+        pending.pending_replacement_custody_hash
+        == transition.final_custody_hash
+    )
+    assert pending.current_identity_custody_hashes == (
+        authority.identity_vaults[0].custody_hash,
+        transition.intermediate_custody_hash,
+        authority.identity_vaults[2].custody_hash,
+    )
+
+    complete = build_complete_solution(
+        my_amount=AUTHORITY_LAUNCHER_AMOUNT,
+        new_authority_version=3,
+    )
+    _pending_parsed, completed, completion_tag = _state_after_solution(
+        transition.authority_pending_inner_puzzle,
+        _outer_solution(complete),
+    )
+    assert completion_tag == SPEND_COMPLETE
+    assert completed.pending_kind == 0
+    assert completed.authority_version == 3
+    assert completed.current_identity_custody_hashes[1] == (
+        transition.final_custody_hash
+    )
+    assert completed.current_identity_custody_hashes[0] == (
+        authority.identity_vaults[0].custody_hash
+    )
+    assert completed.current_identity_custody_hashes[2] == (
+        authority.identity_vaults[2].custody_hash
+    )

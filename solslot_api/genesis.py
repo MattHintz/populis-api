@@ -38,7 +38,7 @@ from .validator_quorum import (
 
 router = APIRouter(prefix="/admin/genesis", tags=["admin-genesis"])
 
-SOURCE_MANIFEST_VERSION = 3
+SOURCE_MANIFEST_VERSION = 4
 REQUIRED_SOURCE_SHAS = (
     "protocol",
     "evm",
@@ -257,6 +257,43 @@ def _admin_pubkeys(record: Mapping[str, Any]) -> list[bytes]:
     ]
 
 
+def _recovery_kits_for_plan(
+    store: GenesisStore,
+    ceremony_id: str,
+) -> list[dict[str, Any]]:
+    kits = store.recovery_kits(ceremony_id)
+    if [int(item["slot"]) for item in kits] != [0, 1, 2]:
+        raise GenesisConflict(
+            "all three administrators must finish their recovery drill"
+        )
+    for kit in kits:
+        if not (
+            kit["offlineCopyConfirmed"]
+            and kit["secondDeviceConfirmed"]
+            and int(kit["revision"]) >= 1
+        ):
+            raise GenesisConflict(
+                "administrator recovery readiness is incomplete"
+            )
+    return [
+        {
+            "slot": int(kit["slot"]),
+            "revision": int(kit["revision"]),
+            "evmGuardian": str(kit["evmGuardian"]).lower(),
+            "recoveryBlsPubkey": str(
+                kit["recoveryBlsPubkey"]
+            ).lower(),
+            "recoveryBlsCommitment": str(
+                kit["recoveryBlsCommitment"]
+            ).lower(),
+            "drillChallengeHash": str(
+                kit["drillChallengeHash"]
+            ).lower(),
+        }
+        for kit in kits
+    ]
+
+
 async def _run_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Execute CLVM work in a fresh interpreter and return canonical JSON."""
     process = await asyncio.create_subprocess_exec(
@@ -324,6 +361,17 @@ def _atomic_json(path: Path, payload: Any, *, mode: int = 0o644) -> None:
     data = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True) + "\n"
     with temporary.open("w", encoding="ascii") as handle:
         handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def _atomic_bytes(path: Path, payload: bytes, *, mode: int = 0o444) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(temporary, mode)
@@ -497,6 +545,10 @@ async def create_plan(
         current = store.get(ceremony_id.lower())
         expires_at = int(time.time()) + settings.genesis_plan_ttl_seconds
         input_payload = body.model_dump(by_alias=True)
+        input_payload["adminRecoveryKits"] = _recovery_kits_for_plan(
+            store,
+            ceremony_id.lower(),
+        )
         result = await _run_worker(
             {
                 "operation": "plan",
@@ -751,6 +803,49 @@ async def _prepare_bundle(
     dict[str, Any],
     tuple[ValidatorHealthResponse, ...],
 ]:
+    from .authority_v3_evidence import (
+        load_governance_evidence,
+        validate_governance_roster,
+    )
+    from .authority_v3_review import (
+        AuthorityV3ReviewError,
+        load_authority_v3_review,
+    )
+
+    try:
+        recovery_kits = record["plan_input"]["adminRecoveryKits"]
+        if not isinstance(recovery_kits, list):
+            raise ValueError(
+                "signed plan does not contain recovery-kit commitments"
+            )
+        authority_evidence = load_governance_evidence(settings)
+        validate_governance_roster(
+            record,
+            recovery_kits,
+            authority_evidence,
+        )
+        inventory = await _run_worker(
+            {"operation": "authorityV3Inventory"}
+        )
+        authority_review = load_authority_v3_review(
+            settings,
+            source_shas=record["draft"]["sourceShas"],
+            authority_inner_mod_hash=str(
+                inventory["adminAuthorityInnerModHash"]
+            ),
+            governance_evidence_hash=str(
+                authority_evidence["artifactHash"]
+            ),
+        )
+    except (
+        AuthorityV3ReviewError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise GenesisConflict(
+            f"Authority V3 launch approval failed: {exc}"
+        ) from exc
     faucet = _faucet()
     if _hex(faucet.address_puzzle_hash).lower() != str(
         record["plan_input"]["faucetPuzzleHash"]
@@ -812,6 +907,7 @@ async def _prepare_bundle(
         )
     else:
         raise GenesisConflict("unsupported genesis review class")
+    approval["authorityV3Review"] = authority_review
     return plan, result, approval, validator_health
 
 
@@ -870,6 +966,22 @@ async def broadcast(
             raise GenesisConflict(
                 "ceremony broadcast requires local-node medium-fee funding"
             )
+        from .authority_v3_review import (
+            AuthorityV3ReviewError,
+            read_authority_v3_review_receipt,
+        )
+
+        try:
+            review_receipt = read_authority_v3_review_receipt(
+                settings,
+                expected_file_sha256=str(
+                    approval["authorityV3Review"]["fileSha256"]
+                ),
+            )
+        except (AuthorityV3ReviewError, KeyError, TypeError) as exc:
+            raise GenesisConflict(
+                f"Authority V3 review archive failed: {exc}"
+            ) from exc
         try:
             receipt = await submitter.submit(bundle["spendBundle"])
         except ProtocolSubmissionError as exc:
@@ -903,6 +1015,10 @@ async def broadcast(
             },
         )
         _atomic_json(output / "audit_approval.json", approval)
+        _atomic_bytes(
+            output / "authority_v3_review.json",
+            review_receipt,
+        )
         _atomic_json(
             output / "validator_health.json",
             {
@@ -1108,9 +1224,9 @@ async def finalize(
 
         # The lock manifest is intentionally the final public file written.
         lock = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
-            "protocolVersion": "solslot-v2-rc22",
+            "protocolVersion": "solslot-v2-rc23",
             "reviewClass": artifact["reviewClass"],
             "testOnly": artifact["testOnly"],
             "auditStatus": artifact["auditStatus"],

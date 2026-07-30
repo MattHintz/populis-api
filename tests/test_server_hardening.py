@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -15,6 +16,7 @@ from solslot_api.server_hardening import (
     documentation_urls,
     trusted_client_ip,
 )
+from solslot_api.genesis_store import GenesisStore
 
 
 class ChallengeBody(BaseModel):
@@ -274,6 +276,50 @@ async def test_request_timeout_returns_bounded_gateway_timeout() -> None:
     assert response.status_code == 504
     assert response.json() == {"detail": "Request processing timed out."}
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_pending_admin_recovery_freezes_privileged_mutations(
+    tmp_path,
+) -> None:
+    database = tmp_path / "genesis.sqlite3"
+    settings = _staging(genesis_db_path=str(database))
+    store = GenesisStore(database)
+    ceremony_id = "0x" + "11" * 32
+    now = int(time.time())
+    store.create_draft(
+        ceremony_id,
+        {"network": "testnet11"},
+        now=now,
+    )
+    store.create_recovery_case(
+        ceremony_id,
+        case_id="case-freeze",
+        authority_slot=0,
+        kind="ROUTINE",
+        intent_hash="0x" + "22" * 32,
+        intent={"schemaVersion": 1, "slot": 0},
+        execute_after=now + 86_400,
+        expires_at=now + 172_800,
+        prepared_by="0x" + "33" * 20,
+        now=now,
+    )
+
+    transport = httpx.ASGITransport(app=_app(settings))
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://test",
+    ) as client:
+        blocked = await client.post("/admin/change")
+        recovery = await client.post(
+            "/admin/security/key-changes/case-freeze/evm/observe"
+        )
+        login = await client.post("/admin/auth/login")
+
+    assert blocked.status_code == 423
+    assert "Security & Access" in blocked.json()["detail"]
+    assert recovery.status_code == 404
+    assert login.status_code == 404
 
 
 def test_development_may_opt_into_http_cookie_and_docs() -> None:

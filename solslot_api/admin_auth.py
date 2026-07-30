@@ -40,13 +40,16 @@ from eth_utils import to_checksum_address
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
 
+from .admin_roster import (
+    current_signed_admin_allowlist,
+    current_signed_admins,
+)
 from .challenges import ChallengeStore, ChallengeStoreFullError, RateLimitedError
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
-    signed_admin_allowlist,
 )
 from .server_hardening import trusted_client_ip
 
@@ -148,7 +151,7 @@ def _effective_admin_allowlist(settings: Settings) -> set[str]:
     if settings.runtime_environment == "test":
         return settings.effective_admin_allowlist_set()
     try:
-        return signed_admin_allowlist(settings)
+        return current_signed_admin_allowlist(settings)
     except (PublicArtifactMissing, PublicArtifactError) as exc:
         logger.error("Admin authority artifact is unavailable: %s", exc)
         return set()
@@ -202,7 +205,7 @@ def get_jwt_secret(settings: Optional[Settings] = None) -> str:
     # when the admin desk itself is disabled (no verified records).
     if _effective_admin_allowlist(s):
         raise RuntimeError(
-            "Admin desk is enabled by the signed V2 artifact but "
+            "Admin desk is enabled by the signed RC23 Authority V3 artifact but "
             "SOLSLOT_ADMIN_JWT_SECRET is "
             "empty.  Multi-worker deployments would generate divergent "
             "per-process secrets, causing intermittent 403s when load-"
@@ -252,35 +255,36 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
 
     if settings.runtime_environment != "test" and settings.admin_records_path:
         raise RuntimeError(
-            "SOLSLOT_ADMIN_RECORDS_PATH is retired for deployed V2 releases. "
+            "SOLSLOT_ADMIN_RECORDS_PATH is retired for deployed RC23 releases. "
             "Administrator identities come from the signed public artifact."
         )
 
     if settings.runtime_environment != "test":
         try:
-            allowlist = signed_admin_allowlist(settings)
+            allowlist = current_signed_admin_allowlist(settings)
         except PublicArtifactMissing as exc:
             if settings.alpha_writes_enabled and not settings.ceremony_mode_enabled:
                 raise RuntimeError(
-                    "Protocol writes require a signed V2 public artifact."
+                    "Protocol writes require a signed RC23 public artifact."
                 ) from exc
-            logger.info("Admin desk disabled (signed V2 artifact unavailable).")
+            logger.info("Admin desk disabled (signed RC23 artifact unavailable).")
             return
         except PublicArtifactError as exc:
             raise RuntimeError(
-                f"Signed V2 public artifact failed admin startup validation: {exc}"
+                f"Signed RC23 public artifact failed admin startup validation: {exc}"
             ) from exc
 
         if not allowlist:
             raise RuntimeError("Signed V2 artifact contains no administrator identities.")
         if not settings.admin_jwt_secret:
             raise RuntimeError(
-                "Admin desk is enabled by the signed V2 artifact but "
+                "Admin desk is enabled by the signed RC23 Authority V3 artifact but "
                 "SOLSLOT_ADMIN_JWT_SECRET is empty. Set a stable "
                 "high-entropy value before starting the API."
             )
         logger.info(
-            "Admin desk gated by the signed V2 artifact: %d administrator slots.",
+            "Admin desk gated by the signed RC23 Authority V3 artifact: "
+            "%d administrator slots.",
             len(allowlist) // 2,
         )
         return
@@ -386,6 +390,8 @@ class AdminClaims:
     auth_type: str       # "evm" | "chia_bls"
     iat: int
     exp: int
+    authority_slot: int | None = None
+    compressed_pubkey: str | None = None
 
 
 def issue_jwt(
@@ -393,6 +399,8 @@ def issue_jwt(
     sub: str,
     auth_type: str,
     settings: Settings,
+    authority_slot: int | None = None,
+    compressed_pubkey: str | None = None,
 ) -> tuple[str, int]:
     """Mint a fresh admin JWT.  Returns ``(token, expires_at_unix)``."""
     now = int(time.time())
@@ -404,6 +412,10 @@ def issue_jwt(
         "exp": exp,
         "scope": "admin",
     }
+    if authority_slot is not None:
+        payload["authority_slot"] = authority_slot
+    if compressed_pubkey is not None:
+        payload["compressed_pubkey"] = compressed_pubkey.lower()
     token = pyjwt.encode(
         payload, get_jwt_secret(settings), algorithm="HS256",
     )
@@ -439,6 +451,16 @@ def verify_jwt(token: str, settings: Optional[Settings] = None) -> AdminClaims:
         auth_type=auth_type,
         iat=int(payload["iat"]),
         exp=int(payload["exp"]),
+        authority_slot=(
+            int(payload["authority_slot"])
+            if payload.get("authority_slot") is not None
+            else None
+        ),
+        compressed_pubkey=(
+            str(payload["compressed_pubkey"]).lower()
+            if payload.get("compressed_pubkey") is not None
+            else None
+        ),
     )
 
 
@@ -486,7 +508,8 @@ def require_admin_jwt(
     # cycle, regardless of whether their JWT is still within its TTL.
     # Without this check, refresh-after-revocation chains keep a
     # compromised admin authoritative until the API process restarts.
-    if claims.sub.lower() not in _effective_admin_allowlist(settings):
+    allowlist = _effective_admin_allowlist(settings)
+    if claims.sub.lower() not in allowlist:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -494,6 +517,27 @@ def require_admin_jwt(
                 f"Re-authenticate via /admin/auth/login if your pubkey was re-added."
             ),
         )
+    if settings.runtime_environment != "test":
+        try:
+            administrators = current_signed_admins(settings)
+            if (
+                claims.authority_slot not in range(3)
+                or claims.compressed_pubkey is None
+                or administrators[claims.authority_slot]
+                != (claims.sub.lower(), claims.compressed_pubkey.lower())
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Administrator session no longer matches its "
+                        "Authority V3 identity slot."
+                    ),
+                )
+        except (PublicArtifactMissing, PublicArtifactError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authority V3 identity evidence is unavailable.",
+            ) from exc
     return claims
 
 
@@ -530,11 +574,15 @@ class AdminLoginResponse(BaseModel):
     jwt: str
     expires_at: int
     owner: str
+    authority_slot: int
+    compressed_pubkey: str
 
 
 class AdminRefreshResponse(BaseModel):
     jwt: str
     expires_at: int
+    authority_slot: int | None = None
+    compressed_pubkey: str | None = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -690,6 +738,29 @@ async def admin_login(
             ),
         )
 
+    if settings.runtime_environment == "test":
+        authority_slot = 0
+        compressed_pubkey = recovery.compressed_pubkey_hex.lower()
+    else:
+        try:
+            administrators = current_signed_admins(settings)
+            authority_slot, (_, compressed_pubkey) = next(
+                (slot, administrator)
+                for slot, administrator in enumerate(administrators)
+                if administrator[0] == recovery.address.lower()
+                and administrator[1] == recovery.compressed_pubkey_hex.lower()
+            )
+        except StopIteration as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Recovered wallet is not an active Authority V3 identity.",
+            ) from exc
+        except (PublicArtifactMissing, PublicArtifactError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authority V3 identity evidence is unavailable.",
+            ) from exc
+
     # Use the address (lowercase) as the JWT subject for evm auth;
     # that's what the portal will display in its UI and what the
     # mint-proposal store will tag rows with via owner_pubkey.
@@ -698,9 +769,17 @@ async def admin_login(
         sub=sub,
         auth_type=body.auth_type,
         settings=settings,
+        authority_slot=authority_slot,
+        compressed_pubkey=compressed_pubkey,
     )
     logger.info("Admin login: %s authenticated (auth_type=%s)", sub, body.auth_type)
-    return AdminLoginResponse(jwt=token, expires_at=exp, owner=sub)
+    return AdminLoginResponse(
+        jwt=token,
+        expires_at=exp,
+        owner=sub,
+        authority_slot=authority_slot,
+        compressed_pubkey=compressed_pubkey,
+    )
 
 
 @router.get(
@@ -912,8 +991,15 @@ async def admin_refresh(
         sub=claims.sub,
         auth_type=claims.auth_type,
         settings=settings,
+        authority_slot=claims.authority_slot,
+        compressed_pubkey=claims.compressed_pubkey,
     )
-    return AdminRefreshResponse(jwt=token, expires_at=exp)
+    return AdminRefreshResponse(
+        jwt=token,
+        expires_at=exp,
+        authority_slot=claims.authority_slot,
+        compressed_pubkey=claims.compressed_pubkey,
+    )
 
 
 __all__ = [

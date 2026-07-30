@@ -40,6 +40,7 @@ class ServerHardeningMiddleware:
         self.settings = settings
         self._challenge_limiter: RequestRateLimiter | None = None
         self._chia_push_limiter: RequestRateLimiter | None = None
+        self._genesis_store: Any | None = None
 
     async def __call__(
         self,
@@ -62,6 +63,30 @@ class ServerHardeningMiddleware:
                         list(message.get("headers") or []),
                     )
             await send(message)
+
+        if self._is_privileged_mutation(scope):
+            try:
+                if self._recovery_store().active_recovery_cases():
+                    await self._json_error(
+                        hardened_send,
+                        status_code=423,
+                        detail=(
+                            "Administrator operations are temporarily locked "
+                            "while a wallet change is pending. Open Security "
+                            "& Access to finish or cancel it."
+                        ),
+                    )
+                    return
+            except Exception:
+                await self._json_error(
+                    hardened_send,
+                    status_code=503,
+                    detail=(
+                        "Administrator recovery state is unavailable; "
+                        "privileged changes are locked."
+                    ),
+                )
+                return
 
         if self._is_public_challenge_request(scope):
             source_ip = self._source_ip(scope)
@@ -143,6 +168,32 @@ class ServerHardeningMiddleware:
                     status_code=504,
                     detail="Request processing timed out.",
                 )
+
+    def _recovery_store(self) -> Any:
+        if self._genesis_store is None:
+            from .genesis_store import GenesisStore
+
+            self._genesis_store = GenesisStore(
+                self.settings.genesis_db_path
+            )
+        return self._genesis_store
+
+    @staticmethod
+    def _is_privileged_mutation(scope: Mapping[str, Any]) -> bool:
+        method = str(scope.get("method") or "").upper()
+        path = str(scope.get("path") or "")
+        if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return False
+        if not path.startswith("/admin/"):
+            return False
+        if path.startswith("/admin/security/key-changes"):
+            return False
+        return path not in {
+            "/admin/auth/challenge",
+            "/admin/auth/login",
+            "/admin/launch/auth/challenge",
+            "/admin/launch/auth/login",
+        }
 
     def _security_headers(
         self,

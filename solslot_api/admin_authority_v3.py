@@ -7,6 +7,7 @@ from typing import Any, Mapping, Optional
 
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
+from chia.types.coin_spend import CoinSpend, make_spend
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
@@ -17,11 +18,13 @@ from solslot_puzzles.admin_authority_v3_driver import (
     AdminAuthorityV3State,
     PENDING_LOST,
     PENDING_NONE,
+    PENDING_RECOVERY_KIT,
     PENDING_ROUTINE,
     SPEND_CANCEL,
     SPEND_COMPLETE,
     SPEND_OPERATIONAL,
     SPEND_PREPARE_LOST,
+    SPEND_PREPARE_KIT,
     SPEND_PREPARE_ROUTINE,
     make_inner_puzzle,
     parse_inner_puzzle,
@@ -57,13 +60,14 @@ class AdminAuthorityV3Snapshot:
     confirmed_height: Optional[int]
     source_manifest_hash: str
     operational_mips_root_hash: str
-    recovery_mips_root_hash: str
+    lost_recovery_mips_root_hashes: tuple[str, str, str]
     authority_version: int
     pending: bool
     pending_kind: str
     pending_slot: Optional[int]
     pending_intent_hash: Optional[str]
     pending_identity_coin_id: Optional[str]
+    pending_original_custody_hash: Optional[str]
     pending_replacement_custody_hash: Optional[str]
     pending_replacement_member_hash: Optional[str]
     pending_delay_seconds: int
@@ -85,12 +89,20 @@ class AdminAuthorityV3Snapshot:
 
 @dataclass(frozen=True)
 class _LiveCoin:
+    parent_coin_id: str
     coin_id: str
     puzzle_hash: str
     amount: int
     confirmed_height: int
     spent_height: Optional[int]
     launcher: bool = False
+
+    def to_coin(self) -> Coin:
+        return Coin(
+            _b32(self.parent_coin_id, "parent coin id"),
+            _b32(self.puzzle_hash, "puzzle hash"),
+            uint64(self.amount),
+        )
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,17 @@ class _SingletonTip:
     latest_spent: Optional[_LiveCoin]
     depth: int
     lineage: tuple[_LiveCoin, ...]
+
+
+@dataclass(frozen=True)
+class LiveSingletonContext:
+    """Exact live singleton input and parent spend used for lineage proofs."""
+
+    launcher_id: bytes32
+    coin: Coin
+    parent_spend: CoinSpend
+    confirmed_height: int
+    depth: int
 
 
 def _hex(value: bytes | bytes32) -> str:
@@ -133,6 +156,7 @@ def _coin(record: Mapping[str, Any], *, launcher: bool = False) -> _LiveCoin:
     coin_id = bytes32(Coin(parent, puzzle_hash, uint64(amount)).name())
     spent_height = int(record.get("spent_block_index") or 0)
     return _LiveCoin(
+        parent_coin_id=_hex(parent),
         coin_id=_hex(coin_id),
         puzzle_hash=_hex(puzzle_hash),
         amount=amount,
@@ -176,6 +200,44 @@ async def _singleton_tip(
     raise ValueError("Authority V3 lineage exceeds the safety limit")
 
 
+async def load_live_singleton_context(
+    *,
+    provider: ChiaProvider,
+    launcher_id: str,
+) -> LiveSingletonContext:
+    """Load one unspent singleton tip and its exact spent parent.
+
+    The caller supplies the expected current puzzle reveal separately and
+    checks it against ``coin.puzzle_hash`` before constructing a spend.
+    """
+
+    normalized_launcher = _b32(launcher_id, "singleton launcher id")
+    tip = await _singleton_tip(provider, _hex(normalized_launcher))
+    if tip is None or tip.depth < 1 or tip.latest_spent is None:
+        raise ValueError("singleton is not launched")
+    parent = tip.latest_spent
+    if parent.spent_height is None:
+        raise ValueError("singleton parent spend height is missing")
+    payload = await provider.get_puzzle_and_solution(
+        parent.coin_id,
+        parent.spent_height,
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("singleton parent spend is unavailable")
+    parent_spend = make_spend(
+        parent.to_coin(),
+        _program(payload.get("puzzle_reveal"), "singleton parent puzzle"),
+        _program(payload.get("solution"), "singleton parent solution"),
+    )
+    return LiveSingletonContext(
+        launcher_id=normalized_launcher,
+        coin=tip.live.to_coin(),
+        parent_spend=parent_spend,
+        confirmed_height=tip.live.confirmed_height,
+        depth=tip.depth,
+    )
+
+
 def _inner_from_full_puzzle(full_puzzle: Program) -> Program:
     uncurried = full_puzzle.uncurry()
     if uncurried is None:
@@ -205,45 +267,85 @@ def _state_after_solution(
     if spend_tag == SPEND_OPERATIONAL:
         if parsed.state.pending_kind != PENDING_NONE:
             raise ValueError("Authority V3 operational spend bypasses recovery freeze")
-        state = AdminAuthorityV3State(authority_version=new_version)
-    elif spend_tag in (SPEND_PREPARE_ROUTINE, SPEND_PREPARE_LOST):
+        state = AdminAuthorityV3State(
+            current_identity_custody_hashes=(
+                parsed.state.current_identity_custody_hashes
+            ),
+            authority_version=new_version,
+        )
+    elif spend_tag in (
+        SPEND_PREPARE_ROUTINE,
+        SPEND_PREPARE_LOST,
+        SPEND_PREPARE_KIT,
+    ):
         if parsed.state.pending_kind != PENDING_NONE:
             raise ValueError("Authority V3 has simultaneous key changes")
         args = list(inner_solution[3].as_iter())
-        if len(args) != 9:
+        if len(args) != 7:
             raise ValueError("Authority V3 prepare solution is malformed")
-        pending_kind = (
-            PENDING_ROUTINE
-            if spend_tag == SPEND_PREPARE_ROUTINE
-            else PENDING_LOST
+        pending = list(args[6].as_iter())
+        if len(pending) != 6:
+            raise ValueError(
+                "Authority V3 prepare transition is malformed"
+            )
+        pending_kind = {
+            SPEND_PREPARE_ROUTINE: PENDING_ROUTINE,
+            SPEND_PREPARE_LOST: PENDING_LOST,
+            SPEND_PREPARE_KIT: PENDING_RECOVERY_KIT,
+        }[spend_tag]
+        pending_slot = int(pending[0].as_int())
+        if pending_slot not in range(3):
+            raise ValueError("Authority V3 pending slot is invalid")
+        current_custodies = list(
+            parsed.state.current_identity_custody_hashes
+        )
+        current_custodies[pending_slot] = _b32(
+            pending[4].as_atom().hex(),
+            "intermediate custody hash",
         )
         state = AdminAuthorityV3State(
+            current_identity_custody_hashes=tuple(current_custodies),  # type: ignore[arg-type]
             authority_version=new_version,
             pending_kind=pending_kind,
-            pending_slot=int(args[4].as_int()),
-            pending_intent_hash=_b32(args[5].as_atom().hex(), "intent hash"),
+            pending_slot=pending_slot,
+            pending_intent_hash=_b32(
+                pending[1].as_atom().hex(),
+                "intent hash",
+            ),
             pending_identity_coin_id=_b32(
-                args[6].as_atom().hex(),
+                pending[3].as_atom().hex(),
                 "identity coin id",
             ),
+            pending_original_custody_hash=(
+                parsed.state.current_identity_custody_hashes[pending_slot]
+            ),
             pending_replacement_custody_hash=_b32(
-                args[7].as_atom().hex(),
+                pending[5].as_atom().hex(),
                 "replacement custody hash",
             ),
-            pending_replacement_member_hash=_b32(
-                args[8].as_atom().hex(),
-                "replacement member hash",
+            pending_replacement_member_hash=bytes32(
+                args[2].get_tree_hash()
             ),
             pending_delay_seconds=(
-                parsed.routine_delay_seconds
-                if pending_kind == PENDING_ROUTINE
-                else parsed.lost_key_delay_seconds
+                parsed.lost_key_delay_seconds
+                if pending_kind == PENDING_LOST
+                else parsed.routine_delay_seconds
             ),
         )
     elif spend_tag in (SPEND_CANCEL, SPEND_COMPLETE):
         if parsed.state.pending_kind == PENDING_NONE:
             raise ValueError("Authority V3 clears an empty recovery state")
-        state = AdminAuthorityV3State(authority_version=new_version)
+        current_custodies = list(
+            parsed.state.current_identity_custody_hashes
+        )
+        if spend_tag == SPEND_COMPLETE:
+            current_custodies[parsed.state.pending_slot] = (
+                parsed.state.pending_replacement_custody_hash
+            )
+        state = AdminAuthorityV3State(
+            current_identity_custody_hashes=tuple(current_custodies),  # type: ignore[arg-type]
+            authority_version=new_version,
+        )
     else:
         raise ValueError("Authority V3 spend tag is unsupported")
     state.validate()
@@ -285,6 +387,11 @@ async def build_admin_authority_v3_snapshot(
     parsed = None
     state = AdminAuthorityV3State()
     chain_verified = False
+    latest_spend_tag: Optional[int] = None
+    expected_identity_custody = [
+        _b32(record["custodyHash"], f"identity {slot} custody hash")
+        for slot, record in enumerate(identity_records)
+    ]
 
     if provider is not None:
         authority_tip = await _singleton_tip(provider, launcher_id)
@@ -299,10 +406,6 @@ async def build_admin_authority_v3_snapshot(
             ).lower()
             if authority_tip.lineage[1].puzzle_hash.lower() != expected_genesis_full:
                 raise ValueError("Authority V3 genesis puzzle hash mismatches")
-            expected_identity_custody = [
-                _b32(record["custodyHash"], f"identity {slot} custody hash")
-                for slot, record in enumerate(identity_records)
-            ]
             for index in range(1, len(authority_tip.lineage) - 1):
                 spent_coin = authority_tip.lineage[index]
                 if spent_coin.spent_height is None:
@@ -320,9 +423,13 @@ async def build_admin_authority_v3_snapshot(
                     old_inner,
                     _program(spend.get("solution"), "authority solution"),
                 )
+                latest_spend_tag = spend_tag
                 next_inner = make_inner_puzzle(
+                    authority_launcher_id=parsed.authority_launcher_id,
                     operational_root_hash=parsed.operational_root_hash,
-                    recovery_root_hash=parsed.recovery_root_hash,
+                    lost_recovery_root_hashes=(
+                        parsed.lost_recovery_root_hashes
+                    ),
                     identity_launcher_ids=parsed.identity_launcher_ids,
                     source_manifest_hash=parsed.source_manifest_hash,
                     state=state,
@@ -359,6 +466,15 @@ async def build_admin_authority_v3_snapshot(
             for slot, tip in enumerate(identity_tips):
                 if tip is None or tip.depth < 1:
                     raise ValueError(f"Identity vault {slot} is not launched")
+                if (
+                    state.pending_kind != PENDING_NONE
+                    and slot == state.pending_slot
+                ):
+                    # The authority spend and identity spend are paired by
+                    # announcements. During the veto window the authority
+                    # commits the exact live intermediate coin id rather than
+                    # its custody hash, so that id is the authoritative check.
+                    continue
                 expected = _hex(
                     singleton_full_puzzle_hash(
                         _b32(
@@ -375,12 +491,23 @@ async def build_admin_authority_v3_snapshot(
             chain_verified = True
 
     operational_root = str(authority["operationalMipsRootHash"]).lower()
-    recovery_root = str(authority["recoveryMipsRootHash"]).lower()
+    recovery_roots = tuple(
+        str(value).lower()
+        for value in authority["lostRecoveryMipsRootHashes"]
+    )
+    if len(recovery_roots) != 3 or len(set(recovery_roots)) != 3:
+        raise ValueError(
+            "Authority V3 requires three distinct lost-key roots"
+        )
     source_manifest = str(authority["sourceManifestHash"]).lower()
     if parsed is not None:
         if (
             _hex(parsed.operational_root_hash) != operational_root
-            or _hex(parsed.recovery_root_hash) != recovery_root
+            or tuple(
+                _hex(value)
+                for value in parsed.lost_recovery_root_hashes
+            )
+            != recovery_roots
             or _hex(parsed.source_manifest_hash) != source_manifest
             or [_hex(value) for value in parsed.identity_launcher_ids]
             != [str(item["launcherId"]).lower() for item in identity_records]
@@ -391,7 +518,13 @@ async def build_admin_authority_v3_snapshot(
         PENDING_NONE: "NONE",
         PENDING_ROUTINE: "ROUTINE",
         PENDING_LOST: "LOST",
+        PENDING_RECOVERY_KIT: "RECOVERY_KIT",
     }
+    reported_identity_custody = (
+        state.current_identity_custody_hashes
+        if parsed is not None
+        else tuple(expected_identity_custody)
+    )
     identities = tuple(
         AdminIdentityVaultV1(
             slot=slot,
@@ -399,7 +532,7 @@ async def build_admin_authority_v3_snapshot(
             daily_compressed_pubkey=str(record["dailyCompressedPubkey"]).lower(),
             recovery_bls_pubkey=str(record["recoveryBlsPubkey"]).lower(),
             recovery_member_hash=str(record["recoveryMemberHash"]).lower(),
-            custody_hash=str(record["custodyHash"]).lower(),
+            custody_hash=_hex(reported_identity_custody[slot]),
             live_coin_id=identity_tips[slot].live.coin_id
             if identity_tips[slot] is not None
             else None,
@@ -422,7 +555,7 @@ async def build_admin_authority_v3_snapshot(
         confirmed_height=authority_tip.live.confirmed_height if authority_tip else None,
         source_manifest_hash=source_manifest,
         operational_mips_root_hash=operational_root,
-        recovery_mips_root_hash=recovery_root,
+        lost_recovery_mips_root_hashes=recovery_roots,  # type: ignore[arg-type]
         authority_version=state.authority_version,
         pending=state.pending_kind != PENDING_NONE,
         pending_kind=pending_labels[state.pending_kind],
@@ -431,6 +564,11 @@ async def build_admin_authority_v3_snapshot(
         if state.pending_kind != PENDING_NONE
         else None,
         pending_identity_coin_id=_hex(state.pending_identity_coin_id)
+        if state.pending_kind != PENDING_NONE
+        else None,
+        pending_original_custody_hash=_hex(
+            state.pending_original_custody_hash
+        )
         if state.pending_kind != PENDING_NONE
         else None,
         pending_replacement_custody_hash=_hex(
@@ -456,6 +594,14 @@ async def build_admin_authority_v3_snapshot(
                 hashes.get("adminAuthorityFull")
             ).lower(),
             "lineageDepth": authority_tip.depth if authority_tip else 0,
+            "latestSpend": {
+                SPEND_OPERATIONAL: "OPERATIONAL",
+                SPEND_PREPARE_ROUTINE: "PREPARE_ROUTINE",
+                SPEND_PREPARE_LOST: "PREPARE_LOST",
+                SPEND_PREPARE_KIT: "PREPARE_RECOVERY_KIT",
+                SPEND_CANCEL: "CANCEL",
+                SPEND_COMPLETE: "COMPLETE",
+            }.get(latest_spend_tag, "GENESIS"),
         },
     )
 
@@ -463,5 +609,7 @@ async def build_admin_authority_v3_snapshot(
 __all__ = [
     "AdminAuthorityV3Snapshot",
     "AdminIdentityVaultV1",
+    "LiveSingletonContext",
     "build_admin_authority_v3_snapshot",
+    "load_live_singleton_context",
 ]

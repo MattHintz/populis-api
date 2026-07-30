@@ -77,7 +77,7 @@ Environment=SOLSLOT_KOS_SIGNER_NETWORK=testnet11
 Environment=SOLSLOT_KOS_SIGNER_BIND_HOST=10.77.0.30
 Environment=SOLSLOT_KOS_SIGNER_BIND_PORT=9445
 Environment=SOLSLOT_KOS_SIGNER_LEDGER_DB_PATH=/var/lib/solslot-kos/kos-mint-execute.db
-Environment=SOLSLOT_KOS_SIGNER_PUBLIC_ARTIFACT_PATH=/etc/solslot-kos/public_artifact_v3.json
+Environment=SOLSLOT_KOS_SIGNER_PUBLIC_ARTIFACT_PATH=/etc/solslot-kos/public_artifact_v4.json
 Environment=SOLSLOT_KOS_SIGNER_RELEASE_METADATA_PATH=/opt/solslot/kos-mint-execute/current/release.json
 Environment=SOLSLOT_KOS_SIGNER_PRIVATE_KEY_FILE=%d/kos-mint-execute.key
 Environment=SOLSLOT_KOS_SIGNER_TLS_CERT_FILE=/etc/solslot-kos/tls/server.pem
