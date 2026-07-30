@@ -52,6 +52,7 @@ def _payload() -> dict:
         "network": "testnet11",
         "protocolVersion": "solslot-v2-rc23",
         "outcome": "approved",
+        "reviewRequestHash": "0x" + "40" * 32,
         "sourceShas": {
             name: f"{index:x}" * 40
             for index, name in enumerate(SOURCE_NAMES, start=1)
@@ -74,6 +75,7 @@ def _payload() -> dict:
                 "scope": scope,
                 "approved": True,
                 "reviewer": f"Independent reviewer {index}",
+                "evidenceFile": f"{scope}.md",
                 "evidenceHash": "0x"
                 + bytes([0x50 + index] * 32).hex(),
                 "completedAt": "2026-07-29T12:00:00+00:00",
@@ -123,6 +125,8 @@ def test_loads_checksum_pinned_complete_review(tmp_path) -> None:
     )
     assert result["artifactHash"] == payload["artifactHash"]
     assert result["reviewerCount"] == 4
+    assert result["reviewRequestHash"] == payload["reviewRequestHash"]
+    assert len(result["evidenceFiles"]) == 4
     assert len(result["scopes"]) == 4
     assert read_authority_v3_review_receipt(
         _write(tmp_path, payload),
@@ -212,6 +216,38 @@ def test_rejects_review_of_different_recovery_dependencies(
     with pytest.raises(
         AuthorityV3ReviewError,
         match="pinned Chia SDK",
+    ):
+        load_authority_v3_review(
+            _write(tmp_path, payload),
+            source_shas=payload["sourceShas"],
+            authority_inner_mod_hash="0x" + "41" * 32,
+            governance_evidence_hash="0x" + "42" * 32,
+        )
+
+
+def test_rejects_unbound_request_or_reused_evidence_file(tmp_path) -> None:
+    payload = _payload()
+    payload.pop("reviewRequestHash")
+    payload["artifactHash"] = _canonical_hash(payload)
+    with pytest.raises(
+        AuthorityV3ReviewError,
+        match="review request hash",
+    ):
+        load_authority_v3_review(
+            _write(tmp_path, payload),
+            source_shas=payload["sourceShas"],
+            authority_inner_mod_hash="0x" + "41" * 32,
+            governance_evidence_hash="0x" + "42" * 32,
+        )
+
+    payload = _payload()
+    payload["reviews"][1]["evidenceFile"] = payload["reviews"][0][
+        "evidenceFile"
+    ]
+    payload["artifactHash"] = _canonical_hash(payload)
+    with pytest.raises(
+        AuthorityV3ReviewError,
+        match="approval is incomplete",
     ):
         load_authority_v3_review(
             _write(tmp_path, payload),

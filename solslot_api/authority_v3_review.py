@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,9 @@ REQUIRED_SCOPES = frozenset(
         "safe-authority-guards",
     }
 )
+_EVIDENCE_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
 class AuthorityV3ReviewError(ValueError):
     """Authority V3 review evidence is absent, stale, or malformed."""
 
@@ -184,6 +188,11 @@ def load_authority_v3_review(
         raise AuthorityV3ReviewError(
             "Authority V3 review receipt is unsupported"
         )
+    review_request_hash = _hex(
+        payload.get("reviewRequestHash"),
+        length=32,
+        label="Authority V3 review request hash",
+    )
     reviewed_sources = payload.get("sourceShas")
     if not isinstance(reviewed_sources, Mapping) or set(
         reviewed_sources
@@ -256,15 +265,23 @@ def load_authority_v3_review(
         raise AuthorityV3ReviewError(
             "Authority V3 review must cover all four trust boundaries"
         )
+    evidence_files: set[str] = set()
     for review in reviews:
+        if not isinstance(review, Mapping):
+            raise AuthorityV3ReviewError(
+                "Authority V3 review approval is incomplete"
+            )
+        evidence_file = str(review.get("evidenceFile") or "")
         if (
-            not isinstance(review, Mapping)
-            or review.get("approved") is not True
+            review.get("approved") is not True
             or not str(review.get("reviewer") or "").strip()
+            or not _EVIDENCE_FILE.fullmatch(evidence_file)
+            or evidence_file in evidence_files
         ):
             raise AuthorityV3ReviewError(
                 "Authority V3 review approval is incomplete"
             )
+        evidence_files.add(evidence_file)
         _hex(
             review.get("evidenceHash"),
             length=32,
@@ -288,12 +305,14 @@ def load_authority_v3_review(
     return {
         "artifactHash": payload["artifactHash"],
         "fileSha256": "0x" + file_hash,
+        "reviewRequestHash": review_request_hash,
         "reviewerCount": len(
             {
                 str(item["reviewer"]).strip()
                 for item in reviews
             }
         ),
+        "evidenceFiles": sorted(evidence_files),
         "scopes": sorted(REQUIRED_SCOPES),
     }
 
