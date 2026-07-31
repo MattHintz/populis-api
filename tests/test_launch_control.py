@@ -37,8 +37,8 @@ def _sign(account, typed_data: dict) -> str:
 
 
 def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
-    release_tag = "solslot-v2-alpha-rc23-20260729"
-    release_branch = "release/testnet-alpha-rc23-20260729"
+    release_tag = "solslot-v2-alpha-rc24-20260730"
+    release_branch = "release/testnet-alpha-rc24-20260730"
     source_shas = {
         name: f"{index:x}" * 40
         for index, name in enumerate(SOURCE_KEYS, start=1)
@@ -86,7 +86,7 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
     )
     evidence = {
         "schemaVersion": 5,
-        "kind": "solslot-rc23-launch-source-evidence",
+        "kind": "solslot-rc24-launch-source-evidence",
         "network": "testnet11",
         "testOnly": True,
         "completeReleaseManifest": True,

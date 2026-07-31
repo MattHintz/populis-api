@@ -837,15 +837,15 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc23-20260729"
+    launch_release_tag: str = "solslot-v2-alpha-rc24-20260730"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc23.json"
+        "./state/source-freeze-evidence-rc24.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
-    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc23.json"
+    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc24.json"
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc23.json"
+        "./state/settlement-rehearsal-rc24.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None
