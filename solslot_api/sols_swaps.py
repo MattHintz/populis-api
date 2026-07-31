@@ -91,6 +91,7 @@ from .credential_auth import (
 from .evm_auth import recover_evm_signer
 from .faucet import AGG_SIG_ME_DATA, Faucet
 from .launch_gates import require_operation_gate
+from .payment_purchase_store import get_payment_purchase_store
 from .protocol_submission import (
     ProtocolBundleSubmitter,
     ProtocolSubmissionError,
@@ -940,6 +941,20 @@ def _authorize_swap(
         )
 
 
+def _require_deed_not_in_stripe_dispute(
+    settings: Settings,
+    deed_launcher_id: str,
+) -> None:
+    dispute = get_payment_purchase_store(
+        settings.payment_purchase_db_path
+    ).get_stripe_dispute_for_deed(deed_launcher_id)
+    if dispute is not None:
+        raise SolsSwapOfferError(
+            "This SmartDeed is paused while its Stripe payment dispute is "
+            "reviewed. Its vault custody has not changed."
+        )
+
+
 async def _load_swap_context(
     *,
     settings: Settings,
@@ -948,6 +963,7 @@ async def _load_swap_context(
     deed_launcher_id: str,
     quote_expires_at: int | None,
 ) -> SolsSwapContext:
+    _require_deed_not_in_stripe_dispute(settings, deed_launcher_id)
     now = int(time())
     if quote_expires_at is not None and (
         quote_expires_at <= now
@@ -1158,6 +1174,7 @@ async def _load_reverse_swap_context(
     payout_public_key: bytes | None,
     quote_expires_at: int | None,
 ) -> ReverseSolsSwapContext:
+    _require_deed_not_in_stripe_dispute(settings, deed_launcher_id)
     now = int(time())
     if quote_expires_at is not None and (
         quote_expires_at <= now

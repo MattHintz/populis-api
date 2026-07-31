@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable, Mapping
 
 from chia.types.blockchain_format.program import Program
+from chia.types.blockchain_format.coin import Coin
 from chia.types.coin_spend import make_spend
 from chia_rs import G2Element, SpendBundle
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint64
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 from .faucet import Faucet
@@ -40,6 +43,21 @@ class ProtocolFeePolicy:
     mempool_poll_seconds: float = 0.5
 
 
+@dataclass(frozen=True)
+class PreparedProtocolBundle:
+    bundle: SpendBundle
+    fee_mojos: int
+    fee_coin_id: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "spendBundleId": "0x" + self.bundle.name().hex(),
+            "feeMojos": str(self.fee_mojos),
+            "feeCoinId": self.fee_coin_id,
+            "spendBundle": self.bundle.to_json_dict(),
+        }
+
+
 class ProtocolBundleSubmitter:
     """Add one bounded fee-till spend and prove local mempool propagation."""
 
@@ -56,47 +74,14 @@ class ProtocolBundleSubmitter:
         self._lock = asyncio.Lock()
 
     async def submit(self, protocol_bundle_json: dict[str, Any]) -> dict[str, Any]:
-        if not self.policy.enabled:
-            raise ProtocolSubmissionError("protocol fee funding is disabled")
-        try:
-            protocol_bundle = SpendBundle.from_json_dict(protocol_bundle_json)
-        except Exception as exc:
-            raise ProtocolSubmissionError("protocol spend bundle is malformed") from exc
-        if not protocol_bundle.coin_spends:
-            raise ProtocolSubmissionError("protocol spend bundle has no coin spends")
-        try:
-            existing_fee = sum(
-                int(coin.amount) for coin in protocol_bundle.removals()
-            ) - sum(int(coin.amount) for coin in protocol_bundle.additions())
-        except Exception as exc:
-            raise ProtocolSubmissionError(
-                "protocol spend bundle conditions cannot be evaluated"
-            ) from exc
-        if existing_fee != 0:
-            raise ProtocolSubmissionError(
-                "protocol spend bundle must not carry a separate user-funded fee"
-            )
-
         # Production keeps one worker for faucet-backed writes. Holding this
         # lock until mempool observation prevents reuse of an unconfirmed coin.
         async with self._lock:
-            preliminary_fee = await self._estimate_fee(protocol_bundle)
-            protocol_input_ids = {
-                bytes(coin.name()) for coin in protocol_bundle.removals()
-            }
-            fee_coin = await self._select_fee_coin(
-                preliminary_fee,
-                excluded_coin_ids=protocol_input_ids,
-            )
-            final_bundle, fee = await self._converge_fee(
-                protocol_bundle,
-                fee_coin,
-                preliminary_fee,
-            )
+            prepared = await self._prepare_locked(protocol_bundle_json)
             try:
                 mempool = await self.provider.push_tx_confirmed_in_primary_mempool(
-                    final_bundle.to_json_dict(),
-                    required_coin_id="0x" + fee_coin.name().hex(),
+                    prepared.bundle.to_json_dict(),
+                    required_coin_id=prepared.fee_coin_id,
                     timeout_seconds=self.policy.mempool_timeout_seconds,
                     poll_seconds=self.policy.mempool_poll_seconds,
                 )
@@ -110,16 +95,187 @@ class ProtocolBundleSubmitter:
             "schemaVersion": 1,
             "status": "MEMPOOL",
             "network": self.faucet.network,
-            "spendBundleId": "0x" + final_bundle.name().hex(),
-            "feeMojos": str(fee),
+            **prepared.to_json(),
             "feeTargetSeconds": self.policy.target_seconds,
-            "feeCoinId": "0x" + fee_coin.name().hex(),
             "feeTillPuzzleHash": self.faucet.address_hex,
             "submissionProvider": mempool["provider"],
             "mempoolObservedAt": mempool["observed_at"],
             "ambiguousPushRecovered": bool(mempool["ambiguous_push"]),
-            "spendBundle": final_bundle.to_json_dict(),
         }
+
+    async def prepare_and_dispatch(
+        self,
+        protocol_bundle_json: dict[str, Any],
+        dispatcher: Callable[
+            [PreparedProtocolBundle],
+            Awaitable[Mapping[str, Any] | None],
+        ],
+    ) -> dict[str, Any]:
+        """Fund one exact bundle and keep the fee coin locked through dispatch.
+
+        Key of Solomon owns submission and retry for asynchronous payment
+        rails. The callback must durably accept the exact prepared bundle
+        before returning.
+        """
+
+        async with self._lock:
+            prepared = await self._prepare_locked(protocol_bundle_json)
+            try:
+                dispatch_result = await dispatcher(prepared)
+            except ProtocolSubmissionError:
+                raise
+            except Exception as exc:
+                raise ProtocolSubmissionError(
+                    "exact protocol executor did not accept the funded bundle",
+                    submission_attempted=True,
+                ) from exc
+        return {
+            "schemaVersion": 1,
+            "status": "DISPATCHED",
+            "network": self.faucet.network,
+            **prepared.to_json(),
+            "feeTargetSeconds": self.policy.target_seconds,
+            "feeTillPuzzleHash": self.faucet.address_hex,
+            "dispatchResult": dict(dispatch_result or {}),
+        }
+
+    async def prepare_funded_output_and_dispatch(
+        self,
+        *,
+        output_puzzle_hash: bytes32,
+        amount: int,
+        dispatcher: Callable[
+            [PreparedProtocolBundle, Coin],
+            Awaitable[Mapping[str, Any] | None],
+        ],
+    ) -> dict[str, Any]:
+        """Create one exact technical output and fund its medium fee.
+
+        Receipt funding and fee selection share the same lock, preventing the
+        faucet worker or another protocol write from selecting either input
+        before Key of Solomon durably accepts the final bundle.
+        """
+
+        if amount < 1 or amount > self.policy.maximum_funding_coin_mojos:
+            raise ProtocolSubmissionError(
+                "funded protocol output amount is outside the configured cap"
+            )
+        async with self._lock:
+            source = await self._select_fee_coin(
+                amount,
+                excluded_coin_ids=set(),
+            )
+            conditions = [
+                Program.to([CREATE_COIN, output_puzzle_hash, amount])
+            ]
+            change = int(source.amount) - amount
+            if change:
+                conditions.append(
+                    Program.to(
+                        [
+                            CREATE_COIN,
+                            self.faucet.address_puzzle_hash,
+                            change,
+                        ]
+                    )
+                )
+            condition_program = Program.to(conditions)
+            delegated = Program.to((1, condition_program))
+            solution = Program.to([0, delegated, Program.to(0)])
+            source_spend = make_spend(
+                source,
+                self.faucet.key.puzzle,
+                solution,
+            )
+            source_signature = G2Element.from_bytes(
+                self.faucet.sign_delegated_spend(
+                    source,
+                    condition_program,
+                )
+            )
+            protocol_bundle = SpendBundle(
+                [source_spend],
+                source_signature,
+            )
+            output_coin = Coin(
+                bytes32(source.name()),
+                output_puzzle_hash,
+                uint64(amount),
+            )
+            prepared = await self._prepare_locked(
+                protocol_bundle.to_json_dict()
+            )
+            try:
+                dispatch_result = await dispatcher(prepared, output_coin)
+            except ProtocolSubmissionError:
+                raise
+            except Exception as exc:
+                raise ProtocolSubmissionError(
+                    "exact protocol executor did not accept the funded output",
+                    submission_attempted=True,
+                ) from exc
+        return {
+            "schemaVersion": 1,
+            "status": "DISPATCHED",
+            "network": self.faucet.network,
+            **prepared.to_json(),
+            "expectedOutputCoinId": "0x" + output_coin.name().hex(),
+            "expectedOutputPuzzleHash": (
+                "0x" + output_coin.puzzle_hash.hex()
+            ),
+            "feeTargetSeconds": self.policy.target_seconds,
+            "feeTillPuzzleHash": self.faucet.address_hex,
+            "dispatchResult": dict(dispatch_result or {}),
+        }
+
+    async def _prepare_locked(
+        self,
+        protocol_bundle_json: dict[str, Any],
+    ) -> PreparedProtocolBundle:
+        if not self.policy.enabled:
+            raise ProtocolSubmissionError("protocol fee funding is disabled")
+        try:
+            protocol_bundle = SpendBundle.from_json_dict(protocol_bundle_json)
+        except Exception as exc:
+            raise ProtocolSubmissionError(
+                "protocol spend bundle is malformed"
+            ) from exc
+        if not protocol_bundle.coin_spends:
+            raise ProtocolSubmissionError(
+                "protocol spend bundle has no coin spends"
+            )
+        try:
+            existing_fee = sum(
+                int(coin.amount) for coin in protocol_bundle.removals()
+            ) - sum(
+                int(coin.amount) for coin in protocol_bundle.additions()
+            )
+        except Exception as exc:
+            raise ProtocolSubmissionError(
+                "protocol spend bundle conditions cannot be evaluated"
+            ) from exc
+        if existing_fee != 0:
+            raise ProtocolSubmissionError(
+                "protocol spend bundle must not carry a separate user-funded fee"
+            )
+        preliminary_fee = await self._estimate_fee(protocol_bundle)
+        protocol_input_ids = {
+            bytes(coin.name()) for coin in protocol_bundle.removals()
+        }
+        fee_coin = await self._select_fee_coin(
+            preliminary_fee,
+            excluded_coin_ids=protocol_input_ids,
+        )
+        final_bundle, fee = await self._converge_fee(
+            protocol_bundle,
+            fee_coin,
+            preliminary_fee,
+        )
+        return PreparedProtocolBundle(
+            bundle=final_bundle,
+            fee_mojos=fee,
+            fee_coin_id="0x" + fee_coin.name().hex(),
+        )
 
     async def _estimate_fee(self, bundle: SpendBundle) -> int:
         try:
@@ -248,5 +404,6 @@ class ProtocolBundleSubmitter:
 __all__ = [
     "ProtocolBundleSubmitter",
     "ProtocolFeePolicy",
+    "PreparedProtocolBundle",
     "ProtocolSubmissionError",
 ]

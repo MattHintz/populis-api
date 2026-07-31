@@ -342,6 +342,73 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 f"ownership, and activation evidence: {exc}"
             ) from exc
 
+    if settings.stripe_smartdeed_fulfillment_enabled:
+        if settings.network != "testnet11":
+            raise RuntimeError(
+                "RC24 Stripe SmartDeed fulfillment is restricted to Testnet11."
+            )
+        if settings.payment_stripe_livemode:
+            raise RuntimeError(
+                "RC24 Stripe SmartDeed fulfillment requires Stripe test mode."
+            )
+        if not settings.alpha_writes_enabled or not settings.minting_enabled:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED requires alpha "
+                "writes and minting."
+            )
+        if not settings.protocol_fee_funding_enabled:
+            raise RuntimeError(
+                "Stripe SmartDeed fulfillment requires bounded protocol fee "
+                "funding."
+            )
+        if (
+            not settings.payment_stripe_account_id
+            or not settings.payment_kos_executor_url
+            or not settings.payment_kos_executor_private_key_file
+            or not settings.payment_kos_executor_public_key
+        ):
+            raise RuntimeError(
+                "Stripe SmartDeed fulfillment requires the Stripe account and "
+                "exact Key of Solomon executor configuration."
+            )
+        if not valid_internal_service_url(
+            settings.payment_kos_executor_url
+        ):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_URL must use HTTPS or "
+                "loopback-only HTTP."
+            )
+        try:
+            public_key = bytes.fromhex(
+                settings.payment_kos_executor_public_key.removeprefix("0x")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY is not valid hex."
+            ) from exc
+        if len(public_key) != 48:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY must be 48 bytes."
+            )
+        kos_mtls = (
+            settings.payment_kos_executor_mtls_ca_path,
+            settings.payment_kos_executor_mtls_cert_path,
+            settings.payment_kos_executor_mtls_key_path,
+        )
+        if any(kos_mtls) and not all(kos_mtls):
+            raise RuntimeError(
+                "KoS exact executor mTLS requires CA, certificate, and key."
+            )
+        if (
+            settings.runtime_environment in {"staging", "production"}
+            and settings.payment_kos_executor_url.startswith("https://")
+            and not all(kos_mtls)
+        ):
+            raise RuntimeError(
+                "Remote KoS exact execution requires mTLS in "
+                "staging/production."
+            )
+
     if settings.runtime_environment not in {"staging", "production"}:
         return
     if settings.chia_primary_url:
@@ -581,6 +648,13 @@ class Settings(BaseSettings):
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
+        "payment_stripe_account_id",
+        "payment_kos_executor_url",
+        "payment_kos_executor_private_key_file",
+        "payment_kos_executor_public_key",
+        "payment_kos_executor_mtls_ca_path",
+        "payment_kos_executor_mtls_cert_path",
+        "payment_kos_executor_mtls_key_path",
         "payment_omnichain_ingest_token",
         "payment_omnichain_rpc_url",
         "payment_omnichain_ownership_safe_operation_path",
@@ -942,6 +1016,37 @@ class Settings(BaseSettings):
     # 0x-prefixed 20-byte token addresses as values.
     payment_purchase_db_path: str = "./state/payment_purchases_v2.db"
     payment_evm_usdc_tokens: dict[str, str] = Field(default_factory=dict)
+    # Stripe secrets remain in Telonium and the independent validators. The
+    # coordinator accepts only normalized, server-authenticated event evidence.
+    payment_stripe_account_id: Optional[str] = None
+    payment_stripe_api_version: str = "2026-02-25.clover"
+    payment_stripe_livemode: bool = False
+    stripe_smartdeed_fulfillment_enabled: bool = False
+    payment_stripe_credit_surcharge_enabled: bool = False
+    payment_stripe_credit_surcharge_bps: int = Field(0, ge=0, le=300)
+    payment_stripe_credit_surcharge_fixed_minor: int = Field(
+        0,
+        ge=0,
+        le=10_000,
+    )
+    payment_stripe_credit_surcharge_cap_bps: int = Field(
+        300,
+        ge=0,
+        le=300,
+    )
+    # The coordinator signs only exact execution envelopes. KoS remains the
+    # durable submit/retry boundary and receives no Stripe credential.
+    payment_kos_executor_url: Optional[str] = None
+    payment_kos_executor_private_key_file: Optional[str] = None
+    payment_kos_executor_public_key: Optional[str] = None
+    payment_kos_executor_timeout_seconds: float = Field(
+        30.0,
+        gt=0,
+        le=120,
+    )
+    payment_kos_executor_mtls_ca_path: Optional[str] = None
+    payment_kos_executor_mtls_cert_path: Optional[str] = None
+    payment_kos_executor_mtls_key_path: Optional[str] = None
     # External CCIP/Warp escrow is separately deployed from the ceremony EVM
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False

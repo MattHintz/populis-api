@@ -3,10 +3,10 @@ set -euo pipefail
 umask 077
 
 usage() {
-  echo "usage: sudo $0 INDEX WG_IP RELEASE_TGZ VALIDATOR_ENV SEED_FILE CA_CERT SERVER_CERT SERVER_KEY" >&2
+  echo "usage: sudo $0 INDEX WG_IP RELEASE_TGZ VALIDATOR_ENV SEED_FILE CA_CERT SERVER_CERT SERVER_KEY STRIPE_READ_KEY_FILE" >&2
   exit 2
 }
-[ "$#" -eq 8 ] || usage
+[ "$#" -eq 9 ] || usage
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 index="$1"
@@ -17,11 +17,12 @@ seed_file="$(readlink -f "$5")"
 ca_cert="$(readlink -f "$6")"
 server_cert="$(readlink -f "$7")"
 server_key="$(readlink -f "$8")"
+stripe_read_key="$(readlink -f "$9")"
 case "$index:$wg_ip" in
   0:10.77.0.10|1:10.77.0.11|2:10.77.0.12) ;;
   *) echo "signer index and WireGuard IP do not match the fixed topology" >&2; exit 1 ;;
 esac
-for path in "$archive" "$env_file" "$seed_file" "$ca_cert" "$server_cert" "$server_key"; do
+for path in "$archive" "$env_file" "$seed_file" "$ca_cert" "$server_cert" "$server_key" "$stripe_read_key"; do
   [ -f "$path" ] || { echo "missing input file" >&2; exit 1; }
 done
 python3 - "$archive" <<'PY'
@@ -103,12 +104,15 @@ fi
 chown -R root:solslot-validator "$release_dir"
 chmod -R u=rwX,g=rX,o= "$release_dir"
 
-"$release_dir/.venv/bin/python" - "$env_file" "$index" "$seed_file" <<'PY'
+"$release_dir/.venv/bin/python" - "$env_file" "$index" "$seed_file" "$stripe_read_key" <<'PY'
 import os
 import pathlib
 import sys
 
-from solslot_api.validator_service import load_validator_private_key
+from solslot_api.validator_service import (
+    load_stripe_read_only_key,
+    load_validator_private_key,
+)
 from solslot_api.validator_settings import ValidatorSettings
 
 for raw_line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
@@ -123,10 +127,14 @@ for raw_line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines
     os.environ[key] = value
 os.environ["SOLSLOT_VALIDATOR_SIGNER_INDEX"] = sys.argv[2]
 os.environ["SOLSLOT_VALIDATOR_SEED_FILE"] = sys.argv[3]
-load_validator_private_key(ValidatorSettings())
+os.environ["SOLSLOT_VALIDATOR_STRIPE_READ_ONLY_KEY_FILE"] = sys.argv[4]
+settings = ValidatorSettings()
+load_validator_private_key(settings)
+load_stripe_read_only_key(settings)
 PY
 
 install -m 0600 "$seed_file" /etc/solslot-validator/private/validator.seed
+install -m 0600 "$stripe_read_key" /etc/solslot-validator/private/stripe.read.key
 install -m 0600 "$server_key" /etc/solslot-validator/private/server.key
 install -m 0644 "$ca_cert" /etc/solslot-validator/tls/ca.crt
 install -m 0644 "$server_cert" /etc/solslot-validator/tls/server.crt

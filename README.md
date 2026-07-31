@@ -69,6 +69,44 @@ share allocation, or delivery address.
   purchase and replay ledger.
 - `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase
   construction and finalization.
+- RC24 Stripe settlement is enabled only when
+  `SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED=true`, Testnet11 writes and
+  minting are enabled, bounded fee funding is configured, and the exact Key
+  of Solomon executor identity is pinned. The coordinator intentionally holds
+  no Stripe secret key.
+- RC24 refuses Stripe live mode. `SOLSLOT_PAYMENT_STRIPE_ACCOUNT_ID` and
+  `SOLSLOT_PAYMENT_STRIPE_API_VERSION=2026-02-25.clover` bind normalized
+  Telonium evidence to the test account. Credit surcharging remains disabled
+  unless the reviewed bounded policy is explicitly configured; ACH, debit,
+  prepaid, and unknown funding are always unsurcharged.
+- Each validator receives its own restricted Stripe test key through a
+  protected `stripe-read-key` systemd credential. Validators independently
+  retrieve the Account, Event, and PaymentIntent and require a matching 2-of-3
+  receipt before any voucher or SmartDeed delivery spend is assembled. Each
+  signer rejects Stripe's highest-risk card result. Direct card delivery also
+  requires an authenticated 3DS result retrieved from the expanded Charge;
+  presales retain the voucher/refund boundary but still reject highest risk.
+
+### Production Stripe Test Rehearsal
+
+An immutable production deploy always installs every Stripe and protocol-write
+ceiling as `false`. After the exact RC24 API, protocol, backend, validator, and
+Key of Solomon releases are deployed, use the **Stripe Test Rehearsal Ceiling**
+GitHub workflow. It accepts exact tagged SHAs and has only two operations:
+
+1. `arm` verifies Testnet11, Stripe test credentials, the locked genesis, three
+   Stripe-ready validators, the local Chia tunnel, exact-only Key of Solomon,
+   and explicitly closed `minting`, `presale`, and `purchases` windows. It then
+   starts the fulfillment workers. It does **not** open customer purchases.
+2. Owner plus one coadministrator opens the short signed purchase or presale
+   window in the administrator UI and closes intake when the rehearsal ends.
+3. `disarm` refuses to stop fulfillment while any Stripe operation is not
+   `FINALIZED`, `REFUNDED`, or `CANCELED`. After the ledger drains, it restores
+   all static ceilings to `false`.
+
+Do not deploy another API or backend release while the ceiling is armed. The
+release workflows enforce this so an in-flight payment cannot lose its worker.
+Native XCH and CAT offers never use this ceiling or Stripe reservation ledger.
 
 Native XCH and CAT purchases are completed as standard atomic Chia offer files.
 The sealed USD target raise and deed share determine the exact integer USD

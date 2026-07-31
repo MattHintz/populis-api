@@ -37,6 +37,7 @@ ALLOWED_OPERATIONS = frozenset(
         "presale.create",
         "presale.cancel",
         "presale.launch",
+        "stripe.dispute.resolve",
     }
 )
 
@@ -69,9 +70,14 @@ def canonical_request_binding(
         raise ValueError("admin operation method must be POST, PUT, PATCH, or DELETE")
     is_admin_path = path.startswith("/admin/")
     is_presale_path = path == "/presales" or path.startswith("/presales/")
-    if (not is_admin_path and not is_presale_path) or "?" in path or "#" in path:
+    is_stripe_admin_path = path.startswith("/protocol/stripe/admin/")
+    if (
+        not is_admin_path
+        and not is_presale_path
+        and not is_stripe_admin_path
+    ) or "?" in path or "#" in path:
         raise ValueError(
-            "admin operation path must be an authoritative /admin/ or /presales API path"
+            "admin operation path must be an authoritative admin API path"
         )
     normalized_query = sorted([[str(key), str(value)] for key, value in query])
     return {

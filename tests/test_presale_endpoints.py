@@ -38,6 +38,7 @@ from solslot_api.presale_endpoints import (
     PresaleCreateRequest,
     PresaleStore,
     RefundEvidenceRequest,
+    StripeVoucherTerminalChainEvidence,
     VoucherIssuanceChainEvidence,
     VoucherIssuanceEvidenceRequest,
     VoucherSeriesPhaseChainEvidence,
@@ -631,6 +632,108 @@ def test_presale_store_creates_parent_directory(tmp_path: Path) -> None:
     store = PresaleStore(str(database_path))
 
     assert database_path.is_file()
+
+
+def test_stripe_voucher_v3_terminal_is_revisioned_and_vault_visible() -> None:
+    now = int(time.time())
+    current_terms = terms(now)
+    store = PresaleStore(":memory:")
+    create_series(store, current_terms)
+    series = store.get(str(current_terms["termsHash"]))
+    current_coin_id = str(series["chainState"]["currentCoinId"])
+    commitment = {
+        "schema": "solslot.voucher-commitment.v3",
+        "paymentPrincipal": "1030",
+        "processingChargeMinor": "20",
+        "basePriceMinor": "1000",
+        "technologyFeeBps": 100,
+        "technologyFeeMinor": "10",
+        "grossPriceMinor": "1010",
+    }
+    purchase_id = hex32(201)
+    vault_launcher_id = approved_vault().launcher_id
+    with store.txn() as cur:
+        cur.execute(
+            """
+            UPDATE presale_series_v2
+            SET state='LIVE', sold_count=1, launched_at=?, updated_at=?
+            WHERE terms_hash=?
+            """,
+            (now, now, str(current_terms["termsHash"]).lower()),
+        )
+        cur.execute(
+            """
+            INSERT INTO stripe_voucher_records_v3(
+              terms_hash, serial, deed_launcher_id, purchase_id,
+              global_payment_id, commitment_hash, commitment_json,
+              original_payer, vault_launcher_id, vault_p2_puzzle_hash,
+              stripe_receipt_hash, payment_evidence_id, state,
+              issuance_bundle_id, voucher_launcher_id,
+              voucher_output_coin_id, receipt_coin_id,
+              series_input_coin_id, series_output_coin_id,
+              issuance_confirmed_height, created_at, updated_at
+            ) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ESCROWED',
+                      ?, ?, ?, ?, ?, ?, 500, ?, ?)
+            """,
+            (
+                str(current_terms["termsHash"]).lower(),
+                str(current_terms["deeds"][0]["deedLauncherId"]).lower(),
+                purchase_id,
+                hex32(202),
+                hex32(203),
+                json.dumps(commitment, sort_keys=True, separators=(",", ":")),
+                hex32(204),
+                vault_launcher_id,
+                approved_vault().p2_puzzle_hash,
+                hex32(205),
+                "evt_stripe_terminal_v3",
+                hex32(206),
+                hex32(207),
+                hex32(208),
+                hex32(209),
+                hex32(210),
+                current_coin_id,
+                now,
+                now,
+            ),
+        )
+
+    submitted = store.record_stripe_terminal_submission(
+        purchase_id,
+        action=VoucherAction.REDEEM,
+        terminal_evidence_hash=hex32(205),
+        spend_bundle_id=hex32(211),
+        terminal_voucher_coin_id=hex32(212),
+        series_input_coin_id=current_coin_id,
+        series_output_coin_id=hex32(213),
+        deed_output_coin_id=hex32(214),
+    )
+    assert submitted["state"] == "REDEEMING"
+    evidence = StripeVoucherTerminalChainEvidence(
+        action=int(VoucherAction.REDEEM),
+        spendBundleId=hex32(211),
+        terminalEvidenceHash=hex32(205),
+        terminalVoucherCoinId=hex32(212),
+        seriesInputCoinId=current_coin_id,
+        seriesInputParentCoinId=hex32(215),
+        seriesOutputCoinId=hex32(213),
+        seriesOutputInnerPuzzleHash=hex32(216),
+        deedOutputCoinId=hex32(214),
+        confirmedHeight=501,
+    )
+    confirmed = store.confirm_stripe_terminal(purchase_id, evidence)
+    assert confirmed["state"] == "REDEEMED"
+    assert confirmed["terminalConfirmedHeight"] == 501
+    assert store.get(str(current_terms["termsHash"]))["chainState"][
+        "redeemedCount"
+    ] == 1
+    scoped = store.vouchers_for_vault(vault_launcher_id)
+    assert scoped[0]["schema"] == "solslot.stripe-voucher-record.v3"
+    assert scoped[0]["state"] == "REDEEMED"
+    assert store.confirm_stripe_terminal(purchase_id, evidence)["state"] == "REDEEMED"
+    altered = evidence.model_copy(update={"spend_bundle_id": hex32(217)})
+    with pytest.raises(ValueError, match="confirmation changed"):
+        store.confirm_stripe_terminal(purchase_id, altered)
 
 
 def test_public_presale_redacts_vouchers_and_vault_view_is_scoped() -> None:

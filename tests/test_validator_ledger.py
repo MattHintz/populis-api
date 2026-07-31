@@ -51,12 +51,24 @@ def test_validator_ledger_uses_wal_and_passes_integrity_check(tmp_path) -> None:
     assert journal_mode.lower() == "wal"
 
 
-def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
+def test_validator_ledger_migrates_current_signature_schema() -> None:
     ledger = ValidatorLedger(":memory:")
     try:
         version = ledger._conn.execute("PRAGMA user_version").fetchone()[0]
         table = ledger._conn.execute(
             "SELECT name FROM sqlite_master WHERE name = 'voucher_series_phase_signatures'"
+        ).fetchone()
+        reservation_table = ledger._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE name = 'inventory_reservation_signatures'"
+        ).fetchone()
+        extension_table = ledger._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE name = 'inventory_extension_signatures'"
+        ).fetchone()
+        release_table = ledger._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE name = 'inventory_release_signatures'"
         ).fetchone()
         columns = {
             row[1]
@@ -64,11 +76,21 @@ def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
                 "PRAGMA table_info(voucher_transition_signatures)"
             ).fetchall()
         }
+        stripe_columns = {
+            row[1]
+            for row in ledger._conn.execute(
+                "PRAGMA table_info(stripe_settlement_signatures)"
+            ).fetchall()
+        }
     finally:
         ledger.close()
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION == 11
     assert table is not None
+    assert reservation_table is not None
+    assert extension_table is not None
+    assert release_table is not None
     assert "deed_coin_id" in columns
+    assert "expected_deed_output_coin_id" in stripe_columns
 
 
 def test_primary_purchase_retry_recovers_the_original_signature() -> None:
@@ -108,6 +130,73 @@ def test_validator_will_not_sign_one_deed_for_two_primary_purchases() -> None:
             )
     finally:
         ledger.close()
+
+
+def _inventory_reservation_record(
+    ledger: ValidatorLedger,
+    *,
+    claim: str = "61",
+    purchase: str = "62",
+    artifact: str = "63",
+    available: str = "64",
+    reserved: str = "65",
+    expires_at: int = 2_000,
+) -> str:
+    return ledger.record_inventory_reservation_or_recover(
+        claim_hash="0x" + claim * 32,
+        canonical_claim='{"reservation":"' + claim + '"}',
+        purchase_id="0x" + purchase * 32,
+        artifact_hash="0x" + artifact * 32,
+        available_coin_id="0x" + available * 32,
+        reserved_coin_id="0x" + reserved * 32,
+        reservation_expires_at=expires_at,
+        signature="0x" + "66" * 96,
+    )
+
+
+def test_inventory_reservation_is_idempotent_and_exclusive(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("solslot_api.validator_ledger.time.time", lambda: 1_000)
+    ledger = ValidatorLedger(":memory:")
+    try:
+        first = _inventory_reservation_record(ledger)
+        assert _inventory_reservation_record(ledger) == first
+        with pytest.raises(ValidatorLedgerConflict, match="live reservation"):
+            _inventory_reservation_record(
+                ledger,
+                claim="67",
+                purchase="68",
+                artifact="69",
+                available="64",
+                reserved="6a",
+            )
+    finally:
+        ledger.close()
+
+
+def test_expired_off_chain_reservation_can_be_replaced(monkeypatch) -> None:
+    now = 1_000
+    monkeypatch.setattr(
+        "solslot_api.validator_ledger.time.time",
+        lambda: now,
+    )
+    ledger = ValidatorLedger(":memory:")
+    try:
+        _inventory_reservation_record(ledger, expires_at=1_001)
+        now = 1_001
+        replacement = _inventory_reservation_record(
+            ledger,
+            claim="67",
+            purchase="68",
+            artifact="69",
+            available="64",
+            reserved="6a",
+            expires_at=2_000,
+        )
+    finally:
+        ledger.close()
+    assert replacement == "0x" + "66" * 96
 
 
 def _voucher_transition_record(

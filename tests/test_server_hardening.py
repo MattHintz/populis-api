@@ -116,6 +116,27 @@ def test_customer_bridge_and_liquidity_cannot_execute_on_testnet() -> None:
         )
 
 
+def test_rc24_stripe_fulfillment_rejects_live_mode() -> None:
+    with pytest.raises(RuntimeError, match="requires Stripe test mode"):
+        validate_server_hardening_at_startup(
+            Settings(
+                runtime_environment="test",
+                network="testnet11",
+                alpha_writes_enabled=True,
+                minting_enabled=True,
+                protocol_fee_funding_enabled=True,
+                chia_primary_url="https://127.0.0.1:8555",
+                faucet_master_sk_hex="11" * 32,
+                stripe_smartdeed_fulfillment_enabled=True,
+                payment_stripe_livemode=True,
+                payment_stripe_account_id="acct_test_rc24",
+                payment_kos_executor_url="http://127.0.0.1:8080",
+                payment_kos_executor_private_key_file="/run/secrets/kos.key",
+                payment_kos_executor_public_key="0x" + "22" * 48,
+            )
+        )
+
+
 def test_mainnet_capability_flag_requires_checksum_pinned_evidence() -> None:
     with pytest.raises(RuntimeError, match="checksum-pinned release evidence"):
         validate_server_hardening_at_startup(
