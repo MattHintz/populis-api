@@ -15,7 +15,7 @@ concurrency:
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # RC24 settlement imports must match the exact reviewed protocol source.
-  PROTOCOL_REF: 8fc0c23b5dc48a41bc72b5acb7be5ca24347c0eb
+  PROTOCOL_REF: a53794fe3e9068348f9f480c90b72dea50bbc8a2
 
 jobs:
   verify:
