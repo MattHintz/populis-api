@@ -14,9 +14,8 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # RC24 settlement imports live in the coordinated protocol release. Keep CI
-  # reproducible by pinning the exact protocol main commit merged from RC24.
-  PROTOCOL_REF: 6b3ce5c4510ca770404a28e5008b49a8665132ed
+  # RC24 settlement imports must match the exact reviewed protocol source.
+  PROTOCOL_REF: 8fc0c23b5dc48a41bc72b5acb7be5ca24347c0eb
 
 jobs:
   verify:
