@@ -471,6 +471,11 @@ jobs:
             Environment=SOLSLOT_API_DOCS_ENABLED=false
             Environment=SOLSLOT_ALPHA_WRITES_ENABLED=false
             Environment=SOLSLOT_MINTING_ENABLED=false
+            Environment=SOLSLOT_COLLECTION_MINTING_ENABLED=false
+            Environment=SOLSLOT_PRESALE_ENABLED=false
+            Environment=SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED=false
+            Environment=SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=false
+            Environment=SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED=false
             Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
             Environment=SOLSLOT_VAULT_SESSION_COOKIE_SECURE=true

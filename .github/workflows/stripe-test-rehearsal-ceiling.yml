@@ -1,0 +1,106 @@
+name: Stripe Test Rehearsal Ceiling
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Arm or disarm the Stripe test-mode infrastructure ceiling."
+        required: true
+        type: choice
+        options:
+          - arm
+          - disarm
+      api_sha:
+        description: "Exact deployed RC24 API commit SHA."
+        required: true
+        type: string
+      protocol_sha:
+        description: "Exact deployed RC24 protocol commit SHA."
+        required: true
+        type: string
+      backend_sha:
+        description: "Exact deployed RC24 legacy backend commit SHA."
+        required: true
+        type: string
+      kos_sha:
+        description: "Exact deployed RC24 Key of Solomon commit SHA."
+        required: true
+        type: string
+      release_tag:
+        description: "Coordinated annotated RC24 release tag."
+        required: true
+        type: string
+      acknowledgement:
+        description: "Type STRIPE TEST MODE ONLY. This does not open customer purchases."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: solslot-api-production
+  cancel-in-progress: false
+
+jobs:
+  verify-request:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.api_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact coordinated API source
+        env:
+          API_SHA: ${{ inputs.api_sha }}
+          PROTOCOL_SHA: ${{ inputs.protocol_sha }}
+          BACKEND_SHA: ${{ inputs.backend_sha }}
+          KOS_SHA: ${{ inputs.kos_sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+        run: |
+          set -euo pipefail
+          test "$ACKNOWLEDGEMENT" = "STRIPE TEST MODE ONLY"
+          for sha in "$API_SHA" "$PROTOCOL_SHA" "$BACKEND_SHA" "$KOS_SHA"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          done
+          [[ "$RELEASE_TAG" =~ ^solslot-v2-alpha-rc24(\.[0-9]+)?-[0-9]{8}$ ]]
+          test "$(git rev-parse HEAD)" = "$API_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$API_SHA" origin/main
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$API_SHA"
+          python3 -m compileall -q scripts/check_stripe_rehearsal_ceiling.py
+          bash -n scripts/manage_stripe_test_rehearsal_ceiling.sh
+
+  transition:
+    needs: verify-request
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Apply fail-closed production ceiling transition
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_IP }}
+          username: ${{ secrets.PRODUCTION_SSH_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PRODUCTION_SSH_PASSPHRASE }}
+          port: 22
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            sudo /opt/solslot/api-production/current/scripts/manage_stripe_test_rehearsal_ceiling.sh \
+              --action '${{ inputs.action }}' \
+              --api-sha '${{ inputs.api_sha }}' \
+              --protocol-sha '${{ inputs.protocol_sha }}' \
+              --backend-sha '${{ inputs.backend_sha }}' \
+              --kos-sha '${{ inputs.kos_sha }}' \
+              --release-tag '${{ inputs.release_tag }}'
+
+      - name: Verify public coordinator remains on the exact release
+        run: |
+          set -euo pipefail
+          curl -fsS https://solslot.com/protocol-api/release \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["release"]; assert d["available"] is True; assert r["apiCommit"] == "${{ inputs.api_sha }}"; assert r["protocolCommit"] == "${{ inputs.protocol_sha }}"'

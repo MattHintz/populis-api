@@ -61,6 +61,8 @@ from .mint_endpoints import router as mint_endpoints_router
 from .collection_endpoints import router as collection_endpoints_router
 from .protocol_artifacts import router as protocol_artifacts_router
 from .native_purchases import router as native_purchases_router
+from .stripe_payments import router as stripe_payments_router
+from .stripe_fulfillment import router as stripe_fulfillment_router
 from .presale_endpoints import router as presale_router
 from .presale_endpoints import get_presale_store
 from .payment_purchase_store import get_payment_purchase_store
@@ -94,6 +96,7 @@ from .config import (
 from .credential_auth import require_alpha_writes
 from .protocol_config import build_snapshot as build_protocol_config_snapshot
 from .protocol_submission import ProtocolBundleSubmitter, ProtocolFeePolicy
+from .kos_exact_execution import KeyOfSolomonExactExecutor
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
@@ -301,6 +304,22 @@ async def lifespan(app: FastAPI):
             ),
         )
 
+    app.state.kos_exact_executor = None
+    if settings.stripe_smartdeed_fulfillment_enabled:
+        app.state.kos_exact_executor = KeyOfSolomonExactExecutor(
+            url=str(settings.payment_kos_executor_url),
+            private_key_file=str(
+                settings.payment_kos_executor_private_key_file
+            ),
+            expected_public_key=str(
+                settings.payment_kos_executor_public_key
+            ),
+            timeout_seconds=settings.payment_kos_executor_timeout_seconds,
+            mtls_ca_path=settings.payment_kos_executor_mtls_ca_path,
+            mtls_cert_path=settings.payment_kos_executor_mtls_cert_path,
+            mtls_key_path=settings.payment_kos_executor_mtls_key_path,
+        )
+
     app.state.voucher_issuance_worker = None
     if settings.voucher_issuance_worker_enabled:
         if app.state.faucet is None:
@@ -322,6 +341,8 @@ async def lifespan(app: FastAPI):
                 enabled=True,
                 interval_seconds=settings.voucher_issuance_interval_seconds,
             ),
+            submitter=app.state.protocol_submitter,
+            exact_executor=app.state.kos_exact_executor,
         )
         await voucher_worker.start()
         app.state.voucher_issuance_worker = voucher_worker
@@ -404,6 +425,8 @@ app.include_router(mint_endpoints_router)
 app.include_router(collection_endpoints_router)
 app.include_router(protocol_artifacts_router)
 app.include_router(native_purchases_router)
+app.include_router(stripe_payments_router)
+app.include_router(stripe_fulfillment_router)
 app.include_router(presale_router)
 app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)

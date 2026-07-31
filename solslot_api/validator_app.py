@@ -12,7 +12,11 @@ from pydantic import BaseModel, ConfigDict
 from .release_metadata import load_release_metadata
 from .validator_ledger import ValidatorLedger
 from .validator_quorum import (
+    InventoryExtensionClaim,
+    InventoryReleaseClaim,
+    InventoryReservationClaim,
     PrimaryPurchaseClaim,
+    StripeSettlementClaim,
     ValidatorClaim,
     ValidatorSignatureResponse,
     VoucherIssuanceClaim,
@@ -21,10 +25,15 @@ from .validator_quorum import (
 )
 from .validator_service import (
     ValidatorEvidenceError,
+    load_stripe_read_only_key,
     load_validator_artifact,
     load_validator_private_key,
     sign_validator_claim,
+    sign_inventory_extension_claim,
+    sign_inventory_release_claim,
+    sign_inventory_reservation_claim,
     sign_primary_purchase_claim,
+    sign_stripe_settlement_claim,
     sign_voucher_issuance_claim,
     sign_voucher_series_phase_claim,
     sign_voucher_transition_claim,
@@ -43,6 +52,34 @@ class PrimaryPurchaseSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim: PrimaryPurchaseClaim
+    claimHash: str
+
+
+class InventoryReservationSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: InventoryReservationClaim
+    claimHash: str
+
+
+class InventoryExtensionSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: InventoryExtensionClaim
+    claimHash: str
+
+
+class InventoryReleaseSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: InventoryReleaseClaim
+    claimHash: str
+
+
+class StripeSettlementSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: StripeSettlementClaim
     claimHash: str
 
 
@@ -79,6 +116,7 @@ class ValidatorHealthResponse(BaseModel):
     artifactHash: str | None
     artifactReady: bool
     ledgerReady: bool
+    stripeSettlementReady: bool
 
 
 def create_validator_app(
@@ -134,6 +172,13 @@ def create_validator_app(
             except ValidatorEvidenceError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         active_ledger: ValidatorLedger = application.state.validator_ledger
+        stripe_settlement_ready = False
+        if signer_settings.stripe_account_id:
+            try:
+                load_stripe_read_only_key(signer_settings)
+                stripe_settlement_ready = not signer_settings.stripe_livemode
+            except ValidatorEvidenceError:
+                stripe_settlement_ready = False
         return ValidatorHealthResponse(
             status="healthy",
             signerIndex=signer_settings.signer_index,
@@ -150,6 +195,7 @@ def create_validator_app(
             artifactHash=artifact_hash,
             artifactReady=artifact_ready,
             ledgerReady=active_ledger.healthcheck(),
+            stripeSettlementReady=stripe_settlement_ready,
         )
 
     @application.post(
@@ -191,6 +237,126 @@ def create_validator_app(
         active_ledger: ValidatorLedger = application.state.validator_ledger
         try:
             signature = sign_primary_purchase_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/stripe-settlement/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_stripe_settlement(
+        request: StripeSettlementSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_stripe_settlement_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/inventory-extension/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_inventory_extension(
+        request: InventoryExtensionSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_inventory_extension_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/inventory-release/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_inventory_release(
+        request: InventoryReleaseSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_inventory_release_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/inventory-reservation/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_inventory_reservation(
+        request: InventoryReservationSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_inventory_reservation_claim(
                 signer_settings,
                 active_ledger,
                 request.claim,

@@ -7,6 +7,10 @@ on:
         description: "Exact 40-character API commit SHA to deploy."
         required: true
         type: string
+      release_tag:
+        description: "Coordinated annotated RC tag resolving to every release commit."
+        required: false
+        type: string
       diagnostics_only:
         description: "Inspect the live production API without deploying a release."
         required: false
@@ -48,6 +52,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
 
       - name: Require frozen release commits
         shell: bash
@@ -57,7 +62,16 @@ jobs:
             echo "release_sha must be an exact 40-character commit SHA." >&2
             exit 1
           fi
+          if [[ ! "${{ inputs.release_tag }}" =~ ^solslot-v2-alpha-rc[0-9]+(\.[0-9]+)?-[0-9]{8}$ ]]; then
+            echo "release_tag must be a coordinated annotated RC tag." >&2
+            exit 1
+          fi
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+          git fetch --force origin \
+            "refs/tags/${{ inputs.release_tag }}:refs/tags/${{ inputs.release_tag }}"
+          test "$(git rev-list -n 1 "${{ inputs.release_tag }}")" = "$RELEASE_SHA"
           if [[ ! "$PROTOCOL_REF" =~ ^[0-9a-f]{40}$ ]]; then
             echo "SOLSLOT_PROTOCOL_REF must be an exact 40-character commit SHA." >&2
             exit 1
@@ -69,6 +83,19 @@ jobs:
           repository: ${{ env.PROTOCOL_REPOSITORY }}
           ref: ${{ env.PROTOCOL_REF }}
           path: protocol
+          fetch-depth: 0
+
+      - name: Verify coordinated protocol release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C protocol rev-parse HEAD)" = "$PROTOCOL_REF"
+          git -C protocol fetch --no-tags origin main
+          git -C protocol merge-base --is-ancestor "$PROTOCOL_REF" origin/main
+          git -C protocol fetch --force origin \
+            "refs/tags/${{ inputs.release_tag }}:refs/tags/${{ inputs.release_tag }}"
+          test "$(git -C protocol rev-list -n 1 "${{ inputs.release_tag }}")" \
+            = "$PROTOCOL_REF"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -138,6 +165,7 @@ jobs:
           data = {
               "schemaVersion": 2,
               "protocolVersion": "solslot-v2",
+              "release": "${{ inputs.release_tag }}",
               "api_commit": "${RELEASE_SHA}",
               "api_repository": "${GITHUB_REPOSITORY}",
               "protocol_repository": "${PROTOCOL_REPOSITORY}",
@@ -257,6 +285,11 @@ jobs:
             actual_hostname="$(hostname)"
             if [ "$actual_hostname" != "${{ env.EXPECTED_HOSTNAME }}" ]; then
               echo "Refusing production deploy: expected host ${{ env.EXPECTED_HOSTNAME }}, got $actual_hostname" >&2
+              exit 1
+            fi
+            if sudo test -f \
+              "/etc/systemd/system/$systemd_service.d/zz-stripe-test-rehearsal.conf"; then
+              echo "Disarm and drain the Stripe test rehearsal before deploying another API release." >&2
               exit 1
             fi
             if ! id "$systemd_user" >/dev/null 2>&1; then
@@ -430,7 +463,15 @@ jobs:
             Environment=SOLSLOT_API_DOCS_ENABLED=false
             Environment=SOLSLOT_ALPHA_WRITES_ENABLED=false
             Environment=SOLSLOT_MINTING_ENABLED=false
+            Environment=SOLSLOT_COLLECTION_METADATA_ENABLED=false
+            Environment=SOLSLOT_COLLECTION_MINTING_ENABLED=false
+            Environment=SOLSLOT_PRESALE_ENABLED=false
+            Environment=SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED=false
+            Environment=SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=false
+            Environment=SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED=false
+            Environment=SOLSLOT_PAYMENT_STRIPE_LIVEMODE=false
             Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
+            Environment=SOLSLOT_LAUNCH_CONTROL_ENABLED=true
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
             Environment=SOLSLOT_VAULT_SESSION_COOKIE_SECURE=true
             Environment=SOLSLOT_SECURITY_HEADERS_ENABLED=true
@@ -443,6 +484,7 @@ jobs:
             Environment=SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH=$state_dir/zkpassport_v2.db
             Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry_v2.db
             Environment=SOLSLOT_ADMIN_DB_PATH=$state_dir/admin_desk_v2.db
+            Environment=SOLSLOT_PAYMENT_PURCHASE_DB_PATH=$state_dir/payment_purchases_v2.db
             Environment=SOLSLOT_DEPLOYMENT_MANIFEST_PATH=$state_dir/deployment_manifest_v2.json
             Environment=SOLSLOT_BOOTSTRAP_MANIFEST_PATH=$state_dir/bootstrap_manifest_v2.json
             ExecStart=
@@ -465,7 +507,11 @@ jobs:
             [Install]
             WantedBy=multi-user.target
             EOF
+            sudo "$release_dir/scripts/normalize_validator_client_credentials.sh" \
+              --service "$systemd_service" \
+              --credential-root /etc/solslot-api/validator-mtls
             sudo systemctl daemon-reload
+            sudo systemd-analyze verify "$systemd_service"
             sudo systemctl enable "$systemd_service"
 
             wait_for_health() {

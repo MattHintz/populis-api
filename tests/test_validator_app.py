@@ -62,7 +62,26 @@ def test_private_signer_health_exposes_public_fingerprints_only(tmp_path) -> Non
             assert body["validatorPubkey"] == settings.roster_pubkeys[0]
             assert body["artifactReady"] is False
             assert body["ledgerReady"] is True
+            assert body["stripeSettlementReady"] is False
             assert client.get("/openapi.json").status_code == 404
+    finally:
+        ledger.close()
+
+
+def test_private_signer_health_reports_test_stripe_readiness(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    read_key = tmp_path / "stripe-read-key"
+    read_key.write_text("rk_test_" + "a" * 32 + "\n", encoding="ascii")
+    read_key.chmod(0o600)
+    settings.stripe_read_only_key_file = str(read_key)
+    settings.stripe_account_id = "acct_test_alpha"
+    ledger = ValidatorLedger(":memory:")
+    app = create_validator_app(settings=settings, ledger=ledger)
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200, response.text
+            assert response.json()["stripeSettlementReady"] is True
     finally:
         ledger.close()
 

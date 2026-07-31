@@ -58,16 +58,18 @@ sudo bash scripts/install_validator_host.sh \
   /secure/validator-material/private/signer-1.seed \
   /secure/validator-network/public/mtls/ca.crt \
   /secure/validator-network/public/mtls/signer-1.crt \
-  /secure/validator-network/private/mtls/signer-1.key
+  /secure/validator-network/private/mtls/signer-1.key \
+  /secure/validator-material/private/signer-1-stripe-read.key
 
 sudo bash scripts/configure_validator_firewall.sh 1
 ```
 
-The installer creates an atomic release, validates the app import, installs
-root-readable credentials through systemd `LoadCredential`, and verifies the
-process and private bind. It refuses an index/address mismatch and does not
-configure a public listener. The coordinator then performs the authenticated
-mTLS health check for the whole fleet.
+The installer creates an atomic release, validates the app import, verifies
+both the signer seed and that host's distinct Stripe restricted test key,
+installs root-readable credentials through systemd `LoadCredential`, and
+verifies the process and private bind. It refuses an index/address mismatch
+and does not configure a public listener. The coordinator then performs the
+authenticated mTLS health check for the whole fleet.
 
 After genesis confirmation and two administrator artifact signatures, install
 the same verified public artifact on each signer. The command rejects an
@@ -86,11 +88,14 @@ install a draft, unsigned, or pre-confirmation artifact.
 
 Start from `config/validator.env.example`. Supply only public configuration in
 the environment: signer index, roster public keys, network, bridge policy,
-signed artifact path, EVM addresses, and RPC endpoints. The seed and TLS
-private key are systemd credentials, never environment variables. The Sepolia
-RPC URL contains the replacement provider credential: install it directly in
-the root-managed host configuration, redact it from diagnostics, and never
-place the completed file in a release archive or ceremony evidence.
+signed artifact path, EVM addresses, Stripe test account ID/API version, and
+RPC endpoints. The seed, Stripe restricted read key, and TLS private key are
+systemd credentials, never environment variables. Generate a different Stripe
+restricted key for each validator and permit only Account, Event, and
+PaymentIntent reads. The Sepolia RPC URL contains the replacement provider
+credential: install it directly in the root-managed host configuration, redact
+it from diagnostics, and never place the completed file in a release archive
+or ceremony evidence.
 
 Signer state is local SQLite-WAL storage. Unique constraints cover claim hash,
 scoped nullifier, bridge coin, vault action, and EVM transaction. A signer

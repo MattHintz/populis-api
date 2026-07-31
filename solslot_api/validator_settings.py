@@ -52,6 +52,17 @@ class ValidatorSettings(BaseSettings):
     base_sepolia_spoke_address: str = ""
     base_sepolia_usdc_address: str = ""
     base_sepolia_min_confirmations: int = Field(12, ge=12, le=100)
+    stripe_read_only_key_file: str = ""
+    stripe_account_id: str = ""
+    stripe_livemode: bool = False
+    stripe_api_base_url: Literal["https://api.stripe.com"] = (
+        "https://api.stripe.com"
+    )
+    stripe_api_version: Literal["2026-02-25.clover"] = (
+        "2026-02-25.clover"
+    )
+    stripe_reject_highest_risk: bool = True
+    stripe_require_direct_card_3ds: bool = True
 
     @field_validator("bridge_policy_hash")
     @classmethod
@@ -99,6 +110,17 @@ class ValidatorSettings(BaseSettings):
         ):
             if value and not _ADDRESS_RE.fullmatch(value):
                 raise ValueError(f"{label} must be a 20-byte EVM address")
+        if bool(self.stripe_read_only_key_file) != bool(
+            self.stripe_account_id
+        ):
+            raise ValueError(
+                "Stripe validator key file and account ID must be configured "
+                "together"
+            )
+        if self.stripe_account_id and not self.stripe_account_id.startswith(
+            "acct_"
+        ):
+            raise ValueError("stripe_account_id must start with acct_")
         return self
 
 

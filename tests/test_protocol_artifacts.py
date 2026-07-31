@@ -15,12 +15,15 @@ from fastapi.testclient import TestClient
 from solslot_api.app import app
 from solslot_api.config import get_settings, validate_server_hardening_at_startup
 from solslot_api.payment_quotes import SNAPSHOT_SCHEMA
+from solslot_api.presale_endpoints import get_presale_store
 from solslot_puzzles.payment_artifacts_v2 import (
     OracleObservationV1,
     build_oracle_round,
     oracle_operator_set_root,
     oracle_round_signature_message,
     oracle_round_to_json,
+)
+from solslot_puzzles.payment_artifacts_v3 import (
     purchase_artifact_from_json,
 )
 from solslot_api.zkpassport_enrollments import (
@@ -44,6 +47,9 @@ def _active_genesis_artifact() -> dict:
             "vaultVersionRegistry": "0x" + "cc" * 32,
         },
         "bridgePolicy": {"policyHash": BRIDGE_POLICY},
+        "puzzleHashes": {
+            "protocolTreasuryPuzzleHash": "0x" + "42" * 32,
+        },
         "retiredCoordinates": ["0x" + "e1" * 32],
     }
 
@@ -67,6 +73,10 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "SOLSLOT_PAYMENT_PURCHASE_DB_PATH",
         str(tmp_path / "payment-purchases.db"),
+    )
+    monkeypatch.setenv(
+        "SOLSLOT_ADMIN_DB_PATH",
+        str(tmp_path / "admin-desk.db"),
     )
     monkeypatch.setenv("SOLSLOT_COLLECTION_METADATA_ENABLED", "true")
 
@@ -166,6 +176,8 @@ def _published_collection(
             "offering": {
                 "currency": offering_currency,
                 "targetRaiseMinor": target_raise_minor,
+                "royaltyBps": "100",
+                "royaltyPuzhash": "0x" + "42" * 32,
             },
             "deedAllocation": [
                 {
@@ -1066,6 +1078,8 @@ def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
         assert body["artifact_hash"].startswith("sha256:")
         assert body["protocol"]["zkPassportRequired"] is True
         assert body["protocol"]["artifactHash"] == body["artifact_hash"]
+        assert body["protocol"]["purchaseKind"] == "DIRECT"
+        assert body["protocol"]["presaleTermsHash"] == "0x" + "00" * 32
 
         verified = client.post(
             "/protocol/offer-artifacts/verify",
@@ -1076,6 +1090,77 @@ def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
         )
         assert verified.status_code == 200, verified.text
         assert verified.json()["valid"] is True
+
+
+def test_stripe_presale_kind_is_derived_from_exact_governed_series(
+    monkeypatch,
+    tmp_path,
+):
+    now = int(time.time())
+    settings = get_settings()
+    terms_hash = "0x" + "91" * 32
+    get_presale_store(settings).create(
+        {
+            "termsHash": terms_hash,
+            "seriesSingletonId": "0x" + "92" * 32,
+            "collectionWorkspaceId": "SOL-LOT-AUSTIN-ALPHA",
+            "collectionId": "0x" + "93" * 32,
+            "saleOpen": now - 60,
+            "saleClose": now + 3_600,
+            "deeds": [
+                {
+                    "deedLauncherId": "0x" + "11" * 32,
+                }
+            ],
+        }
+    )
+
+    with TestClient(app) as client:
+        built = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(
+                purchase_intent_id="pi_presale_exact_deed",
+                expires_at=now + 900,
+            ),
+        )
+
+    assert built.status_code == 200, built.text
+    body = built.json()
+    assert body["purchase_artifact"]["purchaseKind"] == 2
+    assert body["purchase_artifact"]["presaleTermsHash"] == terms_hash
+    assert body["protocol"]["purchaseKind"] == "PRESALE"
+    assert body["protocol"]["presaleTermsHash"] == terms_hash
+
+
+def test_closed_stripe_presale_cannot_fall_through_to_direct_purchase(
+    monkeypatch,
+    tmp_path,
+):
+    now = int(time.time())
+    settings = get_settings()
+    get_presale_store(settings).create(
+        {
+            "termsHash": "0x" + "94" * 32,
+            "seriesSingletonId": "0x" + "95" * 32,
+            "collectionWorkspaceId": "SOL-LOT-AUSTIN-ALPHA",
+            "collectionId": "0x" + "96" * 32,
+            "saleOpen": now - 3_600,
+            "saleClose": now - 1,
+            "deeds": [{"deedLauncherId": "0x" + "11" * 32}],
+        }
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(
+                purchase_intent_id="pi_closed_presale",
+                expires_at=now + 900,
+            ),
+        )
+
+    assert response.status_code == 409
+    assert "presale sales window is closed" in response.text
 
 
 @pytest.mark.parametrize(
@@ -1121,7 +1206,9 @@ def test_builds_native_xch_offer_from_server_authorized_quote(
         assert built.status_code == 200, built.text
         body = built.json()
         canonical = purchase_artifact_from_json(body["purchase_artifact"])
-        assert canonical.usd_amount_minor == 125_000
+        assert canonical.base_amount_minor == 125_000
+        assert canonical.technology_fee_minor == 1_250
+        assert canonical.subtotal_minor == 126_250
         assert canonical.rail_amount > 0
         assert body["purchase_artifact_hash"] == (
             "0x" + bytes(canonical.artifact_hash).hex()
@@ -1165,8 +1252,10 @@ def test_quote_price_uses_target_raise_share_not_chia_par_value(
         )
     assert built.status_code == 200, built.text
     purchase = built.json()["purchase_artifact"]
-    assert purchase["usdAmountMinor"] == 125_000
-    assert purchase["usdAmountMinor"] != 250_000_000_000
+    assert purchase["baseAmountMinor"] == "125000"
+    assert purchase["technologyFeeMinor"] == "1250"
+    assert purchase["subtotalMinor"] == "126250"
+    assert purchase["baseAmountMinor"] != "250000000000"
 
 
 @pytest.mark.parametrize(
@@ -1262,7 +1351,7 @@ def test_evm_finalization_waits_for_authenticated_relay_message(monkeypatch, tmp
         )
         assert built.status_code == 200, built.text
         built = built.json()
-        assert built["purchase_artifact"]["railAmount"] == 1_250_000_000
+        assert built["purchase_artifact"]["railAmount"] == "1262500000"
         finalization = client.post(
             "/protocol/purchase-finalizations/verify",
             json={
@@ -1363,7 +1452,10 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         tampered = client.post(
             "/protocol/external-payments/verify",
             json={
-                "escrowMessage": {**message, "amount": message["amount"] - 1},
+                "escrowMessage": {
+                    **message,
+                    "amount": int(message["amount"]) - 1,
+                },
                 "source": source,
             },
             headers=headers,
@@ -1462,7 +1554,7 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         assert "another external payment" in replay.text
 
 
-def test_finalization_accepts_stripe_checkout_or_payment_intent_evidence(monkeypatch, tmp_path):
+def test_finalization_rejects_browser_supplied_stripe_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
     _configure_external_quote(monkeypatch, tmp_path)
     now = int(time.time())
@@ -1483,7 +1575,7 @@ def test_finalization_accepts_stripe_checkout_or_payment_intent_evidence(monkeyp
         )
         assert built.status_code == 200, built.text
         built = built.json()
-        assert built["purchase_artifact"]["railAmount"] == 125_000
+        assert built["purchase_artifact"]["railAmount"] == "126250"
         finalization = client.post(
             "/protocol/purchase-finalizations/verify",
             json={
@@ -1493,14 +1585,17 @@ def test_finalization_accepts_stripe_checkout_or_payment_intent_evidence(monkeyp
                 "purchase_intent_id": "pi_stripe",
                 "payment_evidence": {
                     "checkout_session_id": "cs_test_123",
-                    "amount_total": 125_000,
+                    "amount_total": 126_250,
                     "currency": "usd",
                 },
             },
         )
         assert finalization.status_code == 200, finalization.text
-        assert finalization.json()["verified"] is True
-        assert finalization.json()["finalized_state"] == "protocol_verified"
+        assert finalization.json()["verified"] is False
+        assert finalization.json()["finalized_state"] == "manual_review"
+        assert "stripe_settlement_receipt_required" in (
+            finalization.json()["reasons"]
+        )
 
         mismatched = client.post(
             "/protocol/purchase-finalizations/verify",
@@ -1518,7 +1613,9 @@ def test_finalization_accepts_stripe_checkout_or_payment_intent_evidence(monkeyp
         )
         assert mismatched.status_code == 200
         assert mismatched.json()["verified"] is False
-        assert "stripe_amount_mismatch" in mismatched.json()["reasons"]
+        assert "stripe_settlement_receipt_required" in (
+            mismatched.json()["reasons"]
+        )
 
 
 def test_build_and_finalization_can_require_server_token(monkeypatch, tmp_path):

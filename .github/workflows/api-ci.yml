@@ -14,9 +14,8 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # Authority V3 recovery imports are introduced by the coordinated RC23
-  # release. Keep CI reproducible without advancing deployment pins.
-  PROTOCOL_REF: a3e88cc4636d9c42203979bf3c2070587365f0fd
+  # RC24 settlement imports must match the exact reviewed protocol source.
+  PROTOCOL_REF: a53794fe3e9068348f9f480c90b72dea50bbc8a2
 
 jobs:
   verify:

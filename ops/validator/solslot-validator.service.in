@@ -12,7 +12,9 @@ EnvironmentFile=/etc/solslot-validator/validator.env
 Environment=PYTHONUNBUFFERED=1
 Environment=SOLSLOT_VALIDATOR_SIGNER_INDEX=@SIGNER_INDEX@
 Environment=SOLSLOT_VALIDATOR_SEED_FILE=%d/validator-seed
+Environment=SOLSLOT_VALIDATOR_STRIPE_READ_ONLY_KEY_FILE=%d/stripe-read-key
 LoadCredential=validator-seed:/etc/solslot-validator/private/validator.seed
+LoadCredential=stripe-read-key:/etc/solslot-validator/private/stripe.read.key
 LoadCredential=tls-key:/etc/solslot-validator/private/server.key
 ExecStart=/opt/solslot/validator/current/.venv/bin/uvicorn solslot_api.validator_app:app --host @WIREGUARD_IP@ --port 9443 --ssl-keyfile %d/tls-key --ssl-certfile /etc/solslot-validator/tls/server.crt --ssl-ca-certs /etc/solslot-validator/tls/ca.crt --ssl-cert-reqs 2 --timeout-keep-alive 5 --timeout-graceful-shutdown 30 --limit-concurrency 32 --backlog 64 --no-server-header
 Restart=on-failure

@@ -24,7 +24,15 @@ from chia_rs.sized_ints import uint64
 
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.payment_artifacts_v2 import purchase_artifact_from_json
+from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseKind,
+    payment_attestation_to_json,
+    purchase_artifact_from_json as purchase_artifact_v3_from_json,
+    stripe_receipt_from_json,
+    stripe_receipt_to_json,
+)
 from solslot_puzzles.voucher_presale_v2 import (
+    DELIVERY_WINDOW_SECONDS,
     VoucherSeriesState,
     series_terms_from_json,
     voucher_commitment_from_json,
@@ -41,6 +49,19 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     curry_series,
     external_receipt_evidence_message,
 )
+from solslot_puzzles.voucher_presale_v3 import (
+    voucher_commitment_v3_from_json,
+)
+from solslot_puzzles.voucher_presale_v3_driver import (
+    build_stripe_voucher_issuance_spends,
+    build_stripe_voucher_primary_offer_v5,
+    build_stripe_voucher_terminal_spends,
+    curry_stripe_voucher_receipt,
+    prepare_stripe_voucher_redemption_offer,
+)
+from solslot_puzzles.stripe_settlement_v1_driver import (
+    InventoryReservationV1,
+)
 from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 from solslot_puzzles.primary_purchase_v2_driver import (
     PrimaryPurchaseMode,
@@ -52,9 +73,19 @@ from solslot_puzzles.primary_purchase_v2_driver import (
 from .config import Settings
 from .faucet import Faucet
 from .payment_purchase_store import PaymentPurchaseStore
+from .payment_purchase_store import (
+    PaymentPurchaseNotFound,
+    PurchaseOperationState,
+)
+from .kos_exact_execution import (
+    ExactExecutionAction,
+    ExactExecutionRequest,
+    KeyOfSolomonExactExecutor,
+)
 from .presale_endpoints import (
     BaseVoucherRefundChainEvidence,
     PresaleStore,
+    StripeVoucherTerminalChainEvidence,
     VoucherIssuanceChainEvidence,
     VoucherRedemptionChainEvidence,
     VoucherRefundChainEvidence,
@@ -63,6 +94,7 @@ from .presale_endpoints import (
 from .presale_endpoints import _confirmed_coin_and_lineage
 from .native_purchases import _load_context
 from .public_artifact import load_signed_public_artifact
+from .protocol_submission import PreparedProtocolBundle, ProtocolBundleSubmitter
 from .validator_quorum import (
     ValidatorQuorumError,
     VoucherIssuanceClaim,
@@ -95,12 +127,16 @@ class VoucherIssuanceWorker:
         presales: PresaleStore,
         purchases: PaymentPurchaseStore,
         config: VoucherIssuanceWorkerConfig,
+        submitter: ProtocolBundleSubmitter | None = None,
+        exact_executor: KeyOfSolomonExactExecutor | None = None,
     ) -> None:
         self.settings = settings
         self.faucet = faucet
         self.coinset = coinset
         self.presales = presales
         self.purchases = purchases
+        self.submitter = submitter
+        self.exact_executor = exact_executor
         self.config = config
         self._task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
@@ -160,6 +196,46 @@ class VoucherIssuanceWorker:
                     "termsHash": terms_hash,
                     "serial": int(voucher["serial"]),
                     "status": "ERROR",
+                    "detail": str(exc),
+                }
+            results.append(result)
+        for series, voucher in self.presales.pending_stripe_issuance():
+            terms_hash = str(series["termsHash"])
+            if terms_hash in seen_series:
+                continue
+            seen_series.add(terms_hash)
+            try:
+                result = await self._advance_stripe(series, voucher)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Stripe voucher issuance failed for %s/%s",
+                    terms_hash,
+                    voucher["serial"],
+                )
+                result = {
+                    "termsHash": terms_hash,
+                    "serial": int(voucher["serial"]),
+                    "status": "STRIPE_ISSUANCE_ERROR",
+                    "detail": str(exc),
+                }
+            results.append(result)
+        for series, voucher in self.presales.pending_stripe_terminals():
+            terms_hash = str(series["termsHash"])
+            if terms_hash in seen_series:
+                continue
+            seen_series.add(terms_hash)
+            try:
+                result = await self._advance_stripe_terminal(series, voucher)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Stripe voucher terminal failed for %s/%s",
+                    terms_hash,
+                    voucher["serial"],
+                )
+                result = {
+                    "termsHash": terms_hash,
+                    "serial": int(voucher["serial"]),
+                    "status": "STRIPE_TERMINAL_ERROR",
                     "detail": str(exc),
                 }
             results.append(result)
@@ -354,6 +430,1067 @@ class VoucherIssuanceWorker:
             **base,
             "status": "ISSUANCE_SUBMITTED" if submitted else "WAITING_FOR_FUNDING",
         }
+
+    async def _advance_stripe(
+        self, series: dict[str, Any], voucher: dict[str, Any]
+    ) -> dict[str, Any]:
+        base = {
+            "termsHash": str(series["termsHash"]),
+            "serial": int(voucher["serial"]),
+            "purchaseId": str(voucher["purchaseId"]),
+        }
+        if self.submitter is None:
+            raise RuntimeError(
+                "Stripe voucher issuance requires bounded medium-speed fee funding"
+            )
+        if voucher["state"] == "ISSUANCE_SUBMITTED":
+            confirmed = await self._confirm_stripe_if_ready(series, voucher)
+            return {
+                **base,
+                "status": "VOUCHER_ESCROWED" if confirmed else "CONFIRMING",
+            }
+        if not voucher.get("purchaseLauncherCoinId"):
+            funded = await self._fund_stripe_purchase_launcher(series, voucher)
+            return {
+                **base,
+                "status": "FUNDING_MEMPOOL",
+                "spendBundleId": funded["fundingBundleId"],
+            }
+        submitted = await self._submit_stripe_if_ready(series, voucher)
+        return {
+            **base,
+            "status": "ISSUANCE_SUBMITTED" if submitted else "WAITING_FOR_FUNDING",
+        }
+
+    async def _fund_stripe_purchase_launcher(
+        self,
+        series: dict[str, Any],
+        voucher_json: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert self.submitter is not None
+        terms = series_terms_from_json(series["terms"])
+        voucher = voucher_commitment_v3_from_json(voucher_json["commitment"])
+        stored_receipt = self.purchases.get_settlement_receipt(
+            str(voucher_json["purchaseId"])
+        )
+        artifact = purchase_artifact_v3_from_json(
+            self.purchases.get(str(voucher_json["purchaseId"])).purchase_artifact
+        )
+        receipt = stripe_receipt_from_json(stored_receipt["receipt"])
+        if receipt.artifact != artifact:
+            raise RuntimeError("Stripe voucher receipt changed before funding")
+        payment_puzzle = curry_stripe_voucher_receipt(
+            terms=terms,
+            voucher=voucher,
+            artifact=artifact,
+        )
+        launcher_puzzle = curry_purchase_launcher(
+            terms=terms,
+            voucher=voucher,  # type: ignore[arg-type]
+            payment_puzzle_hash=bytes32(payment_puzzle.get_tree_hash()),
+            payment_amount=1,
+        )
+        records = await self.coinset.get_coin_records_by_puzzle_hash(
+            "0x" + self.faucet.address_puzzle_hash.hex(),
+            include_spent=False,
+        )
+        parent = self.faucet.select_coin(
+            records,
+            min_amount=2,
+            max_amount=self.settings.faucet_max_spend_mojos,
+        )
+        if parent is None:
+            raise RuntimeError(
+                "fee till has no eligible Stripe voucher funding coin"
+            )
+        conditions_list = [
+            Program.to(
+                [
+                    _CREATE_COIN,
+                    bytes32(launcher_puzzle.get_tree_hash()),
+                    2,
+                    [
+                        terms.terms_hash,
+                        voucher.commitment_hash,
+                        voucher.global_payment_id,
+                    ],
+                ]
+            )
+        ]
+        change = int(parent.amount) - 2
+        if change:
+            conditions_list.append(
+                Program.to(
+                    [_CREATE_COIN, self.faucet.address_puzzle_hash, change]
+                )
+            )
+        conditions = Program.to(conditions_list)
+        delegated = Program.to((1, conditions))
+        parent_spend = make_spend(
+            parent,
+            self.faucet.key.puzzle,
+            Program.to([0, delegated, Program.to(0)]),
+        )
+        signature = G2Element.from_bytes(
+            self.faucet.sign_delegated_spend(parent, conditions)
+        )
+        purchase_launcher = Coin(
+            bytes32(parent.name()),
+            bytes32(launcher_puzzle.get_tree_hash()),
+            uint64(2),
+        )
+        result = await self.submitter.submit(
+            SpendBundle([parent_spend], signature).to_json_dict()
+        )
+        return self.presales.record_stripe_issuance_funding(
+            str(voucher_json["purchaseId"]),
+            funding_bundle_id=str(result["spendBundleId"]),
+            purchase_launcher_coin_id=_hex32(purchase_launcher.name()),
+            purchase_launcher_puzzle_hash=_hex32(
+                purchase_launcher.puzzle_hash
+            ),
+        )
+
+    async def _submit_stripe_if_ready(
+        self,
+        series: dict[str, Any],
+        voucher_json: dict[str, Any],
+    ) -> bool:
+        assert self.submitter is not None
+        purchase_record = await self.coinset.get_coin_record_by_name(
+            str(voucher_json["purchaseLauncherCoinId"])
+        )
+        purchase_coin = _confirmed_unspent_coin(purchase_record)
+        if purchase_coin is None:
+            return False
+        if (
+            _hex32(purchase_coin.name())
+            != str(voucher_json["purchaseLauncherCoinId"]).lower()
+            or _hex32(purchase_coin.puzzle_hash)
+            != str(voucher_json["purchaseLauncherPuzzleHash"]).lower()
+            or int(purchase_coin.amount) != 2
+        ):
+            raise RuntimeError(
+                "confirmed Stripe voucher funding differs from its binding"
+            )
+
+        chain = series["chainState"]
+        current_id = chain.get("currentCoinId")
+        if not isinstance(current_id, str):
+            raise RuntimeError("presale series has no confirmed singleton state")
+        series_record = await self.coinset.get_coin_record_by_name(current_id)
+        series_coin = _confirmed_unspent_coin(series_record)
+        if series_coin is None:
+            return False
+        if _hex32(series_coin.name()) != current_id.lower():
+            raise RuntimeError("current series coin record is not canonical")
+
+        terms = series_terms_from_json(series["terms"])
+        voucher = voucher_commitment_v3_from_json(voucher_json["commitment"])
+        stored_purchase = self.purchases.get(str(voucher_json["purchaseId"]))
+        artifact = purchase_artifact_v3_from_json(
+            stored_purchase.purchase_artifact
+        )
+        stored_receipt = self.purchases.get_settlement_receipt(
+            str(voucher_json["purchaseId"])
+        )
+        receipt = stripe_receipt_from_json(stored_receipt["receipt"])
+        state = _series_state(series)
+        lineage = LineageProof(
+            _b32(chain["lineageParentName"]),
+            (
+                _b32(chain["lineageInnerPuzzleHash"])
+                if chain.get("lineageInnerPuzzleHash")
+                else None
+            ),
+            uint64(1),
+        )
+        provisional = build_stripe_voucher_issuance_spends(
+            terms=terms,
+            state=state,
+            series_coin=series_coin,
+            series_lineage_proof=lineage,
+            voucher=voucher,
+            artifact=artifact,
+            receipt=receipt,
+            expected_original_payer=voucher.original_payer,
+            smart_deed_inner_hash=voucher.smart_deed_inner_hash,
+            purchase_launcher_coin=purchase_coin,
+            signer_indices=tuple(
+                range(self.settings.zkpassport_validator_threshold)
+            ),
+        )
+        public_artifact = load_signed_public_artifact(self.settings)
+        claim = VoucherIssuanceClaim(
+            network=self.settings.network,
+            genesis_artifact_hash=str(
+                public_artifact["artifactHash"]
+            ).lower(),
+            series_terms=series["terms"],
+            voucher_commitment=voucher_json["commitment"],
+            purchase_artifact=stored_purchase.purchase_artifact,
+            series_coin_id=_hex32(series_coin.name()),
+            series_sold_count=state.sold_count,
+            series_redeemed_count=state.redeemed_count,
+            series_refunded_count=state.refunded_count,
+            series_phase=int(state.phase),
+            series_launched_at=state.launched_at,
+            purchase_launcher_coin_id=_hex32(purchase_coin.name()),
+            payment_evidence={
+                "schema": "solslot.stripe-voucher-payment-evidence.v1",
+                "pendingAttestation": stored_receipt["pendingAttestation"],
+                "stripeReceipt": stored_receipt["receipt"],
+            },
+            validator_message=_hex32(provisional.validator_message),
+        )
+        quorum = await collect_voucher_issuance_quorum(self.settings, claim)
+        issuance = build_stripe_voucher_issuance_spends(
+            terms=terms,
+            state=state,
+            series_coin=series_coin,
+            series_lineage_proof=lineage,
+            voucher=voucher,
+            artifact=artifact,
+            receipt=receipt,
+            expected_original_payer=voucher.original_payer,
+            smart_deed_inner_hash=voucher.smart_deed_inner_hash,
+            purchase_launcher_coin=purchase_coin,
+            signer_indices=quorum.signer_indices,
+        )
+        if issuance.validator_message != provisional.validator_message:
+            raise RuntimeError(
+                "Stripe voucher issuance changed after quorum selection"
+            )
+        result = await self.submitter.submit(
+            SpendBundle(
+                list(issuance.coin_spends),
+                quorum.aggregated_signature,
+            ).to_json_dict()
+        )
+        self.presales.record_stripe_issuance_submission(
+            str(voucher_json["purchaseId"]),
+            issuance_bundle_id=str(result["spendBundleId"]),
+            voucher_launcher_id=_hex32(issuance.voucher_launcher_id),
+            voucher_output_coin_id=_hex32(issuance.voucher_coin.name()),
+            receipt_coin_id=_hex32(issuance.receipt_coin.name()),
+            series_input_coin_id=_hex32(series_coin.name()),
+            series_output_coin_id=_hex32(issuance.next_series_coin.name()),
+        )
+        return True
+
+    async def _confirm_stripe_if_ready(
+        self,
+        series: dict[str, Any],
+        voucher: dict[str, Any],
+    ) -> bool:
+        ids = {
+            "voucher": str(voucher["voucherOutputCoinId"]),
+            "receipt": str(voucher["receiptCoinId"]),
+            "series_output": str(voucher["seriesOutputCoinId"]),
+            "series_input": str(voucher["seriesInputCoinId"]),
+            "purchase": str(voucher["purchaseLauncherCoinId"]),
+        }
+        records = {
+            name: await self.coinset.get_coin_record_by_name(coin_id)
+            for name, coin_id in ids.items()
+        }
+        outputs = [
+            records[name]
+            for name in ("voucher", "receipt", "series_output")
+        ]
+        if any(not _is_confirmed(record) for record in outputs):
+            return False
+        if not _is_spent(records["series_input"]) or not _is_spent(
+            records["purchase"]
+        ):
+            return False
+        heights = {
+            int(record.get("confirmed_block_index") or 0)
+            for record in outputs
+            if isinstance(record, Mapping)
+        }
+        spent_heights = {
+            int(record.get("spent_block_index") or 0)
+            for record in (records["series_input"], records["purchase"])
+            if isinstance(record, Mapping)
+        }
+        if len(heights) != 1 or spent_heights != heights:
+            raise RuntimeError(
+                "Stripe voucher outputs are not from one atomic block"
+            )
+        coins = {
+            name: _coin_from_record(record)
+            for name, record in records.items()
+        }
+        if any(coin is None for coin in coins.values()):
+            raise RuntimeError("Stripe voucher confirmation is malformed")
+        for name, coin_id in ids.items():
+            coin = coins[name]
+            assert coin is not None
+            if _hex32(coin.name()) != coin_id.lower():
+                raise RuntimeError(
+                    f"Stripe voucher {name} coin ID changed"
+                )
+        input_coin = coins["series_input"]
+        assert input_coin is not None
+        next_state = _series_state(series)
+        next_state = VoucherSeriesStateV2(
+            sold_count=next_state.sold_count + 1,
+            redeemed_count=next_state.redeemed_count,
+            refunded_count=next_state.refunded_count,
+            phase=next_state.phase,
+            launched_at=next_state.launched_at,
+        )
+        next_inner = curry_series(
+            series_terms_from_json(series["terms"]),
+            next_state,
+        )
+        self.presales.confirm_stripe_issuance(
+            str(voucher["purchaseId"]),
+            VoucherIssuanceChainEvidence(
+                evidenceId="chia:" + str(voucher["issuanceBundleId"]),
+                spendBundleId=str(voucher["issuanceBundleId"]),
+                purchaseLauncherCoinId=ids["purchase"],
+                voucherLauncherId=str(voucher["voucherLauncherId"]),
+                voucherOutputCoinId=ids["voucher"],
+                paymentCommitmentCoinId=ids["receipt"],
+                seriesInputCoinId=ids["series_input"],
+                seriesInputParentCoinId=_hex32(
+                    input_coin.parent_coin_info
+                ),
+                seriesOutputCoinId=ids["series_output"],
+                seriesOutputInnerPuzzleHash=_hex32(
+                    next_inner.get_tree_hash()
+                ),
+                confirmedHeight=next(iter(heights)),
+            ),
+        )
+        return True
+
+    async def _advance_stripe_terminal(
+        self,
+        series: dict[str, Any],
+        voucher: dict[str, Any],
+    ) -> dict[str, Any]:
+        base = {
+            "termsHash": str(series["termsHash"]),
+            "serial": int(voucher["serial"]),
+            "purchaseId": str(voucher["purchaseId"]),
+        }
+        if voucher["state"] in {"REFUNDING", "REDEEMING"}:
+            confirmed = await self._confirm_stripe_terminal_if_ready(
+                series,
+                voucher,
+            )
+            return {
+                **base,
+                "status": (
+                    "STRIPE_VOUCHER_TERMINAL_CONFIRMED"
+                    if confirmed
+                    else "STRIPE_VOUCHER_TERMINAL_CONFIRMING"
+                ),
+            }
+        if voucher["state"] != "ESCROWED" or series["state"] != "LIVE":
+            return {**base, "status": "WAITING_FOR_SERIES_LAUNCH"}
+        deadline = int(series.get("deliveryDeadline") or 0)
+        action = (
+            VoucherAction.REDEEM
+            if deadline > int(time.time())
+            else VoucherAction.REFUND_EXPIRED
+        )
+        submitted = await self._submit_stripe_terminal(
+            series,
+            voucher,
+            action=action,
+        )
+        return {
+            **base,
+            "status": (
+                "STRIPE_VOUCHER_REDEMPTION_MEMPOOL"
+                if action == VoucherAction.REDEEM
+                else "STRIPE_VOUCHER_EXPIRED_REFUND_MEMPOOL"
+            ),
+            "spendBundleId": submitted["voucher"]["terminalBundleId"],
+        }
+
+    async def submit_stripe_owner_refund(
+        self,
+        series: dict[str, Any],
+        voucher: dict[str, Any],
+        *,
+        action: VoucherAction,
+        vault_coin: Coin,
+        vault_inner_puzzle_hash: bytes32,
+        vault_spend: Any,
+        owner_current_timestamp: int,
+        owner_authorization: str,
+        owner_signature: G2Element,
+    ) -> dict[str, Any]:
+        """Submit the one wallet-approved Voucher V3 cancellation spend."""
+
+        return await self._submit_stripe_terminal(
+            series,
+            voucher,
+            action=action,
+            vault_coin=vault_coin,
+            vault_inner_puzzle_hash=vault_inner_puzzle_hash,
+            vault_spend=vault_spend,
+            owner_current_timestamp=owner_current_timestamp,
+            owner_authorization=owner_authorization,
+            owner_signature=owner_signature,
+        )
+
+    async def _submit_stripe_terminal(
+        self,
+        series: dict[str, Any],
+        voucher_json: dict[str, Any],
+        *,
+        action: VoucherAction,
+        vault_coin: Coin | None = None,
+        vault_inner_puzzle_hash: bytes32 = bytes32.zeros,
+        vault_spend: Any | None = None,
+        owner_current_timestamp: int | None = None,
+        owner_authorization: str = "",
+        owner_signature: G2Element | None = None,
+    ) -> dict[str, Any]:
+        if action not in {
+            VoucherAction.REDEEM,
+            VoucherAction.REFUND_EXPIRED,
+            VoucherAction.REFUND_PRESALE,
+            VoucherAction.REFUND_CANCELED,
+        }:
+            raise RuntimeError("Stripe voucher terminal action is unsupported")
+        owner_refund = action in {
+            VoucherAction.REFUND_PRESALE,
+            VoucherAction.REFUND_CANCELED,
+        }
+        if owner_refund and (
+            vault_coin is None
+            or vault_inner_puzzle_hash == bytes32.zeros
+            or vault_spend is None
+            or owner_current_timestamp is None
+            or not owner_authorization
+        ):
+            raise RuntimeError(
+                "Stripe voucher refund requires exact current-vault authorization"
+            )
+        if not owner_refund and any(
+            value is not None for value in (vault_coin, vault_spend)
+        ):
+            raise RuntimeError(
+                "automatic Stripe voucher settlement cannot carry a vault spend"
+            )
+        if self.submitter is None or self.exact_executor is None:
+            raise RuntimeError(
+                "Stripe voucher settlement requires the fee till and Key of Solomon"
+            )
+        from .stripe_fulfillment import (
+            _assert_execution_matches_request,
+            _load_or_create_stripe_receipt,
+            _load_reserved_context,
+            _prepared_from_execution,
+            _save_prepared_execution,
+        )
+
+        context = await _load_reserved_context(
+            self.settings,
+            self.coinset,
+            self.purchases,
+            str(voucher_json["purchaseId"]),
+            require_credential=(action != VoucherAction.REFUND_EXPIRED),
+        )
+        if context.purchase.purchase_kind != PurchaseKind.PRESALE:
+            raise RuntimeError(
+                "Stripe voucher terminal requires a presale purchase"
+            )
+        pending, receipt = _load_or_create_stripe_receipt(
+            self.purchases,
+            context,
+        )
+        terms = series_terms_from_json(series["terms"])
+        voucher = voucher_commitment_v3_from_json(
+            voucher_json["commitment"]
+        )
+        if receipt.receipt_hash != voucher.stripe_receipt_hash:
+            raise RuntimeError("Stripe voucher receipt changed before settlement")
+        state = _series_state(series)
+        if action == VoucherAction.REFUND_PRESALE and (
+            state.phase != VoucherSeriesState.PRESALE
+            or int(time.time()) >= terms.refund_deadline
+        ):
+            raise RuntimeError("Stripe presale refund is not available")
+        if action == VoucherAction.REFUND_CANCELED and (
+            state.phase != VoucherSeriesState.CANCELED
+        ):
+            raise RuntimeError("Stripe canceled-series refund is not available")
+        if action in {
+            VoucherAction.REDEEM,
+            VoucherAction.REFUND_EXPIRED,
+        } and state.phase != VoucherSeriesState.LIVE:
+            raise RuntimeError("Stripe voucher series is not LIVE")
+        delivery_deadline = state.launched_at + DELIVERY_WINDOW_SECONDS
+        now = int(time.time())
+        claim_timestamp = (
+            int(owner_current_timestamp)
+            if owner_refund and owner_current_timestamp is not None
+            else now
+        )
+        if action == VoucherAction.REDEEM and now >= delivery_deadline:
+            raise RuntimeError("Stripe voucher delivery window has expired")
+        if action == VoucherAction.REFUND_EXPIRED and now < delivery_deadline:
+            raise RuntimeError("Stripe voucher delivery window is still open")
+
+        series_coin, series_lineage = await _confirmed_coin_and_lineage(
+            self.coinset,
+            str(series["chainState"]["currentCoinId"]),
+            "Stripe voucher series coin",
+        )
+        voucher_coin, voucher_lineage = await _confirmed_coin_and_lineage(
+            self.coinset,
+            str(voucher_json["voucherOutputCoinId"]),
+            "Stripe voucher coin",
+        )
+        receipt_record = await self.coinset.get_coin_record_by_name(
+            str(voucher_json["receiptCoinId"])
+        )
+        receipt_coin = _confirmed_unspent_coin(receipt_record)
+        if (
+            receipt_coin is None
+            or _hex32(receipt_coin.name())
+            != str(voucher_json["receiptCoinId"]).lower()
+        ):
+            raise RuntimeError(
+                "Stripe voucher receipt coin is not confirmed and unspent"
+            )
+        operation = self.purchases.get_operation(context.operation.purchase_id)
+        terminal_hash = (
+            _b32(operation.refund_request_hash)
+            if owner_refund and operation.refund_request_hash
+            else receipt.receipt_hash
+        )
+        if owner_refund and operation.state != PurchaseOperationState.REFUND_PENDING:
+            raise RuntimeError(
+                "Stripe voucher refund has no durable pending operation"
+            )
+        provisional = build_stripe_voucher_terminal_spends(
+            terms=terms,
+            state=state,
+            series_coin=series_coin,
+            series_lineage_proof=series_lineage,
+            voucher=voucher,
+            artifact=context.purchase,
+            voucher_launcher_id=_b32(voucher_json["voucherLauncherId"]),
+            voucher_coin=voucher_coin,
+            voucher_lineage_proof=voucher_lineage,
+            receipt_coin=receipt_coin,
+            vault_coin_id=(
+                bytes32(vault_coin.name())
+                if owner_refund and vault_coin is not None
+                else bytes32.zeros
+            ),
+            vault_inner_puzzle_hash=(
+                vault_inner_puzzle_hash
+                if owner_refund
+                else bytes32.zeros
+            ),
+            action=action,
+            terminal_evidence_hash=terminal_hash,
+            signer_indices=tuple(
+                range(self.settings.zkpassport_validator_threshold)
+            ),
+        )
+        provisional_offer = None
+        if action == VoucherAction.REDEEM:
+            provisional_offer = prepare_stripe_voucher_redemption_offer(
+                terminal=provisional,
+                receipt_coin=receipt_coin,
+                artifact=context.purchase,
+                terms=context.terms,
+            )
+        public_artifact = load_signed_public_artifact(self.settings)
+        claim = VoucherTransitionClaim(
+            network=self.settings.network,
+            genesis_artifact_hash=str(
+                public_artifact["artifactHash"]
+            ).lower(),
+            series_terms=series["terms"],
+            voucher_commitment=voucher_json["commitment"],
+            purchase_artifact=context.stored.purchase_artifact,
+            series_coin_id=_hex32(series_coin.name()),
+            series_sold_count=state.sold_count,
+            series_redeemed_count=state.redeemed_count,
+            series_refunded_count=state.refunded_count,
+            series_phase=int(state.phase),
+            series_launched_at=state.launched_at,
+            voucher_launcher_id=str(voucher_json["voucherLauncherId"]),
+            voucher_coin_id=_hex32(voucher_coin.name()),
+            payment_coin_id=_hex32(receipt_coin.name()),
+            vault_launcher_id=_hex32(
+                context.purchase.vault_launcher_id
+            ),
+            vault_coin_id=(
+                str(context.credential_receipt["chiaVaultCoinId"])
+                if action != VoucherAction.REFUND_EXPIRED
+                else None
+            ),
+            vault_identity_attest_root=(
+                str(context.credential_receipt["identityAttestRoot"])
+                if action != VoucherAction.REFUND_EXPIRED
+                else None
+            ),
+            vault_owner_auth_type=(
+                context.credential_owner_auth_type
+                if action != VoucherAction.REFUND_EXPIRED
+                else None
+            ),
+            vault_owner_key=(
+                "0x" + context.credential_owner_key.hex()
+                if action != VoucherAction.REFUND_EXPIRED
+                else None
+            ),
+            owner_authorization=owner_authorization,
+            current_timestamp=claim_timestamp,
+            action=int(action),
+            deed_coin_id=(
+                _hex32(context.reserved_coin.name())
+                if action == VoucherAction.REDEEM
+                else None
+            ),
+            deed_puzzle_hash=(
+                _hex32(context.reserved_coin.puzzle_hash)
+                if action == VoucherAction.REDEEM
+                else None
+            ),
+            smart_deed_inner_hash=(
+                _hex32(context.terms.smart_deed_inner_hash)
+                if action == VoucherAction.REDEEM
+                else None
+            ),
+            protocol_puzzle_hash=(
+                _hex32(context.terms.protocol_puzhash)
+                if action == VoucherAction.REDEEM
+                else None
+            ),
+            buyer_offer=(
+                provisional_offer.to_bech32()
+                if provisional_offer is not None
+                else None
+            ),
+            payment_evidence={
+                "schema": "solslot.stripe-voucher-terminal-evidence.v1",
+                "pendingAttestation": payment_attestation_to_json(pending),
+                "stripeReceipt": stripe_receipt_to_json(receipt),
+                "terminalEvidenceHash": _hex32(terminal_hash),
+                **(
+                    {"refundRequestHash": _hex32(terminal_hash)}
+                    if owner_refund
+                    else {}
+                ),
+            },
+            external_settlement_evidence_hash=_hex32(terminal_hash),
+            external_validator_message=_hex32(
+                provisional.receipt_validator_message
+            ),
+            reservation_expires_at=(
+                context.operation.reservation_expires_at
+                if action == VoucherAction.REDEEM
+                else None
+            ),
+            validator_message=_hex32(provisional.validator_message),
+        )
+
+        try:
+            execution = self.purchases.get_chain_execution(
+                context.operation.purchase_id,
+                "VOUCHER_TERMINAL",
+            )
+        except PaymentPurchaseNotFound:
+            execution = None
+
+        terminal = provisional
+        expected_output = provisional.next_series_coin
+        if action == VoucherAction.REDEEM:
+            assert provisional_offer is not None
+            preview_primary = build_stripe_voucher_primary_offer_v5(
+                voucher_offer=provisional_offer,
+                terminal=provisional,
+                receipt_coin=receipt_coin,
+                receipt=receipt,
+                deed_coin=context.reserved_coin,
+                deed_singleton_struct=context.deed_struct,
+                lineage_proof=context.reserved_lineage,
+                signer_indices=tuple(
+                    range(self.settings.zkpassport_validator_threshold)
+                ),
+                terms=context.terms,
+                reservation=InventoryReservationV1(
+                    artifact=context.purchase,
+                    expires_at=context.operation.reservation_expires_at,
+                ),
+            )
+            outputs = compute_additions(preview_primary.deed_spend)
+            if len(outputs) != 1:
+                raise RuntimeError(
+                    "Stripe voucher redemption must create one deed successor"
+                )
+            expected_output = outputs[0]
+
+        selected_indices: tuple[int, ...] = ()
+        if execution is None:
+            quorum = await collect_voucher_transition_quorum(
+                self.settings,
+                claim,
+            )
+            selected_indices = quorum.signer_indices
+            terminal = build_stripe_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                artifact=context.purchase,
+                voucher_launcher_id=_b32(
+                    voucher_json["voucherLauncherId"]
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                receipt_coin=receipt_coin,
+                vault_coin_id=(
+                    bytes32(vault_coin.name())
+                    if owner_refund and vault_coin is not None
+                    else bytes32.zeros
+                ),
+                vault_inner_puzzle_hash=(
+                    vault_inner_puzzle_hash
+                    if owner_refund
+                    else bytes32.zeros
+                ),
+                action=action,
+                terminal_evidence_hash=terminal_hash,
+                signer_indices=quorum.signer_indices,
+            )
+            if (
+                terminal.validator_message != provisional.validator_message
+                or terminal.receipt_validator_message
+                != provisional.receipt_validator_message
+            ):
+                raise RuntimeError(
+                    "Stripe voucher terminal changed after quorum selection"
+                )
+            if action == VoucherAction.REDEEM:
+                buyer_offer = prepare_stripe_voucher_redemption_offer(
+                    terminal=terminal,
+                    receipt_coin=receipt_coin,
+                    artifact=context.purchase,
+                    terms=context.terms,
+                )
+                primary = build_stripe_voucher_primary_offer_v5(
+                    voucher_offer=buyer_offer,
+                    terminal=terminal,
+                    receipt_coin=receipt_coin,
+                    receipt=receipt,
+                    deed_coin=context.reserved_coin,
+                    deed_singleton_struct=context.deed_struct,
+                    lineage_proof=context.reserved_lineage,
+                    signer_indices=quorum.signer_indices,
+                    terms=context.terms,
+                    reservation=InventoryReservationV1(
+                        artifact=context.purchase,
+                        expires_at=context.operation.reservation_expires_at,
+                    ),
+                )
+                valid = primary.aggregate_offer.to_valid_spend()
+                unsigned = SpendBundle(
+                    list(valid.coin_spends),
+                    AugSchemeMPL.aggregate(
+                        [
+                            valid.aggregated_signature,
+                            quorum.aggregated_signature,
+                        ]
+                    ),
+                )
+            else:
+                unsigned = SpendBundle(
+                    [
+                        *(
+                            [vault_spend]
+                            if owner_refund and vault_spend is not None
+                            else []
+                        ),
+                        *terminal.coin_spends,
+                    ],
+                    AugSchemeMPL.aggregate(
+                        [
+                            quorum.aggregated_signature,
+                            owner_signature or G2Element(),
+                        ]
+                    ),
+                )
+            exact_request = ExactExecutionRequest(
+                action=ExactExecutionAction.VOUCHER_TERMINAL,
+                purchase_id=context.purchase.purchase_id,
+                artifact_hash=context.purchase.artifact_hash,
+                claim_hash=_b32(claim.canonical_hash()),
+                expected_output_coin_id=bytes32(expected_output.name()),
+                expected_output_puzzle_hash=bytes32(
+                    expected_output.puzzle_hash
+                ),
+            )
+
+            async def persist_and_dispatch(
+                prepared: PreparedProtocolBundle,
+            ) -> Mapping[str, Any]:
+                saved = _save_prepared_execution(
+                    self.purchases,
+                    context.operation.purchase_id,
+                    "VOUCHER_TERMINAL",
+                    claim.canonical_hash(),
+                    prepared,
+                    expected_output,
+                )
+                _assert_execution_matches_request(saved, exact_request)
+                return await self.exact_executor.dispatch(
+                    exact_request,
+                    prepared,
+                )
+
+            await self.submitter.prepare_and_dispatch(
+                unsigned.to_json_dict(),
+                persist_and_dispatch,
+            )
+            execution = self.purchases.get_chain_execution(
+                context.operation.purchase_id,
+                "VOUCHER_TERMINAL",
+            )
+        else:
+            if (
+                execution.expected_output_coin_id
+                != _hex32(expected_output.name())
+                or execution.expected_output_puzzle_hash
+                != _hex32(expected_output.puzzle_hash)
+            ):
+                raise RuntimeError(
+                    "stored Stripe voucher terminal targets another output"
+                )
+            exact_request = ExactExecutionRequest(
+                action=ExactExecutionAction.VOUCHER_TERMINAL,
+                purchase_id=context.purchase.purchase_id,
+                artifact_hash=context.purchase.artifact_hash,
+                claim_hash=_b32(execution.claim_hash),
+                expected_output_coin_id=bytes32(expected_output.name()),
+                expected_output_puzzle_hash=bytes32(
+                    expected_output.puzzle_hash
+                ),
+            )
+            await self.exact_executor.dispatch(
+                exact_request,
+                _prepared_from_execution(execution),
+            )
+
+        submitted = self.presales.record_stripe_terminal_submission(
+            context.operation.purchase_id,
+            action=action,
+            terminal_evidence_hash=_hex32(terminal_hash),
+            spend_bundle_id=execution.spend_bundle_id,
+            terminal_voucher_coin_id=_hex32(
+                terminal.terminal_voucher_coin.name()
+            ),
+            series_input_coin_id=_hex32(series_coin.name()),
+            series_output_coin_id=_hex32(
+                terminal.next_series_coin.name()
+            ),
+            deed_output_coin_id=(
+                _hex32(expected_output.name())
+                if action == VoucherAction.REDEEM
+                else None
+            ),
+        )
+        operation = self.purchases.get_operation(context.operation.purchase_id)
+        if action == VoucherAction.REDEEM:
+            if operation.state == PurchaseOperationState.VOUCHER_ESCROWED:
+                operation = self.purchases.transition_operation(
+                    operation.purchase_id,
+                    expected_revision=operation.revision,
+                    to_state=PurchaseOperationState.DELIVERY_SUBMITTED,
+                    actor="key-of-solomon",
+                    reason="exact Stripe voucher redemption submitted",
+                    evidence={"claimHash": execution.claim_hash},
+                    changes={
+                        "delivery_bundle_id": execution.spend_bundle_id,
+                        "expected_output_coin_id": (
+                            execution.expected_output_coin_id
+                        ),
+                        "fee_mojos": execution.fee_mojos,
+                    },
+                )
+            if operation.state == PurchaseOperationState.DELIVERY_SUBMITTED:
+                self.purchases.transition_operation(
+                    operation.purchase_id,
+                    expected_revision=operation.revision,
+                    to_state=PurchaseOperationState.MEMPOOL_OBSERVED,
+                    actor="key-of-solomon",
+                    reason="Stripe voucher redemption observed in local mempool",
+                    evidence={"spendBundleId": execution.spend_bundle_id},
+                    changes={"mempool_observed_at": int(time.time())},
+                )
+        elif operation.state == PurchaseOperationState.VOUCHER_ESCROWED:
+            self.purchases.transition_operation(
+                operation.purchase_id,
+                expected_revision=operation.revision,
+                to_state=PurchaseOperationState.REFUND_PENDING,
+                actor="stripe-voucher-coordinator",
+                reason="voucher delivery expired before SmartDeed delivery",
+                changes={
+                    "last_error": (
+                        "voucher terminal refund submitted; returning inventory"
+                    )
+                },
+            )
+        return {
+            "voucher": submitted,
+            "signerIndices": list(selected_indices),
+        }
+
+    async def _confirm_stripe_terminal_if_ready(
+        self,
+        series: dict[str, Any],
+        voucher: dict[str, Any],
+    ) -> bool:
+        action = VoucherAction(int(voucher["terminalAction"]))
+        ids = {
+            "terminal_voucher": str(voucher["terminalVoucherCoinId"]),
+            "series_output": str(voucher["terminalSeriesOutputCoinId"]),
+            "series_input": str(voucher["terminalSeriesInputCoinId"]),
+            "voucher_input": str(voucher["voucherOutputCoinId"]),
+            "receipt_input": str(voucher["receiptCoinId"]),
+        }
+        if action == VoucherAction.REDEEM:
+            ids["deed_output"] = str(voucher["terminalDeedOutputCoinId"])
+            operation = self.purchases.get_operation(
+                str(voucher["purchaseId"])
+            )
+            if not operation.reservation_coin_id:
+                raise RuntimeError(
+                    "Stripe voucher redemption has no reserved deed input"
+                )
+            ids["deed_input"] = operation.reservation_coin_id
+        if any(value in {"", "None"} for value in ids.values()):
+            raise RuntimeError(
+                "Stripe voucher terminal submission is missing chain bindings"
+            )
+        records = {
+            name: await self.coinset.get_coin_record_by_name(coin_id)
+            for name, coin_id in ids.items()
+        }
+        output_names = ["terminal_voucher", "series_output"]
+        input_names = ["series_input", "voucher_input", "receipt_input"]
+        if action == VoucherAction.REDEEM:
+            output_names.append("deed_output")
+            input_names.append("deed_input")
+        if any(not _is_confirmed(records[name]) for name in output_names):
+            return False
+        if any(not _is_spent(records[name]) for name in input_names):
+            return False
+        heights = {
+            int(records[name].get("confirmed_block_index") or 0)
+            for name in output_names
+        }
+        spent_heights = {
+            int(records[name].get("spent_block_index") or 0)
+            for name in input_names
+        }
+        if len(heights) != 1 or spent_heights != heights:
+            raise RuntimeError(
+                "Stripe voucher terminal inputs and outputs are not atomic"
+            )
+        coins = {
+            name: _coin_from_record(record)
+            for name, record in records.items()
+        }
+        if any(coin is None for coin in coins.values()):
+            raise RuntimeError(
+                "Stripe voucher terminal confirmation is malformed"
+            )
+        for name, coin_id in ids.items():
+            coin = coins[name]
+            assert coin is not None
+            if _hex32(coin.name()) != coin_id.lower():
+                raise RuntimeError(
+                    f"Stripe voucher terminal {name} coin ID changed"
+                )
+        series_input = coins["series_input"]
+        assert series_input is not None
+        state = _series_state(series)
+        next_state = VoucherSeriesStateV2(
+            sold_count=state.sold_count,
+            redeemed_count=(
+                state.redeemed_count + 1
+                if action == VoucherAction.REDEEM
+                else state.redeemed_count
+            ),
+            refunded_count=(
+                state.refunded_count
+                if action == VoucherAction.REDEEM
+                else state.refunded_count + 1
+            ),
+            phase=state.phase,
+            launched_at=state.launched_at,
+        )
+        next_inner = curry_series(
+            series_terms_from_json(series["terms"]),
+            next_state,
+        )
+        self.presales.confirm_stripe_terminal(
+            str(voucher["purchaseId"]),
+            StripeVoucherTerminalChainEvidence(
+                action=int(action),
+                spendBundleId=str(voucher["terminalBundleId"]),
+                terminalEvidenceHash=str(
+                    voucher["terminalEvidenceHash"]
+                ),
+                terminalVoucherCoinId=ids["terminal_voucher"],
+                seriesInputCoinId=ids["series_input"],
+                seriesInputParentCoinId=_hex32(
+                    series_input.parent_coin_info
+                ),
+                seriesOutputCoinId=ids["series_output"],
+                seriesOutputInnerPuzzleHash=_hex32(
+                    next_inner.get_tree_hash()
+                ),
+                deedOutputCoinId=ids.get("deed_output"),
+                confirmedHeight=next(iter(heights)),
+            ),
+        )
+        operation = self.purchases.get_operation(str(voucher["purchaseId"]))
+        if action == VoucherAction.REDEEM:
+            if operation.state in {
+                PurchaseOperationState.DELIVERY_SUBMITTED,
+                PurchaseOperationState.MEMPOOL_OBSERVED,
+            }:
+                operation = self.purchases.transition_operation(
+                    operation.purchase_id,
+                    expected_revision=operation.revision,
+                    to_state=PurchaseOperationState.CHAIN_CONFIRMED,
+                    actor="chain-reconciler",
+                    reason="Stripe voucher SmartDeed delivery confirmed",
+                    evidence={"confirmationHeight": next(iter(heights))},
+                    changes={
+                        "confirmation_height": next(iter(heights))
+                    },
+                )
+            if operation.state == PurchaseOperationState.CHAIN_CONFIRMED:
+                self.purchases.transition_operation(
+                    operation.purchase_id,
+                    expected_revision=operation.revision,
+                    to_state=PurchaseOperationState.FINALIZED,
+                    actor="stripe-voucher-coordinator",
+                    reason="Stripe voucher consumed and SmartDeed finalized",
+                    evidence={
+                        "expectedOutputCoinId": ids["deed_output"],
+                        "confirmationHeight": next(iter(heights)),
+                    },
+                )
+        return True
 
     async def _fund_purchase_launcher(
         self, series: dict[str, Any], voucher_json: dict[str, Any]

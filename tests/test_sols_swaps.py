@@ -43,6 +43,7 @@ from solslot_api.sols_swaps import (
     _authorize_swap,
     _build_protocol_offer,
     _build_reverse_protocol_offer,
+    _require_deed_not_in_stripe_dispute,
     complete_sols_swap,
     prepare_sols_swap,
 )
@@ -75,6 +76,7 @@ from solslot_puzzles.sols_pool_v4 import (
     prepare_sols_to_deed,
 )
 from solslot_puzzles.sols_swap_v4_driver import (
+    SolsSwapOfferError,
     aggregate_sols_to_deed_swap,
 )
 from solslot_puzzles.vault_driver import (
@@ -668,6 +670,23 @@ def _settings() -> Settings:
         network="testnet11",
         alpha_writes_enabled=True,
     )
+
+
+def test_stripe_dispute_blocks_protocol_swap(monkeypatch) -> None:
+    class DisputedPurchaseStore:
+        @staticmethod
+        def get_stripe_dispute_for_deed(_deed_launcher_id):
+            return SimpleNamespace(dispute_id="dp_test")
+
+    monkeypatch.setattr(
+        "solslot_api.sols_swaps.get_payment_purchase_store",
+        lambda _path: DisputedPurchaseStore(),
+    )
+    with pytest.raises(SolsSwapOfferError, match="Stripe payment dispute"):
+        _require_deed_not_in_stripe_dispute(
+            _settings(),
+            _hex32(DEED_LAUNCHER),
+        )
 
 
 def _request(
