@@ -5,21 +5,38 @@ import json
 import httpx
 import pytest
 from chia_rs import AugSchemeMPL, G1Element
+from chia_rs.sized_bytes import bytes32
 
 from solslot_api import validator_quorum
 from solslot_api.config import Settings
 from solslot_api.validator_quorum import (
+    PrimaryPurchaseDeedItem,
     PrimaryPurchaseClaim,
+    StripeSettlementClaim,
     ValidatorClaim,
     ValidatorQuorumError,
     VoucherSeriesPhaseClaim,
     VoucherTransitionClaim,
     collect_primary_purchase_quorum,
+    collect_stripe_settlement_quorum,
     collect_validator_quorum,
     collect_voucher_series_phase_quorum,
     collect_voucher_transition_quorum,
     probe_validator_health,
 )
+from solslot_puzzles.payment_artifacts_v3 import (
+    StripeDisputeState,
+    StripeFundingType,
+    StripeMethodFamily,
+    StripePaymentStatus,
+    StripeRefundState,
+    StripeSettlementEvidenceV1,
+    build_purchase_batch_v1,
+    build_stripe_purchase_artifact_v3,
+    purchase_batch_to_json,
+    stripe_settlement_evidence_to_json,
+)
+from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
 from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
 
 
@@ -147,6 +164,81 @@ def _voucher_series_phase_claim() -> VoucherSeriesPhaseClaim:
     )
 
 
+def _stripe_batch_claim(keys) -> StripeSettlementClaim:
+    vault = bytes32(bytes.fromhex("51" * 32))
+    common = {
+        "network": "testnet11",
+        "collection_id": bytes32(bytes.fromhex("52" * 32)),
+        "metadata_root": bytes32(bytes.fromhex("53" * 32)),
+        "metadata_anchor_id": bytes32(bytes.fromhex("54" * 32)),
+        "share_ppm": 50_000,
+        "base_usd_amount_minor": 10_000,
+        "technology_fee_bps": 100,
+        "protocol_treasury_puzzle_hash": bytes32(bytes.fromhex("55" * 32)),
+        "zkpassport_root": bytes32(bytes.fromhex("56" * 32)),
+        "vault_launcher_id": vault,
+        "vault_p2_puzzle_hash": puzzle_hash_for_p2_vault(vault),
+        "authorization_nonce": bytes32(bytes.fromhex("57" * 32)),
+        "authorization_expires_at": 1_900_000_600,
+        "quote_expires_at": 1_900_000_300,
+    }
+    batch = build_purchase_batch_v1(
+        batch_nonce=bytes32(bytes.fromhex("58" * 32)),
+        artifacts=(
+            build_stripe_purchase_artifact_v3(
+                deed_launcher_id=bytes32(bytes.fromhex("59" * 32)),
+                **common,
+            ),
+            build_stripe_purchase_artifact_v3(
+                deed_launcher_id=bytes32(bytes.fromhex("5a" * 32)),
+                **common,
+            ),
+        ),
+    )
+    evidence = StripeSettlementEvidenceV1(
+        stripe_account_id="acct_test_batch",
+        livemode=False,
+        payment_intent_id="pi_test_batch",
+        event_id="evt_test_batch",
+        amount_minor=batch.total_subtotal_minor,
+        currency="usd",
+        method_family=StripeMethodFamily.CARD,
+        funding_type=StripeFundingType.CREDIT,
+        processing_charge_minor=0,
+        status=StripePaymentStatus.SUCCEEDED,
+        refunded_minor=0,
+        refund_state=StripeRefundState.NONE,
+        dispute_state=StripeDisputeState.NONE,
+        observed_at=1_800_000_100,
+    )
+    items = tuple(
+        PrimaryPurchaseDeedItem(
+            deed_launcher_id="0x" + child.deed_launcher_id.hex(),
+            deed_coin_id="0x" + (bytes([0x60 + index]) * 32).hex(),
+            deed_puzzle_hash="0x" + (bytes([0x62 + index]) * 32).hex(),
+            smart_deed_inner_hash="0x" + (bytes([0x64 + index]) * 32).hex(),
+            reservation_expires_at=1_900_000_200,
+        )
+        for index, child in enumerate(batch.artifacts)
+    )
+    return StripeSettlementClaim(
+        network="testnet11",
+        genesis_artifact_hash="0x" + "66" * 32,
+        purchase_artifact=purchase_batch_to_json(batch),
+        stripe_evidence=stripe_settlement_evidence_to_json(evidence),
+        receipt_coin_id="0x" + "67" * 32,
+        receipt_puzzle_hash="0x" + "68" * 32,
+        deed_items=items,
+        protocol_puzzle_hash="0x" + "55" * 32,
+        credential_vault_coin_id="0x" + "69" * 32,
+        credential_identity_root="0x" + "56" * 32,
+        credential_policy_version=2,
+        credential_bridge_policy_hash="0x" + "6a" * 32,
+        credential_owner_auth_type=1,
+        credential_owner_key="0x" + bytes(keys[0].get_g1()).hex(),
+    )
+
+
 def test_private_validator_client_loads_mtls_chain_into_ssl_context(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -262,6 +354,53 @@ async def test_primary_purchase_collects_two_signers_for_deed_coin_message():
     assert AugSchemeMPL.aggregate_verify(
         [keys[0].get_g1(), keys[1].get_g1()],
         [claim.signature_message(), claim.signature_message()],
+        result.aggregated_signature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stripe_batch_quorum_signs_one_exact_two_deed_receipt():
+    keys = _keys()
+    claim = _stripe_batch_claim(keys)
+    pubkeys = tuple(bytes(key.get_g1()) for key in keys)
+    messages = claim.signature_messages(pubkeys)  # type: ignore[arg-type]
+    assert len(messages) == 1
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        body = json.loads(request.content)
+        assert body["claim"] == claim.model_dump(mode="json")
+        signature = AugSchemeMPL.aggregate(
+            [AugSchemeMPL.sign(keys[index], message) for message in messages]
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claimHash": claim.canonical_hash(),
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "signature": "0x" + bytes(signature).hex(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await collect_stripe_settlement_quorum(
+            _settings(keys),
+            claim,
+            client=client,
+        )
+
+    assert result.signer_indices == (0, 1)
+    with pytest.raises(ValueError, match="canonical deed order"):
+        StripeSettlementClaim(
+            **{
+                **claim.model_dump(mode="python"),
+                "deed_items": tuple(reversed(claim.deed_items)),
+            }
+        )
+    assert AugSchemeMPL.aggregate_verify(
+        [keys[0].get_g1(), keys[1].get_g1()],
+        [messages[0], messages[0]],
         result.aggregated_signature,
     )
 
