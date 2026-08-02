@@ -233,14 +233,22 @@ async def test_prepared_delivery_finalizes_only_one_atomic_block(tmp_path):
 
     deed_input = Coin(_b32(10), _b32(11), uint64(1))
     receipt_spend = make_spend(
-        receipt_coin, Program.to((1, [])), Program.to(0)
+        receipt_coin,
+        Program.to((1, [[51, _b32(13), 1]])),
+        Program.to(0),
     )
     deed_spend = make_spend(
-        deed_input, Program.to((1, [])), Program.to(0)
+        deed_input,
+        Program.to((1, [[51, _b32(12), 1]])),
+        Program.to(0),
     )
     bundle = SpendBundle([receipt_spend, deed_spend], G2Element())
-    deed_output = Coin(deed_input.name(), _b32(12), uint64(1))
-    treasury_output = Coin(receipt_coin.name(), _b32(13), uint64(1))
+    deed_output = next(
+        coin for coin in bundle.additions() if coin.parent_coin_info == deed_input.name()
+    )
+    treasury_output = next(
+        coin for coin in bundle.additions() if coin.parent_coin_info == receipt_coin.name()
+    )
     operation = store.record_delivery_prepared(
         operation.purchase_id,
         protocol_bundle=bundle.to_json_dict(),
@@ -270,6 +278,101 @@ async def test_prepared_delivery_finalizes_only_one_atomic_block(tmp_path):
     assert finalized.state == FINALIZED
     assert finalized.confirmation_height == 30
     assert submitter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_two_deed_delivery_confirms_every_output_in_one_block(tmp_path):
+    store = StripeDeliveryStore(str(tmp_path / "delivery.db"))
+    provider = FakeProvider()
+    operation = _queued(store)
+    receipt_coin = Coin(_b32(70), _b32(71), uint64(2))
+    deed_inputs = (
+        Coin(_b32(72), _b32(73), uint64(1)),
+        Coin(_b32(74), _b32(75), uint64(1)),
+    )
+    receipt_spend = make_spend(
+        receipt_coin,
+        Program.to((1, [])),
+        Program.to(0),
+    )
+    deed_spends = tuple(
+        make_spend(
+            coin,
+            Program.to(
+                (
+                    1,
+                    [
+                        [51, _b32(76 + index), 1],
+                        [51, _b32(78), 1],
+                    ],
+                )
+            ),
+            Program.to(0),
+        )
+        for index, coin in enumerate(deed_inputs)
+    )
+    bundle = SpendBundle([receipt_spend, *deed_spends], G2Element())
+    additions = bundle.additions()
+    delivery_outputs = tuple(
+        next(
+            output
+            for output in additions
+            if output.parent_coin_info == coin.name()
+            and output.puzzle_hash == _b32(76 + index)
+        )
+        for index, coin in enumerate(deed_inputs)
+    )
+    treasury_outputs = tuple(
+        next(
+            output
+            for output in additions
+            if output.parent_coin_info == coin.name()
+            and output.puzzle_hash == _b32(78)
+        )
+        for coin in deed_inputs
+    )
+    operation = store.record_receipt_prepared(
+        operation.purchase_id,
+        input_coin_id=_hex(_b32(79)),
+        protocol_bundle={"coin_spends": [], "aggregated_signature": "c0"},
+        receipt_coin_id=_hex(receipt_coin.name()),
+        receipt_puzzle_hash=_hex(receipt_coin.puzzle_hash),
+    )
+    operation = store.record_receipt_confirmed(operation.purchase_id)
+    operation = store.record_delivery_prepared(
+        operation.purchase_id,
+        protocol_bundle=bundle.to_json_dict(),
+        delivery_output_coin_id=_hex(delivery_outputs[0].name()),
+        delivery_output_coin_ids=tuple(
+            _hex(output.name()) for output in delivery_outputs
+        ),
+        treasury_output_coin_id=_hex(treasury_outputs[0].name()),
+        treasury_output_coin_ids=tuple(
+            _hex(output.name()) for output in treasury_outputs
+        ),
+        signer_indices=(0, 1),
+    )
+    for coin in (receipt_coin, *deed_inputs):
+        provider.records[_hex(coin.name())] = _record(
+            coin,
+            confirmed=40,
+            spent=50,
+        )
+    for coin in (*delivery_outputs, *treasury_outputs):
+        provider.records[_hex(coin.name())] = _record(coin, confirmed=50)
+
+    finalized = await _worker(
+        tmp_path,
+        provider,
+        FakeSubmitter(),
+        store,
+    )._confirm_delivery(operation)
+
+    assert finalized.state == FINALIZED
+    assert finalized.confirmation_height == 50
+    assert finalized.expected_delivery_output_coin_ids == tuple(
+        _hex(output.name()) for output in delivery_outputs
+    )
 
 
 @pytest.mark.asyncio

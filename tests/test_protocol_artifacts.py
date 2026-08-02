@@ -40,6 +40,7 @@ from solslot_puzzles.payment_artifacts_v3 import (
     build_sgt_purchase_artifact_v3,
     purchase_artifact_v3_to_json,
     purchase_artifact_v3_from_json,
+    purchase_batch_from_json,
     stripe_settlement_evidence_to_json,
 )
 from solslot_api.zkpassport_enrollments import (
@@ -208,8 +209,13 @@ def _published_collection(
                 },
                 {
                     "deedId": "US-TX-AUSTIN-002",
-                    "sharePpm": 975_000,
-                    "parValueMojos": "9750000000000",
+                    "sharePpm": 25_000,
+                    "parValueMojos": "250000000000",
+                },
+                {
+                    "deedId": "US-TX-AUSTIN-003",
+                    "sharePpm": 950_000,
+                    "parValueMojos": "9500000000000",
                 },
             ],
         },
@@ -221,7 +227,15 @@ def _published_collection(
                 "parValueMojos": "250000000000",
                 "executeBundleId": "0x" + "31" * 32,
                 "confirmationHeight": 12346,
-            }
+            },
+            {
+                "deedId": "US-TX-AUSTIN-002",
+                "deedLauncherId": "0x" + "15" * 32,
+                "sharePpm": 25_000,
+                "parValueMojos": "250000000000",
+                "executeBundleId": "0x" + "32" * 32,
+                "confirmationHeight": 12347,
+            },
         ],
     }
 
@@ -1200,6 +1214,65 @@ def test_builds_native_xch_offer_from_server_authorized_quote(
         )
         assert verified.status_code == 200, verified.text
         assert verified.json()["valid"] is True, verified.json()
+
+
+def test_builds_one_canonical_native_batch_for_multiple_smartdeeds(
+    monkeypatch,
+    tmp_path,
+):
+    now = int(time.time())
+    _configure_native_quote(monkeypatch, tmp_path, now)
+    request = _request(
+        rail="chia_xch",
+        purchase_intent_id="pi_xch_batch",
+        expires_at=now + 240,
+        payment_terms={"currency": "XCH", "quantity": 2},
+        authorization_nonce="0x" + "16" * 32,
+        authorization_expires_at=now + 600,
+    )
+    request.pop("deed_launcher_id")
+    request.pop("share_ppm")
+
+    with TestClient(app) as client:
+        built = client.post("/protocol/offer-artifacts", json=request)
+        assert built.status_code == 200, built.text
+        body = built.json()
+        batch = purchase_batch_from_json(body["purchase_batch"])
+        assert batch.quantity == 2
+        assert len(batch.artifacts) == 2
+        assert len({item.deed_launcher_id for item in batch.artifacts}) == 2
+        assert body["protocol"]["quantity"] == 2
+        assert body["protocol"]["deedLauncherIds"] == [
+            "0x" + bytes(item.deed_launcher_id).hex()
+            for item in batch.artifacts
+        ]
+        assert body["purchase_artifact_hash"] == (
+            "0x" + bytes(batch.batch_hash).hex()
+        )
+        assert body["artifact"]["paymentTerms"]["amount"] == str(
+            batch.total_rail_amount
+        )
+
+        verified = client.post(
+            "/protocol/offer-artifacts/verify",
+            json={
+                "artifact": body["artifact"],
+                "artifact_hash": body["artifact_hash"],
+                "now": now,
+            },
+        )
+        assert verified.status_code == 200, verified.text
+        assert verified.json()["valid"] is True, verified.json()
+
+
+def test_multi_smartdeed_checkout_fails_when_equivalent_inventory_is_short():
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(payment_terms={"currency": "USD", "quantity": 3}),
+        )
+    assert response.status_code == 409
+    assert "only 2 equivalent confirmed SmartDeeds" in response.text
 
 
 def test_quote_price_uses_target_raise_share_not_chia_par_value(

@@ -11,7 +11,10 @@ from solslot_puzzles.payment_artifacts_v2 import PaymentArtifactError, PaymentRa
 from solslot_puzzles.payment_artifacts_v3 import (
     ExternalSettlementReceiptV1,
     PurchaseArtifactV3,
+    PurchaseBatchSettlementReceiptV1,
+    PurchaseBatchV1,
     build_external_settlement_receipt_v1,
+    build_purchase_batch_settlement_receipt_v1,
 )
 from solslot_puzzles.voucher_presale_v2_driver import (
     curry_direct_base_result_authorization,
@@ -93,7 +96,7 @@ def build_base_settlement_receipt(
 
 def base_result_authorization_puzzle_hash(
     *,
-    artifact: PurchaseArtifactV3,
+    artifact: PurchaseArtifactV3 | PurchaseBatchV1,
     evidence: Mapping[str, Any],
     return_puzzle_hash: bytes32,
 ) -> bytes32:
@@ -111,11 +114,58 @@ def base_result_authorization_puzzle_hash(
         raise PaymentArtifactError("Base return puzzle hash cannot be zero")
     return bytes32(
         curry_direct_base_result_authorization(
-            purchase_artifact_hash=artifact.artifact_hash,
+            purchase_artifact_hash=(
+                artifact.batch_hash
+                if isinstance(artifact, PurchaseBatchV1)
+                else artifact.artifact_hash
+            ),
             global_payment_id=global_payment_id,
-            payment_principal=artifact.rail_amount,
+            payment_principal=(
+                artifact.total_rail_amount
+                if isinstance(artifact, PurchaseBatchV1)
+                else artifact.rail_amount
+            ),
             return_puzzle_hash=return_puzzle_hash,
         ).get_tree_hash()
+    )
+
+
+def build_base_batch_settlement_receipt(
+    *,
+    batch: PurchaseBatchV1,
+    evidence: Mapping[str, Any],
+    validator_pubkeys: tuple[bytes, bytes, bytes],
+    result_authorization_puzzle_hash: bytes32,
+) -> PurchaseBatchSettlementReceiptV1:
+    """Bind one confirmed Base deposit to an exact SmartDeed batch."""
+
+    if batch.rail != PaymentRail.EVM_TEST_USD:
+        raise PaymentArtifactError("Base batch receipt requires EVM USDC")
+    source = evidence.get("source")
+    if not isinstance(source, Mapping):
+        raise PaymentArtifactError("Base batch evidence source is missing")
+    chain_id = source.get("chainId")
+    observed_at = source.get("blockTimestamp")
+    if isinstance(chain_id, bool) or not isinstance(chain_id, int):
+        raise PaymentArtifactError("Base batch evidence chain ID is invalid")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int):
+        raise PaymentArtifactError("Base batch evidence timestamp is invalid")
+    return build_purchase_batch_settlement_receipt_v1(
+        batch=batch,
+        provider_id=base_provider_id(
+            chain_id=chain_id,
+            spoke=str(source.get("spoke") or ""),
+            settlement_token=str(evidence.get("settlementToken") or ""),
+        ),
+        external_reference_hash=_hex32(
+            evidence.get("globalPaymentId"),
+            "globalPaymentId",
+        ),
+        evidence_hash=base_evidence_hash(evidence),
+        observed_at=observed_at,
+        validator_pubkeys=validator_pubkeys,
+        collected_amount_minor=batch.total_rail_amount,
+        result_authorization_puzzle_hash=result_authorization_puzzle_hash,
     )
 
 
@@ -147,6 +197,7 @@ __all__ = [
     "base_evidence_hash",
     "base_provider_id",
     "base_result_authorization_puzzle_hash",
+    "build_base_batch_settlement_receipt",
     "build_base_settlement_receipt",
     "canonical_base_evidence_json",
 ]

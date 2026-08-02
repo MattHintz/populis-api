@@ -23,6 +23,20 @@ class PaymentPurchaseConflict(ValueError):
 
 
 @dataclass(frozen=True)
+class StoredPaymentInventoryItem:
+    ordinal: int
+    deed_launcher_id: str
+    child_purchase_id: str
+    child_artifact_hash: str
+    state: str
+    available_coin_id: str | None
+    reserved_coin_id: str | None
+    reserved_puzzle_hash: str | None
+    signer_indices: tuple[int, ...]
+    signature: str | None
+
+
+@dataclass(frozen=True)
 class StoredPaymentPurchase:
     purchase_id: str
     artifact_hash: str
@@ -34,6 +48,7 @@ class StoredPaymentPurchase:
     purchase_artifact: dict[str, Any]
     external_message: dict[str, Any] | None
     deed_launcher_id: str | None = None
+    deed_launcher_ids: tuple[str, ...] = ()
     inventory_state: str = "UNRESERVED"
     inventory_available_coin_id: str | None = None
     inventory_reserved_coin_id: str | None = None
@@ -68,6 +83,7 @@ class PaymentPurchaseStore:
                     external_transaction_hash TEXT,
                     external_message_json TEXT,
                     deed_launcher_id TEXT,
+                    deed_launcher_ids_json TEXT NOT NULL DEFAULT '[]',
                     inventory_state TEXT NOT NULL DEFAULT 'UNRESERVED',
                     inventory_available_coin_id TEXT,
                     inventory_reserved_coin_id TEXT UNIQUE,
@@ -83,6 +99,23 @@ class PaymentPurchaseStore:
                 );
                 CREATE INDEX IF NOT EXISTS payment_purchases_expiry
                     ON payment_purchases(quote_expires_at);
+                CREATE TABLE IF NOT EXISTS payment_purchase_inventory_items (
+                    purchase_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    deed_launcher_id TEXT NOT NULL,
+                    child_purchase_id TEXT NOT NULL UNIQUE,
+                    child_artifact_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL DEFAULT 'UNRESERVED',
+                    available_coin_id TEXT,
+                    reserved_coin_id TEXT UNIQUE,
+                    reserved_puzzle_hash TEXT,
+                    signer_indices_json TEXT NOT NULL DEFAULT '[]',
+                    signature TEXT,
+                    PRIMARY KEY (purchase_id, ordinal),
+                    UNIQUE (purchase_id, deed_launcher_id),
+                    FOREIGN KEY (purchase_id) REFERENCES payment_purchases(purchase_id)
+                        ON DELETE CASCADE
+                );
                 """
             )
             columns = {
@@ -98,6 +131,7 @@ class PaymentPurchaseStore:
                 )
             inventory_columns = {
                 "deed_launcher_id": "TEXT",
+                "deed_launcher_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "inventory_state": "TEXT NOT NULL DEFAULT 'UNRESERVED'",
                 "inventory_available_coin_id": "TEXT",
                 "inventory_reserved_coin_id": "TEXT",
@@ -112,7 +146,7 @@ class PaymentPurchaseStore:
             }
             for name, declaration in inventory_columns.items():
                 if name not in columns:
-                    connection.execute(
+                    cursor = connection.execute(
                         f"ALTER TABLE payment_purchases ADD COLUMN {name} {declaration}"
                     )
             connection.execute(
@@ -138,6 +172,12 @@ class PaymentPurchaseStore:
                 "ON payment_purchases(deed_launcher_id) "
                 "WHERE deed_launcher_id IS NOT NULL AND inventory_state IN "
                 "('PREPARED', 'SUBMITTED', 'CONFIRMED')"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "payment_purchase_inventory_active_deed "
+                "ON payment_purchase_inventory_items(deed_launcher_id) "
+                "WHERE state IN ('PREPARED', 'SUBMITTED', 'CONFIRMED')"
             )
 
     @contextmanager
@@ -168,14 +208,53 @@ class PaymentPurchaseStore:
         created_at: int,
     ) -> StoredPaymentPurchase:
         purchase_id = _required_string(purchase_artifact, "purchaseId")
-        artifact_hash = _required_string(purchase_artifact, "artifactHash")
-        quote_expires_at = _required_decimal(
-            purchase_artifact,
-            "quoteExpiresAt",
-        )
-        deed_launcher_id = _optional_nonzero_hex32(
-            purchase_artifact.get("deedLauncherId")
-        )
+        if purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
+            artifact_hash = _required_string(purchase_artifact, "batchHash")
+            children = purchase_artifact.get("artifacts")
+            if not isinstance(children, list) or not children:
+                raise PaymentPurchaseConflict(
+                    "purchase batch must contain canonical child artifacts"
+                )
+            quote_expires_at = min(
+                _required_decimal(child, "quoteExpiresAt")
+                for child in children
+                if isinstance(child, Mapping)
+            )
+            deed_launcher_ids = tuple(
+                value
+                for value in (
+                    _optional_nonzero_hex32(child.get("deedLauncherId"))
+                    for child in children
+                    if isinstance(child, Mapping)
+                )
+                if value is not None
+            )
+            if len(deed_launcher_ids) != len(children):
+                raise PaymentPurchaseConflict(
+                    "purchase batch child deed commitments are incomplete"
+                )
+            inventory_children = tuple(children)
+        else:
+            artifact_hash = _required_string(purchase_artifact, "artifactHash")
+            quote_expires_at = _required_decimal(
+                purchase_artifact,
+                "quoteExpiresAt",
+            )
+            single_launcher = _optional_nonzero_hex32(
+                purchase_artifact.get("deedLauncherId")
+            )
+            deed_launcher_ids = (
+                (single_launcher,) if single_launcher is not None else ()
+            )
+            inventory_children = (
+                (purchase_artifact,) if single_launcher is not None else ()
+            )
+        if len(set(deed_launcher_ids)) != len(deed_launcher_ids):
+            raise PaymentPurchaseConflict(
+                "purchase contains duplicate SmartDeed launchers"
+            )
+        deed_launcher_id = deed_launcher_ids[0] if deed_launcher_ids else None
+        deed_launcher_ids_json = json.dumps(list(deed_launcher_ids))
         offer_json = _canonical_json(offer_artifact)
         purchase_json = _canonical_json(purchase_artifact)
         with self._connect() as connection:
@@ -216,8 +295,9 @@ class PaymentPurchaseStore:
                     offer_artifact_json,
                     purchase_artifact_json,
                     deed_launcher_id,
+                    deed_launcher_ids_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     purchase_id,
@@ -229,9 +309,26 @@ class PaymentPurchaseStore:
                     offer_json,
                     purchase_json,
                     deed_launcher_id,
+                    deed_launcher_ids_json,
                     created_at,
                 ),
             )
+            for ordinal, child in enumerate(inventory_children):
+                connection.execute(
+                    """
+                    INSERT INTO payment_purchase_inventory_items (
+                        purchase_id, ordinal, deed_launcher_id,
+                        child_purchase_id, child_artifact_hash
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        purchase_id,
+                        ordinal,
+                        deed_launcher_ids[ordinal],
+                        _required_string(child, "purchaseId"),
+                        _required_string(child, "artifactHash"),
+                    ),
+                )
             row = connection.execute(
                 "SELECT * FROM payment_purchases WHERE purchase_id = ?",
                 (purchase_id,),
@@ -239,6 +336,183 @@ class PaymentPurchaseStore:
             connection.execute("COMMIT")
         assert row is not None
         return _record(row)
+
+    def inventory_items(
+        self,
+        purchase_id: str,
+    ) -> tuple[StoredPaymentInventoryItem, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM payment_purchase_inventory_items
+                WHERE purchase_id = ? ORDER BY ordinal
+                """,
+                (purchase_id,),
+            ).fetchall()
+        return tuple(_inventory_item(row) for row in rows)
+
+    def record_inventory_batch_prepared(
+        self,
+        purchase_id: str,
+        *,
+        items: tuple[Mapping[str, Any], ...],
+        bundle: Mapping[str, Any],
+    ) -> StoredPaymentPurchase:
+        """Atomically bind every selected deed to one reservation bundle."""
+
+        if not items:
+            raise PaymentPurchaseConflict(
+                "reservation manifest must contain at least one SmartDeed"
+            )
+        bundle_json = _canonical_json(bundle)
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                signer_indices = tuple(int(value) for value in item["signer_indices"])
+                normalized_items.append(
+                    {
+                        "deed_launcher_id": str(item["deed_launcher_id"]),
+                        "available_coin_id": str(item["available_coin_id"]),
+                        "reserved_coin_id": str(item["reserved_coin_id"]),
+                        "reserved_puzzle_hash": str(item["reserved_puzzle_hash"]),
+                        "expires_at": int(item["expires_at"]),
+                        "signer_indices_json": json.dumps(list(signer_indices)),
+                        "signature": str(item["signature"]),
+                    }
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PaymentPurchaseConflict(
+                    "reservation manifest is incomplete"
+                ) from exc
+        expires_at = normalized_items[0]["expires_at"]
+        if any(item["expires_at"] != expires_at for item in normalized_items):
+            raise PaymentPurchaseConflict(
+                "all SmartDeeds in a batch must share one reservation expiry"
+            )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            parent = connection.execute(
+                "SELECT * FROM payment_purchases WHERE purchase_id = ?",
+                (purchase_id,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT * FROM payment_purchase_inventory_items
+                   WHERE purchase_id = ? ORDER BY ordinal""",
+                (purchase_id,),
+            ).fetchall()
+            if parent is None or not rows:
+                connection.execute("ROLLBACK")
+                raise PaymentPurchaseNotFound("purchase inventory was not found")
+            if len(rows) != len(normalized_items):
+                connection.execute("ROLLBACK")
+                raise PaymentPurchaseConflict(
+                    "reservation manifest does not match the purchase quantity"
+                )
+            try:
+                for row, item in zip(rows, normalized_items, strict=True):
+                    expected_launcher = str(row["deed_launcher_id"])
+                    if item["deed_launcher_id"] != expected_launcher:
+                        raise PaymentPurchaseConflict(
+                            "reservation manifest changes a SmartDeed launcher"
+                        )
+                    expected_values = {
+                        "available_coin_id": item["available_coin_id"],
+                        "reserved_coin_id": item["reserved_coin_id"],
+                        "reserved_puzzle_hash": item["reserved_puzzle_hash"],
+                        "signer_indices_json": item["signer_indices_json"],
+                        "signature": item["signature"],
+                    }
+                    if row["state"] == "PREPARED":
+                        if any(row[name] != value for name, value in expected_values.items()):
+                            raise PaymentPurchaseConflict(
+                                "prepared reservation evidence cannot be changed"
+                            )
+                        continue
+                    if row["state"] != "UNRESERVED":
+                        raise PaymentPurchaseConflict(
+                            "reservation item is not in a preparable state"
+                        )
+                    cursor = connection.execute(
+                        """
+                        UPDATE payment_purchase_inventory_items
+                        SET state='PREPARED', available_coin_id=?,
+                            reserved_coin_id=?, reserved_puzzle_hash=?,
+                            signer_indices_json=?, signature=?
+                        WHERE purchase_id=? AND ordinal=?
+                          AND state IN ('UNRESERVED', 'PREPARED')
+                        """,
+                        (
+                            item["available_coin_id"],
+                            item["reserved_coin_id"],
+                            item["reserved_puzzle_hash"],
+                            item["signer_indices_json"],
+                            item["signature"],
+                            purchase_id,
+                            int(row["ordinal"]),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise PaymentPurchaseConflict(
+                            "reservation item is not in a preparable state"
+                        )
+                first = normalized_items[0]
+                parent_values = {
+                    "inventory_available_coin_id": first["available_coin_id"],
+                    "inventory_reserved_coin_id": first["reserved_coin_id"],
+                    "inventory_reserved_puzzle_hash": first["reserved_puzzle_hash"],
+                    "inventory_expires_at": expires_at,
+                    "inventory_bundle_json": bundle_json,
+                    "inventory_signer_indices_json": first["signer_indices_json"],
+                    "inventory_signature": first["signature"],
+                }
+                if parent["inventory_state"] == "PREPARED":
+                    if any(parent[name] != value for name, value in parent_values.items()):
+                        raise PaymentPurchaseConflict(
+                            "prepared batch evidence cannot be changed"
+                        )
+                elif parent["inventory_state"] == "UNRESERVED":
+                    parent_cursor = connection.execute(
+                        """
+                        UPDATE payment_purchases
+                        SET inventory_state='PREPARED',
+                            inventory_available_coin_id=?,
+                            inventory_reserved_coin_id=?,
+                            inventory_reserved_puzzle_hash=?,
+                            inventory_expires_at=?, inventory_bundle_json=?,
+                            inventory_signer_indices_json=?, inventory_signature=?
+                        WHERE purchase_id=? AND inventory_state='UNRESERVED'
+                        """,
+                        (
+                            *parent_values.values(),
+                            purchase_id,
+                        ),
+                    )
+                    if parent_cursor.rowcount != 1:
+                        raise PaymentPurchaseConflict(
+                            "reservation batch is not in a preparable state"
+                        )
+                else:
+                    raise PaymentPurchaseConflict(
+                        "reservation batch is not in a preparable state"
+                    )
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                sqlite3.IntegrityError,
+                PaymentPurchaseConflict,
+            ) as exc:
+                connection.execute("ROLLBACK")
+                raise PaymentPurchaseConflict(
+                    "one or more SmartDeeds are already reserved"
+                ) from exc
+            result = connection.execute(
+                "SELECT * FROM payment_purchases WHERE purchase_id = ?",
+                (purchase_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+        assert result is not None
+        return _record(result)
 
     def record_inventory_prepared(
         self,
@@ -252,19 +526,25 @@ class PaymentPurchaseStore:
         signer_indices: tuple[int, ...],
         signature: str,
     ) -> StoredPaymentPurchase:
-        return self._transition_inventory(
+        record = self.get(purchase_id)
+        if record.deed_launcher_id is None:
+            raise PaymentPurchaseConflict(
+                "purchase has no SmartDeed inventory commitment"
+            )
+        return self.record_inventory_batch_prepared(
             purchase_id,
-            expected_states=("UNRESERVED", "PREPARED"),
-            next_state="PREPARED",
-            values={
-                "inventory_available_coin_id": available_coin_id,
-                "inventory_reserved_coin_id": reserved_coin_id,
-                "inventory_reserved_puzzle_hash": reserved_puzzle_hash,
-                "inventory_expires_at": expires_at,
-                "inventory_bundle_json": _canonical_json(bundle),
-                "inventory_signer_indices_json": json.dumps(list(signer_indices)),
-                "inventory_signature": signature,
-            },
+            items=(
+                {
+                    "deed_launcher_id": record.deed_launcher_id,
+                    "available_coin_id": available_coin_id,
+                    "reserved_coin_id": reserved_coin_id,
+                    "reserved_puzzle_hash": reserved_puzzle_hash,
+                    "expires_at": expires_at,
+                    "signer_indices": signer_indices,
+                    "signature": signature,
+                },
+            ),
+            bundle=bundle,
         )
 
     def record_inventory_submitted(
@@ -274,7 +554,7 @@ class PaymentPurchaseStore:
         bundle_id: str,
         mempool_observed_at: str,
     ) -> StoredPaymentPurchase:
-        return self._transition_inventory(
+        result = self._transition_inventory(
             purchase_id,
             expected_states=("PREPARED", "SUBMITTED"),
             next_state="SUBMITTED",
@@ -283,6 +563,7 @@ class PaymentPurchaseStore:
                 "inventory_mempool_observed_at": mempool_observed_at,
             },
         )
+        return result
 
     def record_inventory_confirmed(
         self,
@@ -290,12 +571,13 @@ class PaymentPurchaseStore:
         *,
         confirmation_height: int,
     ) -> StoredPaymentPurchase:
-        return self._transition_inventory(
+        result = self._transition_inventory(
             purchase_id,
             expected_states=("SUBMITTED", "CONFIRMED"),
             next_state="CONFIRMED",
             values={"inventory_confirmation_height": confirmation_height},
         )
+        return result
 
     def _transition_inventory(
         self,
@@ -336,6 +618,23 @@ class PaymentPurchaseStore:
                     return record
                 raise PaymentPurchaseConflict(
                     f"inventory transition {record.inventory_state} -> {next_state} is not allowed"
+                )
+            item_cursor = connection.execute(
+                f"UPDATE payment_purchase_inventory_items SET state=? "
+                f"WHERE purchase_id=? AND state IN ({placeholders})",
+                (next_state, purchase_id, *expected_states),
+            )
+            item_total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM payment_purchase_inventory_items "
+                    "WHERE purchase_id=?",
+                    (purchase_id,),
+                ).fetchone()[0]
+            )
+            if item_total < 1 or item_cursor.rowcount != item_total:
+                connection.execute("ROLLBACK")
+                raise PaymentPurchaseConflict(
+                    "inventory item transition is incomplete"
                 )
             row = connection.execute(
                 "SELECT * FROM payment_purchases WHERE purchase_id = ?",
@@ -430,6 +729,9 @@ def _record(row: sqlite3.Row) -> StoredPaymentPurchase:
             json.loads(external_json) if external_json is not None else None
         ),
         deed_launcher_id=row["deed_launcher_id"],
+        deed_launcher_ids=tuple(
+            str(value) for value in json.loads(row["deed_launcher_ids_json"])
+        ),
         inventory_state=row["inventory_state"],
         inventory_available_coin_id=row["inventory_available_coin_id"],
         inventory_reserved_coin_id=row["inventory_reserved_coin_id"],
@@ -456,6 +758,23 @@ def _record(row: sqlite3.Row) -> StoredPaymentPurchase:
             if row["inventory_confirmation_height"] is not None
             else None
         ),
+    )
+
+
+def _inventory_item(row: sqlite3.Row) -> StoredPaymentInventoryItem:
+    return StoredPaymentInventoryItem(
+        ordinal=int(row["ordinal"]),
+        deed_launcher_id=str(row["deed_launcher_id"]),
+        child_purchase_id=str(row["child_purchase_id"]),
+        child_artifact_hash=str(row["child_artifact_hash"]),
+        state=str(row["state"]),
+        available_coin_id=row["available_coin_id"],
+        reserved_coin_id=row["reserved_coin_id"],
+        reserved_puzzle_hash=row["reserved_puzzle_hash"],
+        signer_indices=tuple(
+            int(value) for value in json.loads(row["signer_indices_json"])
+        ),
+        signature=row["signature"],
     )
 
 

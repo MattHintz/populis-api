@@ -21,14 +21,23 @@ from chia_rs.sized_ints import uint64
 from solslot_puzzles.payment_artifacts_v2 import PaymentArtifactError, PaymentRail
 from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseDeliveryKind,
+    PurchaseBatchV1,
+    STRIPE_PAYMENT_PROVIDER_ID,
+    build_purchase_batch_settlement_receipt_v1,
     build_stripe_settlement_receipt_v1,
     purchase_artifact_v3_from_json,
+    purchase_batch_from_json,
     stripe_settlement_evidence_from_json,
 )
 from solslot_puzzles.stripe_settlement_v1_driver import (
+    PurchaseBatchSettlementTermsV1,
     build_stripe_primary_offer_v5,
+    build_external_primary_batch_offer_v5,
+    build_purchase_batch_receipt_spend,
     prepare_stripe_receipt_offer,
+    prepare_purchase_batch_receipt_offer,
     StripeSettlementTermsV1,
+    curry_purchase_batch_settlement_receipt,
     curry_stripe_settlement_receipt,
     stripe_settlement_receipt_solution,
 )
@@ -46,11 +55,12 @@ from .base_direct_settlement import build_direct_settlement_authorization
 from .credential_auth import require_minting_writes
 from .external_settlement import (
     base_result_authorization_puzzle_hash,
+    build_base_batch_settlement_receipt,
     build_base_settlement_receipt,
 )
 from .faucet import Faucet
 from .launch_gates import require_operation_gate
-from .native_purchases import _load_context
+from .native_purchases import _load_context, _load_context_group
 from .omnichain_evidence import load_omnichain_evidence
 from .governance_queue import GovernanceQueueStore
 from .governance_sale_offer import (
@@ -83,6 +93,7 @@ from .stripe_delivery_store import (
 )
 from .vault_eligibility import require_current_approved_vault
 from .validator_quorum import (
+    PrimaryPurchaseDeedItem,
     StripeSettlementClaim,
     collect_stripe_settlement_quorum,
     configured_validator_pubkeys,
@@ -248,9 +259,7 @@ class StripeDeliveryWorker:
             return await self._confirm_delivery(operation)
         if operation.state == EXTERNAL_SETTLEMENT_PENDING:
             if operation.settlement_authorization is None:
-                purchase = purchase_artifact_v3_from_json(
-                    self._stored_purchase(operation.purchase_id)
-                )
+                purchase = self._stored_purchase_document(operation.purchase_id)
                 authorization_id, authorization = (
                     build_direct_settlement_authorization(
                         operation=operation,
@@ -266,18 +275,38 @@ class StripeDeliveryWorker:
         return operation
 
     def _receipt_terms(self, operation: StripeDeliveryOperation):
-        purchase = purchase_artifact_v3_from_json(
-            self._stored_purchase(operation.purchase_id)
+        purchase_document = self._stored_purchase_document(
+            operation.purchase_id
         )
+        batch = (
+            purchase_document
+            if isinstance(purchase_document, PurchaseBatchV1)
+            else None
+        )
+        purchase = (
+            batch.artifacts[0] if batch is not None else purchase_document
+        )
+        validator_pubkeys = configured_validator_pubkeys(self.settings)
         result_puzzle_hash = bytes32.zeros
         if operation.payment_rail == PAYMENT_RAIL_STRIPE:
             evidence = stripe_settlement_evidence_from_json(operation.evidence)
-            receipt = build_stripe_settlement_receipt_v1(
-                artifact=purchase,
-                evidence=evidence,
-                validator_pubkeys=configured_validator_pubkeys(
-                    self.settings
-                ),
+            receipt = (
+                build_purchase_batch_settlement_receipt_v1(
+                    batch=batch,
+                    provider_id=STRIPE_PAYMENT_PROVIDER_ID,
+                    external_reference_hash=evidence.payment_reference_hash,
+                    evidence_hash=evidence.evidence_hash,
+                    observed_at=evidence.observed_at,
+                    validator_pubkeys=validator_pubkeys,
+                    collected_amount_minor=evidence.amount_minor,
+                    processing_charge_minor=evidence.processing_charge_minor,
+                )
+                if batch is not None
+                else build_stripe_settlement_receipt_v1(
+                    artifact=purchase,
+                    evidence=evidence,
+                    validator_pubkeys=validator_pubkeys,
+                )
             )
         elif operation.payment_rail == PAYMENT_RAIL_BASE_USDC:
             token = self.settings.payment_evm_usdc_tokens.get(
@@ -297,16 +326,25 @@ class StripeDeliveryWorker:
             )
             try:
                 result_puzzle_hash = base_result_authorization_puzzle_hash(
-                    artifact=purchase,
+                    artifact=purchase_document,
                     evidence=operation.evidence,
                     return_puzzle_hash=bytes32.from_hexstr(
                         deployment.return_puzzle_hash
                     ),
                 )
-                receipt = build_base_settlement_receipt(
-                    artifact=purchase,
-                    evidence=operation.evidence,
-                    result_authorization_puzzle_hash=result_puzzle_hash,
+                receipt = (
+                    build_base_batch_settlement_receipt(
+                        batch=batch,
+                        evidence=operation.evidence,
+                        validator_pubkeys=validator_pubkeys,
+                        result_authorization_puzzle_hash=result_puzzle_hash,
+                    )
+                    if batch is not None
+                    else build_base_settlement_receipt(
+                        artifact=purchase,
+                        evidence=operation.evidence,
+                        result_authorization_puzzle_hash=result_puzzle_hash,
+                    )
                 )
             except (ValueError, PaymentArtifactError) as exc:
                 raise StripeDeliveryManualReview(
@@ -318,18 +356,33 @@ class StripeDeliveryWorker:
             raise StripeDeliveryManualReview(
                 "stored Stripe receipt hash differs from canonical evidence"
             )
-        terms = StripeSettlementTermsV1(
-            receipt=receipt,
-            validator_pubkeys=configured_validator_pubkeys(self.settings),
+        terms = (
+            PurchaseBatchSettlementTermsV1(
+                receipt=receipt,
+                validator_pubkeys=validator_pubkeys,
+            )
+            if batch is not None
+            else StripeSettlementTermsV1(
+                receipt=receipt,
+                validator_pubkeys=validator_pubkeys,
+            )
         )
         if receipt.result_authorization_puzzle_hash != result_puzzle_hash:
             raise StripeDeliveryManualReview(
                 "external receipt result authorization differs from deployment evidence"
             )
-        return purchase, receipt, terms
+        return purchase_document, receipt, terms
 
     def _stored_purchase(self, purchase_id: str) -> dict[str, Any]:
         return self._stored_record(purchase_id).purchase_artifact
+
+    def _stored_purchase_document(self, purchase_id: str):
+        raw = self._stored_purchase(purchase_id)
+        return (
+            purchase_batch_from_json(raw)
+            if raw.get("schema") == "solslot.purchase-batch.v1"
+            else purchase_artifact_v3_from_json(raw)
+        )
 
     def _stored_record(self, purchase_id: str):
         return get_payment_purchase_store(
@@ -340,20 +393,27 @@ class StripeDeliveryWorker:
         self,
         operation: StripeDeliveryOperation,
     ) -> StripeDeliveryOperation:
-        _purchase, _receipt, terms = self._receipt_terms(operation)
-        receipt_puzzle = curry_stripe_settlement_receipt(terms)
-        parent = await self._select_faucet_coin(1)
+        purchase, _receipt, terms = self._receipt_terms(operation)
+        receipt_amount = (
+            purchase.quantity if isinstance(purchase, PurchaseBatchV1) else 1
+        )
+        receipt_puzzle = (
+            curry_purchase_batch_settlement_receipt(terms)
+            if isinstance(purchase, PurchaseBatchV1)
+            else curry_stripe_settlement_receipt(terms)
+        )
+        parent = await self._select_faucet_coin(receipt_amount)
         conditions = [
             Program.to(
                 [
                     _CREATE_COIN,
                     bytes32(receipt_puzzle.get_tree_hash()),
-                    1,
+                    receipt_amount,
                     [terms.receipt.receipt_hash],
                 ]
             )
         ]
-        change = int(parent.amount) - 1
+        change = int(parent.amount) - receipt_amount
         if change:
             conditions.append(
                 Program.to(
@@ -374,7 +434,7 @@ class StripeDeliveryWorker:
         receipt_coin = Coin(
             bytes32(parent.name()),
             bytes32(receipt_puzzle.get_tree_hash()),
-            uint64(1),
+            uint64(receipt_amount),
         )
         return self.store.record_receipt_prepared(
             operation.purchase_id,
@@ -390,10 +450,11 @@ class StripeDeliveryWorker:
     ) -> StripeDeliveryOperation:
         if not operation.receipt_coin_id or not operation.receipt_funding_input_coin_id:
             raise StripeDeliveryManualReview("prepared receipt funding is incomplete")
+        receipt_amount = self._receipt_amount(operation)
         if await self._is_exact_confirmed_output(
             operation.receipt_coin_id,
             operation.receipt_puzzle_hash,
-            1,
+            receipt_amount,
             require_unspent=True,
         ):
             return self.store.record_receipt_confirmed(operation.purchase_id)
@@ -473,17 +534,41 @@ class StripeDeliveryWorker:
         if await self._is_exact_confirmed_output(
             operation.receipt_coin_id,
             operation.receipt_puzzle_hash,
-            1,
+            self._receipt_amount(operation),
             require_unspent=True,
         ):
             return self.store.record_receipt_confirmed(operation.purchase_id)
         return self.store.release_lease(operation.purchase_id)
 
+    def _receipt_amount(self, operation: StripeDeliveryOperation) -> int:
+        if operation.receipt_funding_bundle and operation.receipt_coin_id:
+            bundle = SpendBundle.from_json_dict(operation.receipt_funding_bundle)
+            matches = [
+                int(coin.amount)
+                for coin in bundle.additions()
+                if _hex32(coin.name()) == operation.receipt_coin_id.lower()
+            ]
+            if len(matches) != 1:
+                raise StripeDeliveryManualReview(
+                    "persisted receipt funding bundle has no exact receipt output"
+                )
+            return matches[0]
+        purchase = self._stored_purchase_document(operation.purchase_id)
+        return purchase.quantity if isinstance(purchase, PurchaseBatchV1) else 1
+
     async def _prepare_delivery(
         self,
         operation: StripeDeliveryOperation,
     ) -> StripeDeliveryOperation:
-        purchase, receipt, receipt_terms = self._receipt_terms(operation)
+        purchase_document, receipt, receipt_terms = self._receipt_terms(operation)
+        batch = (
+            purchase_document
+            if isinstance(purchase_document, PurchaseBatchV1)
+            else None
+        )
+        purchase = (
+            batch.artifacts[0] if batch is not None else purchase_document
+        )
         expected_rail = (
             PaymentRail.STRIPE
             if operation.payment_rail == PAYMENT_RAIL_STRIPE
@@ -498,6 +583,10 @@ class StripeDeliveryWorker:
         if receipt_coin is None:
             return self.store.release_lease(operation.purchase_id)
         if purchase.delivery_kind == PurchaseDeliveryKind.SGT:
+            if batch is not None:
+                raise StripeDeliveryManualReview(
+                    "SGT delivery cannot use a SmartDeed purchase batch"
+                )
             return await self._prepare_sgt_delivery(
                 operation=operation,
                 purchase=purchase,
@@ -508,6 +597,15 @@ class StripeDeliveryWorker:
         if purchase.delivery_kind != PurchaseDeliveryKind.SMARTDEED:
             raise StripeDeliveryManualReview(
                 "external purchase has an unsupported delivery kind"
+            )
+        if batch is not None:
+            return await self._prepare_smartdeed_batch_delivery(
+                operation=operation,
+                batch=batch,
+                receipt=receipt,
+                receipt_terms=receipt_terms,
+                receipt_coin=receipt_coin,
+                expected_rail=expected_rail,
             )
         context = await _load_context(
             self.settings,
@@ -586,7 +684,6 @@ class StripeDeliveryWorker:
             deed_singleton_struct=context.deed_struct,
             lineage_proof=context.deed_lineage,
             artifact=purchase,
-            signer_indices=quorum.signer_indices,
             terms=context.terms,
             reservation=context.reservation,
         )
@@ -631,6 +728,174 @@ class StripeDeliveryWorker:
             protocol_bundle=signed.to_json_dict(),
             delivery_output_coin_id=_hex32(deed_output.name()),
             treasury_output_coin_id=_hex32(treasury_output.name()),
+            signer_indices=quorum.signer_indices,
+        )
+
+    async def _prepare_smartdeed_batch_delivery(
+        self,
+        *,
+        operation: StripeDeliveryOperation,
+        batch: PurchaseBatchV1,
+        receipt: Any,
+        receipt_terms: PurchaseBatchSettlementTermsV1,
+        receipt_coin: Coin,
+        expected_rail: PaymentRail,
+    ) -> StripeDeliveryOperation:
+        group = await _load_context_group(
+            self.settings,
+            self.provider,
+            operation.purchase_id,
+            require_live=False,
+            allowed_rails=(expected_rail,),
+        )
+        if group.batch != batch or len(group.contexts) != batch.quantity:
+            raise StripeDeliveryManualReview(
+                "SmartDeed batch differs from its canonical inventory"
+            )
+        if any(context.reservation is None for context in group.contexts):
+            raise StripeDeliveryManualReview(
+                "SmartDeed batch reservation terms are incomplete"
+            )
+        first = group.contexts[0]
+        if any(
+            context.credential_receipt != first.credential_receipt
+            or context.credential_owner_auth_type
+            != first.credential_owner_auth_type
+            or context.credential_owner_key != first.credential_owner_key
+            for context in group.contexts[1:]
+        ):
+            raise StripeDeliveryManualReview(
+                "SmartDeed batch does not share one approved vault credential"
+            )
+        deed_items = tuple(
+            PrimaryPurchaseDeedItem(
+                deed_launcher_id=_hex32(context.purchase.deed_launcher_id),
+                deed_coin_id=_hex32(context.deed_coin.name()),
+                deed_puzzle_hash=_hex32(context.deed_coin.puzzle_hash),
+                smart_deed_inner_hash=_hex32(
+                    context.terms.smart_deed_inner_hash
+                ),
+                reservation_expires_at=int(context.reservation.expires_at),
+            )
+            for context in group.contexts
+            if context.reservation is not None
+        )
+        claim = StripeSettlementClaim(
+            network=self.settings.network,
+            genesis_artifact_hash=str(
+                first.genesis_artifact["artifactHash"]
+            ).lower(),
+            purchase_artifact=group.stored.purchase_artifact,
+            stripe_evidence=(
+                operation.evidence
+                if operation.payment_rail == PAYMENT_RAIL_STRIPE
+                else None
+            ),
+            base_evidence=(
+                operation.evidence
+                if operation.payment_rail == PAYMENT_RAIL_BASE_USDC
+                else None
+            ),
+            base_result_authorization_puzzle_hash=(
+                _hex32(receipt.result_authorization_puzzle_hash)
+                if operation.payment_rail == PAYMENT_RAIL_BASE_USDC
+                else None
+            ),
+            receipt_coin_id=_hex32(receipt_coin.name()),
+            receipt_puzzle_hash=_hex32(receipt_coin.puzzle_hash),
+            deed_items=deed_items,
+            protocol_puzzle_hash=_hex32(first.terms.protocol_puzhash),
+            credential_vault_coin_id=str(
+                first.credential_receipt["chiaVaultCoinId"]
+            ),
+            credential_identity_root=str(
+                first.credential_receipt["identityAttestRoot"]
+            ),
+            credential_policy_version=int(
+                first.credential_receipt["policyVersion"]
+            ),
+            credential_bridge_policy_hash=str(
+                first.credential_receipt["bridgePolicyHash"]
+            ),
+            credential_owner_auth_type=first.credential_owner_auth_type,
+            credential_owner_key="0x" + first.credential_owner_key.hex(),
+        )
+        quorum = await collect_stripe_settlement_quorum(self.settings, claim)
+        receipt_spend = build_purchase_batch_receipt_spend(
+            receipt_coin=receipt_coin,
+            terms=receipt_terms,
+            signer_indices=quorum.signer_indices,
+        )
+        item_terms = tuple(context.terms for context in group.contexts)
+        receipt_offer = prepare_purchase_batch_receipt_offer(
+            receipt_spend=receipt_spend,
+            receipt=receipt,
+            terms=item_terms,
+        )
+        primary = build_external_primary_batch_offer_v5(
+            receipt_offer=receipt_offer,
+            receipt_coin=receipt_coin,
+            receipt=receipt,
+            deed_coins=tuple(context.deed_coin for context in group.contexts),
+            deed_singleton_structs=tuple(
+                context.deed_struct for context in group.contexts
+            ),
+            lineage_proofs=tuple(
+                context.deed_lineage for context in group.contexts
+            ),
+            terms=item_terms,
+            reservations=tuple(
+                context.reservation
+                for context in group.contexts
+                if context.reservation is not None
+            ),
+        )
+        valid = primary.aggregate_offer.to_valid_spend()
+        signed = WalletSpendBundle(
+            valid.coin_spends,
+            AugSchemeMPL.aggregate(
+                [valid.aggregated_signature, quorum.aggregated_signature]
+            ),
+        )
+        additions = signed.additions()
+        delivery_outputs: list[Coin] = []
+        treasury_outputs: list[Coin] = []
+        for context in group.contexts:
+            vault_full = SINGLETON_MOD.curry(
+                context.deed_struct,
+                puzzle_for_p2_vault(batch.vault_launcher_id),
+            )
+            delivery_outputs.append(
+                _one_child_output(
+                    additions,
+                    parent_coin_id=context.deed_coin.name(),
+                    puzzle_hash=bytes32(vault_full.get_tree_hash()),
+                    amount=1,
+                    label="vault SmartDeed",
+                )
+            )
+            treasury_outputs.append(
+                _one_child_output(
+                    additions,
+                    parent_coin_id=context.deed_coin.name(),
+                    puzzle_hash=(
+                        receipt.result_authorization_puzzle_hash
+                        if operation.payment_rail == PAYMENT_RAIL_BASE_USDC
+                        else context.terms.protocol_puzhash
+                    ),
+                    amount=1,
+                    label="external settlement result",
+                )
+            )
+        delivery_ids = tuple(_hex32(coin.name()) for coin in delivery_outputs)
+        treasury_ids = tuple(_hex32(coin.name()) for coin in treasury_outputs)
+        return self.store.record_delivery_prepared(
+            operation.purchase_id,
+            protocol_bundle=signed.to_json_dict(),
+            delivery_output_coin_id=delivery_ids[0],
+            delivery_output_coin_ids=delivery_ids,
+            treasury_output_coin_id=treasury_ids[0],
+            treasury_output_coin_ids=treasury_ids,
             signer_indices=quorum.signer_indices,
         )
 
@@ -833,6 +1098,11 @@ class StripeDeliveryWorker:
             raise StripeDeliveryManualReview("prepared delivery bundle is missing")
         bundle = SpendBundle.from_json_dict(operation.delivery_bundle)
         input_ids = [_hex32(coin.name()) for coin in bundle.removals()]
+        delivery_output_ids, treasury_output_ids = _operation_output_ids(operation)
+        if not delivery_output_ids or not treasury_output_ids:
+            raise StripeDeliveryManualReview(
+                "prepared delivery output manifest is incomplete"
+            )
         for coin_id in input_ids:
             pending_id = await self._mempool_bundle_id(coin_id)
             if pending_id:
@@ -848,12 +1118,10 @@ class StripeDeliveryWorker:
                 return self.store.record_delivery_submission(
                     operation.purchase_id,
                     bundle_id=pending_id,
-                    delivery_output_coin_id=str(
-                        operation.expected_delivery_output_coin_id
-                    ),
-                    treasury_output_coin_id=str(
-                        operation.expected_treasury_output_coin_id
-                    ),
+                    delivery_output_coin_id=delivery_output_ids[0],
+                    delivery_output_coin_ids=delivery_output_ids,
+                    treasury_output_coin_id=treasury_output_ids[0],
+                    treasury_output_coin_ids=treasury_output_ids,
                     signer_indices=operation.signer_indices,
                     fee_mojos=prepared.fee_mojos,
                     mempool_observed_at=_utc_now(),
@@ -866,20 +1134,13 @@ class StripeDeliveryWorker:
             raise StripeDeliveryManualReview(
                 "delivery input was spent without both committed outputs"
             )
-        expected_output_ids = (
-            operation.expected_delivery_output_coin_id,
-            operation.expected_treasury_output_coin_id,
-        )
-        if any(value is None for value in expected_output_ids):
-            raise StripeDeliveryManualReview(
-                "prepared delivery output manifest is incomplete"
-            )
+        expected_output_ids = (*delivery_output_ids, *treasury_output_ids)
         request = self._exact_execution_request(
             operation,
             action=ExactExecutionAction.DELIVER,
             outputs=_bound_outputs(
                 operation.delivery_bundle,
-                tuple(str(value) for value in expected_output_ids),
+                expected_output_ids,
             ),
         )
         if operation.delivery_exact_bundle is None:
@@ -901,12 +1162,10 @@ class StripeDeliveryWorker:
         return self.store.record_delivery_submission(
             operation.purchase_id,
             bundle_id=str(result["spendBundleId"]).lower(),
-            delivery_output_coin_id=str(
-                operation.expected_delivery_output_coin_id
-            ),
-            treasury_output_coin_id=str(
-                operation.expected_treasury_output_coin_id
-            ),
+            delivery_output_coin_id=delivery_output_ids[0],
+            delivery_output_coin_ids=delivery_output_ids,
+            treasury_output_coin_id=treasury_output_ids[0],
+            treasury_output_coin_ids=treasury_output_ids,
             signer_indices=operation.signer_indices,
             fee_mojos=int(result["feeMojos"]),
             mempool_observed_at=_utc_now(),
@@ -919,8 +1178,11 @@ class StripeDeliveryWorker:
         action: ExactExecutionAction,
         outputs: tuple[ExactExecutionOutput, ...],
     ) -> ExactExecutionRequest:
-        purchase = purchase_artifact_v3_from_json(
-            self._stored_purchase(operation.purchase_id)
+        purchase = self._stored_purchase_document(operation.purchase_id)
+        purchase_hash = (
+            purchase.batch_hash
+            if isinstance(purchase, PurchaseBatchV1)
+            else purchase.artifact_hash
         )
         if _hex32(purchase.purchase_id) != operation.purchase_id.lower():
             raise StripeDeliveryManualReview(
@@ -929,7 +1191,7 @@ class StripeDeliveryWorker:
         return ExactExecutionRequest(
             action=action,
             purchase_id=purchase.purchase_id,
-            artifact_hash=purchase.artifact_hash,
+            artifact_hash=purchase_hash,
             claim_hash=bytes32.from_hexstr(operation.receipt_hash),
             expected_outputs=outputs,
         )
@@ -954,9 +1216,7 @@ class StripeDeliveryWorker:
         )
         if confirmed.payment_rail != PAYMENT_RAIL_BASE_USDC:
             return confirmed
-        purchase = purchase_artifact_v3_from_json(
-            self._stored_purchase(operation.purchase_id)
-        )
+        purchase = self._stored_purchase_document(operation.purchase_id)
         authorization_id, authorization = build_direct_settlement_authorization(
             operation=confirmed,
             purchase=purchase,
@@ -971,36 +1231,37 @@ class StripeDeliveryWorker:
         self,
         operation: StripeDeliveryOperation,
     ) -> int | None:
-        if not (
-            operation.expected_delivery_output_coin_id
-            and operation.expected_treasury_output_coin_id
-            and (operation.delivery_exact_bundle or operation.delivery_bundle)
+        delivery_output_ids, treasury_output_ids = _operation_output_ids(operation)
+        output_ids = (*delivery_output_ids, *treasury_output_ids)
+        if not output_ids or not (
+            operation.delivery_exact_bundle or operation.delivery_bundle
         ):
             return None
-        delivery_record = await self.provider.get_coin_record_by_name(
-            operation.expected_delivery_output_coin_id
-        )
-        treasury_record = await self.provider.get_coin_record_by_name(
-            operation.expected_treasury_output_coin_id
-        )
-        if not (
-            _is_confirmed(delivery_record)
-            and _is_confirmed(treasury_record)
-        ):
-            return None
-        heights = {
-            int(delivery_record.get("confirmed_block_index") or 0),
-            int(treasury_record.get("confirmed_block_index") or 0),
-        }
-        if len(heights) != 1:
-            raise StripeDeliveryManualReview(
-                "delivery asset and treasury outputs did not confirm atomically"
-            )
         bundle = (
             _prepared_from_binding(operation.delivery_exact_bundle).bundle
             if operation.delivery_exact_bundle is not None
             else SpendBundle.from_json_dict(operation.delivery_bundle)
         )
+        bundle_output_ids = {_hex32(coin.name()) for coin in bundle.additions()}
+        if any(coin_id not in bundle_output_ids for coin_id in output_ids):
+            raise StripeDeliveryManualReview(
+                "stored delivery output manifest differs from the exact bundle"
+            )
+        output_records = [
+            await self.provider.get_coin_record_by_name(coin_id)
+            for coin_id in output_ids
+        ]
+        if any(not _is_confirmed(record) for record in output_records):
+            return None
+        heights = {
+            int(record.get("confirmed_block_index") or 0)
+            for record in output_records
+            if isinstance(record, Mapping)
+        }
+        if len(heights) != 1:
+            raise StripeDeliveryManualReview(
+                "delivery assets and settlement outputs did not confirm atomically"
+            )
         input_records = [
             await self.provider.get_coin_record_by_name(_hex32(coin.name()))
             for coin in bundle.removals()
@@ -1102,6 +1363,44 @@ def _one_output(
             f"delivery must create exactly one {label}; found {len(matches)}"
         )
     return matches[0]
+
+
+def _one_child_output(
+    additions: list[Coin],
+    *,
+    parent_coin_id: bytes32,
+    puzzle_hash: bytes32,
+    amount: int,
+    label: str,
+) -> Coin:
+    matches = [
+        coin
+        for coin in additions
+        if coin.parent_coin_info == parent_coin_id
+        and coin.puzzle_hash == puzzle_hash
+        and int(coin.amount) == amount
+    ]
+    if len(matches) != 1:
+        raise StripeDeliveryManualReview(
+            f"delivery bundle has {len(matches)} exact {label} outputs"
+        )
+    return matches[0]
+
+
+def _operation_output_ids(
+    operation: StripeDeliveryOperation,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    delivery_ids = operation.expected_delivery_output_coin_ids or (
+        (str(operation.expected_delivery_output_coin_id),)
+        if operation.expected_delivery_output_coin_id
+        else ()
+    )
+    treasury_ids = operation.expected_treasury_output_coin_ids or (
+        (str(operation.expected_treasury_output_coin_id),)
+        if operation.expected_treasury_output_coin_id
+        else ()
+    )
+    return delivery_ids, treasury_ids
 
 
 def _bound_outputs(

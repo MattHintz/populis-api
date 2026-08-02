@@ -69,7 +69,7 @@ def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
         }
     finally:
         ledger.close()
-    assert version == SCHEMA_VERSION == 8
+    assert version == SCHEMA_VERSION == 9
     assert table is not None
     assert stripe_table is not None
     assert "deed_coin_id" in columns
@@ -139,6 +139,49 @@ def test_validator_will_not_sign_one_deed_for_two_primary_purchases() -> None:
         ledger.close()
 
 
+def test_primary_purchase_batch_is_recorded_atomically() -> None:
+    ledger = ValidatorLedger(":memory:")
+    values = {
+        "claim_hashes": ("0x" + "41" * 32, "0x" + "42" * 32),
+        "canonical_claims": (
+            '{"batch":"one","item":0}',
+            '{"batch":"one","item":1}',
+        ),
+        "purchase_ids": ("0x" + "43" * 32, "0x" + "44" * 32),
+        "deed_coin_ids": ("0x" + "45" * 32, "0x" + "46" * 32),
+        "signatures": ("0x" + "47" * 96, "0x" + "48" * 96),
+    }
+    try:
+        first = ledger.record_primary_purchase_batch_or_recover(**values)
+        assert ledger.record_primary_purchase_batch_or_recover(**values) == first
+        count = ledger._conn.execute(
+            "SELECT COUNT(*) FROM primary_purchase_signatures"
+        ).fetchone()[0]
+        with pytest.raises(ValidatorLedgerConflict, match="already authorized"):
+            ledger.record_primary_purchase_batch_or_recover(
+                **{
+                    **values,
+                    "claim_hashes": (
+                        "0x" + "49" * 32,
+                        "0x" + "4a" * 32,
+                    ),
+                    "canonical_claims": (
+                        '{"batch":"two","item":0}',
+                        '{"batch":"two","item":1}',
+                    ),
+                    "purchase_ids": (
+                        "0x" + "4b" * 32,
+                        "0x" + "4c" * 32,
+                    ),
+                }
+            )
+        assert ledger._conn.execute(
+            "SELECT COUNT(*) FROM primary_purchase_signatures"
+        ).fetchone()[0] == count
+    finally:
+        ledger.close()
+
+
 def test_stripe_settlement_retry_is_exact_and_rebinding_fails_closed() -> None:
     ledger = ValidatorLedger(":memory:")
     kwargs = {
@@ -162,6 +205,49 @@ def test_stripe_settlement_retry_is_exact_and_rebinding_fails_closed() -> None:
                     "receipt_coin_id": "0x" + "2e" * 32,
                 }
             )
+    finally:
+        ledger.close()
+
+
+def test_stripe_batch_settlement_is_atomic_and_idempotent() -> None:
+    ledger = ValidatorLedger(":memory:")
+    kwargs = {
+        "claim_hash": "0x" + "51" * 32,
+        "canonical_claim": '{"stripeBatch":"one"}',
+        "purchase_id": "0x" + "52" * 32,
+        "payment_intent_id": "pi_test_batch_one",
+        "receipt_coin_id": "0x" + "53" * 32,
+        "delivery_coin_ids": (
+            "0x" + "54" * 32,
+            "0x" + "55" * 32,
+        ),
+        "signature": "0x" + "56" * 96,
+    }
+    try:
+        first = ledger.record_stripe_settlement_batch_or_recover(**kwargs)
+        assert ledger.record_stripe_settlement_batch_or_recover(**kwargs) == first
+        rows = ledger._conn.execute(
+            """
+            SELECT delivery_coin_id
+            FROM stripe_settlement_delivery_locks
+            ORDER BY rowid
+            """
+        ).fetchall()
+        assert tuple(str(row[0]) for row in rows) == kwargs["delivery_coin_ids"]
+        with pytest.raises(ValidatorLedgerConflict, match="already authorized"):
+            ledger.record_stripe_settlement_batch_or_recover(
+                **{
+                    **kwargs,
+                    "claim_hash": "0x" + "57" * 32,
+                    "canonical_claim": '{"stripeBatch":"changed"}',
+                    "purchase_id": "0x" + "58" * 32,
+                    "payment_intent_id": "pi_test_batch_two",
+                    "receipt_coin_id": "0x" + "59" * 32,
+                }
+            )
+        assert ledger._conn.execute(
+            "SELECT COUNT(*) FROM stripe_settlement_signatures"
+        ).fetchone()[0] == 1
     finally:
         ledger.close()
 

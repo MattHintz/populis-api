@@ -56,7 +56,9 @@ class StripeDeliveryOperation:
     delivery_exact_bundle: dict[str, Any] | None
     delivery_bundle_id: str | None
     expected_delivery_output_coin_id: str | None
+    expected_delivery_output_coin_ids: tuple[str, ...]
     expected_treasury_output_coin_id: str | None
+    expected_treasury_output_coin_ids: tuple[str, ...]
     fee_mojos: int | None
     mempool_observed_at: str | None
     confirmation_height: int | None
@@ -75,6 +77,14 @@ class StripeDeliveryOperation:
             self.expected_delivery_output_coin_id
             if self.delivery_kind == DELIVERY_SMARTDEED
             else None
+        )
+
+    @property
+    def expected_deed_output_coin_ids(self) -> tuple[str, ...]:
+        return (
+            self.expected_delivery_output_coin_ids
+            if self.delivery_kind == DELIVERY_SMARTDEED
+            else ()
         )
 
     @property
@@ -115,7 +125,9 @@ class StripeDeliveryStore:
                     delivery_bundle_id TEXT UNIQUE,
                     expected_deed_output_coin_id TEXT UNIQUE,
                     expected_delivery_output_coin_id TEXT UNIQUE,
+                    expected_delivery_output_coin_ids_json TEXT NOT NULL DEFAULT '[]',
                     expected_treasury_output_coin_id TEXT,
+                    expected_treasury_output_coin_ids_json TEXT NOT NULL DEFAULT '[]',
                     fee_mojos INTEGER,
                     mempool_observed_at TEXT,
                     confirmation_height INTEGER,
@@ -209,6 +221,40 @@ class StripeDeliveryStore:
                     "ALTER TABLE stripe_delivery_operations "
                     "ADD COLUMN delivery_exact_bundle_json TEXT"
                 )
+            if "expected_delivery_output_coin_ids_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE stripe_delivery_operations "
+                    "ADD COLUMN expected_delivery_output_coin_ids_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+                for row in connection.execute(
+                    "SELECT purchase_id, expected_delivery_output_coin_id "
+                    "FROM stripe_delivery_operations "
+                    "WHERE expected_delivery_output_coin_id IS NOT NULL"
+                ).fetchall():
+                    connection.execute(
+                        "UPDATE stripe_delivery_operations "
+                        "SET expected_delivery_output_coin_ids_json=? "
+                        "WHERE purchase_id=?",
+                        (json.dumps([row[1]]), row[0]),
+                    )
+            if "expected_treasury_output_coin_ids_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE stripe_delivery_operations "
+                    "ADD COLUMN expected_treasury_output_coin_ids_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+                for row in connection.execute(
+                    "SELECT purchase_id, expected_treasury_output_coin_id "
+                    "FROM stripe_delivery_operations "
+                    "WHERE expected_treasury_output_coin_id IS NOT NULL"
+                ).fetchall():
+                    connection.execute(
+                        "UPDATE stripe_delivery_operations "
+                        "SET expected_treasury_output_coin_ids_json=? "
+                        "WHERE purchase_id=?",
+                        (json.dumps([row[1]]), row[0]),
+                    )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -541,15 +587,23 @@ class StripeDeliveryStore:
         *,
         bundle_id: str,
         delivery_output_coin_id: str | None = None,
+        delivery_output_coin_ids: tuple[str, ...] | None = None,
         treasury_output_coin_id: str,
+        treasury_output_coin_ids: tuple[str, ...] | None = None,
         signer_indices: tuple[int, ...],
         fee_mojos: int | None,
         mempool_observed_at: str,
         deed_output_coin_id: str | None = None,
     ) -> StripeDeliveryOperation:
-        output_coin_id = _delivery_output_id(
+        output_coin_ids = _delivery_output_ids(
             delivery_output_coin_id,
+            delivery_output_coin_ids,
             deed_output_coin_id,
+        )
+        treasury_coin_ids = _output_ids(
+            treasury_output_coin_id,
+            treasury_output_coin_ids,
+            "treasury",
         )
         return self._transition(
             purchase_id,
@@ -557,8 +611,14 @@ class StripeDeliveryStore:
             state=DELIVERY_SUBMITTED,
             values={
                 "delivery_bundle_id": bundle_id,
-                "expected_delivery_output_coin_id": output_coin_id,
-                "expected_treasury_output_coin_id": treasury_output_coin_id,
+                "expected_delivery_output_coin_id": output_coin_ids[0],
+                "expected_delivery_output_coin_ids_json": json.dumps(
+                    list(output_coin_ids)
+                ),
+                "expected_treasury_output_coin_id": treasury_coin_ids[0],
+                "expected_treasury_output_coin_ids_json": json.dumps(
+                    list(treasury_coin_ids)
+                ),
                 "signer_indices_json": json.dumps(list(signer_indices)),
                 "fee_mojos": fee_mojos,
                 "mempool_observed_at": mempool_observed_at,
@@ -587,13 +647,21 @@ class StripeDeliveryStore:
         *,
         protocol_bundle: Mapping[str, Any],
         delivery_output_coin_id: str | None = None,
+        delivery_output_coin_ids: tuple[str, ...] | None = None,
         treasury_output_coin_id: str,
+        treasury_output_coin_ids: tuple[str, ...] | None = None,
         signer_indices: tuple[int, ...],
         deed_output_coin_id: str | None = None,
     ) -> StripeDeliveryOperation:
-        output_coin_id = _delivery_output_id(
+        output_coin_ids = _delivery_output_ids(
             delivery_output_coin_id,
+            delivery_output_coin_ids,
             deed_output_coin_id,
+        )
+        treasury_coin_ids = _output_ids(
+            treasury_output_coin_id,
+            treasury_output_coin_ids,
+            "treasury",
         )
         return self._transition(
             purchase_id,
@@ -601,8 +669,14 @@ class StripeDeliveryStore:
             state=DELIVERY_PREPARED,
             values={
                 "delivery_bundle_json": _canonical_json(protocol_bundle),
-                "expected_delivery_output_coin_id": output_coin_id,
-                "expected_treasury_output_coin_id": treasury_output_coin_id,
+                "expected_delivery_output_coin_id": output_coin_ids[0],
+                "expected_delivery_output_coin_ids_json": json.dumps(
+                    list(output_coin_ids)
+                ),
+                "expected_treasury_output_coin_id": treasury_coin_ids[0],
+                "expected_treasury_output_coin_ids_json": json.dumps(
+                    list(treasury_coin_ids)
+                ),
                 "signer_indices_json": json.dumps(list(signer_indices)),
             },
         )
@@ -759,7 +833,15 @@ class StripeDeliveryStore:
                 existing = row[field]
                 if (
                     existing is not None
-                    and not (field == "signer_indices_json" and existing == "[]")
+                    and not (
+                        field
+                        in {
+                            "signer_indices_json",
+                            "expected_delivery_output_coin_ids_json",
+                            "expected_treasury_output_coin_ids_json",
+                        }
+                        and existing == "[]"
+                    )
                     and existing != value
                 ):
                     connection.execute("ROLLBACK")
@@ -835,7 +917,19 @@ def _record(row: sqlite3.Row) -> StripeDeliveryOperation:
         expected_delivery_output_coin_id=row[
             "expected_delivery_output_coin_id"
         ],
+        expected_delivery_output_coin_ids=tuple(
+            str(value)
+            for value in json.loads(
+                str(row["expected_delivery_output_coin_ids_json"])
+            )
+        ),
         expected_treasury_output_coin_id=row["expected_treasury_output_coin_id"],
+        expected_treasury_output_coin_ids=tuple(
+            str(value)
+            for value in json.loads(
+                str(row["expected_treasury_output_coin_ids_json"])
+            )
+        ),
         fee_mojos=(int(row["fee_mojos"]) if row["fee_mojos"] is not None else None),
         mempool_observed_at=row["mempool_observed_at"],
         confirmation_height=(
@@ -874,18 +968,39 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
     )
 
 
-def _delivery_output_id(
+def _delivery_output_ids(
     delivery_output_coin_id: str | None,
+    delivery_output_coin_ids: tuple[str, ...] | None,
     deed_output_coin_id: str | None,
-) -> str:
+) -> tuple[str, ...]:
     values = {
         value
         for value in (delivery_output_coin_id, deed_output_coin_id)
         if value is not None
     }
+    if delivery_output_coin_ids is not None:
+        if values and values != {delivery_output_coin_ids[0]}:
+            raise ValueError("singular delivery output differs from its batch")
+        return _output_ids(None, delivery_output_coin_ids, "delivery")
     if len(values) != 1:
         raise ValueError("exactly one delivery output coin ID is required")
-    return values.pop()
+    return _output_ids(values.pop(), None, "delivery")
+
+
+def _output_ids(
+    singular: str | None,
+    plural: tuple[str, ...] | None,
+    label: str,
+) -> tuple[str, ...]:
+    values = tuple(plural or (() if singular is None else (singular,)))
+    if not values or len(values) > 100:
+        raise ValueError(f"{label} output manifest must contain 1..100 coin IDs")
+    normalized = tuple(value.lower() for value in values)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{label} output manifest contains duplicate coin IDs")
+    if singular is not None and normalized[0] != singular.lower():
+        raise ValueError(f"{label} output manifest changes its primary coin ID")
+    return normalized
 
 
 def _external_payment_id(

@@ -137,3 +137,30 @@ def test_one_active_reservation_per_smartdeed(tmp_path) -> None:
             signer_indices=(1, 2),
             signature="0x" + "7" * 192,
         )
+
+
+def test_batch_store_preserves_every_exact_smartdeed(tmp_path) -> None:
+    store = PaymentPurchaseStore(str(tmp_path / "purchases.db"))
+    batch = {
+        "schema": "solslot.purchase-batch.v1",
+        "purchaseId": _hex32("1"),
+        "batchHash": _hex32("2"),
+        "artifacts": [
+            _artifact(purchase="3", deed="a"),
+            _artifact(purchase="5", deed="b"),
+        ],
+    }
+    stored = store.save(
+        purchase_intent_id="intent-batch",
+        rail="chia_xch",
+        offer_artifact_hash="sha256:" + "9" * 64,
+        offer_artifact={"purchase": "batch"},
+        purchase_artifact=batch,
+        created_at=1,
+    )
+
+    assert stored.purchase_id == batch["purchaseId"]
+    assert stored.artifact_hash == batch["batchHash"]
+    assert stored.deed_launcher_ids == (_hex32("a"), _hex32("b"))
+    assert stored.deed_launcher_id == _hex32("a")
+    assert stored.quote_expires_at == 2_000_000_000

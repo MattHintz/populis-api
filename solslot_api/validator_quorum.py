@@ -20,17 +20,25 @@ from solslot_puzzles.zkpassport_bridge_driver import require_genesis_validator_s
 from solslot_puzzles.payment_artifacts_v2 import PaymentRail
 from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseDeliveryKind,
+    STRIPE_PAYMENT_PROVIDER_ID,
+    build_purchase_batch_settlement_receipt_v1,
     build_stripe_settlement_receipt_v1,
     purchase_artifact_v3_from_json,
+    purchase_batch_from_json,
     stripe_settlement_evidence_from_json,
 )
 from solslot_puzzles.stripe_settlement_v1_driver import (
+    PurchaseBatchSettlementTermsV1,
     StripeSettlementTermsV1,
+    purchase_batch_settlement_authorization_message,
     stripe_settlement_authorization_message,
 )
 
 from .config import Settings
-from .external_settlement import build_base_settlement_receipt
+from .external_settlement import (
+    build_base_batch_settlement_receipt,
+    build_base_settlement_receipt,
+)
 from .faucet import AGG_SIG_ME_DATA
 
 
@@ -145,6 +153,26 @@ class ValidatorClaim(BaseModel):
         )
 
 
+class PrimaryPurchaseDeedItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deed_launcher_id: str
+    deed_coin_id: str
+    deed_puzzle_hash: str
+    smart_deed_inner_hash: str
+    reservation_expires_at: int = Field(..., ge=1)
+
+    @field_validator(
+        "deed_launcher_id",
+        "deed_coin_id",
+        "deed_puzzle_hash",
+        "smart_deed_inner_hash",
+    )
+    @classmethod
+    def _hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+
 class PrimaryPurchaseClaim(BaseModel):
     """Public evidence for one governed native SmartDeed delivery."""
 
@@ -165,6 +193,7 @@ class PrimaryPurchaseClaim(BaseModel):
     credential_bridge_policy_hash: str
     credential_owner_auth_type: int
     credential_owner_key: str
+    deed_items: tuple[PrimaryPurchaseDeedItem, ...] = ()
 
     @field_validator(
         "genesis_artifact_hash",
@@ -212,21 +241,68 @@ class PrimaryPurchaseClaim(BaseModel):
 
     def purchase_artifact_hash(self) -> str:
         value = self.purchase_artifact.get("artifactHash")
+        if value is None:
+            value = self.purchase_artifact.get("batchHash")
         if not isinstance(value, str):
             raise ValidatorQuorumError("purchase artifact has no artifact hash")
-        return _hex(value, 32, "artifactHash")
+        return _hex(value, 32, "artifactHash or batchHash")
 
-    def signature_message(self) -> bytes:
+    def delivery_items(self) -> tuple[PrimaryPurchaseDeedItem, ...]:
+        if self.purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
+            if not self.deed_items:
+                raise ValidatorQuorumError("purchase batch has no deed evidence")
+            return self.deed_items
+        if self.deed_items:
+            raise ValidatorQuorumError(
+                "single purchase cannot carry batch deed evidence"
+            )
+        return (
+            PrimaryPurchaseDeedItem(
+                deed_launcher_id=str(
+                    self.purchase_artifact.get("deedLauncherId") or ""
+                ),
+                deed_coin_id=self.deed_coin_id,
+                deed_puzzle_hash=self.deed_puzzle_hash,
+                smart_deed_inner_hash=self.smart_deed_inner_hash,
+                reservation_expires_at=self.reservation_expires_at,
+            ),
+        )
+
+    def delivery_coin_id(self) -> str:
+        return self.delivery_items()[0].deed_coin_id
+
+    def signature_messages(self) -> tuple[bytes, ...]:
         additional_data = AGG_SIG_ME_DATA.get(self.network)
         if additional_data is None:
             raise ValidatorQuorumError(
                 f"unsupported Chia network: {self.network}"
             )
+        if self.purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
+            batch = purchase_batch_from_json(self.purchase_artifact)
+            items = self.delivery_items()
+            if len(items) != len(batch.artifacts):
+                raise ValidatorQuorumError(
+                    "purchase batch deed evidence is incomplete"
+                )
+            return tuple(
+                bytes(artifact.artifact_hash)
+                + bytes.fromhex(item.deed_coin_id[2:])
+                + additional_data
+                for artifact, item in zip(batch.artifacts, items, strict=True)
+            )
         return (
             bytes.fromhex(self.purchase_artifact_hash()[2:])
             + bytes.fromhex(self.deed_coin_id[2:])
-            + additional_data
+            + additional_data,
         )
+
+    def signature_message(self) -> bytes:
+        messages = self.signature_messages()
+        if len(messages) != 1:
+            raise ValidatorQuorumError(
+                "batch purchase uses aggregate validator signature messages"
+            )
+        return messages[0]
 
 
 class InventoryReservationClaim(BaseModel):
@@ -340,6 +416,7 @@ class StripeSettlementClaim(BaseModel):
     credential_bridge_policy_hash: str
     credential_owner_auth_type: int
     credential_owner_key: str
+    deed_items: tuple[PrimaryPurchaseDeedItem, ...] = ()
 
     @field_validator(
         "genesis_artifact_hash",
@@ -379,7 +456,20 @@ class StripeSettlementClaim(BaseModel):
         object.__setattr__(self, "credential_owner_key", normalized)
         if self.credential_owner_auth_type == 1:
             G1Element.from_bytes(bytes.fromhex(normalized[2:]))
-        purchase = purchase_artifact_v3_from_json(self.purchase_artifact)
+        is_batch = (
+            self.purchase_artifact.get("schema")
+            == "solslot.purchase-batch.v1"
+        )
+        batch = (
+            purchase_batch_from_json(self.purchase_artifact)
+            if is_batch
+            else None
+        )
+        purchase = (
+            batch.artifacts[0]
+            if batch is not None
+            else purchase_artifact_v3_from_json(self.purchase_artifact)
+        )
         if purchase.rail == PaymentRail.STRIPE:
             if (
                 self.stripe_evidence is None
@@ -397,12 +487,7 @@ class StripeSettlementClaim(BaseModel):
         else:
             raise ValueError("external claim has an unsupported payment rail")
         if purchase.delivery_kind == PurchaseDeliveryKind.SMARTDEED:
-            if None in {
-                self.deed_coin_id,
-                self.deed_puzzle_hash,
-                self.smart_deed_inner_hash,
-                self.reservation_expires_at,
-            } or any(
+            if any(
                 value is not None
                 for value in (
                     self.sgt_sale_coin_id,
@@ -412,6 +497,42 @@ class StripeSettlementClaim(BaseModel):
                 )
             ):
                 raise ValueError("SmartDeed claim has inconsistent delivery evidence")
+            if batch is not None:
+                if any(
+                    value is not None
+                    for value in (
+                        self.deed_coin_id,
+                        self.deed_puzzle_hash,
+                        self.smart_deed_inner_hash,
+                        self.reservation_expires_at,
+                    )
+                ):
+                    raise ValueError(
+                        "SmartDeed batch cannot carry singular deed evidence"
+                    )
+                if len(self.deed_items) != len(batch.artifacts):
+                    raise ValueError(
+                        "SmartDeed batch claim has incomplete deed evidence"
+                    )
+                if any(
+                    item.deed_launcher_id
+                    != "0x" + bytes(artifact.deed_launcher_id).hex()
+                    for artifact, item in zip(
+                        batch.artifacts,
+                        self.deed_items,
+                        strict=True,
+                    )
+                ):
+                    raise ValueError(
+                        "SmartDeed batch claim changes canonical deed order"
+                    )
+            elif self.deed_items or None in {
+                self.deed_coin_id,
+                self.deed_puzzle_hash,
+                self.smart_deed_inner_hash,
+                self.reservation_expires_at,
+            }:
+                raise ValueError("single SmartDeed claim requires one deed")
         elif purchase.delivery_kind == PurchaseDeliveryKind.SGT:
             if None in {
                 self.sgt_sale_coin_id,
@@ -438,6 +559,36 @@ class StripeSettlementClaim(BaseModel):
             raise ValidatorQuorumError("external claim has no delivery coin")
         return value
 
+    def delivery_items(self) -> tuple[PrimaryPurchaseDeedItem, ...]:
+        if self.purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
+            if not self.deed_items:
+                raise ValidatorQuorumError(
+                    "external purchase batch has no deed evidence"
+                )
+            return self.deed_items
+        if self.deed_items:
+            raise ValidatorQuorumError(
+                "single external purchase cannot carry batch deed evidence"
+            )
+        if None in {
+            self.deed_coin_id,
+            self.deed_puzzle_hash,
+            self.smart_deed_inner_hash,
+            self.reservation_expires_at,
+        }:
+            return ()
+        return (
+            PrimaryPurchaseDeedItem(
+                deed_launcher_id=str(
+                    self.purchase_artifact.get("deedLauncherId") or ""
+                ),
+                deed_coin_id=str(self.deed_coin_id),
+                deed_puzzle_hash=str(self.deed_puzzle_hash),
+                smart_deed_inner_hash=str(self.smart_deed_inner_hash),
+                reservation_expires_at=int(self.reservation_expires_at),
+            ),
+        )
+
     def canonical_hash(self) -> str:
         encoded = json.dumps(
             self.model_dump(mode="json"),
@@ -462,7 +613,52 @@ class StripeSettlementClaim(BaseModel):
             raise ValidatorQuorumError(
                 f"unsupported Chia network: {self.network}"
             )
-        purchase = purchase_artifact_v3_from_json(self.purchase_artifact)
+        batch = (
+            purchase_batch_from_json(self.purchase_artifact)
+            if self.purchase_artifact.get("schema")
+            == "solslot.purchase-batch.v1"
+            else None
+        )
+        purchase = (
+            batch.artifacts[0]
+            if batch is not None
+            else purchase_artifact_v3_from_json(self.purchase_artifact)
+        )
+        if batch is not None:
+            if purchase.rail == PaymentRail.STRIPE:
+                assert self.stripe_evidence is not None
+                evidence = stripe_settlement_evidence_from_json(
+                    self.stripe_evidence
+                )
+                receipt = build_purchase_batch_settlement_receipt_v1(
+                    batch=batch,
+                    provider_id=STRIPE_PAYMENT_PROVIDER_ID,
+                    external_reference_hash=evidence.payment_reference_hash,
+                    evidence_hash=evidence.evidence_hash,
+                    observed_at=evidence.observed_at,
+                    validator_pubkeys=validator_pubkeys,
+                    collected_amount_minor=evidence.amount_minor,
+                    processing_charge_minor=evidence.processing_charge_minor,
+                )
+            else:
+                assert self.base_evidence is not None
+                receipt = build_base_batch_settlement_receipt(
+                    batch=batch,
+                    evidence=self.base_evidence,
+                    validator_pubkeys=validator_pubkeys,
+                    result_authorization_puzzle_hash=bytes32.from_hexstr(
+                        str(self.base_result_authorization_puzzle_hash)
+                    ),
+                )
+            terms = PurchaseBatchSettlementTermsV1(
+                receipt=receipt,
+                validator_pubkeys=validator_pubkeys,
+            )
+            return (
+                bytes(purchase_batch_settlement_authorization_message(terms))
+                + bytes.fromhex(self.receipt_coin_id[2:])
+                + additional_data,
+            )
         if purchase.rail == PaymentRail.STRIPE:
             assert self.stripe_evidence is not None
             evidence = stripe_settlement_evidence_from_json(self.stripe_evidence)
@@ -484,18 +680,11 @@ class StripeSettlementClaim(BaseModel):
             receipt=receipt,
             validator_pubkeys=validator_pubkeys,
         )
-        messages = [
+        return (
             bytes(stripe_settlement_authorization_message(terms))
             + bytes.fromhex(self.receipt_coin_id[2:])
-            + additional_data
-        ]
-        if purchase.delivery_kind == PurchaseDeliveryKind.SMARTDEED:
-            messages.append(
-                bytes(purchase.artifact_hash)
-                + bytes.fromhex(self.delivery_coin_id()[2:])
-                + additional_data
-            )
-        return tuple(messages)
+            + additional_data,
+        )
 
 
 class VoucherIssuanceClaim(BaseModel):
@@ -1095,7 +1284,7 @@ async def collect_primary_purchase_quorum(
 
     pubkeys = configured_validator_pubkeys(settings)
     claim_hash = claim.canonical_hash()
-    message = claim.signature_message()
+    messages = claim.signature_messages()
     owns_client = client is None
     if client is None:
         client = _private_validator_client(settings)
@@ -1128,11 +1317,17 @@ async def collect_primary_purchase_quorum(
             signature = G2Element.from_bytes(
                 bytes.fromhex(parsed.signature.removeprefix("0x"))
             )
-            if not AugSchemeMPL.verify(
-                G1Element.from_bytes(configured_pubkey),
-                message,
-                signature,
-            ):
+            signer_key = G1Element.from_bytes(configured_pubkey)
+            valid_signature = (
+                AugSchemeMPL.verify(signer_key, messages[0], signature)
+                if len(messages) == 1
+                else AugSchemeMPL.aggregate_verify(
+                    [signer_key] * len(messages),
+                    list(messages),
+                    signature,
+                )
+            )
+            if not valid_signature:
                 raise ValueError("invalid validator signature")
             return index, signature
         except Exception as exc:  # noqa: BLE001
@@ -1581,6 +1776,7 @@ async def collect_voucher_series_phase_quorum(
 __all__ = [
     "ValidatorClaim",
     "PrimaryPurchaseClaim",
+    "PrimaryPurchaseDeedItem",
     "StripeSettlementClaim",
     "VoucherIssuanceClaim",
     "VoucherSeriesPhaseClaim",

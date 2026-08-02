@@ -10,6 +10,7 @@ from chia_rs import SpendBundle
 from solslot_puzzles.payment_artifacts_v2 import PaymentArtifactError, PaymentRail
 from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseArtifactV3,
+    PurchaseBatchV1,
     PurchaseDeliveryKind,
 )
 
@@ -27,21 +28,33 @@ SCHEMA = "solslot.base-direct-settlement-authorization.v1"
 def build_direct_settlement_authorization(
     *,
     operation: StripeDeliveryOperation,
-    purchase: PurchaseArtifactV3,
+    purchase: PurchaseArtifactV3 | PurchaseBatchV1,
 ) -> tuple[str, dict[str, Any]]:
+    batch = purchase if isinstance(purchase, PurchaseBatchV1) else None
+    canonical = batch.artifacts[0] if batch is not None else purchase
     if (
         operation.payment_rail != PAYMENT_RAIL_BASE_USDC
         or operation.state != EXTERNAL_SETTLEMENT_PENDING
-        or purchase.rail != PaymentRail.EVM_TEST_USD
+        or canonical.rail != PaymentRail.EVM_TEST_USD
     ):
         raise PaymentArtifactError("Base direct delivery is not ready to settle")
+    delivery_output_ids = _operation_output_ids(
+        operation,
+        plural_name="expected_delivery_output_coin_ids",
+        singular_name="expected_delivery_output_coin_id",
+    )
+    result_output_ids = _operation_output_ids(
+        operation,
+        plural_name="expected_treasury_output_coin_ids",
+        singular_name="expected_treasury_output_coin_id",
+    )
     if not all(
         (
             operation.delivery_bundle,
             operation.delivery_bundle_id,
             operation.receipt_coin_id,
-            operation.expected_delivery_output_coin_id,
-            operation.expected_treasury_output_coin_id,
+            delivery_output_ids,
+            result_output_ids,
             operation.confirmation_height,
         )
     ):
@@ -50,18 +63,18 @@ def build_direct_settlement_authorization(
     receipt_id = str(operation.receipt_coin_id).lower()
     removals = {"0x" + coin.name().hex(): coin for coin in bundle.removals()}
     additions = {"0x" + coin.name().hex(): coin for coin in bundle.additions()}
-    delivery_output_id = str(
-        operation.expected_delivery_output_coin_id
-    ).lower()
-    result_output_id = str(
-        operation.expected_treasury_output_coin_id
-    ).lower()
-    delivery_output = additions.get(delivery_output_id)
-    result_output = additions.get(result_output_id)
-    if delivery_output is None or result_output is None:
+    delivery_outputs = tuple(additions.get(value) for value in delivery_output_ids)
+    result_outputs = tuple(additions.get(value) for value in result_output_ids)
+    if any(value is None for value in (*delivery_outputs, *result_outputs)):
         raise PaymentArtifactError("Base direct committed outputs are missing")
-    delivery_input_id = "0x" + delivery_output.parent_coin_info.hex()
-    if receipt_id not in removals or delivery_input_id not in removals:
+    delivery_input_ids = tuple(
+        "0x" + value.parent_coin_info.hex()
+        for value in delivery_outputs
+        if value is not None
+    )
+    if receipt_id not in removals or any(
+        value not in removals for value in delivery_input_ids
+    ):
         raise PaymentArtifactError("Base direct committed inputs are missing")
     source = operation.evidence.get("source")
     if not isinstance(source, dict):
@@ -76,37 +89,48 @@ def build_direct_settlement_authorization(
         "outcome": "DELIVERED",
         "globalPaymentId": global_payment_id,
         "purchaseId": "0x" + purchase.purchase_id.hex(),
-        "purchaseArtifactHash": "0x" + purchase.artifact_hash.hex(),
+        "purchaseArtifactHash": "0x" + (
+            purchase.batch_hash if batch is not None else purchase.artifact_hash
+        ).hex(),
         "deliveryKind": (
             "SMARTDEED"
-            if purchase.delivery_kind == PurchaseDeliveryKind.SMARTDEED
+            if canonical.delivery_kind == PurchaseDeliveryKind.SMARTDEED
             else "SGT"
         ),
-        "deliveryAssetId": "0x" + purchase.delivery_asset_id.hex(),
-        "deliveryAmount": int(purchase.delivery_amount),
-        "deliveryContextHash": "0x" + purchase.delivery_context_hash.hex(),
-        "vaultLauncherId": "0x" + purchase.vault_launcher_id.hex(),
-        "vaultP2PuzzleHash": "0x" + purchase.vault_p2_puzzle_hash.hex(),
+        "deliveryAssetId": "0x" + canonical.delivery_asset_id.hex(),
+        "deliveryAssetIds": [
+            "0x" + value.delivery_asset_id.hex()
+            for value in (batch.artifacts if batch is not None else (canonical,))
+        ],
+        "deliveryAmount": batch.quantity if batch is not None else int(canonical.delivery_amount),
+        "deliveryContextHash": "0x" + canonical.delivery_context_hash.hex(),
+        "vaultLauncherId": "0x" + canonical.vault_launcher_id.hex(),
+        "vaultP2PuzzleHash": "0x" + canonical.vault_p2_puzzle_hash.hex(),
         "originalPayer": "0x" + (bytes(12) + _address(
             str(operation.evidence.get("depositor") or ""),
             "original payer",
         )).hex(),
         "payment": {
             "rail": "BASE_SEPOLIA_USDC",
-            "chainId": int(purchase.rail_chain_id),
-            "assetId": "0x" + purchase.rail_asset_id.hex(),
-            "assetDecimals": int(purchase.rail_asset_decimals),
+            "chainId": int(canonical.rail_chain_id),
+            "assetId": "0x" + canonical.rail_asset_id.hex(),
+            "assetDecimals": int(canonical.rail_asset_decimals),
             "escrowContract": "0x" + (bytes(12) + spoke).hex(),
-            "principal": int(purchase.rail_amount),
+            "principal": int(
+                batch.total_rail_amount if batch is not None else canonical.rail_amount
+            ),
             "evidenceHash": "0x" + base_evidence_hash(operation.evidence).hex(),
         },
         "chia": {
             "spendBundleId": str(operation.delivery_bundle_id).lower(),
             "confirmedHeight": int(operation.confirmation_height),
             "externalReceiptInputCoinId": receipt_id,
-            "deliveryInputCoinId": delivery_input_id,
-            "deliveryOutputCoinId": delivery_output_id,
-            "resultAuthorizationCoinId": result_output_id,
+            "deliveryInputCoinId": delivery_input_ids[0],
+            "deliveryInputCoinIds": list(delivery_input_ids),
+            "deliveryOutputCoinId": delivery_output_ids[0],
+            "deliveryOutputCoinIds": list(delivery_output_ids),
+            "resultAuthorizationCoinId": result_output_ids[0],
+            "resultAuthorizationCoinIds": list(result_output_ids),
         },
     }
     encoded = json.dumps(
@@ -116,6 +140,19 @@ def build_direct_settlement_authorization(
         ensure_ascii=True,
     ).encode("ascii")
     return "0x" + sha256(encoded).hexdigest(), authorization
+
+
+def _operation_output_ids(
+    operation: StripeDeliveryOperation,
+    *,
+    plural_name: str,
+    singular_name: str,
+) -> tuple[str, ...]:
+    plural = getattr(operation, plural_name, ()) or ()
+    if plural:
+        return tuple(str(value).lower() for value in plural)
+    singular = getattr(operation, singular_name, None)
+    return (str(singular).lower(),) if singular else ()
 
 
 def _address(value: str, label: str) -> bytes:
