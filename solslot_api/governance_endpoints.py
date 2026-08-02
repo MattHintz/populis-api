@@ -783,6 +783,7 @@ async def claim_external_sgt_purchase_artifact(
             "deliveryKind": "sgt",
             "deliveryAssetId": "0x" + purchase.delivery_asset_id.hex(),
             "deliveryAmount": str(purchase.delivery_amount),
+            "quantity": purchase.delivery_amount,
             "deliveryContextHash": "0x" + purchase.delivery_context_hash.hex(),
         }
         envelope = {

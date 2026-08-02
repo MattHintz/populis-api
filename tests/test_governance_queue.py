@@ -328,6 +328,7 @@ async def test_external_sgt_purchase_uses_shared_verified_offer_envelope(
     envelope = response["artifact"]
     assert envelope["protocol"]["deliveryKind"] == "sgt"
     assert envelope["protocol"]["deliveryAmount"] == "500"
+    assert envelope["protocol"]["quantity"] == 500
     assert envelope["protocol"]["collectionId"] == "0x" + "00" * 32
     assert envelope["paymentTerms"]["gross_usd_amount_minor"] == "101000"
     assert _artifact_rejection_reasons(
