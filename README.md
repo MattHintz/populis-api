@@ -37,6 +37,9 @@ share allocation, or delivery address.
   from `SOLSLOT_PAYMENT_ORACLE_OPERATOR_PUBKEYS`.
 - `SOLSLOT_PAYMENT_ORACLE_ALLOWED_CAT_ASSET_IDS` is the explicit native CAT
   allowlist.
+- `SOLSLOT_SGT_WUSDC_B_ASSET_ID` names the one wUSDC.b CAT accepted by the SGT
+  allocation desk. It must also appear in the oracle CAT allowlist. The admin
+  UI never accepts an arbitrary CAT asset ID.
 - `SOLSLOT_PAYMENT_EVM_USDC_TOKENS` must contain exactly one binding when the
   omnichain rail is enabled. Alpha binds Base Sepolia chain `84532` to Circle
   USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` and accepts no USDT.
@@ -69,6 +72,29 @@ share allocation, or delivery address.
   purchase and replay ledger.
 - `SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN` protects server-to-server purchase
   construction and finalization.
+- `SOLSLOT_PURCHASE_OPERATIONS_SERVICE_URL` and
+  `SOLSLOT_PURCHASE_OPERATIONS_TOKEN` connect the administrator Sales desk to
+  the durable backend ledger. Configure both or neither. The URL must use TLS,
+  except that `http://127.0.0.1` is accepted for same-host deployment. Use the
+  same generated token in the backend and never expose it to either Angular
+  build.
+- External SmartDeed and governed SGT delivery is controlled by
+  `SOLSLOT_STRIPE_SETTLEMENT_ENABLED` and
+  `SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED`. The worker also requires protocol
+  fee funding, mint writes, and a signed `purchases` operation window; a
+  partial configuration fails closed. Store its SQLite-WAL ledger outside the
+  release directory with `SOLSLOT_STRIPE_DELIVERY_DB_PATH`. Interval and lease
+  settings are bounded by `SOLSLOT_STRIPE_DELIVERY_INTERVAL_SECONDS` and
+  `SOLSLOT_STRIPE_DELIVERY_LEASE_SECONDS`. The worker persists each exact
+  receipt-funding and delivery bundle before submission, then finalizes only
+  after the expected asset and coordination output coins confirm atomically.
+  The same durable worker handles reviewed Base Sepolia USDC when
+  `SOLSLOT_PAYMENT_OMNICHAIN_ENABLED=true`; Base remains pending until Samuel
+  relays the one-use Chia result and the API independently verifies the final
+  escrow payout. Each isolated validator must receive the reviewed return
+  puzzle as `SOLSLOT_VALIDATOR_BASE_RETURN_PUZZLE_HASH`, alongside its existing
+  Base RPC, spoke, and official USDC settings. The hash must match the Samuel
+  `send_bridge_message` curry in the signed omnichain evidence.
 
 Native XCH and CAT purchases are completed as standard atomic Chia offer files.
 The sealed USD target raise and deed share determine the exact integer USD

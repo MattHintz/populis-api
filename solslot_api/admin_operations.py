@@ -34,6 +34,7 @@ ALLOWED_OPERATIONS = frozenset(
         "mint.cancel",
         "mint.execute",
         "mint.publish",
+        "sgt.allocate",
         "presale.create",
         "presale.cancel",
         "presale.launch",

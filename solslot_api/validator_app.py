@@ -12,7 +12,9 @@ from pydantic import BaseModel, ConfigDict
 from .release_metadata import load_release_metadata
 from .validator_ledger import ValidatorLedger
 from .validator_quorum import (
+    InventoryReservationClaim,
     PrimaryPurchaseClaim,
+    StripeSettlementClaim,
     ValidatorClaim,
     ValidatorSignatureResponse,
     VoucherIssuanceClaim,
@@ -24,7 +26,9 @@ from .validator_service import (
     load_validator_artifact,
     load_validator_private_key,
     sign_validator_claim,
+    sign_inventory_reservation_claim,
     sign_primary_purchase_claim,
+    sign_stripe_settlement_claim,
     sign_voucher_issuance_claim,
     sign_voucher_series_phase_claim,
     sign_voucher_transition_claim,
@@ -43,6 +47,20 @@ class PrimaryPurchaseSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim: PrimaryPurchaseClaim
+    claimHash: str
+
+
+class InventoryReservationSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: InventoryReservationClaim
+    claimHash: str
+
+
+class StripeSettlementSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: StripeSettlementClaim
     claimHash: str
 
 
@@ -181,6 +199,36 @@ def create_validator_app(
         )
 
     @application.post(
+        "/v1/inventory-reservation/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_inventory_reservation(
+        request: InventoryReservationSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_inventory_reservation_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
         "/v1/primary-purchase/sign",
         response_model=ValidatorSignatureResponse,
     )
@@ -221,6 +269,36 @@ def create_validator_app(
         active_ledger: ValidatorLedger = application.state.validator_ledger
         try:
             signature = sign_voucher_issuance_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/stripe-settlement/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    def sign_stripe_settlement(
+        request: StripeSettlementSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = sign_stripe_settlement_claim(
                 signer_settings,
                 active_ledger,
                 request.claim,

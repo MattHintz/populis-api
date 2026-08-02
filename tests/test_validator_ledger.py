@@ -58,6 +58,9 @@ def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
         table = ledger._conn.execute(
             "SELECT name FROM sqlite_master WHERE name = 'voucher_series_phase_signatures'"
         ).fetchone()
+        stripe_table = ledger._conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'stripe_settlement_signatures'"
+        ).fetchone()
         columns = {
             row[1]
             for row in ledger._conn.execute(
@@ -66,9 +69,35 @@ def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
         }
     finally:
         ledger.close()
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION == 8
     assert table is not None
+    assert stripe_table is not None
     assert "deed_coin_id" in columns
+
+
+def test_inventory_reservation_retry_is_exact_and_rebinding_fails_closed() -> None:
+    ledger = ValidatorLedger(":memory:")
+    kwargs = {
+        "claim_hash": "0x" + "15" * 32,
+        "canonical_claim": '{"reservation":"one"}',
+        "purchase_id": "0x" + "16" * 32,
+        "available_coin_id": "0x" + "17" * 32,
+        "signature": "0x" + "18" * 96,
+    }
+    try:
+        first = ledger.record_inventory_reservation_or_recover(**kwargs)
+        assert ledger.record_inventory_reservation_or_recover(**kwargs) == first
+        with pytest.raises(ValidatorLedgerConflict, match="already reserved"):
+            ledger.record_inventory_reservation_or_recover(
+                **{
+                    **kwargs,
+                    "claim_hash": "0x" + "19" * 32,
+                    "canonical_claim": '{"reservation":"changed"}',
+                    "purchase_id": "0x" + "1a" * 32,
+                }
+            )
+    finally:
+        ledger.close()
 
 
 def test_primary_purchase_retry_recovers_the_original_signature() -> None:
@@ -105,6 +134,33 @@ def test_validator_will_not_sign_one_deed_for_two_primary_purchases() -> None:
                 purchase_id="0x" + "26" * 32,
                 deed_coin_id="0x" + "23" * 32,
                 signature="0x" + "27" * 96,
+            )
+    finally:
+        ledger.close()
+
+
+def test_stripe_settlement_retry_is_exact_and_rebinding_fails_closed() -> None:
+    ledger = ValidatorLedger(":memory:")
+    kwargs = {
+        "claim_hash": "0x" + "28" * 32,
+        "canonical_claim": '{"stripe":"one"}',
+        "purchase_id": "0x" + "29" * 32,
+        "payment_intent_id": "pi_test_one",
+        "receipt_coin_id": "0x" + "2a" * 32,
+        "deed_coin_id": "0x" + "2b" * 32,
+        "signature": "0x" + "2c" * 96,
+    }
+    try:
+        first = ledger.record_stripe_settlement_or_recover(**kwargs)
+        assert ledger.record_stripe_settlement_or_recover(**kwargs) == first
+        with pytest.raises(ValidatorLedgerConflict, match="already authorized"):
+            ledger.record_stripe_settlement_or_recover(
+                **{
+                    **kwargs,
+                    "claim_hash": "0x" + "2d" * 32,
+                    "canonical_claim": '{"stripe":"changed"}',
+                    "receipt_coin_id": "0x" + "2e" * 32,
+                }
             )
     finally:
         ledger.close()

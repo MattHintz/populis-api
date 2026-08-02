@@ -88,6 +88,7 @@ def _primary_claim() -> PrimaryPurchaseClaim:
         deed_coin_id="0x" + "24" * 32,
         deed_puzzle_hash="0x" + "25" * 32,
         smart_deed_inner_hash="0x" + "26" * 32,
+        reservation_expires_at=1_800_000_300,
         protocol_puzzle_hash="0x" + "27" * 32,
         credential_vault_coin_id="0x" + "28" * 32,
         credential_identity_root="0x" + "29" * 32,

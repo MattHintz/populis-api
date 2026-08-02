@@ -40,11 +40,17 @@ from solslot_puzzles.mint_publish_driver import (
     deed_launcher_puzzle_hash,
     deed_singleton_struct,
 )
-from solslot_puzzles.payment_artifacts_v2 import PaymentRail, PurchaseArtifactV2
-from solslot_puzzles.primary_purchase_v2_driver import (
+from solslot_puzzles.payment_artifacts_v2 import PaymentRail
+from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseArtifactV3,
+    PurchaseDeliveryKind,
+)
+from solslot_puzzles.stripe_settlement_v1_driver import (
+    InventoryReservationV1,
     PRIMARY_PURCHASE_PROVIDER_ID,
-    PrimaryMintTermsV2,
-    make_mint_offer_v4_inner,
+    PrimaryMintTermsV3,
+    make_inventory_available_inner,
+    make_mint_offer_v5_inner,
 )
 from solslot_puzzles.protocol_deployment import singleton_struct
 from solslot_puzzles.vault_driver import puzzle_for_p2_vault
@@ -109,19 +115,24 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         uint64(1),
     )
 
-    artifact = PurchaseArtifactV2(
+    artifact = PurchaseArtifactV3(
         network="testnet11",
         collection_id=_b32(10),
         deed_launcher_id=bytes32(deed_launcher_coin.name()),
         metadata_root=_b32(12),
         metadata_anchor_id=_b32(13),
         share_ppm=250_000,
-        usd_amount_minor=125_000,
+        base_amount_minor=125_000,
+        technology_fee_bps=100,
+        technology_fee_minor=1_250,
+        subtotal_minor=126_250,
+        protocol_treasury_puzzle_hash=_b32(19),
+        zkpassport_root=_b32(25),
         rail=PaymentRail.CHIA_XCH,
         rail_chain_id=0,
         rail_asset_id=bytes32.zeros,
         rail_asset_decimals=12,
-        rail_amount=50_000_000_000_000,
+        rail_amount=50_500_000_000_000,
         vault_launcher_id=vault_launcher,
         vault_p2_puzzle_hash=bytes32(
             puzzle_for_p2_vault(vault_launcher).get_tree_hash()
@@ -129,6 +140,10 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         authorization_nonce=_b32(14),
         authorization_expires_at=now + 600,
         quote_expires_at=now + 300,
+        delivery_kind=PurchaseDeliveryKind.SMARTDEED,
+        delivery_asset_id=bytes32(deed_launcher_coin.name()),
+        delivery_amount=1,
+        delivery_context_hash=_b32(10),
         oracle_round_hash=_b32(15),
         oracle_price_usd_minor_per_asset=2_500,
         source_evidence_root=_b32(16),
@@ -137,22 +152,33 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         deed_launcher_id=artifact.deed_launcher_id,
         protocol_did_singleton_struct=protocol_did,
     )
-    terms = PrimaryMintTermsV2(
-        network="testnet11",
+    terms = PrimaryMintTermsV3.for_artifact(
+        artifact=artifact,
         smart_deed_inner_hash=_b32(18),
-        deed_launcher_id=artifact.deed_launcher_id,
-        collection_id=artifact.collection_id,
-        metadata_root=artifact.metadata_root,
-        metadata_anchor_id=artifact.metadata_anchor_id,
-        share_ppm=artifact.share_ppm,
-        usd_amount_minor=artifact.usd_amount_minor,
-        protocol_puzhash=_b32(19),
+        protocol_puzhash=artifact.protocol_treasury_puzzle_hash,
         validator_pubkeys=tuple(bytes(key.get_g1()) for key in validator_keys),
         provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
     )
-    deed_puzzle = SINGLETON_MOD.curry(deed_struct, make_mint_offer_v4_inner(terms))
-    deed_coin = Coin(
+    reservation = InventoryReservationV1(
+        artifact=artifact,
+        expires_at=min(
+            artifact.quote_expires_at,
+            artifact.authorization_expires_at,
+        ),
+    )
+    available_inner = make_inventory_available_inner(terms)
+    available_puzzle = SINGLETON_MOD.curry(deed_struct, available_inner)
+    available_coin = Coin(
         artifact.deed_launcher_id,
+        available_puzzle.get_tree_hash(),
+        uint64(1),
+    )
+    deed_puzzle = SINGLETON_MOD.curry(
+        deed_struct,
+        make_mint_offer_v5_inner(terms, reservation),
+    )
+    deed_coin = Coin(
+        available_coin.name(),
         deed_puzzle.get_tree_hash(),
         uint64(1),
     )
@@ -172,6 +198,13 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
         offer_artifact={},
         purchase_artifact={},
         external_message=None,
+        deed_launcher_id="0x" + artifact.deed_launcher_id.hex(),
+        inventory_state="CONFIRMED",
+        inventory_available_coin_id="0x" + available_coin.name().hex(),
+        inventory_reserved_coin_id="0x" + deed_coin.name().hex(),
+        inventory_reserved_puzzle_hash="0x" + deed_coin.puzzle_hash.hex(),
+        inventory_expires_at=reservation.expires_at,
+        inventory_confirmation_height=124,
     )
     return (
         NativePurchaseContext(
@@ -181,7 +214,8 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
             deed_coin=deed_coin,
             deed_struct=deed_struct,
             deed_lineage=LineageProof(
-                parent_name=deed_launcher_parent,
+                parent_name=available_coin.parent_coin_info,
+                inner_puzzle_hash=bytes32(available_inner.get_tree_hash()),
                 amount=uint64(1),
             ),
             genesis_artifact={"artifactHash": "0x" + "23" * 32},
@@ -193,6 +227,7 @@ def _context(payment_key, validator_keys) -> tuple[NativePurchaseContext, Coin]:
             },
             credential_owner_auth_type=1,
             credential_owner_key=bytes(payment_key.get_g1()),
+            reservation=reservation,
         ),
         payment_coin,
     )
@@ -213,11 +248,11 @@ def test_purchase_terms_must_match_the_governed_proposal() -> None:
     )
     from solslot_puzzles.property_registry_driver import canonicalise_property_id
 
+    collection_id = bytes32(canonicalise_property_id(proposal.collection_id))
     purchase = replace(
         context.purchase,
-        collection_id=bytes32(
-            canonicalise_property_id(proposal.collection_id)
-        ),
+        collection_id=collection_id,
+        delivery_context_hash=collection_id,
     )
     assert _proposal_rejection_reasons(proposal, deed, purchase) == []
 
@@ -312,6 +347,7 @@ async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(monkey
     async def collect_quorum(_settings, claim, **_kwargs):
         assert claim.credential_owner_auth_type == 1
         assert claim.credential_owner_key == "0x" + bytes(payment_key.get_g1()).hex()
+        assert claim.reservation_expires_at == context.reservation.expires_at
         return ValidatorQuorumResult(
             signer_indices=(0, 1),
             aggregated_signature=quorum_signature,

@@ -8,6 +8,7 @@ import os
 import stat
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import httpx
@@ -17,6 +18,7 @@ from chia.consensus.condition_tools import (
 )
 from chia.types.blockchain_format.program import INFINITE_COST, Program
 from chia.types.coin_spend import make_spend
+from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
@@ -39,6 +41,7 @@ from solslot_puzzles.vault_driver import (
     eip712_typed_data_for_vault_spend,
     one_leaf_merkle_root,
     puzzle_for_vault_full,
+    puzzle_hash_for_p2_vault,
 )
 from solslot_puzzles.mint_publish_driver import (
     deed_singleton_struct,
@@ -48,16 +51,42 @@ from solslot_puzzles.payment_artifacts_v2 import (
     PaymentRail,
     purchase_artifact_from_json,
 )
+from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseDeliveryKind,
+    build_stripe_settlement_receipt_v1,
+    purchase_artifact_v3_from_json,
+    stripe_settlement_evidence_from_json,
+)
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.primary_purchase_v2_driver import (
-    PRIMARY_PURCHASE_PROVIDER_ID,
     PrimaryMintTermsV2,
     PrimaryPurchaseMode,
     build_universal_primary_offer_v4,
     make_mint_offer_v4_inner,
     prepare_base_voucher_redemption_offer,
     prepare_xch_voucher_redemption_offer,
-    validate_chia_buyer_offer,
+)
+from solslot_puzzles.stripe_settlement_v1_driver import (
+    PRIMARY_PURCHASE_PROVIDER_ID,
+    InventoryReservationV1,
+    PrimaryMintTermsV3,
+    StripeSettlementTermsV1,
+    curry_stripe_settlement_receipt,
+    inventory_reservation_message,
+    make_inventory_available_inner,
+    make_mint_offer_v5_inner,
+    validate_chia_buyer_offer_v3,
+)
+from solslot_puzzles.sgt_driver import (
+    sgt_free_inner_puzzle,
+    sgt_locked_inner_mod,
+)
+from solslot_puzzles.sgt_reserve_driver import (
+    SGTAllocationRail,
+    sgt_cat_puzzle,
+    sgt_reserve_inner_puzzle,
+    sgt_sale_inner_puzzle,
+    sgt_sale_terms_from_bill,
 )
 from solslot_puzzles.protocol_deployment import singleton_struct
 from solslot_puzzles.voucher_presale_v2 import (
@@ -79,6 +108,7 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     build_voucher_issuance_spends,
     build_voucher_series_phase_spend,
     curry_external_receipt,
+    curry_direct_base_result_authorization,
     curry_xch_escrow,
     external_receipt_evidence_message,
     validate_xch_voucher_offer,
@@ -86,6 +116,7 @@ from solslot_puzzles.voucher_presale_v2_driver import (
 
 from .config import Settings
 from .evm_auth import recover_evm_signer
+from .external_settlement import build_base_settlement_receipt
 from .faucet import AGG_SIG_ME_DATA
 from .public_artifact import (
     PublicArtifactError,
@@ -94,7 +125,9 @@ from .public_artifact import (
 from .release_metadata import ReleaseMetadata, load_release_metadata
 from .validator_ledger import ValidatorLedger, ValidatorLedgerConflict
 from .validator_quorum import (
+    InventoryReservationClaim,
     PrimaryPurchaseClaim,
+    StripeSettlementClaim,
     ValidatorClaim,
     VoucherIssuanceClaim,
     VoucherSeriesPhaseClaim,
@@ -546,6 +579,240 @@ def canonical_primary_purchase_claim_json(
     )
 
 
+def canonical_inventory_reservation_claim_json(
+    claim: InventoryReservationClaim,
+) -> str:
+    return json.dumps(
+        claim.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def verify_inventory_reservation_claim(
+    settings: ValidatorSettings,
+    claim: InventoryReservationClaim,
+    claim_hash: str,
+) -> None:
+    if claim.canonical_hash() != claim_hash.lower():
+        raise ValidatorEvidenceError(
+            "reservation claim hash does not match canonical evidence"
+        )
+    artifact, _release = load_validator_artifact(settings)
+    if (
+        claim.network != settings.network
+        or claim.genesis_artifact_hash
+        != str(artifact.get("artifactHash", "")).lower()
+    ):
+        raise ValidatorEvidenceError(
+            "reservation does not reference the active network artifact"
+        )
+    try:
+        purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
+        purchase.assert_live(int(time.time()))
+    except (PaymentArtifactError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "reservation purchase artifact is invalid or expired"
+        ) from exc
+    if purchase.delivery_kind != PurchaseDeliveryKind.SMARTDEED:
+        raise ValidatorEvidenceError("only SmartDeeds use inventory reservations")
+    if claim.purchase_id() != "0x" + purchase.purchase_id.hex():
+        raise ValidatorEvidenceError("reservation purchase ID is not canonical")
+    if claim.reservation_expires_at > min(
+        purchase.quote_expires_at,
+        purchase.authorization_expires_at,
+    ):
+        raise ValidatorEvidenceError(
+            "reservation outlives the quote or vault authorization"
+        )
+
+    bridge = artifact.get("bridgePolicy")
+    validator_set = artifact.get("validatorSet")
+    launchers = artifact.get("launcherIds")
+    puzzle_hashes = artifact.get("puzzleHashes")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (bridge, validator_set, launchers, puzzle_hashes)
+    ):
+        raise ValidatorEvidenceError(
+            "signed artifact reservation coordinates are incomplete"
+        )
+    if (
+        claim.credential_policy_version != 2
+        or claim.credential_bridge_policy_hash
+        != str(bridge.get("policyHash", "")).lower()
+        or claim.credential_identity_root
+        == "0x" + bytes(DEFAULT_IDENTITY_ATTEST_ROOT).hex()
+        or "0x" + purchase.zkpassport_root.hex()
+        != claim.credential_identity_root
+    ):
+        raise ValidatorEvidenceError(
+            "reservation has no matching current zkPassport credential"
+        )
+    credential_record = _fetch_coin(
+        settings,
+        claim.credential_vault_coin_id,
+        "reservation credential vault coin",
+    )
+    credential_coin = _coin_from_record(
+        credential_record,
+        "reservation credential vault coin",
+    )
+    credential_parent = _coin_from_record(
+        _fetch_coin(
+            settings,
+            "0x" + credential_coin.parent_coin_info.hex(),
+            "reservation pre-credential vault coin",
+            require_unspent=False,
+        ),
+        "reservation pre-credential vault coin",
+    )
+    if (
+        credential_parent.parent_coin_info != purchase.vault_launcher_id
+        or int(credential_parent.amount) != 1
+        or int(credential_coin.amount) != 1
+    ):
+        raise ValidatorEvidenceError(
+            "reservation credential is not the approved vault successor"
+        )
+    try:
+        owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
+        pool_launcher = bytes32.fromhex(
+            str(launchers["pool"]).removeprefix("0x")
+        )
+        bridge_policy_hash = bytes32.fromhex(
+            claim.credential_bridge_policy_hash.removeprefix("0x")
+        )
+        member_root = one_leaf_merkle_root(owner_key)
+        unstamped_puzzle = puzzle_for_vault_full(
+            purchase.vault_launcher_id,
+            owner_key,
+            claim.credential_owner_auth_type,
+            member_root,
+            pool_launcher,
+            identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+            zkpassport_bridge_policy_hash=bridge_policy_hash,
+        )
+        stamped_puzzle = puzzle_for_vault_full(
+            purchase.vault_launcher_id,
+            owner_key,
+            claim.credential_owner_auth_type,
+            member_root,
+            pool_launcher,
+            identity_attest_root=bytes32.fromhex(
+                claim.credential_identity_root.removeprefix("0x")
+            ),
+            zkpassport_bridge_policy_hash=bridge_policy_hash,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "reservation vault ownership data is malformed"
+        ) from exc
+    if (
+        credential_parent.puzzle_hash != unstamped_puzzle.get_tree_hash()
+        or credential_coin.puzzle_hash != stamped_puzzle.get_tree_hash()
+    ):
+        raise ValidatorEvidenceError(
+            "reservation credential root is not committed by the vault"
+        )
+
+    raw_pubkeys = validator_set.get("pubkeys")
+    if (
+        validator_set.get("threshold") != 2
+        or not isinstance(raw_pubkeys, list)
+        or raw_pubkeys != settings.roster_pubkeys
+        or claim.protocol_puzzle_hash
+        != str(puzzle_hashes.get("protocolTreasuryPuzzleHash", "")).lower()
+        or purchase.protocol_treasury_puzzle_hash
+        != bytes32.fromhex(claim.protocol_puzzle_hash.removeprefix("0x"))
+    ):
+        raise ValidatorEvidenceError(
+            "reservation differs from signed treasury or validator roster"
+        )
+    try:
+        terms = PrimaryMintTermsV3.for_artifact(
+            artifact=purchase,
+            smart_deed_inner_hash=bytes32.fromhex(
+                claim.smart_deed_inner_hash.removeprefix("0x")
+            ),
+            protocol_puzhash=purchase.protocol_treasury_puzzle_hash,
+            validator_pubkeys=tuple(
+                bytes.fromhex(str(value).removeprefix("0x"))
+                for value in raw_pubkeys
+            ),
+            provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+        )
+        deed_struct = deed_singleton_struct(
+            deed_launcher_id=purchase.deed_launcher_id,
+            protocol_did_singleton_struct=singleton_struct(
+                bytes32.fromhex(
+                    str(launchers["did"]).removeprefix("0x")
+                )
+            ),
+        )
+        available_puzzle = SINGLETON_MOD.curry(
+            deed_struct,
+            make_inventory_available_inner(terms),
+        )
+        available_coin = _coin_from_record(
+            _fetch_coin(
+                settings,
+                claim.available_coin_id,
+                "available SmartDeed coin",
+            ),
+            "available SmartDeed coin",
+        )
+        reservation = InventoryReservationV1(
+            artifact=purchase,
+            expires_at=claim.reservation_expires_at,
+        )
+        expected_message = inventory_reservation_message(
+            available_coin=available_coin,
+            reservation=reservation,
+        )
+    except (KeyError, PaymentArtifactError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "reservation mint terms cannot be reconstructed"
+        ) from exc
+    if (
+        available_coin.parent_coin_info != purchase.deed_launcher_id
+        or int(available_coin.amount) != 1
+        or available_coin.puzzle_hash != available_puzzle.get_tree_hash()
+        or claim.available_puzzle_hash
+        != "0x" + available_puzzle.get_tree_hash().hex()
+        or claim.validator_message != "0x" + expected_message.hex()
+    ):
+        raise ValidatorEvidenceError(
+            "reservation does not spend the exact available governed SmartDeed"
+        )
+
+
+def sign_inventory_reservation_claim(
+    settings: ValidatorSettings,
+    ledger: ValidatorLedger,
+    claim: InventoryReservationClaim,
+    claim_hash: str,
+) -> str:
+    verify_inventory_reservation_claim(settings, claim, claim_hash)
+    signature = "0x" + bytes(
+        AugSchemeMPL.sign(
+            load_validator_private_key(settings),
+            claim.signature_message(),
+        )
+    ).hex()
+    try:
+        return ledger.record_inventory_reservation_or_recover(
+            claim_hash=claim_hash.lower(),
+            canonical_claim=canonical_inventory_reservation_claim_json(claim),
+            purchase_id=claim.purchase_id(),
+            available_coin_id=claim.available_coin_id,
+            signature=signature,
+        )
+    except ValidatorLedgerConflict as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+
+
 def verify_primary_purchase_claim(
     settings: ValidatorSettings,
     claim: PrimaryPurchaseClaim,
@@ -565,7 +832,9 @@ def verify_primary_purchase_claim(
             "purchase does not reference the active signed artifact"
         )
     try:
-        purchase = purchase_artifact_from_json(claim.purchase_artifact)
+        purchase = purchase_artifact_v3_from_json(
+            claim.purchase_artifact
+        )
         purchase.assert_live(int(time.time()))
     except (PaymentArtifactError, TypeError, ValueError) as exc:
         raise ValidatorEvidenceError(
@@ -598,6 +867,13 @@ def verify_primary_purchase_claim(
     ):
         raise ValidatorEvidenceError(
             "purchase has no current zkPassport credential"
+        )
+    if (
+        "0x" + bytes(purchase.zkpassport_root).hex()
+        != claim.credential_identity_root
+    ):
+        raise ValidatorEvidenceError(
+            "purchase does not bind the current zkPassport root"
         )
     credential_record = _fetch_coin(
         settings,
@@ -678,17 +954,11 @@ def verify_primary_purchase_claim(
             "signed artifact validator roster is inconsistent"
         )
     try:
-        terms = PrimaryMintTermsV2(
-            network=purchase.network,
+        terms = PrimaryMintTermsV3.for_artifact(
+            artifact=purchase,
             smart_deed_inner_hash=bytes32.fromhex(
                 claim.smart_deed_inner_hash.removeprefix("0x")
             ),
-            deed_launcher_id=purchase.deed_launcher_id,
-            collection_id=purchase.collection_id,
-            metadata_root=purchase.metadata_root,
-            metadata_anchor_id=purchase.metadata_anchor_id,
-            share_ppm=purchase.share_ppm,
-            usd_amount_minor=purchase.usd_amount_minor,
             protocol_puzhash=bytes32.fromhex(
                 claim.protocol_puzzle_hash.removeprefix("0x")
             ),
@@ -706,9 +976,18 @@ def verify_primary_purchase_claim(
             deed_launcher_id=purchase.deed_launcher_id,
             protocol_did_singleton_struct=did_struct,
         )
+        reservation = InventoryReservationV1(
+            artifact=purchase,
+            expires_at=claim.reservation_expires_at,
+        )
+        if reservation.expires_at > min(
+            purchase.quote_expires_at,
+            purchase.authorization_expires_at,
+        ):
+            raise ValueError("reservation outlives purchase authorization")
         expected_puzzle = SINGLETON_MOD.curry(
             deed_struct,
-            make_mint_offer_v4_inner(terms),
+            make_mint_offer_v5_inner(terms, reservation),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValidatorEvidenceError(
@@ -717,6 +996,8 @@ def verify_primary_purchase_claim(
     if (
         claim.protocol_puzzle_hash
         != str(puzzle_hashes.get("protocolTreasuryPuzzleHash", "")).lower()
+        or "0x" + bytes(purchase.protocol_treasury_puzzle_hash).hex()
+        != claim.protocol_puzzle_hash
         or claim.deed_puzzle_hash
         != "0x" + bytes(expected_puzzle.get_tree_hash()).hex()
     ):
@@ -730,8 +1011,7 @@ def verify_primary_purchase_claim(
     )
     deed_coin = _coin_from_record(deed_record, "primary SmartDeed coin")
     if (
-        deed_coin.parent_coin_info != purchase.deed_launcher_id
-        or int(deed_coin.amount) != 1
+        int(deed_coin.amount) != 1
         or deed_coin.puzzle_hash != expected_puzzle.get_tree_hash()
         or "0x" + bytes(deed_coin.name()).hex() != claim.deed_coin_id
     ):
@@ -741,7 +1021,7 @@ def verify_primary_purchase_claim(
 
     try:
         buyer_offer = Offer.from_bech32(claim.buyer_offer)
-        validate_chia_buyer_offer(
+        validate_chia_buyer_offer_v3(
             buyer_offer=buyer_offer,
             artifact=purchase,
             terms=terms,
@@ -792,6 +1072,632 @@ def sign_primary_purchase_claim(
             claim_hash=claim_hash.lower(),
             canonical_claim=canonical_primary_purchase_claim_json(claim),
             purchase_id=claim.purchase_id(),
+            delivery_coin_id=claim.delivery_coin_id(),
+            signature=signature,
+        )
+    except ValidatorLedgerConflict as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+
+
+def canonical_stripe_settlement_claim_json(
+    claim: StripeSettlementClaim,
+) -> str:
+    return json.dumps(
+        claim.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _stripe_restricted_key(settings: ValidatorSettings) -> str:
+    if not settings.stripe_settlement_enabled:
+        raise ValidatorEvidenceError("Stripe settlement signing is disabled")
+    path = Path(settings.stripe_restricted_key_file)
+    if path.is_symlink() or not path.is_file():
+        raise ValidatorEvidenceError("Stripe restricted key file is missing")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ValidatorEvidenceError(
+            "Stripe restricted key file must not be accessible by group/other"
+        )
+    try:
+        key = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise ValidatorEvidenceError("Stripe restricted key is unreadable") from exc
+    expected_prefix = "rk_test_" if settings.stripe_mode == "test" else "rk_live_"
+    if not key.startswith(expected_prefix) or len(key) < len(expected_prefix) + 16:
+        raise ValidatorEvidenceError(
+            "Stripe restricted key does not match the configured mode"
+        )
+    return key
+
+
+def _verify_stripe_provider_evidence(
+    settings: ValidatorSettings,
+    claim: StripeSettlementClaim,
+) -> None:
+    evidence = stripe_settlement_evidence_from_json(claim.stripe_evidence)
+    if (
+        evidence.stripe_account_id != settings.stripe_account_id
+        or (settings.stripe_mode == "test") != (int(evidence.mode) == 1)
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe evidence does not match this validator's account and mode"
+        )
+    headers = {
+        "authorization": f"Bearer {_stripe_restricted_key(settings)}",
+        "stripe-version": "2024-06-20",
+    }
+    try:
+        with httpx.Client(
+            base_url=settings.stripe_api_url.rstrip("/"),
+            headers=headers,
+            timeout=20.0,
+        ) as client:
+            intent_response = client.get(
+                f"/v1/payment_intents/{evidence.payment_intent_id}",
+                params={"expand[]": "latest_charge"},
+            )
+            intent_response.raise_for_status()
+            event_response = client.get(f"/v1/events/{evidence.event_id}")
+            event_response.raise_for_status()
+            intent = intent_response.json()
+            event = event_response.json()
+            charge = intent.get("latest_charge")
+            if isinstance(charge, str):
+                charge_response = client.get(f"/v1/charges/{charge}")
+                charge_response.raise_for_status()
+                charge = charge_response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "Stripe could not independently verify the paid purchase"
+        ) from exc
+    if not isinstance(intent, Mapping) or not isinstance(event, Mapping):
+        raise ValidatorEvidenceError("Stripe returned malformed payment evidence")
+    event_object = event.get("data", {}).get("object") if isinstance(
+        event.get("data"), Mapping
+    ) else None
+    metadata = intent.get("metadata")
+    purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
+    expected_live = settings.stripe_mode == "live"
+    if (
+        intent.get("id") != evidence.payment_intent_id
+        or bool(intent.get("livemode")) != expected_live
+        or intent.get("status") != "succeeded"
+        or int(intent.get("created") or 0) <= 0
+        or int(intent.get("created") or 0) >= purchase.quote_expires_at
+        or intent.get("currency") != "usd"
+        or int(intent.get("amount_received") or 0) != evidence.amount_minor
+        or event.get("id") != evidence.event_id
+        or event.get("type") != "payment_intent.succeeded"
+        or bool(event.get("livemode")) != expected_live
+        or not isinstance(event_object, Mapping)
+        or event_object.get("id") != evidence.payment_intent_id
+        or not isinstance(metadata, Mapping)
+        or str(metadata.get("protocol_purchase_id") or "").lower()
+        != "0x" + purchase.purchase_id.hex()
+        or str(metadata.get("protocol_artifact_hash") or "").lower()
+        != "0x" + purchase.artifact_hash.hex()
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe PaymentIntent or event differs from the purchase receipt"
+        )
+    if not isinstance(charge, Mapping):
+        raise ValidatorEvidenceError("Stripe payment has no retrievable charge")
+    method_details = charge.get("payment_method_details")
+    if not isinstance(method_details, Mapping):
+        raise ValidatorEvidenceError("Stripe payment method evidence is unavailable")
+    method_type = str(method_details.get("type") or "")
+    expected_method = "card" if int(evidence.method_family) == 1 else "us_bank_account"
+    card = method_details.get("card")
+    observed_funding = (
+        str(card.get("funding") or "unknown")
+        if isinstance(card, Mapping)
+        else "not_applicable"
+    )
+    expected_funding = {
+        0: "not_applicable",
+        1: "credit",
+        2: "debit",
+        3: "prepaid",
+        4: "unknown",
+    }[int(evidence.funding_type)]
+    if (
+        method_type != expected_method
+        or observed_funding != expected_funding
+        or bool(charge.get("refunded"))
+        or int(charge.get("amount_refunded") or 0) != 0
+        or bool(charge.get("disputed"))
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe funding, refund, or dispute state differs from the receipt"
+        )
+
+
+def _verify_stripe_sgt_sale(
+    settings: ValidatorSettings,
+    artifact: Mapping[str, Any],
+    claim: StripeSettlementClaim,
+    purchase: Any,
+) -> None:
+    """Reconstruct an external SGT sale from signed release and Chia state."""
+
+    if None in {
+        claim.sgt_sale_coin_id,
+        claim.sgt_sale_puzzle_hash,
+        claim.governance_bill_clvm_hex,
+    }:
+        raise ValidatorEvidenceError("Stripe SGT sale evidence is incomplete")
+    try:
+        plan_value = artifact.get("genesisPlan", artifact)
+        if not isinstance(plan_value, Mapping):
+            raise TypeError
+        launchers = plan_value["launcherIds"]
+        puzzles = plan_value["puzzleHashes"]
+        trusted_assets = plan_value["trustedAssets"]
+        destinations = plan_value["trustedDestinations"]
+        permanent_rules = plan_value.get("permanentRules", {})
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                launchers,
+                puzzles,
+                trusted_assets,
+                destinations,
+                permanent_rules,
+            )
+        ):
+            raise TypeError
+        tracker_struct = singleton_struct(
+            bytes32.fromhex(str(launchers["governance"]).removeprefix("0x"))
+        )
+        admin_struct = singleton_struct(
+            bytes32.fromhex(str(launchers["adminAuthority"]).removeprefix("0x"))
+        )
+        sgt_tail = bytes32.fromhex(
+            str(
+                artifact.get("sgtTailHash")
+                or permanent_rules["sgtTailHash"]
+            ).removeprefix("0x")
+        )
+        company_treasury = bytes32.fromhex(
+            str(
+                destinations["companySgtSaleTreasuryPuzzleHash"]
+            ).removeprefix("0x")
+        )
+        wusdc_b_asset_id = bytes32.fromhex(
+            str(trusted_assets["wusdcBAssetId"]).removeprefix("0x")
+        )
+        reserve_inner = sgt_reserve_inner_puzzle(
+            proposal_tracker_struct=tracker_struct,
+            admin_authority_struct=admin_struct,
+            sgt_tail_hash=sgt_tail,
+            wusdc_b_asset_id=wusdc_b_asset_id,
+            company_treasury_puzzle_hash=company_treasury,
+        )
+        reserve_owner = bytes32(reserve_inner.get_tree_hash())
+        if reserve_owner != bytes32.fromhex(
+            str(puzzles["sgtReserveInner"]).removeprefix("0x")
+        ):
+            raise ValueError("signed SGT reserve hash changed")
+        bill = Program.from_bytes(
+            bytes.fromhex(
+                str(claim.governance_bill_clvm_hex).removeprefix("0x")
+            )
+        )
+        terms = sgt_sale_terms_from_bill(
+            bill,
+            reserve_owner_inner_hash=reserve_owner,
+        )
+        sale_inner = sgt_sale_inner_puzzle(
+            reserve_owner_inner_hash=reserve_owner,
+            sgt_tail_hash=sgt_tail,
+            terms=terms,
+        )
+        sale_full = sgt_cat_puzzle(
+            proposal_tracker_struct=tracker_struct,
+            sgt_tail_hash=sgt_tail,
+            owner_inner_puzzle=sale_inner,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "Stripe SGT sale cannot be reconstructed from signed evidence"
+        ) from exc
+
+    expected_sale_rail = (
+        SGTAllocationRail.STRIPE
+        if purchase.rail == PaymentRail.STRIPE
+        else SGTAllocationRail.BASE_USDC
+    )
+    if (
+        purchase.delivery_kind != PurchaseDeliveryKind.SGT
+        or purchase.rail not in {PaymentRail.STRIPE, PaymentRail.EVM_TEST_USD}
+        or purchase.delivery_asset_id != sgt_tail
+        or purchase.delivery_amount != terms.sgt_amount
+        or purchase.delivery_context_hash != terms.sale_id
+        or purchase.vault_launcher_id != terms.recipient_vault_launcher_id
+        or purchase.vault_p2_puzzle_hash
+        != puzzle_hash_for_p2_vault(terms.recipient_vault_launcher_id)
+        or purchase.artifact_hash != terms.purchase_artifact_hash
+        or purchase.rail_amount != terms.payment_amount
+        or terms.payment_rail != expected_sale_rail
+        or terms.company_treasury_puzzle_hash != company_treasury
+        or int(time.time()) >= terms.expires_at
+        or claim.sgt_sale_puzzle_hash
+        != "0x" + sale_full.get_tree_hash().hex()
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe SGT purchase differs from its governed sale"
+        )
+
+    sale_record = _fetch_coin(
+        settings,
+        str(claim.sgt_sale_coin_id),
+        "Stripe SGT sale coin",
+    )
+    sale_coin = _coin_from_record(sale_record, "Stripe SGT sale coin")
+    if (
+        sale_coin.puzzle_hash != sale_full.get_tree_hash()
+        or int(sale_coin.amount) != terms.sgt_amount
+        or "0x" + sale_coin.name().hex() != claim.sgt_sale_coin_id
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe SGT sale coin is not the governed allocation"
+        )
+    parent_record = _fetch_coin(
+        settings,
+        "0x" + sale_coin.parent_coin_info.hex(),
+        "Stripe SGT reserve parent",
+        require_unspent=False,
+    )
+    parent_coin = _coin_from_record(parent_record, "Stripe SGT reserve parent")
+    reserve_free = sgt_free_inner_puzzle(
+        bytes32(sgt_locked_inner_mod().get_tree_hash()),
+        tracker_struct,
+        reserve_owner,
+    )
+    reserve_full = construct_cat_puzzle(CAT_MOD, sgt_tail, reserve_free)
+    if (
+        parent_coin.puzzle_hash != reserve_full.get_tree_hash()
+        or int(parent_coin.amount) < terms.sgt_amount
+        or int(parent_record.get("spent_block_index") or 0) <= 0
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe SGT sale is not descended from the governed reserve"
+        )
+
+
+def verify_stripe_settlement_claim(
+    settings: ValidatorSettings,
+    claim: StripeSettlementClaim,
+    claim_hash: str,
+) -> None:
+    if claim.canonical_hash() != claim_hash.lower():
+        raise ValidatorEvidenceError(
+            "Stripe claim hash does not match canonical evidence"
+        )
+    artifact, _release = load_validator_artifact(settings)
+    if claim.network != settings.network or claim.genesis_artifact_hash != str(
+        artifact.get("artifactHash", "")
+    ).lower():
+        raise ValidatorEvidenceError(
+            "Stripe delivery does not reference the active Testnet11 artifact"
+        )
+    try:
+        purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
+        if purchase.rail == PaymentRail.STRIPE:
+            if claim.stripe_evidence is None:
+                raise PaymentArtifactError("Stripe evidence is missing")
+            evidence = stripe_settlement_evidence_from_json(
+                claim.stripe_evidence
+            )
+            receipt = build_stripe_settlement_receipt_v1(
+                artifact=purchase,
+                evidence=evidence,
+                validator_pubkeys=tuple(
+                    bytes.fromhex(value.removeprefix("0x"))
+                    for value in settings.roster_pubkeys
+                ),  # type: ignore[arg-type]
+            )
+        elif purchase.rail == PaymentRail.EVM_TEST_USD:
+            if claim.base_evidence is None:
+                raise PaymentArtifactError("Base evidence is missing")
+            receipt = build_base_settlement_receipt(
+                artifact=purchase,
+                evidence=claim.base_evidence,
+                result_authorization_puzzle_hash=bytes32.from_hexstr(
+                    str(claim.base_result_authorization_puzzle_hash)
+                ),
+            )
+        else:
+            raise PaymentArtifactError("unsupported external payment rail")
+    except (PaymentArtifactError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "Stripe purchase or receipt evidence is invalid"
+        ) from exc
+    base_result_authorization_puzzle_hash = bytes32.zeros
+    if purchase.rail == PaymentRail.STRIPE:
+        _verify_stripe_provider_evidence(settings, claim)
+    else:
+        assert claim.base_evidence is not None
+        depositor = str(claim.base_evidence.get("depositor") or "").lower()
+        if not depositor.startswith("0x") or len(depositor) != 42:
+            raise ValidatorEvidenceError("Base depositor is invalid")
+        try:
+            payer = bytes32(bytes(12) + bytes.fromhex(depositor[2:]))
+            global_payment = bytes32.from_hexstr(
+                str(claim.base_evidence.get("globalPaymentId") or "")
+            )
+        except ValueError as exc:
+            raise ValidatorEvidenceError("Base payment identifiers are invalid") from exc
+        _verify_base_voucher_payment(
+            settings,
+            claim.base_evidence,
+            purchase=purchase,
+            voucher=SimpleNamespace(
+                original_payer=payer,
+                global_payment_id=global_payment,
+                payment_principal=purchase.rail_amount,
+                collection_id=purchase.delivery_context_hash,
+                deed_launcher_id=purchase.delivery_asset_id,
+                approved_vault_launcher_id=purchase.vault_launcher_id,
+                approved_vault_p2_puzzle_hash=purchase.vault_p2_puzzle_hash,
+            ),
+        )
+        if not settings.base_return_puzzle_hash:
+            raise ValidatorEvidenceError(
+                "reviewed Base return puzzle hash is unavailable"
+            )
+        try:
+            base_result_authorization_puzzle_hash = bytes32(
+                curry_direct_base_result_authorization(
+                    purchase_artifact_hash=purchase.artifact_hash,
+                    global_payment_id=global_payment,
+                    payment_principal=purchase.rail_amount,
+                    return_puzzle_hash=bytes32.from_hexstr(
+                        settings.base_return_puzzle_hash
+                    ),
+                ).get_tree_hash()
+            )
+        except (PaymentArtifactError, ValueError) as exc:
+            raise ValidatorEvidenceError(
+                "Base result authorization cannot be reconstructed"
+            ) from exc
+        if claim.base_result_authorization_puzzle_hash != (
+            "0x" + base_result_authorization_puzzle_hash.hex()
+        ):
+            raise ValidatorEvidenceError(
+                "Base result authorization puzzle hash changed"
+            )
+
+    validator_set = artifact.get("validatorSet")
+    launchers = artifact.get("launcherIds")
+    puzzle_hashes = artifact.get("puzzleHashes")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (validator_set, launchers, puzzle_hashes)
+    ):
+        raise ValidatorEvidenceError(
+            "signed artifact purchase coordinates are incomplete"
+        )
+    raw_pubkeys = validator_set.get("pubkeys")
+    if (
+        validator_set.get("threshold") != 2
+        or raw_pubkeys != settings.roster_pubkeys
+        or claim.protocol_puzzle_hash
+        != str(puzzle_hashes.get("protocolTreasuryPuzzleHash", "")).lower()
+        or purchase.protocol_treasury_puzzle_hash
+        != bytes32.fromhex(claim.protocol_puzzle_hash.removeprefix("0x"))
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe delivery differs from the signed treasury or validator roster"
+        )
+
+    if (
+        purchase.zkpassport_root
+        != bytes32.fromhex(claim.credential_identity_root.removeprefix("0x"))
+        or claim.credential_identity_root
+        == "0x" + bytes(DEFAULT_IDENTITY_ATTEST_ROOT).hex()
+        or claim.credential_policy_version != 2
+        or claim.credential_bridge_policy_hash != settings.bridge_policy_hash
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe delivery has no matching zkPassport-approved vault root"
+        )
+    credential_record = _fetch_coin(
+        settings,
+        claim.credential_vault_coin_id,
+        "Stripe credential vault coin",
+    )
+    credential_coin = _coin_from_record(
+        credential_record,
+        "Stripe credential vault coin",
+    )
+    credential_parent_record = _fetch_coin(
+        settings,
+        "0x" + credential_coin.parent_coin_info.hex(),
+        "Stripe credential parent coin",
+        require_unspent=False,
+    )
+    credential_parent = _coin_from_record(
+        credential_parent_record,
+        "Stripe credential parent coin",
+    )
+    owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
+    try:
+        pool_launcher = bytes32.fromhex(
+            str(launchers["pool"]).removeprefix("0x")
+        )
+        expected_credential_puzzle = puzzle_for_vault_full(
+            purchase.vault_launcher_id,
+            owner_key,
+            claim.credential_owner_auth_type,
+            one_leaf_merkle_root(owner_key),
+            pool_launcher,
+            identity_attest_root=purchase.zkpassport_root,
+            zkpassport_bridge_policy_hash=bytes32.fromhex(
+                claim.credential_bridge_policy_hash.removeprefix("0x")
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "Stripe vault ownership evidence is malformed"
+        ) from exc
+    if (
+        credential_parent.parent_coin_info != purchase.vault_launcher_id
+        or int(credential_parent.amount) != 1
+        or int(credential_coin.amount) != 1
+        or credential_coin.puzzle_hash != expected_credential_puzzle.get_tree_hash()
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe vault credential is not the approved singleton state"
+        )
+
+    try:
+        validator_pubkeys = tuple(
+            bytes.fromhex(str(value).removeprefix("0x"))
+            for value in raw_pubkeys
+        )
+        receipt_terms = StripeSettlementTermsV1(
+            receipt=receipt,
+            validator_pubkeys=validator_pubkeys,  # type: ignore[arg-type]
+        )
+        if receipt.result_authorization_puzzle_hash != (
+            base_result_authorization_puzzle_hash
+        ):
+            raise PaymentArtifactError(
+                "external receipt result authorization changed"
+            )
+        receipt_puzzle = curry_stripe_settlement_receipt(receipt_terms)
+    except (KeyError, PaymentArtifactError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "Stripe receipt puzzle cannot be reconstructed"
+        ) from exc
+    if claim.receipt_puzzle_hash != "0x" + receipt_puzzle.get_tree_hash().hex():
+        raise ValidatorEvidenceError("Stripe receipt puzzle hash changed")
+    receipt_record = _fetch_coin(
+        settings,
+        claim.receipt_coin_id,
+        "Stripe settlement receipt coin",
+    )
+    receipt_coin = _coin_from_record(
+        receipt_record,
+        "Stripe settlement receipt coin",
+    )
+    if (
+        receipt_coin.puzzle_hash != receipt_puzzle.get_tree_hash()
+        or int(receipt_coin.amount) != 1
+        or "0x" + receipt_coin.name().hex() != claim.receipt_coin_id
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe settlement receipt coin is not exact and unspent"
+        )
+
+    if purchase.delivery_kind == PurchaseDeliveryKind.SGT:
+        _verify_stripe_sgt_sale(settings, artifact, claim, purchase)
+        return
+    if purchase.delivery_kind != PurchaseDeliveryKind.SMARTDEED or None in {
+        claim.deed_coin_id,
+        claim.deed_puzzle_hash,
+        claim.smart_deed_inner_hash,
+    }:
+        raise ValidatorEvidenceError("Stripe delivery kind is unsupported")
+
+    try:
+        did_struct = singleton_struct(
+            bytes32.fromhex(str(launchers["did"]).removeprefix("0x"))
+        )
+        deed_struct = deed_singleton_struct(
+            deed_launcher_id=purchase.deed_launcher_id,
+            protocol_did_singleton_struct=did_struct,
+        )
+        mint_terms = PrimaryMintTermsV3.for_artifact(
+            artifact=purchase,
+            smart_deed_inner_hash=bytes32.fromhex(
+                claim.smart_deed_inner_hash.removeprefix("0x")
+            ),
+            protocol_puzhash=purchase.protocol_treasury_puzzle_hash,
+            validator_pubkeys=validator_pubkeys,  # type: ignore[arg-type]
+            provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+        )
+        reservation = InventoryReservationV1(
+            artifact=purchase,
+            expires_at=int(claim.reservation_expires_at or 0),
+        )
+        if reservation.expires_at > min(
+            purchase.quote_expires_at,
+            purchase.authorization_expires_at,
+        ):
+            raise PaymentArtifactError(
+                "reservation outlives purchase authorization"
+            )
+        expected_deed_puzzle = SINGLETON_MOD.curry(
+            deed_struct,
+            make_mint_offer_v5_inner(
+                mint_terms,
+                reservation,
+            ),
+        )
+    except (KeyError, PaymentArtifactError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "Stripe governed deed puzzle cannot be reconstructed"
+        ) from exc
+    if claim.deed_puzzle_hash != "0x" + expected_deed_puzzle.get_tree_hash().hex():
+        raise ValidatorEvidenceError(
+            "Stripe SmartDeed puzzle hash changed"
+        )
+    deed_record = _fetch_coin(
+        settings,
+        str(claim.deed_coin_id),
+        "Stripe SmartDeed coin",
+    )
+    deed_coin = _coin_from_record(deed_record, "Stripe SmartDeed coin")
+    if (
+        deed_coin.puzzle_hash != expected_deed_puzzle.get_tree_hash()
+        or int(deed_coin.amount) != 1
+        or "0x" + deed_coin.name().hex() != claim.deed_coin_id
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe receipt or governed SmartDeed coin is not exact and unspent"
+        )
+
+
+def sign_stripe_settlement_claim(
+    settings: ValidatorSettings,
+    ledger: ValidatorLedger,
+    claim: StripeSettlementClaim,
+    claim_hash: str,
+) -> str:
+    verify_stripe_settlement_claim(settings, claim, claim_hash)
+    pubkeys = tuple(
+        bytes.fromhex(value.removeprefix("0x"))
+        for value in settings.roster_pubkeys
+    )
+    private_key = load_validator_private_key(settings)
+    signature = "0x" + bytes(
+        AugSchemeMPL.aggregate(
+            [
+                AugSchemeMPL.sign(private_key, message)
+                for message in claim.signature_messages(pubkeys)  # type: ignore[arg-type]
+            ]
+        )
+    ).hex()
+    purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
+    if purchase.rail == PaymentRail.STRIPE:
+        assert claim.stripe_evidence is not None
+        evidence = stripe_settlement_evidence_from_json(claim.stripe_evidence)
+        external_payment_id = evidence.payment_intent_id
+    else:
+        assert claim.base_evidence is not None
+        external_payment_id = str(claim.base_evidence["globalPaymentId"]).lower()
+    try:
+        return ledger.record_stripe_settlement_or_recover(
+            claim_hash=claim_hash.lower(),
+            canonical_claim=canonical_stripe_settlement_claim_json(claim),
+            purchase_id=claim.purchase_id(),
+            payment_intent_id=external_payment_id,
+            receipt_coin_id=claim.receipt_coin_id,
             deed_coin_id=claim.deed_coin_id,
             signature=signature,
         )
@@ -1932,16 +2838,19 @@ __all__ = [
     "ValidatorEvidenceError",
     "canonical_claim_json",
     "canonical_primary_purchase_claim_json",
+    "canonical_stripe_settlement_claim_json",
     "canonical_voucher_issuance_claim_json",
     "canonical_voucher_transition_claim_json",
     "load_validator_artifact",
     "load_validator_private_key",
     "sign_validator_claim",
     "sign_primary_purchase_claim",
+    "sign_stripe_settlement_claim",
     "sign_voucher_issuance_claim",
     "sign_voucher_transition_claim",
     "verify_validator_claim",
     "verify_primary_purchase_claim",
+    "verify_stripe_settlement_claim",
     "verify_voucher_issuance_claim",
     "verify_voucher_transition_claim",
 ]

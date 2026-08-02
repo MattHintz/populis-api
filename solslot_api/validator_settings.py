@@ -51,7 +51,13 @@ class ValidatorSettings(BaseSettings):
     base_sepolia_rpc_url: str = ""
     base_sepolia_spoke_address: str = ""
     base_sepolia_usdc_address: str = ""
+    base_return_puzzle_hash: str = ""
     base_sepolia_min_confirmations: int = Field(12, ge=12, le=100)
+    stripe_settlement_enabled: bool = False
+    stripe_account_id: str = ""
+    stripe_mode: Literal["test", "live"] = "test"
+    stripe_restricted_key_file: str = ""
+    stripe_api_url: str = "https://api.stripe.com"
 
     @field_validator("bridge_policy_hash")
     @classmethod
@@ -93,12 +99,31 @@ class ValidatorSettings(BaseSettings):
             "https://"
         ):
             raise ValueError("base_sepolia_rpc_url must use HTTPS")
+        if not self.stripe_api_url.startswith("https://"):
+            raise ValueError("stripe_api_url must use HTTPS")
         for value, label in (
             (self.base_sepolia_spoke_address, "base_sepolia_spoke_address"),
             (self.base_sepolia_usdc_address, "base_sepolia_usdc_address"),
         ):
             if value and not _ADDRESS_RE.fullmatch(value):
                 raise ValueError(f"{label} must be a 20-byte EVM address")
+        if self.base_return_puzzle_hash and not _HEX32_RE.fullmatch(
+            self.base_return_puzzle_hash
+        ):
+            raise ValueError("base_return_puzzle_hash must be a 32-byte hash")
+        if self.base_sepolia_rpc_url and not self.base_return_puzzle_hash:
+            raise ValueError(
+                "Base settlement requires the reviewed return puzzle hash"
+            )
+        if self.stripe_settlement_enabled:
+            if not self.stripe_account_id.startswith("acct_"):
+                raise ValueError(
+                    "Stripe settlement requires a configured Stripe account ID"
+                )
+            if not self.stripe_restricted_key_file:
+                raise ValueError(
+                    "Stripe settlement requires a restricted read-key file"
+                )
         return self
 
 

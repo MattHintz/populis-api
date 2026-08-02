@@ -13,11 +13,24 @@ from typing import Any
 
 import httpx
 from chia_rs import AugSchemeMPL, G1Element, G2Element
+from chia_rs.sized_bytes import bytes32
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from solslot_puzzles.zkpassport_bridge_driver import require_genesis_validator_set
+from solslot_puzzles.payment_artifacts_v2 import PaymentRail
+from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseDeliveryKind,
+    build_stripe_settlement_receipt_v1,
+    purchase_artifact_v3_from_json,
+    stripe_settlement_evidence_from_json,
+)
+from solslot_puzzles.stripe_settlement_v1_driver import (
+    StripeSettlementTermsV1,
+    stripe_settlement_authorization_message,
+)
 
 from .config import Settings
+from .external_settlement import build_base_settlement_receipt
 from .faucet import AGG_SIG_ME_DATA
 
 
@@ -144,6 +157,7 @@ class PrimaryPurchaseClaim(BaseModel):
     deed_coin_id: str
     deed_puzzle_hash: str
     smart_deed_inner_hash: str
+    reservation_expires_at: int = Field(..., ge=1)
     protocol_puzzle_hash: str
     credential_vault_coin_id: str
     credential_identity_root: str
@@ -213,6 +227,275 @@ class PrimaryPurchaseClaim(BaseModel):
             + bytes.fromhex(self.deed_coin_id[2:])
             + additional_data
         )
+
+
+class InventoryReservationClaim(BaseModel):
+    """Evidence for the one chain-authoritative reservation of a SmartDeed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: str
+    genesis_artifact_hash: str
+    purchase_artifact: dict[str, Any]
+    available_coin_id: str
+    available_puzzle_hash: str
+    smart_deed_inner_hash: str
+    protocol_puzzle_hash: str
+    reservation_expires_at: int = Field(..., ge=1)
+    validator_message: str
+    credential_vault_coin_id: str
+    credential_identity_root: str
+    credential_policy_version: int = Field(..., ge=2)
+    credential_bridge_policy_hash: str
+    credential_owner_auth_type: int
+    credential_owner_key: str
+
+    @field_validator(
+        "genesis_artifact_hash",
+        "available_coin_id",
+        "available_puzzle_hash",
+        "smart_deed_inner_hash",
+        "protocol_puzzle_hash",
+        "validator_message",
+        "credential_vault_coin_id",
+        "credential_identity_root",
+        "credential_bridge_policy_hash",
+    )
+    @classmethod
+    def _reservation_hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_credential_owner(self) -> "InventoryReservationClaim":
+        expected_size = {1: 48, 3: 33}.get(self.credential_owner_auth_type)
+        if expected_size is None:
+            raise ValueError("credential owner auth type must be BLS or secp256k1")
+        normalized = _hex(
+            self.credential_owner_key,
+            expected_size,
+            "credential_owner_key",
+        )
+        object.__setattr__(self, "credential_owner_key", normalized)
+        if self.credential_owner_auth_type == 1:
+            G1Element.from_bytes(bytes.fromhex(normalized[2:]))
+        return self
+
+    def canonical_hash(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return "0x" + hashlib.sha256(encoded).hexdigest()
+
+    def purchase_id(self) -> str:
+        value = self.purchase_artifact.get("purchaseId")
+        if not isinstance(value, str):
+            raise ValidatorQuorumError("purchase artifact has no purchase ID")
+        return _hex(value, 32, "purchaseId")
+
+    def signature_message(self) -> bytes:
+        additional_data = AGG_SIG_ME_DATA.get(self.network)
+        if additional_data is None:
+            raise ValidatorQuorumError(
+                f"unsupported Chia network: {self.network}"
+            )
+        return (
+            bytes.fromhex(self.validator_message[2:])
+            + bytes.fromhex(self.available_coin_id[2:])
+            + additional_data
+        )
+
+
+class StripeSettlementClaim(BaseModel):
+    """Evidence for one exact paid external protocol-asset delivery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: str
+    genesis_artifact_hash: str
+    purchase_artifact: dict[str, Any]
+    stripe_evidence: dict[str, Any] | None = None
+    base_evidence: dict[str, Any] | None = None
+    base_result_authorization_puzzle_hash: str | None = None
+    receipt_coin_id: str
+    receipt_puzzle_hash: str
+    deed_coin_id: str | None = None
+    deed_puzzle_hash: str | None = None
+    smart_deed_inner_hash: str | None = None
+    reservation_expires_at: int | None = Field(None, ge=1)
+    sgt_sale_coin_id: str | None = None
+    sgt_sale_puzzle_hash: str | None = None
+    governance_proposal_id: str | None = Field(None, min_length=8, max_length=96)
+    governance_bill_clvm_hex: str | None = Field(
+        None,
+        pattern=r"^(?:0x)?[0-9a-fA-F]+$",
+        max_length=8194,
+    )
+    protocol_puzzle_hash: str
+    credential_vault_coin_id: str
+    credential_identity_root: str
+    credential_policy_version: int = Field(..., ge=2)
+    credential_bridge_policy_hash: str
+    credential_owner_auth_type: int
+    credential_owner_key: str
+
+    @field_validator(
+        "genesis_artifact_hash",
+        "receipt_coin_id",
+        "receipt_puzzle_hash",
+        "protocol_puzzle_hash",
+        "credential_vault_coin_id",
+        "credential_identity_root",
+        "credential_bridge_policy_hash",
+    )
+    @classmethod
+    def _stripe_hex32(cls, value: str, info) -> str:
+        return _hex(value, 32, info.field_name)
+
+    @field_validator(
+        "deed_coin_id",
+        "deed_puzzle_hash",
+        "smart_deed_inner_hash",
+        "sgt_sale_coin_id",
+        "sgt_sale_puzzle_hash",
+        "base_result_authorization_puzzle_hash",
+    )
+    @classmethod
+    def _optional_stripe_hex32(cls, value: str | None, info) -> str | None:
+        return None if value is None else _hex(value, 32, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_credential_owner(self) -> "StripeSettlementClaim":
+        expected_size = {1: 48, 3: 33}.get(self.credential_owner_auth_type)
+        if expected_size is None:
+            raise ValueError("credential owner auth type must be BLS or secp256k1")
+        normalized = _hex(
+            self.credential_owner_key,
+            expected_size,
+            "credential_owner_key",
+        )
+        object.__setattr__(self, "credential_owner_key", normalized)
+        if self.credential_owner_auth_type == 1:
+            G1Element.from_bytes(bytes.fromhex(normalized[2:]))
+        purchase = purchase_artifact_v3_from_json(self.purchase_artifact)
+        if purchase.rail == PaymentRail.STRIPE:
+            if (
+                self.stripe_evidence is None
+                or self.base_evidence is not None
+                or self.base_result_authorization_puzzle_hash is not None
+            ):
+                raise ValueError("Stripe claim requires only Stripe evidence")
+        elif purchase.rail == PaymentRail.EVM_TEST_USD:
+            if (
+                self.base_evidence is None
+                or self.stripe_evidence is not None
+                or self.base_result_authorization_puzzle_hash is None
+            ):
+                raise ValueError("Base claim requires only Base evidence")
+        else:
+            raise ValueError("external claim has an unsupported payment rail")
+        if purchase.delivery_kind == PurchaseDeliveryKind.SMARTDEED:
+            if None in {
+                self.deed_coin_id,
+                self.deed_puzzle_hash,
+                self.smart_deed_inner_hash,
+                self.reservation_expires_at,
+            } or any(
+                value is not None
+                for value in (
+                    self.sgt_sale_coin_id,
+                    self.sgt_sale_puzzle_hash,
+                    self.governance_proposal_id,
+                    self.governance_bill_clvm_hex,
+                )
+            ):
+                raise ValueError("SmartDeed claim has inconsistent delivery evidence")
+        elif purchase.delivery_kind == PurchaseDeliveryKind.SGT:
+            if None in {
+                self.sgt_sale_coin_id,
+                self.sgt_sale_puzzle_hash,
+                self.governance_proposal_id,
+                self.governance_bill_clvm_hex,
+            } or any(
+                value is not None
+                for value in (
+                    self.deed_coin_id,
+                    self.deed_puzzle_hash,
+                    self.smart_deed_inner_hash,
+                    self.reservation_expires_at,
+                )
+            ):
+                raise ValueError("SGT claim has inconsistent delivery evidence")
+        else:
+            raise ValueError("external claim has an unsupported delivery kind")
+        return self
+
+    def delivery_coin_id(self) -> str:
+        value = self.deed_coin_id or self.sgt_sale_coin_id
+        if value is None:
+            raise ValidatorQuorumError("external claim has no delivery coin")
+        return value
+
+    def canonical_hash(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return "0x" + hashlib.sha256(encoded).hexdigest()
+
+    def purchase_id(self) -> str:
+        value = self.purchase_artifact.get("purchaseId")
+        if not isinstance(value, str):
+            raise ValidatorQuorumError("purchase artifact has no purchase ID")
+        return _hex(value, 32, "purchaseId")
+
+    def signature_messages(
+        self,
+        validator_pubkeys: tuple[bytes, bytes, bytes],
+    ) -> tuple[bytes, ...]:
+        additional_data = AGG_SIG_ME_DATA.get(self.network)
+        if additional_data is None:
+            raise ValidatorQuorumError(
+                f"unsupported Chia network: {self.network}"
+            )
+        purchase = purchase_artifact_v3_from_json(self.purchase_artifact)
+        if purchase.rail == PaymentRail.STRIPE:
+            assert self.stripe_evidence is not None
+            evidence = stripe_settlement_evidence_from_json(self.stripe_evidence)
+            receipt = build_stripe_settlement_receipt_v1(
+                artifact=purchase,
+                evidence=evidence,
+                validator_pubkeys=validator_pubkeys,
+            )
+        else:
+            assert self.base_evidence is not None
+            receipt = build_base_settlement_receipt(
+                artifact=purchase,
+                evidence=self.base_evidence,
+                result_authorization_puzzle_hash=bytes32.from_hexstr(
+                    str(self.base_result_authorization_puzzle_hash)
+                ),
+            )
+        terms = StripeSettlementTermsV1(
+            receipt=receipt,
+            validator_pubkeys=validator_pubkeys,
+        )
+        messages = [
+            bytes(stripe_settlement_authorization_message(terms))
+            + bytes.fromhex(self.receipt_coin_id[2:])
+            + additional_data
+        ]
+        if purchase.delivery_kind == PurchaseDeliveryKind.SMARTDEED:
+            messages.append(
+                bytes(purchase.artifact_hash)
+                + bytes.fromhex(self.delivery_coin_id()[2:])
+                + additional_data
+            )
+        return tuple(messages)
 
 
 class VoucherIssuanceClaim(BaseModel):
@@ -892,6 +1175,172 @@ async def collect_primary_purchase_quorum(
     )
 
 
+async def collect_inventory_reservation_quorum(
+    settings: Settings,
+    claim: InventoryReservationClaim,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ValidatorQuorumResult:
+    """Collect 2-of-3 signatures for one exact available-to-reserved spend."""
+
+    pubkeys = configured_validator_pubkeys(settings)
+    claim_hash = claim.canonical_hash()
+    message = claim.signature_message()
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_signature(
+        index: int,
+        url: str,
+    ) -> tuple[int, G2Element] | None:
+        try:
+            response = await client.post(
+                url.rstrip("/") + "/v1/inventory-reservation/sign",
+                json={
+                    "claim": claim.model_dump(mode="json"),
+                    "claimHash": claim_hash,
+                },
+            )
+            response.raise_for_status()
+            parsed = ValidatorSignatureResponse.model_validate(response.json())
+            if parsed.claimHash.lower() != claim_hash or parsed.signerIndex != index:
+                raise ValueError("inventory signer response does not match claim")
+            configured_pubkey = pubkeys[index]
+            if bytes.fromhex(parsed.validatorPubkey.removeprefix("0x")) != configured_pubkey:
+                raise ValueError("validator public key mismatch")
+            signature = G2Element.from_bytes(
+                bytes.fromhex(parsed.signature.removeprefix("0x"))
+            )
+            if not AugSchemeMPL.verify(
+                G1Element.from_bytes(configured_pubkey),
+                message,
+                signature,
+            ):
+                raise ValueError("invalid inventory reservation signature")
+            return index, signature
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "inventory reservation signer %s rejected or unavailable: %s",
+                index,
+                exc,
+            )
+            return None
+
+    try:
+        responses = await asyncio.gather(
+            *(
+                request_signature(index, url)
+                for index, url in enumerate(settings.zkpassport_validator_urls)
+            )
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    valid = sorted(
+        (item for item in responses if item is not None),
+        key=lambda item: item[0],
+    )
+    threshold = settings.zkpassport_validator_threshold
+    if len(valid) < threshold:
+        raise ValidatorQuorumError(
+            "inventory reservation validator quorum unavailable: "
+            f"received {len(valid)} of {threshold} required signatures"
+        )
+    selected = valid[:threshold]
+    return ValidatorQuorumResult(
+        signer_indices=tuple(index for index, _signature in selected),
+        aggregated_signature=AugSchemeMPL.aggregate(
+            [signature for _index, signature in selected]
+        ),
+        claim_hash=claim_hash,
+    )
+
+
+async def collect_stripe_settlement_quorum(
+    settings: Settings,
+    claim: StripeSettlementClaim,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ValidatorQuorumResult:
+    """Collect signatures for both receipt authorization and deed delivery."""
+
+    pubkeys = configured_validator_pubkeys(settings)
+    claim_hash = claim.canonical_hash()
+    messages = claim.signature_messages(pubkeys)
+    owns_client = client is None
+    if client is None:
+        client = _private_validator_client(settings)
+
+    async def request_signature(
+        index: int,
+        url: str,
+    ) -> tuple[int, G2Element] | None:
+        try:
+            response = await client.post(
+                url.rstrip("/") + "/v1/stripe-settlement/sign",
+                json={
+                    "claim": claim.model_dump(mode="json"),
+                    "claimHash": claim_hash,
+                },
+            )
+            response.raise_for_status()
+            parsed = ValidatorSignatureResponse.model_validate(response.json())
+            if parsed.claimHash.lower() != claim_hash or parsed.signerIndex != index:
+                raise ValueError("Stripe signer response does not match claim")
+            configured_pubkey = pubkeys[index]
+            if bytes.fromhex(
+                parsed.validatorPubkey.removeprefix("0x")
+            ) != configured_pubkey:
+                raise ValueError("validator public key mismatch")
+            signature = G2Element.from_bytes(
+                bytes.fromhex(parsed.signature.removeprefix("0x"))
+            )
+            if not AugSchemeMPL.aggregate_verify(
+                [G1Element.from_bytes(configured_pubkey)] * len(messages),
+                list(messages),
+                signature,
+            ):
+                raise ValueError("invalid Stripe settlement signature")
+            return index, signature
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Stripe settlement signer %s rejected or unavailable: %s",
+                index,
+                exc,
+            )
+            return None
+
+    try:
+        responses = await asyncio.gather(
+            *(
+                request_signature(index, url)
+                for index, url in enumerate(settings.zkpassport_validator_urls)
+            )
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    valid = sorted(
+        (item for item in responses if item is not None),
+        key=lambda item: item[0],
+    )
+    threshold = settings.zkpassport_validator_threshold
+    if len(valid) < threshold:
+        raise ValidatorQuorumError(
+            "Stripe settlement validator quorum unavailable: "
+            f"received {len(valid)} of {threshold} required signatures"
+        )
+    selected = valid[:threshold]
+    return ValidatorQuorumResult(
+        signer_indices=tuple(index for index, _ in selected),
+        aggregated_signature=AugSchemeMPL.aggregate(
+            [signature for _, signature in selected]
+        ),
+        claim_hash=claim_hash,
+    )
+
+
 async def collect_voucher_issuance_quorum(
     settings: Settings,
     claim: VoucherIssuanceClaim,
@@ -1132,6 +1581,7 @@ async def collect_voucher_series_phase_quorum(
 __all__ = [
     "ValidatorClaim",
     "PrimaryPurchaseClaim",
+    "StripeSettlementClaim",
     "VoucherIssuanceClaim",
     "VoucherSeriesPhaseClaim",
     "VoucherTransitionClaim",
@@ -1141,6 +1591,7 @@ __all__ = [
     "base_settlement_evidence_hash",
     "collect_validator_quorum",
     "collect_primary_purchase_quorum",
+    "collect_stripe_settlement_quorum",
     "collect_voucher_issuance_quorum",
     "collect_voucher_series_phase_quorum",
     "collect_voucher_transition_quorum",

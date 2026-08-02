@@ -138,6 +138,8 @@ def _plan_template(kos_pubkey: bytes) -> dict:
         "validatorPubkeys": ["0x" + value.hex() for value in validator_pubkeys],
         "trustedTreasuryReservePuzzleHash": "0x" + "41" * 32,
         "trustedProtocolTreasuryPuzzleHash": "0x" + "42" * 32,
+        "companySgtSaleTreasuryPuzzleHash": "0x" + "45" * 32,
+        "wusdcBAssetId": "0x" + "46" * 32,
         "trustedGovernanceRewardsPuzzleHash": "0x" + "43" * 32,
         "trustedGovernanceRewardsRoot": "0x" + "44" * 32,
         "retiredCoordinates": ["0x" + "51" * 32],

@@ -149,6 +149,10 @@ class PlanRequest(ApiModel):
     trusted_protocol_treasury_puzzle_hash: str = Field(
         alias="trustedProtocolTreasuryPuzzleHash"
     )
+    company_sgt_sale_treasury_puzzle_hash: str = Field(
+        alias="companySgtSaleTreasuryPuzzleHash"
+    )
+    wusdc_b_asset_id: str = Field(alias="wusdcBAssetId")
     trusted_governance_rewards_puzzle_hash: str = Field(
         alias="trustedGovernanceRewardsPuzzleHash"
     )

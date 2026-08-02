@@ -25,6 +25,7 @@ Removed endpoints:
 from __future__ import annotations
 
 import base64
+import gc
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -58,9 +59,12 @@ except ModuleNotFoundError as e:
         raise
     admin_roster_update_router = None
 from .mint_endpoints import router as mint_endpoints_router
+from .governance_endpoints import router as governance_endpoints_router
 from .collection_endpoints import router as collection_endpoints_router
+from .admin_sales import router as admin_sales_router
 from .protocol_artifacts import router as protocol_artifacts_router
 from .native_purchases import router as native_purchases_router
+from .stripe_deliveries import router as stripe_deliveries_router
 from .presale_endpoints import router as presale_router
 from .presale_endpoints import get_presale_store
 from .payment_purchase_store import get_payment_purchase_store
@@ -302,6 +306,33 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.voucher_issuance_worker = None
+    app.state.stripe_delivery_worker = None
+    if settings.stripe_delivery_worker_enabled:
+        if app.state.faucet is None or app.state.protocol_submitter is None:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the faucet "
+                "and protocol fee funding."
+            )
+        from .stripe_delivery_store import get_stripe_delivery_store
+        from .stripe_delivery_worker import (
+            StripeDeliveryWorker,
+            StripeDeliveryWorkerConfig,
+        )
+
+        stripe_worker = StripeDeliveryWorker(
+            settings=settings,
+            faucet=app.state.faucet,
+            provider=app.state.coinset,
+            submitter=app.state.protocol_submitter,
+            store=get_stripe_delivery_store(settings.stripe_delivery_db_path),
+            config=StripeDeliveryWorkerConfig(
+                enabled=True,
+                interval_seconds=settings.stripe_delivery_interval_seconds,
+                lease_seconds=settings.stripe_delivery_lease_seconds,
+            ),
+        )
+        await stripe_worker.start()
+        app.state.stripe_delivery_worker = stripe_worker
     if settings.voucher_issuance_worker_enabled:
         if app.state.faucet is None:
             raise RuntimeError(
@@ -355,11 +386,17 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if app.state.stripe_delivery_worker is not None:
+            await app.state.stripe_delivery_worker.stop()
         if app.state.voucher_issuance_worker is not None:
             await app.state.voucher_issuance_worker.stop()
         if app.state.faucet_worker is not None:
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()
+        # chia_rs Program/LazyNode values are thread-affine.  Collect request
+        # cycles before this event-loop thread exits so their finalizers never
+        # run later on an unrelated server or test-runner thread.
+        gc.collect()
 
 
 _server_settings = get_settings()
@@ -401,9 +438,12 @@ app.include_router(omnichain_ownership_activation_router)
 if admin_roster_update_router is not None:
     app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
+app.include_router(governance_endpoints_router)
 app.include_router(collection_endpoints_router)
+app.include_router(admin_sales_router)
 app.include_router(protocol_artifacts_router)
 app.include_router(native_purchases_router)
+app.include_router(stripe_deliveries_router)
 app.include_router(presale_router)
 app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)

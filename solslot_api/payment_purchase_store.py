@@ -33,6 +33,18 @@ class StoredPaymentPurchase:
     offer_artifact: dict[str, Any]
     purchase_artifact: dict[str, Any]
     external_message: dict[str, Any] | None
+    deed_launcher_id: str | None = None
+    inventory_state: str = "UNRESERVED"
+    inventory_available_coin_id: str | None = None
+    inventory_reserved_coin_id: str | None = None
+    inventory_reserved_puzzle_hash: str | None = None
+    inventory_expires_at: int | None = None
+    inventory_bundle: dict[str, Any] | None = None
+    inventory_bundle_id: str | None = None
+    inventory_signer_indices: tuple[int, ...] = ()
+    inventory_signature: str | None = None
+    inventory_mempool_observed_at: str | None = None
+    inventory_confirmation_height: int | None = None
 
 
 class PaymentPurchaseStore:
@@ -55,6 +67,18 @@ class PaymentPurchaseStore:
                     external_global_payment_id TEXT UNIQUE,
                     external_transaction_hash TEXT,
                     external_message_json TEXT,
+                    deed_launcher_id TEXT,
+                    inventory_state TEXT NOT NULL DEFAULT 'UNRESERVED',
+                    inventory_available_coin_id TEXT,
+                    inventory_reserved_coin_id TEXT UNIQUE,
+                    inventory_reserved_puzzle_hash TEXT,
+                    inventory_expires_at INTEGER,
+                    inventory_bundle_json TEXT,
+                    inventory_bundle_id TEXT UNIQUE,
+                    inventory_signer_indices_json TEXT NOT NULL DEFAULT '[]',
+                    inventory_signature TEXT,
+                    inventory_mempool_observed_at TEXT,
+                    inventory_confirmation_height INTEGER,
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS payment_purchases_expiry
@@ -72,10 +96,48 @@ class PaymentPurchaseStore:
                     "ALTER TABLE payment_purchases "
                     "ADD COLUMN external_transaction_hash TEXT"
                 )
+            inventory_columns = {
+                "deed_launcher_id": "TEXT",
+                "inventory_state": "TEXT NOT NULL DEFAULT 'UNRESERVED'",
+                "inventory_available_coin_id": "TEXT",
+                "inventory_reserved_coin_id": "TEXT",
+                "inventory_reserved_puzzle_hash": "TEXT",
+                "inventory_expires_at": "INTEGER",
+                "inventory_bundle_json": "TEXT",
+                "inventory_bundle_id": "TEXT",
+                "inventory_signer_indices_json": "TEXT NOT NULL DEFAULT '[]'",
+                "inventory_signature": "TEXT",
+                "inventory_mempool_observed_at": "TEXT",
+                "inventory_confirmation_height": "INTEGER",
+            }
+            for name, declaration in inventory_columns.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE payment_purchases ADD COLUMN {name} {declaration}"
+                    )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "payment_purchases_external_transaction "
                 "ON payment_purchases(external_transaction_hash)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "payment_purchases_inventory_bundle "
+                "ON payment_purchases(inventory_bundle_id) "
+                "WHERE inventory_bundle_id IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "payment_purchases_reserved_coin "
+                "ON payment_purchases(inventory_reserved_coin_id) "
+                "WHERE inventory_reserved_coin_id IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "payment_purchases_active_deed_reservation "
+                "ON payment_purchases(deed_launcher_id) "
+                "WHERE deed_launcher_id IS NOT NULL AND inventory_state IN "
+                "('PREPARED', 'SUBMITTED', 'CONFIRMED')"
             )
 
     @contextmanager
@@ -107,9 +169,12 @@ class PaymentPurchaseStore:
     ) -> StoredPaymentPurchase:
         purchase_id = _required_string(purchase_artifact, "purchaseId")
         artifact_hash = _required_string(purchase_artifact, "artifactHash")
-        quote_expires_at = _required_int(
+        quote_expires_at = _required_decimal(
             purchase_artifact,
             "quoteExpiresAt",
+        )
+        deed_launcher_id = _optional_nonzero_hex32(
+            purchase_artifact.get("deedLauncherId")
         )
         offer_json = _canonical_json(offer_artifact)
         purchase_json = _canonical_json(purchase_artifact)
@@ -150,8 +215,9 @@ class PaymentPurchaseStore:
                     offer_artifact_hash,
                     offer_artifact_json,
                     purchase_artifact_json,
+                    deed_launcher_id,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     purchase_id,
@@ -162,9 +228,115 @@ class PaymentPurchaseStore:
                     offer_artifact_hash,
                     offer_json,
                     purchase_json,
+                    deed_launcher_id,
                     created_at,
                 ),
             )
+            row = connection.execute(
+                "SELECT * FROM payment_purchases WHERE purchase_id = ?",
+                (purchase_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+        assert row is not None
+        return _record(row)
+
+    def record_inventory_prepared(
+        self,
+        purchase_id: str,
+        *,
+        available_coin_id: str,
+        reserved_coin_id: str,
+        reserved_puzzle_hash: str,
+        expires_at: int,
+        bundle: Mapping[str, Any],
+        signer_indices: tuple[int, ...],
+        signature: str,
+    ) -> StoredPaymentPurchase:
+        return self._transition_inventory(
+            purchase_id,
+            expected_states=("UNRESERVED", "PREPARED"),
+            next_state="PREPARED",
+            values={
+                "inventory_available_coin_id": available_coin_id,
+                "inventory_reserved_coin_id": reserved_coin_id,
+                "inventory_reserved_puzzle_hash": reserved_puzzle_hash,
+                "inventory_expires_at": expires_at,
+                "inventory_bundle_json": _canonical_json(bundle),
+                "inventory_signer_indices_json": json.dumps(list(signer_indices)),
+                "inventory_signature": signature,
+            },
+        )
+
+    def record_inventory_submitted(
+        self,
+        purchase_id: str,
+        *,
+        bundle_id: str,
+        mempool_observed_at: str,
+    ) -> StoredPaymentPurchase:
+        return self._transition_inventory(
+            purchase_id,
+            expected_states=("PREPARED", "SUBMITTED"),
+            next_state="SUBMITTED",
+            values={
+                "inventory_bundle_id": bundle_id,
+                "inventory_mempool_observed_at": mempool_observed_at,
+            },
+        )
+
+    def record_inventory_confirmed(
+        self,
+        purchase_id: str,
+        *,
+        confirmation_height: int,
+    ) -> StoredPaymentPurchase:
+        return self._transition_inventory(
+            purchase_id,
+            expected_states=("SUBMITTED", "CONFIRMED"),
+            next_state="CONFIRMED",
+            values={"inventory_confirmation_height": confirmation_height},
+        )
+
+    def _transition_inventory(
+        self,
+        purchase_id: str,
+        *,
+        expected_states: tuple[str, ...],
+        next_state: str,
+        values: Mapping[str, Any],
+    ) -> StoredPaymentPurchase:
+        assignments = ["inventory_state = ?", *[f"{name} = ?" for name in values]]
+        parameters = [next_state, *values.values(), purchase_id, *expected_states]
+        placeholders = ", ".join("?" for _ in expected_states)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    f"UPDATE payment_purchases SET {', '.join(assignments)} "
+                    f"WHERE purchase_id = ? AND inventory_state IN ({placeholders})",
+                    parameters,
+                )
+            except sqlite3.IntegrityError as exc:
+                connection.execute("ROLLBACK")
+                raise PaymentPurchaseConflict(
+                    "SmartDeed inventory is already reserved by another purchase"
+                ) from exc
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    "SELECT * FROM payment_purchases WHERE purchase_id = ?",
+                    (purchase_id,),
+                ).fetchone()
+                connection.execute("ROLLBACK")
+                if row is None:
+                    raise PaymentPurchaseNotFound("purchase artifact was not found")
+                record = _record(row)
+                if record.inventory_state == next_state and all(
+                    row[name] == value for name, value in values.items()
+                ):
+                    return record
+                raise PaymentPurchaseConflict(
+                    f"inventory transition {record.inventory_state} -> {next_state} is not allowed"
+                )
             row = connection.execute(
                 "SELECT * FROM payment_purchases WHERE purchase_id = ?",
                 (purchase_id,),
@@ -244,6 +416,7 @@ class PaymentPurchaseStore:
 
 def _record(row: sqlite3.Row) -> StoredPaymentPurchase:
     external_json = row["external_message_json"]
+    inventory_bundle_json = row["inventory_bundle_json"]
     return StoredPaymentPurchase(
         purchase_id=row["purchase_id"],
         artifact_hash=row["artifact_hash"],
@@ -255,6 +428,33 @@ def _record(row: sqlite3.Row) -> StoredPaymentPurchase:
         purchase_artifact=json.loads(row["purchase_artifact_json"]),
         external_message=(
             json.loads(external_json) if external_json is not None else None
+        ),
+        deed_launcher_id=row["deed_launcher_id"],
+        inventory_state=row["inventory_state"],
+        inventory_available_coin_id=row["inventory_available_coin_id"],
+        inventory_reserved_coin_id=row["inventory_reserved_coin_id"],
+        inventory_reserved_puzzle_hash=row["inventory_reserved_puzzle_hash"],
+        inventory_expires_at=(
+            int(row["inventory_expires_at"])
+            if row["inventory_expires_at"] is not None
+            else None
+        ),
+        inventory_bundle=(
+            json.loads(inventory_bundle_json)
+            if inventory_bundle_json is not None
+            else None
+        ),
+        inventory_bundle_id=row["inventory_bundle_id"],
+        inventory_signer_indices=tuple(
+            int(value)
+            for value in json.loads(row["inventory_signer_indices_json"])
+        ),
+        inventory_signature=row["inventory_signature"],
+        inventory_mempool_observed_at=row["inventory_mempool_observed_at"],
+        inventory_confirmation_height=(
+            int(row["inventory_confirmation_height"])
+            if row["inventory_confirmation_height"] is not None
+            else None
         ),
     )
 
@@ -276,11 +476,30 @@ def _required_string(value: Mapping[str, Any], field: str) -> str:
     return result
 
 
-def _required_int(value: Mapping[str, Any], field: str) -> int:
+def _required_decimal(value: Mapping[str, Any], field: str) -> int:
     result = value.get(field)
-    if not isinstance(result, int) or isinstance(result, bool):
-        raise PaymentPurchaseConflict(f"{field} must be an integer")
-    return result
+    if isinstance(result, bool):
+        raise PaymentPurchaseConflict(f"{field} must be a decimal integer")
+    if isinstance(result, int):
+        return result
+    if isinstance(result, str) and result.isdecimal():
+        return int(result)
+    raise PaymentPurchaseConflict(f"{field} must be a decimal integer")
+
+
+def _optional_nonzero_hex32(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.lower()
+    if not normalized.startswith("0x"):
+        normalized = "0x" + normalized
+    try:
+        raw = bytes.fromhex(normalized[2:])
+    except ValueError as exc:
+        raise PaymentPurchaseConflict("deedLauncherId is not valid hex") from exc
+    if len(raw) != 32:
+        raise PaymentPurchaseConflict("deedLauncherId must be 32 bytes")
+    return None if raw == bytes(32) else normalized
 
 
 def _required_mapping(value: Mapping[str, Any], field: str) -> Mapping[str, Any]:

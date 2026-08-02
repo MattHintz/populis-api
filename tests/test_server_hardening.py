@@ -87,6 +87,20 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
 
 
+def test_sgt_allocations_require_release_bound_company_treasury() -> None:
+    with pytest.raises(RuntimeError, match="SGT_COMPANY_TREASURY"):
+        validate_server_hardening_at_startup(
+            _staging(sgt_allocations_enabled=True)
+        )
+    validate_server_hardening_at_startup(
+        _staging(
+            sgt_allocations_enabled=True,
+            sgt_company_treasury_puzzle_hash="0x" + "19" * 32,
+            sgt_wusdc_b_asset_id="0x" + "20" * 32,
+        )
+    )
+
+
 def test_guided_launch_requires_a_separate_owner_claim_token() -> None:
     common = {
         "launch_control_enabled": True,
