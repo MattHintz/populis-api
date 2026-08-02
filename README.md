@@ -88,6 +88,9 @@ share allocation, or delivery address.
   `SOLSLOT_STRIPE_DELIVERY_LEASE_SECONDS`. The worker persists each exact
   receipt-funding and delivery bundle before submission, then finalizes only
   after the expected asset and coordination output coins confirm atomically.
+  `SOLSLOT_PAYMENT_KOS_EXECUTOR_URL`, request-key file, and matching BLS public
+  key are mandatory. Key of Solomon is the sole submit/retry boundary and
+  receives no Stripe or Base credential; hosted remote links require mTLS.
   The same durable worker handles reviewed Base Sepolia USDC when
   `SOLSLOT_PAYMENT_OMNICHAIN_ENABLED=true`; Base remains pending until Samuel
   relays the one-use Chia result and the API independently verifies the final
@@ -99,8 +102,8 @@ share allocation, or delivery address.
 Native XCH and CAT purchases are completed as standard atomic Chia offer files.
 The sealed USD target raise and deed share determine the exact integer USD
 minor-unit price; the H-system oracle round converts that price to XCH mojos or
-CAT base units. The offer requests those exact units and delivers exactly one
-governed SmartDeed to the canonical vault puzzle hash in one atomic settlement.
+CAT base units. A quantity order binds every selected governed SmartDeed output
+or the exact SGT CAT amount to the canonical vault in one atomic settlement.
 Native offers do not pass through Samuel, Key of Solomon, or the EVM escrow.
 EVM and Stripe use escrow-backed fulfillment, but must bind the same purchase
 ID, artifact hash, deed launcher, vault launcher, destination, quantity, and

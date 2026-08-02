@@ -62,6 +62,7 @@ from solslot_api.stripe_delivery_store import (
 from solslot_api.stripe_delivery_worker import (
     StripeDeliveryWorker,
     StripeDeliveryWorkerConfig,
+    _bound_outputs,
 )
 
 
@@ -111,12 +112,22 @@ class FakeSubmitter:
         }
 
 
+class FakeExactExecutor:
+    def __init__(self):
+        self.calls = []
+
+    async def dispatch(self, request, prepared):
+        self.calls.append((request, prepared))
+        return {"accepted": True}
+
+
 def _worker(tmp_path, provider, submitter, store):
     return StripeDeliveryWorker(
         settings=Settings(),
         faucet=Faucet.from_seed_hex("01" * 32, "testnet11"),
         provider=provider,
         submitter=submitter,
+        exact_executor=FakeExactExecutor(),
         store=store,
         config=StripeDeliveryWorkerConfig(enabled=True),
     )
@@ -130,6 +141,28 @@ def _queued(store):
     )
 
 
+def test_exact_output_manifest_preserves_sgt_quantity_and_multiple_outputs():
+    parent = Coin(_b32(60), _b32(61), uint64(30_001))
+    conditions = Program.to(
+        [
+            [51, _b32(62), 30_000],
+            [51, _b32(63), 1],
+        ]
+    )
+    spend = make_spend(parent, Program.to((1, conditions)), Program.to(0))
+    bundle = SpendBundle([spend], G2Element())
+    additions = bundle.additions()
+    outputs = _bound_outputs(
+        bundle.to_json_dict(),
+        tuple(_hex(coin.name()) for coin in additions),
+    )
+
+    assert sorted(output.amount for output in outputs) == [1, 30_000]
+    assert {output.coin_id for output in outputs} == {
+        bytes32(coin.name()) for coin in additions
+    }
+
+
 @pytest.mark.asyncio
 async def test_receipt_prepared_recovers_mempool_without_second_push(tmp_path):
     store = StripeDeliveryStore(str(tmp_path / "delivery.db"))
@@ -140,15 +173,34 @@ async def test_receipt_prepared_recovers_mempool_without_second_push(tmp_path):
     receipt_coin = Coin(input_coin.name(), _b32(5), uint64(1))
     provider.records[_hex(input_coin.name())] = _record(input_coin, confirmed=10)
     provider.mempool[_hex(input_coin.name())] = [
-        {"spend_bundle_name": _hex(_b32(6))}
+        {"spend_bundle_name": "pending"}
     ]
+    receipt_conditions = Program.to([[51, receipt_coin.puzzle_hash, 1]])
+    receipt_spend = make_spend(
+        input_coin,
+        Program.to((1, receipt_conditions)),
+        Program.to(0),
+    )
+    receipt_bundle = SpendBundle([receipt_spend], G2Element())
     prepared = store.record_receipt_prepared(
         operation.purchase_id,
         input_coin_id=_hex(input_coin.name()),
-        protocol_bundle={"coin_spends": [], "aggregated_signature": "c0"},
+        protocol_bundle=receipt_bundle.to_json_dict(),
         receipt_coin_id=_hex(receipt_coin.name()),
         receipt_puzzle_hash=_hex(receipt_coin.puzzle_hash),
     )
+    prepared = store.bind_receipt_exact_bundle(
+        operation.purchase_id,
+        exact_bundle={
+            "spendBundleId": _hex(receipt_bundle.name()),
+            "feeMojos": "4",
+            "feeCoinId": _hex(input_coin.name()),
+            "spendBundle": receipt_bundle.to_json_dict(),
+        },
+    )
+    provider.mempool[_hex(input_coin.name())] = [
+        {"spend_bundle_name": _hex(receipt_bundle.name())}
+    ]
     assert prepared.state == RECEIPT_FUNDING_PREPARED
 
     recovered = await _worker(
@@ -156,8 +208,8 @@ async def test_receipt_prepared_recovers_mempool_without_second_push(tmp_path):
     )._submit_or_recover_receipt_funding(prepared)
 
     assert recovered.state == RECEIPT_FUNDING_SUBMITTED
-    assert recovered.receipt_funding_bundle_id == _hex(_b32(6))
-    assert recovered.receipt_funding_fee_mojos is None
+    assert recovered.receipt_funding_bundle_id == _hex(receipt_bundle.name())
+    assert recovered.receipt_funding_fee_mojos == 4
     assert submitter.calls == 0
 
 

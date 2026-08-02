@@ -39,6 +39,7 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
         "SOLSLOT_PURCHASE_OPERATIONS_TOKEN",
+        "SOLSLOT_PAYMENT_KOS_EXECUTOR_PRIVATE_KEY_FILE",
         "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN",
         "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY",
         "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN",
@@ -164,6 +165,49 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             raise RuntimeError(
                 "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires "
                 "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED."
+            )
+        if not (
+            settings.payment_kos_executor_url
+            and settings.payment_kos_executor_private_key_file
+            and settings.payment_kos_executor_public_key
+        ):
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the exact "
+                "Key of Solomon executor URL, request key file, and public key."
+            )
+        if not valid_internal_service_url(settings.payment_kos_executor_url):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_URL must use HTTPS or "
+                "loopback-only HTTP."
+            )
+        try:
+            kos_public_key = bytes.fromhex(
+                settings.payment_kos_executor_public_key.removeprefix("0x")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY is not valid hex."
+            ) from exc
+        if len(kos_public_key) != 48:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY must be 48 bytes."
+            )
+        kos_mtls = (
+            settings.payment_kos_executor_mtls_ca_path,
+            settings.payment_kos_executor_mtls_cert_path,
+            settings.payment_kos_executor_mtls_key_path,
+        )
+        if any(kos_mtls) and not all(kos_mtls):
+            raise RuntimeError(
+                "Key of Solomon mTLS requires CA, certificate, and key paths."
+            )
+        if (
+            settings.runtime_environment in {"staging", "production"}
+            and settings.payment_kos_executor_url.startswith("https://")
+            and not all(kos_mtls)
+        ):
+            raise RuntimeError(
+                "Remote Key of Solomon execution requires mTLS in hosted environments."
             )
 
     if settings.minting_enabled and not settings.alpha_writes_enabled:
@@ -628,6 +672,12 @@ class Settings(BaseSettings):
         "protocol_artifact_api_token",
         "purchase_operations_service_url",
         "purchase_operations_token",
+        "payment_kos_executor_url",
+        "payment_kos_executor_private_key_file",
+        "payment_kos_executor_public_key",
+        "payment_kos_executor_mtls_ca_path",
+        "payment_kos_executor_mtls_cert_path",
+        "payment_kos_executor_mtls_key_path",
         "payment_omnichain_ingest_token",
         "payment_omnichain_rpc_url",
         "payment_omnichain_ownership_safe_operation_path",
@@ -1010,6 +1060,15 @@ class Settings(BaseSettings):
     stripe_delivery_worker_enabled: bool = False
     stripe_delivery_interval_seconds: float = Field(15.0, ge=5.0, le=300.0)
     stripe_delivery_lease_seconds: int = Field(60, ge=30, le=600)
+    # The coordinator signs only exact execution envelopes. Key of Solomon
+    # receives no payment credential and is the sole submit/retry boundary.
+    payment_kos_executor_url: Optional[str] = None
+    payment_kos_executor_private_key_file: Optional[str] = None
+    payment_kos_executor_public_key: Optional[str] = None
+    payment_kos_executor_timeout_seconds: float = Field(30.0, gt=0, le=120.0)
+    payment_kos_executor_mtls_ca_path: Optional[str] = None
+    payment_kos_executor_mtls_cert_path: Optional[str] = None
+    payment_kos_executor_mtls_key_path: Optional[str] = None
     # External CCIP/Warp escrow is separately deployed from the ceremony EVM
     # bridge. Token allowlisting alone must never activate this rail.
     payment_omnichain_enabled: bool = False

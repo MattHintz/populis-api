@@ -46,12 +46,14 @@ class StripeDeliveryOperation:
     state: str
     receipt_funding_input_coin_id: str | None
     receipt_funding_bundle: dict[str, Any] | None
+    receipt_funding_exact_bundle: dict[str, Any] | None
     receipt_funding_bundle_id: str | None
     receipt_coin_id: str | None
     receipt_puzzle_hash: str | None
     receipt_funding_fee_mojos: int | None
     receipt_funding_mempool_observed_at: str | None
     delivery_bundle: dict[str, Any] | None
+    delivery_exact_bundle: dict[str, Any] | None
     delivery_bundle_id: str | None
     expected_delivery_output_coin_id: str | None
     expected_treasury_output_coin_id: str | None
@@ -102,12 +104,14 @@ class StripeDeliveryStore:
                     state TEXT NOT NULL,
                     receipt_funding_input_coin_id TEXT UNIQUE,
                     receipt_funding_bundle_json TEXT,
+                    receipt_funding_exact_bundle_json TEXT,
                     receipt_funding_bundle_id TEXT UNIQUE,
                     receipt_coin_id TEXT UNIQUE,
                     receipt_puzzle_hash TEXT,
                     receipt_funding_fee_mojos INTEGER,
                     receipt_funding_mempool_observed_at TEXT,
                     delivery_bundle_json TEXT,
+                    delivery_exact_bundle_json TEXT,
                     delivery_bundle_id TEXT UNIQUE,
                     expected_deed_output_coin_id TEXT UNIQUE,
                     expected_delivery_output_coin_id TEXT UNIQUE,
@@ -194,6 +198,16 @@ class StripeDeliveryStore:
                     "stripe_delivery_output_once ON "
                     "stripe_delivery_operations(expected_delivery_output_coin_id) "
                     "WHERE expected_delivery_output_coin_id IS NOT NULL"
+                )
+            if "receipt_funding_exact_bundle_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE stripe_delivery_operations "
+                    "ADD COLUMN receipt_funding_exact_bundle_json TEXT"
+                )
+            if "delivery_exact_bundle_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE stripe_delivery_operations "
+                    "ADD COLUMN delivery_exact_bundle_json TEXT"
                 )
 
     @contextmanager
@@ -469,6 +483,22 @@ class StripeDeliveryStore:
             },
         )
 
+    def bind_receipt_exact_bundle(
+        self,
+        purchase_id: str,
+        *,
+        exact_bundle: Mapping[str, Any],
+    ) -> StripeDeliveryOperation:
+        return self._transition(
+            purchase_id,
+            allowed={RECEIPT_FUNDING_PREPARED},
+            state=RECEIPT_FUNDING_PREPARED,
+            values={
+                "receipt_funding_exact_bundle_json": _canonical_json(exact_bundle),
+            },
+            release_lease=False,
+        )
+
     def record_receipt_prepared(
         self,
         purchase_id: str,
@@ -533,6 +563,22 @@ class StripeDeliveryStore:
                 "fee_mojos": fee_mojos,
                 "mempool_observed_at": mempool_observed_at,
             },
+        )
+
+    def bind_delivery_exact_bundle(
+        self,
+        purchase_id: str,
+        *,
+        exact_bundle: Mapping[str, Any],
+    ) -> StripeDeliveryOperation:
+        return self._transition(
+            purchase_id,
+            allowed={DELIVERY_PREPARED},
+            state=DELIVERY_PREPARED,
+            values={
+                "delivery_exact_bundle_json": _canonical_json(exact_bundle),
+            },
+            release_lease=False,
         )
 
     def record_delivery_prepared(
@@ -691,6 +737,7 @@ class StripeDeliveryStore:
         allowed: set[str],
         state: str,
         values: Mapping[str, Any],
+        release_lease: bool = True,
     ) -> StripeDeliveryOperation:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -719,7 +766,9 @@ class StripeDeliveryStore:
                     raise StripeDeliveryConflict(
                         f"Stripe delivery {field} is already bound"
                     )
-            assignments = ["state=?", "lease_owner=NULL", "lease_expires_at=NULL", "updated_at=?"]
+            assignments = ["state=?", "updated_at=?"]
+            if release_lease:
+                assignments.extend(["lease_owner=NULL", "lease_expires_at=NULL"])
             if "last_error" not in values:
                 assignments.append("last_error=NULL")
             params: list[Any] = [state, int(time.time())]
@@ -741,7 +790,6 @@ class StripeDeliveryStore:
         assert row is not None
         return _record(row)
 
-
 def _record(row: sqlite3.Row) -> StripeDeliveryOperation:
     return StripeDeliveryOperation(
         purchase_id=str(row["purchase_id"]),
@@ -755,6 +803,11 @@ def _record(row: sqlite3.Row) -> StripeDeliveryOperation:
         receipt_funding_bundle=(
             json.loads(str(row["receipt_funding_bundle_json"]))
             if row["receipt_funding_bundle_json"] is not None
+            else None
+        ),
+        receipt_funding_exact_bundle=(
+            json.loads(str(row["receipt_funding_exact_bundle_json"]))
+            if row["receipt_funding_exact_bundle_json"] is not None
             else None
         ),
         receipt_funding_bundle_id=row["receipt_funding_bundle_id"],
@@ -771,6 +824,11 @@ def _record(row: sqlite3.Row) -> StripeDeliveryOperation:
         delivery_bundle=(
             json.loads(str(row["delivery_bundle_json"]))
             if row["delivery_bundle_json"] is not None
+            else None
+        ),
+        delivery_exact_bundle=(
+            json.loads(str(row["delivery_exact_bundle_json"]))
+            if row["delivery_exact_bundle_json"] is not None
             else None
         ),
         delivery_bundle_id=row["delivery_bundle_id"],

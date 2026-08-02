@@ -98,6 +98,7 @@ from .config import (
 from .credential_auth import require_alpha_writes
 from .protocol_config import build_snapshot as build_protocol_config_snapshot
 from .protocol_submission import ProtocolBundleSubmitter, ProtocolFeePolicy
+from .kos_exact_execution import KeyOfSolomonExactExecutor
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
@@ -307,6 +308,7 @@ async def lifespan(app: FastAPI):
 
     app.state.voucher_issuance_worker = None
     app.state.stripe_delivery_worker = None
+    app.state.kos_exact_executor = None
     if settings.stripe_delivery_worker_enabled:
         if app.state.faucet is None or app.state.protocol_submitter is None:
             raise RuntimeError(
@@ -319,11 +321,24 @@ async def lifespan(app: FastAPI):
             StripeDeliveryWorkerConfig,
         )
 
+        app.state.kos_exact_executor = KeyOfSolomonExactExecutor(
+            url=str(settings.payment_kos_executor_url),
+            private_key_file=str(
+                settings.payment_kos_executor_private_key_file
+            ),
+            expected_public_key=str(settings.payment_kos_executor_public_key),
+            timeout_seconds=settings.payment_kos_executor_timeout_seconds,
+            mtls_ca_path=settings.payment_kos_executor_mtls_ca_path,
+            mtls_cert_path=settings.payment_kos_executor_mtls_cert_path,
+            mtls_key_path=settings.payment_kos_executor_mtls_key_path,
+        )
+
         stripe_worker = StripeDeliveryWorker(
             settings=settings,
             faucet=app.state.faucet,
             provider=app.state.coinset,
             submitter=app.state.protocol_submitter,
+            exact_executor=app.state.kos_exact_executor,
             store=get_stripe_delivery_store(settings.stripe_delivery_db_path),
             config=StripeDeliveryWorkerConfig(
                 enabled=True,

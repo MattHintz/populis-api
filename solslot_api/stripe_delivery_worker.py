@@ -57,8 +57,14 @@ from .governance_sale_offer import (
     reconstruct_governed_sale_coin,
     reconstruct_governed_sale_lineage,
 )
+from .kos_exact_execution import (
+    ExactExecutionAction,
+    ExactExecutionOutput,
+    ExactExecutionRequest,
+    KeyOfSolomonExactExecutor,
+)
 from .payment_purchase_store import get_payment_purchase_store
-from .protocol_submission import ProtocolBundleSubmitter
+from .protocol_submission import PreparedProtocolBundle, ProtocolBundleSubmitter
 from .public_artifact import load_signed_public_artifact
 from .state import get_registry
 from .stripe_delivery_store import (
@@ -110,6 +116,7 @@ class StripeDeliveryWorker:
         faucet: Faucet,
         provider: Any,
         submitter: ProtocolBundleSubmitter,
+        exact_executor: KeyOfSolomonExactExecutor,
         store: StripeDeliveryStore,
         config: StripeDeliveryWorkerConfig,
     ) -> None:
@@ -117,6 +124,7 @@ class StripeDeliveryWorker:
         self.faucet = faucet
         self.provider = provider
         self.submitter = submitter
+        self.exact_executor = exact_executor
         self.store = store
         self.config = config
         self._task: asyncio.Task[None] | None = None
@@ -396,12 +404,23 @@ class StripeDeliveryWorker:
             operation.receipt_funding_input_coin_id
         )
         if pending_id:
+            if operation.receipt_funding_exact_bundle is None:
+                raise StripeDeliveryManualReview(
+                    "receipt input is pending without a persisted exact KoS bundle"
+                )
+            prepared = _prepared_from_binding(
+                operation.receipt_funding_exact_bundle
+            )
+            if pending_id != _hex32(prepared.bundle.name()):
+                raise StripeDeliveryManualReview(
+                    "receipt input is reserved by a different mempool bundle"
+                )
             return self.store.record_receipt_funding(
                 operation.purchase_id,
                 bundle_id=pending_id,
                 receipt_coin_id=operation.receipt_coin_id,
                 receipt_puzzle_hash=str(operation.receipt_puzzle_hash),
-                fee_mojos=None,
+                fee_mojos=prepared.fee_mojos,
                 mempool_observed_at=_utc_now(),
             )
         if _is_spent(input_record):
@@ -410,14 +429,39 @@ class StripeDeliveryWorker:
             )
         if operation.receipt_funding_bundle is None:
             raise StripeDeliveryManualReview("prepared receipt bundle is missing")
-        result = await self.submitter.submit(operation.receipt_funding_bundle)
+        request = self._exact_execution_request(
+            operation,
+            action=ExactExecutionAction.RECEIPT,
+            outputs=_bound_outputs(
+                operation.receipt_funding_bundle,
+                (operation.receipt_coin_id,),
+            ),
+        )
+        if operation.receipt_funding_exact_bundle is None:
+            async def dispatch(prepared: PreparedProtocolBundle):
+                self.store.bind_receipt_exact_bundle(
+                    operation.purchase_id,
+                    exact_bundle=prepared.to_json(),
+                )
+                return await self.exact_executor.dispatch(request, prepared)
+
+            result = await self.submitter.prepare_and_dispatch(
+                operation.receipt_funding_bundle,
+                dispatch,
+            )
+        else:
+            prepared = _prepared_from_binding(
+                operation.receipt_funding_exact_bundle
+            )
+            await self.exact_executor.dispatch(request, prepared)
+            result = prepared.to_json()
         return self.store.record_receipt_funding(
             operation.purchase_id,
             bundle_id=str(result["spendBundleId"]).lower(),
             receipt_coin_id=operation.receipt_coin_id,
             receipt_puzzle_hash=str(operation.receipt_puzzle_hash),
             fee_mojos=int(result["feeMojos"]),
-            mempool_observed_at=str(result["mempoolObservedAt"]),
+            mempool_observed_at=_utc_now(),
         )
 
     async def _confirm_receipt(
@@ -792,6 +836,15 @@ class StripeDeliveryWorker:
         for coin_id in input_ids:
             pending_id = await self._mempool_bundle_id(coin_id)
             if pending_id:
+                if operation.delivery_exact_bundle is None:
+                    raise StripeDeliveryManualReview(
+                        "delivery input is pending without a persisted exact KoS bundle"
+                    )
+                prepared = _prepared_from_binding(operation.delivery_exact_bundle)
+                if pending_id != _hex32(prepared.bundle.name()):
+                    raise StripeDeliveryManualReview(
+                        "delivery input is reserved by a different mempool bundle"
+                    )
                 return self.store.record_delivery_submission(
                     operation.purchase_id,
                     bundle_id=pending_id,
@@ -802,7 +855,7 @@ class StripeDeliveryWorker:
                         operation.expected_treasury_output_coin_id
                     ),
                     signer_indices=operation.signer_indices,
-                    fee_mojos=None,
+                    fee_mojos=prepared.fee_mojos,
                     mempool_observed_at=_utc_now(),
                 )
         input_records = [
@@ -813,7 +866,38 @@ class StripeDeliveryWorker:
             raise StripeDeliveryManualReview(
                 "delivery input was spent without both committed outputs"
             )
-        result = await self.submitter.submit(operation.delivery_bundle)
+        expected_output_ids = (
+            operation.expected_delivery_output_coin_id,
+            operation.expected_treasury_output_coin_id,
+        )
+        if any(value is None for value in expected_output_ids):
+            raise StripeDeliveryManualReview(
+                "prepared delivery output manifest is incomplete"
+            )
+        request = self._exact_execution_request(
+            operation,
+            action=ExactExecutionAction.DELIVER,
+            outputs=_bound_outputs(
+                operation.delivery_bundle,
+                tuple(str(value) for value in expected_output_ids),
+            ),
+        )
+        if operation.delivery_exact_bundle is None:
+            async def dispatch(prepared: PreparedProtocolBundle):
+                self.store.bind_delivery_exact_bundle(
+                    operation.purchase_id,
+                    exact_bundle=prepared.to_json(),
+                )
+                return await self.exact_executor.dispatch(request, prepared)
+
+            result = await self.submitter.prepare_and_dispatch(
+                operation.delivery_bundle,
+                dispatch,
+            )
+        else:
+            prepared = _prepared_from_binding(operation.delivery_exact_bundle)
+            await self.exact_executor.dispatch(request, prepared)
+            result = prepared.to_json()
         return self.store.record_delivery_submission(
             operation.purchase_id,
             bundle_id=str(result["spendBundleId"]).lower(),
@@ -825,7 +909,29 @@ class StripeDeliveryWorker:
             ),
             signer_indices=operation.signer_indices,
             fee_mojos=int(result["feeMojos"]),
-            mempool_observed_at=str(result["mempoolObservedAt"]),
+            mempool_observed_at=_utc_now(),
+        )
+
+    def _exact_execution_request(
+        self,
+        operation: StripeDeliveryOperation,
+        *,
+        action: ExactExecutionAction,
+        outputs: tuple[ExactExecutionOutput, ...],
+    ) -> ExactExecutionRequest:
+        purchase = purchase_artifact_v3_from_json(
+            self._stored_purchase(operation.purchase_id)
+        )
+        if _hex32(purchase.purchase_id) != operation.purchase_id.lower():
+            raise StripeDeliveryManualReview(
+                "delivery operation differs from its purchase artifact"
+            )
+        return ExactExecutionRequest(
+            action=action,
+            purchase_id=purchase.purchase_id,
+            artifact_hash=purchase.artifact_hash,
+            claim_hash=bytes32.from_hexstr(operation.receipt_hash),
+            expected_outputs=outputs,
         )
 
     async def _confirm_delivery(
@@ -868,7 +974,7 @@ class StripeDeliveryWorker:
         if not (
             operation.expected_delivery_output_coin_id
             and operation.expected_treasury_output_coin_id
-            and operation.delivery_bundle
+            and (operation.delivery_exact_bundle or operation.delivery_bundle)
         ):
             return None
         delivery_record = await self.provider.get_coin_record_by_name(
@@ -890,7 +996,11 @@ class StripeDeliveryWorker:
             raise StripeDeliveryManualReview(
                 "delivery asset and treasury outputs did not confirm atomically"
             )
-        bundle = SpendBundle.from_json_dict(operation.delivery_bundle)
+        bundle = (
+            _prepared_from_binding(operation.delivery_exact_bundle).bundle
+            if operation.delivery_exact_bundle is not None
+            else SpendBundle.from_json_dict(operation.delivery_bundle)
+        )
         input_records = [
             await self.provider.get_coin_record_by_name(_hex32(coin.name()))
             for coin in bundle.removals()
@@ -992,6 +1102,67 @@ def _one_output(
             f"delivery must create exactly one {label}; found {len(matches)}"
         )
     return matches[0]
+
+
+def _bound_outputs(
+    bundle_json: Mapping[str, Any],
+    coin_ids: tuple[str, ...],
+) -> tuple[ExactExecutionOutput, ...]:
+    try:
+        bundle = SpendBundle.from_json_dict(dict(bundle_json))
+        additions = {_hex32(coin.name()): coin for coin in bundle.additions()}
+    except Exception as exc:  # noqa: BLE001
+        raise StripeDeliveryManualReview(
+            "prepared bundle output manifest cannot be reconstructed"
+        ) from exc
+    if len(set(value.lower() for value in coin_ids)) != len(coin_ids):
+        raise StripeDeliveryManualReview(
+            "prepared bundle output manifest contains duplicate coin IDs"
+        )
+    outputs: list[ExactExecutionOutput] = []
+    for value in coin_ids:
+        coin = additions.get(value.lower())
+        if coin is None:
+            raise StripeDeliveryManualReview(
+                "prepared bundle does not create a committed output"
+            )
+        outputs.append(
+            ExactExecutionOutput(
+                coin_id=bytes32(coin.name()),
+                puzzle_hash=bytes32(coin.puzzle_hash),
+                amount=int(coin.amount),
+            )
+        )
+    return tuple(sorted(outputs, key=lambda output: bytes(output.coin_id)))
+
+
+def _prepared_from_binding(value: Mapping[str, Any]) -> PreparedProtocolBundle:
+    try:
+        bundle = SpendBundle.from_json_dict(dict(value["spendBundle"]))
+        bundle_id = _normalize_hex32(str(value["spendBundleId"]))
+        fee_mojos = int(value["feeMojos"])
+        fee_coin_id = _normalize_hex32(str(value["feeCoinId"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StripeDeliveryManualReview(
+            "persisted exact KoS bundle is malformed"
+        ) from exc
+    if _hex32(bundle.name()) != bundle_id:
+        raise StripeDeliveryManualReview(
+            "persisted exact KoS bundle ID differs from its bytes"
+        )
+    if fee_mojos < 0:
+        raise StripeDeliveryManualReview(
+            "persisted exact KoS fee cannot be negative"
+        )
+    if fee_coin_id not in {_hex32(coin.name()) for coin in bundle.removals()}:
+        raise StripeDeliveryManualReview(
+            "persisted exact KoS fee coin is not an input"
+        )
+    return PreparedProtocolBundle(
+        bundle=bundle,
+        fee_mojos=fee_mojos,
+        fee_coin_id=fee_coin_id,
+    )
 
 
 def _coin_from_record(record: Any) -> Coin | None:

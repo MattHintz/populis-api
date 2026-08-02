@@ -113,6 +113,52 @@ def test_delivery_rejects_rebinding_and_duplicate_receipt(tmp_path) -> None:
         )
 
 
+def test_exact_bundle_binding_is_immutable_and_keeps_worker_lease(tmp_path) -> None:
+    store = StripeDeliveryStore(str(tmp_path / "exact-deliveries.db"))
+    purchase_id = _hex("31")
+    store.queue(
+        purchase_id=purchase_id,
+        evidence={"paymentIntentId": "pi_exact"},
+        receipt_hash=_hex("32"),
+        now=100,
+    )
+    store.record_receipt_prepared(
+        purchase_id,
+        input_coin_id=_hex("33"),
+        protocol_bundle={"coin_spends": []},
+        receipt_coin_id=_hex("34"),
+        receipt_puzzle_hash=_hex("35"),
+    )
+    assert store.claim(
+        purchase_id,
+        owner="worker-a",
+        lease_seconds=60,
+        now=101,
+    ) is not None
+    exact = {
+        "spendBundleId": _hex("36"),
+        "feeMojos": "7",
+        "feeCoinId": _hex("37"),
+        "spendBundle": {"coin_spends": []},
+    }
+    bound = store.bind_receipt_exact_bundle(
+        purchase_id,
+        exact_bundle=exact,
+    )
+    assert bound.receipt_funding_exact_bundle == exact
+    assert store.claim(
+        purchase_id,
+        owner="worker-b",
+        lease_seconds=60,
+        now=110,
+    ) is None
+    with pytest.raises(StripeDeliveryConflict, match="already bound"):
+        store.bind_receipt_exact_bundle(
+            purchase_id,
+            exact_bundle={**exact, "feeMojos": "8"},
+        )
+
+
 def test_targeted_reconciliation_uses_the_same_cross_process_lease(tmp_path) -> None:
     store = StripeDeliveryStore(str(tmp_path / "deliveries.db"))
     queued = store.queue(
