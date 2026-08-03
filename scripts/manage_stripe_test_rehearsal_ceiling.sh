@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Arm or disarm the RC24 Stripe test-mode infrastructure ceiling.
+# Arm or disarm the RC26 Stripe test-mode infrastructure ceiling.
 #
 # This does not open a signed launch window. The administrator UI remains the
 # only transaction-level switch for minting, presales, and purchases.
@@ -184,13 +184,13 @@ missing = [name for name in required_backend if not backend.get(name)]
 if missing:
     raise SystemExit("backend Stripe configuration is incomplete: " + ", ".join(missing))
 if not backend["STRIPE_SECRET_KEY"].startswith("sk_test_"):
-    raise SystemExit("RC24 rehearsal requires a Stripe test secret key")
+    raise SystemExit("RC26 rehearsal requires a Stripe test secret key")
 if not backend["STRIPE_WEBHOOK_SECRET"].startswith("whsec_"):
     raise SystemExit("Stripe webhook signing secret is malformed")
 if not backend["STRIPE_ACCOUNT_ID"].startswith("acct_"):
     raise SystemExit("Stripe account ID is malformed")
 if backend["STRIPE_API_VERSION"] != "2026-02-25.clover":
-    raise SystemExit("Stripe API version is not pinned to RC24")
+    raise SystemExit("Stripe API version is not pinned to RC26")
 for name in ("SOLSLOT_PROTOCOL_CALLBACK_TOKEN", "SOLSLOT_TELONIUM_INTERNAL_TOKEN"):
     if len(backend[name]) < 32:
         raise SystemExit(f"{name} must contain at least 32 characters")
@@ -201,10 +201,10 @@ for name in (
 ):
     value = backend.get(name, "false" if name.endswith("ENABLED") else "0").lower()
     if value not in ({"", "0", "false", "no", "off"} if name.endswith("ENABLED") else {"", "0"}):
-        raise SystemExit("credit surcharge must remain disabled for RC24 rehearsal")
+        raise SystemExit("credit surcharge must remain disabled for RC26 rehearsal")
 
 required_api = (
-    "SOLSLOT_PAYMENT_STRIPE_ACCOUNT_ID",
+    "SOLSLOT_STRIPE_ACCOUNT_ID",
     "SOLSLOT_PAYMENT_KOS_EXECUTOR_URL",
     "SOLSLOT_PAYMENT_KOS_EXECUTOR_PRIVATE_KEY_FILE",
     "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY",
@@ -213,14 +213,10 @@ required_api = (
 missing = [name for name in required_api if not api.get(name)]
 if missing:
     raise SystemExit("API Stripe configuration is incomplete: " + ", ".join(missing))
-if api["SOLSLOT_PAYMENT_STRIPE_ACCOUNT_ID"] != backend["STRIPE_ACCOUNT_ID"]:
+if api["SOLSLOT_STRIPE_ACCOUNT_ID"] != backend["STRIPE_ACCOUNT_ID"]:
     raise SystemExit("API and Telonium Stripe account IDs do not match")
-if api.get("SOLSLOT_PAYMENT_STRIPE_API_VERSION", "") != "2026-02-25.clover":
-    raise SystemExit("API Stripe version is not pinned to RC24")
-if api.get("SOLSLOT_PAYMENT_STRIPE_LIVEMODE", "false").lower() not in {
-    "", "0", "false", "no", "off"
-}:
-    raise SystemExit("RC24 rehearsal cannot use Stripe live mode")
+if api.get("SOLSLOT_STRIPE_MODE", "test").lower() != "test":
+    raise SystemExit("RC26 rehearsal cannot use Stripe live mode")
 if len(api["SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN"]) < 32:
     raise SystemExit("protocol artifact service token is too short")
 PY
@@ -251,13 +247,13 @@ if [ "$(process_env_value "$api_service" SOLSLOT_LAUNCH_CONTROL_ENABLED)" != "tr
   exit 1
 fi
 genesis_db="$(process_env_value "$api_service" SOLSLOT_GENESIS_DB_PATH)"
-purchase_db="$(process_env_value "$api_service" SOLSLOT_PAYMENT_PURCHASE_DB_PATH)"
+delivery_db="$(process_env_value "$api_service" SOLSLOT_STRIPE_DELIVERY_DB_PATH)"
 checker="$api_root/current/scripts/check_stripe_rehearsal_ceiling.py"
 test -x "$checker"
 "$api_root/current/.venv/bin/python" "$checker" \
   --mode "$action" \
   --genesis-db "$genesis_db" \
-  --purchase-db "$purchase_db"
+  --delivery-db "$delivery_db"
 
 if [ "$action" = "arm" ]; then
   for credential in ca.crt coordinator.crt coordinator.key; do
@@ -306,7 +302,7 @@ for record in records:
     if record.get("status") != "healthy":
         raise SystemExit("a validator is unhealthy")
     if record.get("apiCommit") != api_sha or record.get("protocolCommit") != protocol_sha:
-        raise SystemExit("validator release does not match RC24")
+        raise SystemExit("validator release does not match RC26")
     if record.get("network") != "testnet11":
         raise SystemExit("validator is not on Testnet11")
     if record.get("stripeSettlementReady") is not True:
@@ -370,7 +366,8 @@ Environment=SOLSLOT_COLLECTION_MINTING_ENABLED=true
 Environment=SOLSLOT_PRESALE_ENABLED=true
 Environment=SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED=true
 Environment=SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=true
-Environment=SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED=true
+Environment=SOLSLOT_STRIPE_SETTLEMENT_ENABLED=true
+Environment=SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED=true
 Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
 EOF
   for path in "$backend_dropin" "$telonium_dropin" "$reconciler_dropin"; do
@@ -412,7 +409,8 @@ for key in \
   SOLSLOT_MINTING_ENABLED \
   SOLSLOT_PRESALE_ENABLED \
   SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED \
-  SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED; do
+  SOLSLOT_STRIPE_SETTLEMENT_ENABLED \
+  SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED; do
   if [ "$(process_env_value "$api_service" "$key")" != "$expected" ]; then
     echo "API process did not apply $key=$expected." >&2
     exit 1
@@ -432,7 +430,7 @@ PY
 "$api_root/current/.venv/bin/python" "$checker" \
   --mode "$action" \
   --genesis-db "$genesis_db" \
-  --purchase-db "$purchase_db"
+  --delivery-db "$delivery_db"
 if [ "$action" = "arm" ]; then
   systemctl start "$reconciler_service"
   systemctl is-failed --quiet "$reconciler_service" && {

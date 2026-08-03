@@ -18,7 +18,7 @@ from typing import Any
 
 
 _GATE_NAMES = ("minting", "presale", "purchases")
-_TERMINAL_STATES = frozenset({"CANCELED", "REFUNDED", "FINALIZED"})
+_TERMINAL_STATES = frozenset({"FINALIZED"})
 
 
 class CeilingCheckError(RuntimeError):
@@ -91,12 +91,13 @@ def _closed_launch_gates(genesis_db: str) -> dict[str, Any]:
     }
 
 
-def _stripe_operation_summary(purchase_db: str) -> dict[str, Any]:
-    with _read_only_connection(purchase_db) as connection:
-        _require_table(connection, "purchase_operations_v1")
+def _stripe_operation_summary(delivery_db: str) -> dict[str, Any]:
+    with _read_only_connection(delivery_db) as connection:
+        _require_table(connection, "stripe_delivery_operations")
         rows = connection.execute(
             "SELECT state,COUNT(*) AS operation_count "
-            "FROM purchase_operations_v1 WHERE LOWER(rail)='stripe' "
+            "FROM stripe_delivery_operations "
+            "WHERE LOWER(payment_rail)='stripe' "
             "GROUP BY state ORDER BY state"
         ).fetchall()
     counts = {str(row["state"]): int(row["operation_count"]) for row in rows}
@@ -112,9 +113,9 @@ def _stripe_operation_summary(purchase_db: str) -> dict[str, Any]:
     }
 
 
-def check_transition(*, mode: str, genesis_db: str, purchase_db: str) -> dict[str, Any]:
+def check_transition(*, mode: str, genesis_db: str, delivery_db: str) -> dict[str, Any]:
     gates = _closed_launch_gates(genesis_db)
-    operations = _stripe_operation_summary(purchase_db)
+    operations = _stripe_operation_summary(delivery_db)
     if mode == "disarm" and operations["nonterminalCount"]:
         states = ", ".join(
             f"{state}={count}"
@@ -136,7 +137,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("arm", "disarm"), required=True)
     parser.add_argument("--genesis-db", required=True)
-    parser.add_argument("--purchase-db", required=True)
+    parser.add_argument("--delivery-db", required=True)
     return parser
 
 
@@ -146,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         result = check_transition(
             mode=args.mode,
             genesis_db=args.genesis_db,
-            purchase_db=args.purchase_db,
+            delivery_db=args.delivery_db,
         )
     except (CeilingCheckError, sqlite3.Error) as exc:
         print(f"Stripe rehearsal ceiling check failed: {exc}", file=sys.stderr)

@@ -14,8 +14,10 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # RC24 settlement imports must match the exact reviewed protocol source.
-  PROTOCOL_REF: a53794fe3e9068348f9f480c90b72dea50bbc8a2
+  # RC26 adds funded redemption and vault-bound Sols custody while preserving
+  # the frozen Pool V4 hash. Keep CI on the exact reviewed protocol commit.
+  # Keep CI reproducible without advancing deployment environment pins.
+  PROTOCOL_REF: 5c54f89614bb1dd8e30b297c131fa11741625b1e
 
 jobs:
   verify:
@@ -69,7 +71,9 @@ jobs:
           PY
 
       - name: Test
-        run: python -m pytest tests -q
+        run: >-
+          python -m pytest tests -q
+          -W error::pytest.PytestUnraisableExceptionWarning
 
       - name: Namespace gate
         run: python scripts/check_namespace.py --paths .

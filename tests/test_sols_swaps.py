@@ -4,6 +4,9 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+from eth_keys import keys as eth_keys
 from chia.consensus.condition_tools import (
     conditions_dict_for_solution,
     pkm_pairs_for_conditions_dict,
@@ -37,13 +40,11 @@ from solslot_api.sols_swaps import (
     CompleteSolsSwapRequest,
     PrepareSolsSwapRequest,
     ReverseSolsSwapContext,
-    SolsPaymentCoin,
     SolsSwapContext,
     VaultHeldDeed,
     _authorize_swap,
     _build_protocol_offer,
     _build_reverse_protocol_offer,
-    _require_deed_not_in_stripe_dispute,
     complete_sols_swap,
     prepare_sols_swap,
 )
@@ -76,11 +77,11 @@ from solslot_puzzles.sols_pool_v4 import (
     prepare_sols_to_deed,
 )
 from solslot_puzzles.sols_swap_v4_driver import (
-    SolsSwapOfferError,
     aggregate_sols_to_deed_swap,
 )
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
+    AUTH_TYPE_SECP256K1,
     one_leaf_merkle_root,
     puzzle_hash_for_p2_vault,
 )
@@ -88,6 +89,7 @@ from solslot_puzzles.vault_v2_driver import (
     puzzle_for_vault_v2_full,
     vault_v2_inner_mod_hash,
 )
+from solslot_puzzles.vault_sols_v1 import puzzle_for_vault_sols_inner
 
 
 def _b32(seed: int) -> bytes32:
@@ -117,6 +119,11 @@ SHARE_PPM = 100_000
 OWNER_SK = AugSchemeMPL.key_gen(bytes([42]) * 32)
 OWNER_PK = bytes(OWNER_SK.get_g1())
 MEMBERS_ROOT = one_leaf_merkle_root(OWNER_PK)
+EVM_PRIVATE_KEY = bytes.fromhex("11" * 32)
+EVM_ACCOUNT = Account.from_key(EVM_PRIVATE_KEY)
+EVM_OWNER_KEY = eth_keys.PrivateKey(
+    EVM_PRIVATE_KEY
+).public_key.to_compressed_bytes()
 
 PARAMETERS = ProtocolParameters()
 RULES = PermanentRules(
@@ -196,7 +203,6 @@ DEED_COMMITMENT = bytes32(
 @dataclass(frozen=True)
 class SwapFixture:
     context: SolsSwapContext
-    payment: SolsPaymentCoin
 
 
 def _singleton_child(
@@ -264,7 +270,10 @@ def _deed_singleton_child(
     )
 
 
-def _fixture() -> SwapFixture:
+def _fixture(*, evm: bool = False) -> SwapFixture:
+    owner_key = EVM_OWNER_KEY if evm else OWNER_PK
+    auth_type = AUTH_TYPE_SECP256K1 if evm else AUTH_TYPE_BLS
+    members_root = one_leaf_merkle_root(owner_key)
     empty_pool_full = make_pool_v4_full(CONFIG, EMPTY_POOL)
     empty_pool_uncurried = empty_pool_full.uncurry()
     assert empty_pool_uncurried is not None
@@ -320,9 +329,9 @@ def _fixture() -> SwapFixture:
 
     vault_full = puzzle_for_vault_v2_full(
         vault_launcher_id=VAULT_LAUNCHER,
-        owner_pubkey=OWNER_PK,
-        auth_type=AUTH_TYPE_BLS,
-        members_merkle_root=MEMBERS_ROOT,
+        owner_pubkey=owner_key,
+        auth_type=auth_type,
+        members_merkle_root=members_root,
         pool_launcher_id=POOL_LAUNCHER,
         identity_attest_root=IDENTITY_ROOT,
         zkpassport_bridge_policy_hash=RULES.zkpassport_policy_hash,
@@ -337,6 +346,29 @@ def _fixture() -> SwapFixture:
         current_inner=vault_inner,
         seed=43,
     )
+    payment_puzzle = puzzle_for_vault_sols_inner(
+        config=CONFIG,
+        vault_launcher_id=VAULT_LAUNCHER,
+    )
+    payment_parent = Coin(
+        _b32(45),
+        construct_cat_puzzle(
+            CAT_MOD,
+            RULES.sols_tail_hash,
+            payment_puzzle,
+        ).get_tree_hash(),
+        1_000_000,
+    )
+    payment_coin = Coin(
+        payment_parent.name(),
+        payment_parent.puzzle_hash,
+        payment_parent.amount,
+    )
+    payment_lineage = LineageProof(
+        parent_name=payment_parent.parent_coin_info,
+        inner_puzzle_hash=bytes32(payment_puzzle.get_tree_hash()),
+        amount=payment_parent.amount,
+    )
     receipt = prepare_sols_to_deed(
         pool_coin_id=pool_coin.name(),
         state=deposit.next_state,
@@ -348,6 +380,7 @@ def _fixture() -> SwapFixture:
         pause=None,
         vault_launcher_id=VAULT_LAUNCHER,
         vault_coin_id=vault_coin.name(),
+        sols_payment_coin_id=payment_coin.name(),
         destination_p2_vault_hash=puzzle_hash_for_p2_vault(VAULT_LAUNCHER),
         quote_expires_at=QUOTE_EXPIRES,
     )
@@ -363,28 +396,9 @@ def _fixture() -> SwapFixture:
         current_inner=statutes_inner,
         seed=44,
     )
-    payment_puzzle = puzzle_for_pk(OWNER_SK.get_g1())
     quote = receipt.sols_to_deed_quote
     assert quote is not None
-    payment_parent = Coin(
-        _b32(45),
-        construct_cat_puzzle(
-            CAT_MOD,
-            RULES.sols_tail_hash,
-            payment_puzzle,
-        ).get_tree_hash(),
-        quote.buyer_total_sols_mojos + 10,
-    )
-    payment_coin = Coin(
-        payment_parent.name(),
-        payment_parent.puzzle_hash,
-        payment_parent.amount,
-    )
-    payment_lineage = LineageProof(
-        parent_name=payment_parent.parent_coin_info,
-        inner_puzzle_hash=bytes32(payment_puzzle.get_tree_hash()),
-        amount=payment_parent.amount,
-    )
+    assert int(payment_coin.amount) > quote.buyer_total_sols_mojos
     assert custody_coin.parent_coin_info == deed_parent.name()
 
     approved = ApprovedVault(
@@ -399,9 +413,9 @@ def _fixture() -> SwapFixture:
         launcher_id=VAULT_LAUNCHER,
         full_puzhash=bytes32(vault_full.get_tree_hash()),
         p2_vault_puzhash=puzzle_hash_for_p2_vault(VAULT_LAUNCHER),
-        auth_type=AUTH_TYPE_BLS,
-        owner_pubkey=OWNER_PK,
-        owner_evm_address=None,
+        auth_type=auth_type,
+        owner_pubkey=owner_key,
+        owner_evm_address=EVM_ACCOUNT.address if evm else None,
         spend_bundle_id="0x" + "46" * 32,
         pushed_at=1.0,
     )
@@ -437,19 +451,21 @@ def _fixture() -> SwapFixture:
         vault_lineage=vault_lineage,
         custody_coin=custody_coin,
         custody_lineage=custody_lineage,
+        payment_coin=payment_coin,
+        payment_lineage=payment_lineage,
         receipt=receipt,
     )
-    return SwapFixture(
-        context=context,
-        payment=SolsPaymentCoin(
-            coin=payment_coin,
-            public_key=OWNER_PK,
-            lineage=payment_lineage,
-        ),
-    )
+    return SwapFixture(context=context)
 
 
-def _reverse_fixture(faucet: Faucet) -> ReverseSolsSwapContext:
+def _reverse_fixture(
+    faucet: Faucet,
+    *,
+    evm: bool = False,
+) -> ReverseSolsSwapContext:
+    owner_key = EVM_OWNER_KEY if evm else OWNER_PK
+    auth_type = AUTH_TYPE_SECP256K1 if evm else AUTH_TYPE_BLS
+    members_root = one_leaf_merkle_root(owner_key)
     config = replace(CONFIG, reserve_puzzle_hash=faucet.key.puzzle_hash)
     pool_full = make_pool_v4_full(config, EMPTY_POOL)
     pool_uncurried = pool_full.uncurry()
@@ -465,9 +481,9 @@ def _reverse_fixture(faucet: Faucet) -> ReverseSolsSwapContext:
 
     vault_full = puzzle_for_vault_v2_full(
         vault_launcher_id=VAULT_LAUNCHER,
-        owner_pubkey=OWNER_PK,
-        auth_type=AUTH_TYPE_BLS,
-        members_merkle_root=MEMBERS_ROOT,
+        owner_pubkey=owner_key,
+        auth_type=auth_type,
+        members_merkle_root=members_root,
         pool_launcher_id=POOL_LAUNCHER,
         identity_attest_root=IDENTITY_ROOT,
         zkpassport_bridge_policy_hash=RULES.zkpassport_policy_hash,
@@ -532,7 +548,12 @@ def _reverse_fixture(faucet: Faucet) -> ReverseSolsSwapContext:
         bytes32(SINGLETON_MOD.curry(deed_struct, custody_inner).get_tree_hash()),
         1,
     )
-    payout_hash = bytes32(puzzle_for_pk(OWNER_SK.get_g1()).get_tree_hash())
+    payout_hash = bytes32(
+        puzzle_for_vault_sols_inner(
+            config=config,
+            vault_launcher_id=VAULT_LAUNCHER,
+        ).get_tree_hash()
+    )
     receipt = prepare_deed_to_sols(
         pool_coin_id=pool_coin.name(),
         state=EMPTY_POOL,
@@ -585,9 +606,9 @@ def _reverse_fixture(faucet: Faucet) -> ReverseSolsSwapContext:
         launcher_id=VAULT_LAUNCHER,
         full_puzhash=bytes32(vault_full.get_tree_hash()),
         p2_vault_puzhash=puzzle_hash_for_p2_vault(VAULT_LAUNCHER),
-        auth_type=AUTH_TYPE_BLS,
-        owner_pubkey=OWNER_PK,
-        owner_evm_address=None,
+        auth_type=auth_type,
+        owner_pubkey=owner_key,
+        owner_evm_address=EVM_ACCOUNT.address if evm else None,
         spend_bundle_id="0x" + "46" * 32,
         pushed_at=1.0,
     )
@@ -672,23 +693,6 @@ def _settings() -> Settings:
     )
 
 
-def test_stripe_dispute_blocks_protocol_swap(monkeypatch) -> None:
-    class DisputedPurchaseStore:
-        @staticmethod
-        def get_stripe_dispute_for_deed(_deed_launcher_id):
-            return SimpleNamespace(dispute_id="dp_test")
-
-    monkeypatch.setattr(
-        "solslot_api.sols_swaps.get_payment_purchase_store",
-        lambda _path: DisputedPurchaseStore(),
-    )
-    with pytest.raises(SolsSwapOfferError, match="Stripe payment dispute"):
-        _require_deed_not_in_stripe_dispute(
-            _settings(),
-            _hex32(DEED_LAUNCHER),
-        )
-
-
 def _request(
     node: FakeNode,
     submitter: FakeProtocolSubmitter,
@@ -708,23 +712,15 @@ async def _prepare(monkeypatch, fixture, request):
     async def load_context(**_kwargs):
         return fixture.context
 
-    async def select_coin(*_args, **_kwargs):
-        return fixture.payment
-
     monkeypatch.setattr("solslot_api.sols_swaps._authorize_swap", lambda *_: None)
     monkeypatch.setattr(
         "solslot_api.sols_swaps._load_swap_context",
         load_context,
     )
-    monkeypatch.setattr(
-        "solslot_api.sols_swaps._select_sols_payment_coin",
-        select_coin,
-    )
     return await prepare_sols_swap(
         _hex32(VAULT_LAUNCHER),
         PrepareSolsSwapRequest(
             deedLauncherId=_hex32(DEED_LAUNCHER),
-            paymentPublicKeys=["0x" + OWNER_PK.hex()],
         ),
         request,
         _settings(),
@@ -872,7 +868,7 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
     assert prepared.destination_p2_vault_hash == _hex32(
         puzzle_hash_for_p2_vault(VAULT_LAUNCHER)
     )
-    assert len(prepared.signing_coin_spends) == 2
+    assert len(prepared.signing_coin_spends) == 1
 
     signature = _wallet_signature(fixture.context, prepared.buyer_offer)
     completed = await complete_sols_swap(
@@ -900,6 +896,70 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
 
 
 @pytest.mark.asyncio
+async def test_evm_vault_can_swap_sols_to_deed_with_one_typed_signature(
+    monkeypatch,
+) -> None:
+    fixture = _fixture(evm=True)
+    node = FakeNode()
+    submitter = FakeProtocolSubmitter()
+    request = _request(node, submitter)
+    prepared = await _prepare(monkeypatch, fixture, request)
+
+    assert prepared.vault_auth_type == "evm"
+    assert prepared.signing_coin_spends == []
+    assert prepared.vault_typed_data is not None
+    signature = EVM_ACCOUNT.sign_message(
+        encode_typed_data(full_message=prepared.vault_typed_data)
+    ).signature
+    completed = await complete_sols_swap(
+        _hex32(VAULT_LAUNCHER),
+        CompleteSolsSwapRequest(
+            deedLauncherId=_hex32(DEED_LAUNCHER),
+            operationHash=prepared.operation_hash,
+            quoteExpiresAt=prepared.quote_expires_at,
+            buyerOffer=prepared.buyer_offer,
+            vaultOwnerAuthorization="0x" + signature.hex(),
+        ),
+        request,
+        _settings(),
+    )
+
+    assert completed.status == "MEMPOOL"
+    assert submitter.submitted is not None
+
+
+@pytest.mark.asyncio
+async def test_evm_sols_swap_rejects_a_different_wallet(
+    monkeypatch,
+) -> None:
+    fixture = _fixture(evm=True)
+    node = FakeNode()
+    submitter = FakeProtocolSubmitter()
+    request = _request(node, submitter)
+    prepared = await _prepare(monkeypatch, fixture, request)
+    assert prepared.vault_typed_data is not None
+    attacker = Account.from_key(bytes.fromhex("12" * 32))
+    signature = attacker.sign_message(
+        encode_typed_data(full_message=prepared.vault_typed_data)
+    ).signature
+
+    with pytest.raises(HTTPException, match="vault owner"):
+        await complete_sols_swap(
+            _hex32(VAULT_LAUNCHER),
+            CompleteSolsSwapRequest(
+                deedLauncherId=_hex32(DEED_LAUNCHER),
+                operationHash=prepared.operation_hash,
+                quoteExpiresAt=prepared.quote_expires_at,
+                buyerOffer=prepared.buyer_offer,
+                vaultOwnerAuthorization="0x" + signature.hex(),
+            ),
+            request,
+            _settings(),
+        )
+    assert submitter.submitted is None
+
+
+@pytest.mark.asyncio
 async def test_reverse_swap_requires_protocol_fountain_before_chain_loading(
     monkeypatch,
 ) -> None:
@@ -917,7 +977,6 @@ async def test_reverse_swap_requires_protocol_fountain_before_chain_loading(
             PrepareSolsSwapRequest(
                 direction="DEED_TO_SOLS",
                 deedLauncherId=_hex32(DEED_LAUNCHER),
-                paymentPublicKeys=["0x" + OWNER_PK.hex()],
             ),
             request,
             _settings(),
@@ -950,7 +1009,6 @@ async def test_prepare_and_complete_deed_to_sols_is_atomic_and_fee_funded(
         PrepareSolsSwapRequest(
             direction="DEED_TO_SOLS",
             deedLauncherId=_hex32(DEED_LAUNCHER),
-            paymentPublicKeys=["0x" + OWNER_PK.hex()],
         ),
         request,
         _settings(),
@@ -962,7 +1020,10 @@ async def test_prepare_and_complete_deed_to_sols_is_atomic_and_fee_funded(
     assert prepared.direction == "DEED_TO_SOLS"
     assert prepared.destination_p2_vault_hash is None
     assert prepared.destination_puzzle_hash == _hex32(
-        puzzle_for_pk(OWNER_SK.get_g1()).get_tree_hash()
+        puzzle_for_vault_sols_inner(
+            config=fixture.config,
+            vault_launcher_id=VAULT_LAUNCHER,
+        ).get_tree_hash()
     )
     assert prepared.total_sols_mojos == str(quote.seller_sols_mojos)
     assert prepared.fresh_sols_mojos_minted == str(
@@ -992,6 +1053,59 @@ async def test_prepare_and_complete_deed_to_sols_is_atomic_and_fee_funded(
     assert completed.fee_mojos == "420"
     assert submitter.submitted is not None
     assert len(submitter.submitted["coin_spends"]) == 7
+
+
+@pytest.mark.asyncio
+async def test_evm_vault_can_swap_deed_to_vault_bound_sols(
+    monkeypatch,
+) -> None:
+    faucet = Faucet.from_seed_hex("77" * 32, "testnet11")
+    fixture = _reverse_fixture(faucet, evm=True)
+    node = FakeNode()
+    submitter = FakeProtocolSubmitter()
+    request = _request(node, submitter, faucet)
+
+    async def load_context(**_kwargs):
+        return fixture
+
+    monkeypatch.setattr("solslot_api.sols_swaps._authorize_swap", lambda *_: None)
+    monkeypatch.setattr(
+        "solslot_api.sols_swaps._load_reverse_swap_context",
+        load_context,
+    )
+    prepared = await prepare_sols_swap(
+        _hex32(VAULT_LAUNCHER),
+        PrepareSolsSwapRequest(
+            direction="DEED_TO_SOLS",
+            deedLauncherId=_hex32(DEED_LAUNCHER),
+        ),
+        request,
+        _settings(),
+    )
+
+    assert prepared.vault_auth_type == "evm"
+    assert prepared.signing_coin_spends == []
+    assert prepared.vault_typed_data is not None
+    signature = EVM_ACCOUNT.sign_message(
+        encode_typed_data(full_message=prepared.vault_typed_data)
+    ).signature
+    completed = await complete_sols_swap(
+        _hex32(VAULT_LAUNCHER),
+        CompleteSolsSwapRequest(
+            direction="DEED_TO_SOLS",
+            deedLauncherId=_hex32(DEED_LAUNCHER),
+            operationHash=prepared.operation_hash,
+            quoteExpiresAt=prepared.quote_expires_at,
+            buyerOffer=prepared.buyer_offer,
+            vaultOwnerAuthorization="0x" + signature.hex(),
+        ),
+        request,
+        _settings(),
+    )
+
+    assert completed.status == "MEMPOOL"
+    assert completed.destination_puzzle_hash == prepared.destination_puzzle_hash
+    assert submitter.submitted is not None
 
 
 @pytest.mark.asyncio

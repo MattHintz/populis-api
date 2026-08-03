@@ -12,13 +12,12 @@ import httpx
 from chia_rs import AugSchemeMPL, PrivateKey
 from chia_rs.sized_bytes import bytes32
 
-from .protocol_submission import (
-    PreparedProtocolBundle,
-    ProtocolSubmissionError,
-)
+from .protocol_submission import PreparedProtocolBundle, ProtocolSubmissionError
 
 
-_DOMAIN = b"SOLSLOT_KOS_EXACT_EXECUTION_V1"
+_DOMAIN = b"SOLSLOT_KOS_EXACT_EXECUTION_V2"
+MAX_EXACT_INPUTS = 102
+MAX_EXACT_OUTPUTS = 200
 
 
 class ExactExecutionAction(IntEnum):
@@ -32,13 +31,19 @@ class ExactExecutionAction(IntEnum):
 
 
 @dataclass(frozen=True)
+class ExactExecutionOutput:
+    coin_id: bytes32
+    puzzle_hash: bytes32
+    amount: int
+
+
+@dataclass(frozen=True)
 class ExactExecutionRequest:
     action: ExactExecutionAction
     purchase_id: bytes32
     artifact_hash: bytes32
     claim_hash: bytes32
-    expected_output_coin_id: bytes32
-    expected_output_puzzle_hash: bytes32
+    expected_outputs: tuple[ExactExecutionOutput, ...]
 
 
 class KeyOfSolomonExactExecutor:
@@ -89,38 +94,41 @@ class KeyOfSolomonExactExecutor:
                 key=bytes,
             )
         )
+        outputs = _canonical_outputs(request.expected_outputs)
         bundle_id = bytes32(prepared.bundle.name())
+        operation_reference = _hex32(request.purchase_id)
         digest = exact_execution_digest(
-            operation_reference=_hex32(request.purchase_id),
+            operation_reference=operation_reference,
             action=request.action,
             purchase_id=request.purchase_id,
             artifact_hash=request.artifact_hash,
             claim_hash=request.claim_hash,
             spend_bundle_id=bundle_id,
             required_input_coin_ids=inputs,
-            expected_output_coin_id=request.expected_output_coin_id,
-            expected_output_puzzle_hash=request.expected_output_puzzle_hash,
+            expected_outputs=outputs,
             fee_mojos=prepared.fee_mojos,
         )
         signature = AugSchemeMPL.sign(self.private_key, digest)
         payload = {
-            "payment_intent": _hex32(request.purchase_id),
+            "payment_intent": operation_reference,
             "kind": {
                 "ProtocolExecute": {
                     "action": request.action.name,
-                    "purchase_id": _hex32(request.purchase_id),
+                    "purchase_id": operation_reference,
                     "artifact_hash": _hex32(request.artifact_hash),
                     "claim_hash": _hex32(request.claim_hash),
                     "spend_bundle_id": _hex32(bundle_id),
                     "required_input_coin_ids": [
                         _hex32(value) for value in inputs
                     ],
-                    "expected_output_coin_id": _hex32(
-                        request.expected_output_coin_id
-                    ),
-                    "expected_output_puzzle_hash": _hex32(
-                        request.expected_output_puzzle_hash
-                    ),
+                    "expected_outputs": [
+                        {
+                            "coin_id": _hex32(output.coin_id),
+                            "puzzle_hash": _hex32(output.puzzle_hash),
+                            "amount": output.amount,
+                        }
+                        for output in outputs
+                    ],
                     "fee_mojos": prepared.fee_mojos,
                     "spend_bundle": prepared.bundle.to_json_dict(),
                 }
@@ -133,10 +141,7 @@ class KeyOfSolomonExactExecutor:
                 cert=self.cert,
                 timeout=self.timeout_seconds,
             ) as client:
-                response = await client.post(
-                    self.url + "/submit",
-                    json=payload,
-                )
+                response = await client.post(self.url + "/submit", json=payload)
         except httpx.HTTPError as exc:
             raise ProtocolSubmissionError(
                 "Key of Solomon exact executor is unavailable",
@@ -165,14 +170,21 @@ def exact_execution_digest(
     claim_hash: bytes32,
     spend_bundle_id: bytes32,
     required_input_coin_ids: tuple[bytes32, ...],
-    expected_output_coin_id: bytes32,
-    expected_output_puzzle_hash: bytes32,
+    expected_outputs: tuple[ExactExecutionOutput, ...],
     fee_mojos: int,
 ) -> bytes:
-    if not required_input_coin_ids or len(required_input_coin_ids) > 100:
-        raise ValueError("exact execution requires 1..100 input coins")
+    if (
+        not required_input_coin_ids
+        or len(required_input_coin_ids) > MAX_EXACT_INPUTS
+    ):
+        raise ValueError("exact execution requires 1..102 input coins")
     if len(set(required_input_coin_ids)) != len(required_input_coin_ids):
         raise ValueError("exact execution input coin IDs must be unique")
+    if tuple(sorted(required_input_coin_ids, key=bytes)) != required_input_coin_ids:
+        raise ValueError("exact execution input coin IDs must be canonical")
+    outputs = _canonical_outputs(expected_outputs)
+    if outputs != expected_outputs:
+        raise ValueError("exact execution outputs must be canonical")
     if fee_mojos < 0 or fee_mojos > 0xFFFFFFFFFFFFFFFF:
         raise ValueError("exact execution fee must be uint64")
     digest = hashlib.sha256()
@@ -186,15 +198,31 @@ def exact_execution_digest(
     digest.update(len(required_input_coin_ids).to_bytes(8, "big"))
     for coin_id in required_input_coin_ids:
         digest.update(bytes(coin_id))
-    digest.update(bytes(expected_output_coin_id))
-    digest.update(bytes(expected_output_puzzle_hash))
+    digest.update(len(outputs).to_bytes(8, "big"))
+    for output in outputs:
+        digest.update(bytes(output.coin_id))
+        digest.update(bytes(output.puzzle_hash))
+        digest.update(output.amount.to_bytes(8, "big"))
     digest.update(fee_mojos.to_bytes(8, "big"))
     return digest.digest()
 
 
+def _canonical_outputs(
+    outputs: tuple[ExactExecutionOutput, ...],
+) -> tuple[ExactExecutionOutput, ...]:
+    if not outputs or len(outputs) > MAX_EXACT_OUTPUTS:
+        raise ValueError("exact execution requires 1..200 expected outputs")
+    if len({output.coin_id for output in outputs}) != len(outputs):
+        raise ValueError("exact execution output coin IDs must be unique")
+    for output in outputs:
+        if output.amount < 1 or output.amount > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("exact execution output amount must be uint64")
+    return tuple(sorted(outputs, key=lambda output: bytes(output.coin_id)))
+
+
 def _load_private_key(path_value: str) -> PrivateKey:
     path = Path(path_value)
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink():
         raise RuntimeError("KoS exact-execution request key file is missing")
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -216,9 +244,7 @@ def _load_private_key(path_value: str) -> PrivateKey:
     try:
         return PrivateKey.from_bytes(value)
     except ValueError as exc:
-        raise RuntimeError(
-            "KoS exact-execution request key is invalid"
-        ) from exc
+        raise RuntimeError("KoS exact-execution request key is invalid") from exc
 
 
 def _hex_bytes(value: str, size: int, field: str) -> bytes:
@@ -237,6 +263,7 @@ def _hex32(value: bytes32) -> str:
 
 __all__ = [
     "ExactExecutionAction",
+    "ExactExecutionOutput",
     "ExactExecutionRequest",
     "KeyOfSolomonExactExecutor",
     "exact_execution_digest",

@@ -14,6 +14,7 @@ from chia_rs.sized_ints import uint64
 from solslot_api.faucet import Faucet
 from solslot_api.config import Settings, validate_server_hardening_at_startup
 from solslot_api.protocol_submission import (
+    PreparedProtocolBundle,
     ProtocolBundleSubmitter,
     ProtocolFeePolicy,
     ProtocolSubmissionError,
@@ -148,6 +149,31 @@ async def test_medium_fee_is_added_from_till_without_changing_protocol_outputs()
     assert len(fee_additions) == 1
     assert fee_additions[0].puzzle_hash == faucet.address_puzzle_hash
     assert int(fee_additions[0].amount) == 93
+
+
+@pytest.mark.asyncio
+async def test_exact_dispatch_hands_off_funded_bundle_without_direct_push() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(41), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    dispatched: list[PreparedProtocolBundle] = []
+
+    async def dispatcher(prepared: PreparedProtocolBundle) -> dict[str, bool]:
+        dispatched.append(prepared)
+        return {"accepted": True}
+
+    receipt = await submitter(provider, faucet).prepare_and_dispatch(
+        protocol_bundle().to_json_dict(),
+        dispatcher,
+    )
+
+    assert receipt["status"] == "DISPATCHED"
+    assert receipt["feeMojos"] == "7"
+    assert receipt["dispatchResult"] == {"accepted": True}
+    assert provider.submitted is None
+    assert len(dispatched) == 1
+    assert receipt["spendBundleId"] == "0x" + dispatched[0].bundle.name().hex()
+    assert receipt["feeCoinId"] == "0x" + fee_coin.name().hex()
 
 
 @pytest.mark.asyncio

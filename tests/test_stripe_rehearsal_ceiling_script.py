@@ -39,15 +39,16 @@ def _genesis_db(tmp_path: Path, *, state: str = "locked", gate_state: str = "clo
     return path
 
 
-def _purchase_db(tmp_path: Path, *operations: tuple[str, str]) -> Path:
-    path = tmp_path / "purchases.db"
+def _delivery_db(tmp_path: Path, *operations: tuple[str, str]) -> Path:
+    path = tmp_path / "stripe-deliveries.db"
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "CREATE TABLE purchase_operations_v1 ("
-            "purchase_id TEXT PRIMARY KEY,rail TEXT NOT NULL,state TEXT NOT NULL)"
+            "CREATE TABLE stripe_delivery_operations ("
+            "purchase_id TEXT PRIMARY KEY,payment_rail TEXT NOT NULL,state TEXT NOT NULL)"
         )
         connection.executemany(
-            "INSERT INTO purchase_operations_v1(purchase_id,rail,state) VALUES(?,?,?)",
+            "INSERT INTO stripe_delivery_operations"
+            "(purchase_id,payment_rail,state) VALUES(?,?,?)",
             ((f"purchase-{index}", rail, state) for index, (rail, state) in enumerate(operations)),
         )
     return path
@@ -62,7 +63,7 @@ def _run(mode: str, genesis: Path, purchases: Path) -> subprocess.CompletedProce
             mode,
             "--genesis-db",
             str(genesis),
-            "--purchase-db",
+            "--delivery-db",
             str(purchases),
         ],
         check=False,
@@ -75,7 +76,7 @@ def test_arm_requires_locked_genesis(tmp_path: Path) -> None:
     result = _run(
         "arm",
         _genesis_db(tmp_path, state="approving"),
-        _purchase_db(tmp_path),
+        _delivery_db(tmp_path),
     )
     assert result.returncode == 1
     assert "requires a locked genesis" in result.stderr
@@ -85,7 +86,7 @@ def test_arm_requires_explicitly_closed_signed_windows(tmp_path: Path) -> None:
     result = _run(
         "arm",
         _genesis_db(tmp_path, gate_state="open"),
-        _purchase_db(tmp_path),
+        _delivery_db(tmp_path),
     )
     assert result.returncode == 1
     assert "must be explicitly closed" in result.stderr
@@ -95,7 +96,7 @@ def test_arm_allows_existing_work_so_workers_can_recover(tmp_path: Path) -> None
     result = _run(
         "arm",
         _genesis_db(tmp_path),
-        _purchase_db(tmp_path, ("stripe", "PAYMENT_PROCESSING")),
+        _delivery_db(tmp_path, ("stripe", "PAYMENT_VERIFIED")),
     )
     assert result.returncode == 0, result.stderr
     assert '"nonterminalCount":1' in result.stdout
@@ -105,23 +106,21 @@ def test_disarm_blocks_nonterminal_stripe_operations(tmp_path: Path) -> None:
     result = _run(
         "disarm",
         _genesis_db(tmp_path),
-        _purchase_db(tmp_path, ("stripe", "REVIEW_REQUIRED")),
+        _delivery_db(tmp_path, ("stripe", "MANUAL_REVIEW")),
     )
     assert result.returncode == 1
     assert "must remain armed" in result.stderr
-    assert "REVIEW_REQUIRED=1" in result.stderr
+    assert "MANUAL_REVIEW=1" in result.stderr
 
 
 def test_disarm_allows_only_terminal_stripe_operations(tmp_path: Path) -> None:
     result = _run(
         "disarm",
         _genesis_db(tmp_path),
-        _purchase_db(
+        _delivery_db(
             tmp_path,
-            ("stripe", "CANCELED"),
-            ("stripe", "REFUNDED"),
             ("stripe", "FINALIZED"),
-            ("base_usdc", "PAYMENT_PROCESSING"),
+            ("base_usdc", "PAYMENT_VERIFIED"),
         ),
     )
     assert result.returncode == 0, result.stderr
@@ -129,8 +128,8 @@ def test_disarm_allows_only_terminal_stripe_operations(tmp_path: Path) -> None:
 
 
 def test_missing_purchase_schema_fails_closed(tmp_path: Path) -> None:
-    purchases = tmp_path / "purchases.db"
-    sqlite3.connect(purchases).close()
-    result = _run("arm", _genesis_db(tmp_path), purchases)
+    deliveries = tmp_path / "stripe-deliveries.db"
+    sqlite3.connect(deliveries).close()
+    result = _run("arm", _genesis_db(tmp_path), deliveries)
     assert result.returncode == 1
     assert "required SQLite table is missing" in result.stderr

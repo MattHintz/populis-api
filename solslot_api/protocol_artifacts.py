@@ -7,6 +7,7 @@ completion is bound to the artifact the buyer saw.
 """
 from __future__ import annotations
 
+import hashlib
 import secrets
 import time
 from typing import Annotated, Any, Literal, Mapping, Optional
@@ -19,18 +20,41 @@ from solslot_puzzles.payment_artifacts_v2 import (
     DeedPriceV1,
     PaymentArtifactError,
     PaymentRail,
-    validate_deed_price_plan,
-)
-from solslot_puzzles.payment_artifacts_v3 import (
-    TECHNOLOGY_FEE_BPS_ALPHA,
-    PurchaseArtifactV3,
-    PurchaseKind,
+    PurchaseArtifactV2,
     build_cat_purchase_artifact,
     build_evm_test_usd_purchase_artifact,
     build_stripe_purchase_artifact,
     build_xch_purchase_artifact,
     purchase_artifact_from_json,
     purchase_artifact_to_json,
+    validate_deed_price_plan,
+)
+from solslot_puzzles.payment_artifacts_v3 import (
+    MAX_TECHNOLOGY_FEE_BPS,
+    PurchaseDeliveryKind,
+    PurchaseArtifactV3,
+    PurchaseBatchV1,
+    STRIPE_PAYMENT_PROVIDER_ID,
+    StripeDisputeState,
+    StripeFundingType,
+    StripeMethodFamily,
+    StripePaymentStatus,
+    StripeRefundState,
+    StripeSettlementEvidenceV1,
+    build_stripe_settlement_receipt_v1,
+    build_cat_purchase_artifact_v3,
+    build_evm_test_usd_purchase_artifact_v3,
+    build_stripe_purchase_artifact_v3,
+    build_xch_purchase_artifact_v3,
+    build_purchase_batch_v1,
+    build_purchase_batch_settlement_receipt_v1,
+    purchase_artifact_v3_from_json,
+    purchase_artifact_v3_to_json,
+    purchase_batch_from_json,
+    purchase_batch_to_json,
+    stripe_settlement_evidence_from_json,
+    stripe_settlement_evidence_to_json,
+    technology_fee_minor,
 )
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
@@ -38,6 +62,11 @@ from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
 from .bootstrap_manifest import _assert_public_artifact, content_hash
 from .config import Settings, get_settings
 from .credential_auth import require_minting_writes
+from .external_settlement import (
+    base_result_authorization_puzzle_hash,
+    build_base_batch_settlement_receipt,
+    build_base_settlement_receipt,
+)
 from .collection_store import (
     CollectionNotFound,
     get_collection_store,
@@ -58,6 +87,7 @@ from .public_artifact import (
     PublicArtifactMissing,
     load_signed_public_artifact,
 )
+from .validator_quorum import configured_validator_pubkeys
 
 
 router = APIRouter(prefix="/protocol", tags=["protocol-artifacts"])
@@ -82,6 +112,8 @@ PurchaseIntentState = Literal[
     "refund_pending",
     "manual_review",
 ]
+
+ALPHA_TECHNOLOGY_FEE_BPS = 100
 
 
 @router.get("/artifact", response_model=dict[str, Any])
@@ -159,6 +191,7 @@ class ProtocolOfferArtifactResponse(BaseModel):
     artifact_hash: str
     protocol: dict[str, Any]
     purchase_artifact: Optional[dict[str, Any]] = None
+    purchase_batch: Optional[dict[str, Any]] = None
     purchase_artifact_hash: Optional[str] = None
     purchase_id: Optional[str] = None
     oracle_authorization: Optional[dict[str, Any]] = None
@@ -192,6 +225,52 @@ class VerifyPurchaseFinalizationResponse(BaseModel):
     artifact_hash: str
     finalized_state: PurchaseIntentState
     reasons: list[str] = Field(default_factory=list)
+    delivery_state: Optional[str] = None
+
+
+class CanonicalizeStripeEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    stripe_account_id: str = Field(
+        ..., alias="stripeAccountId", pattern=r"^acct_[A-Za-z0-9_]+$"
+    )
+    mode: Literal["test", "live"]
+    payment_intent_id: str = Field(
+        ..., alias="paymentIntentId", pattern=r"^pi_[A-Za-z0-9_]+$"
+    )
+    event_id: str = Field(
+        ..., alias="eventId", pattern=r"^evt_[A-Za-z0-9_]+$"
+    )
+    amount_minor: int = Field(..., alias="amountMinor", gt=0)
+    currency: Literal["usd"]
+    method_family: Literal["card", "us_bank_account"] = Field(
+        ..., alias="methodFamily"
+    )
+    funding_type: Literal[
+        "not_applicable",
+        "credit",
+        "debit",
+        "prepaid",
+        "unknown",
+    ] = Field(..., alias="fundingType")
+    processing_charge_minor: int = Field(
+        0,
+        alias="processingChargeMinor",
+        ge=0,
+    )
+    payment_status: Literal[
+        "processing",
+        "succeeded",
+        "canceled",
+    ] = Field(..., alias="paymentStatus")
+    refund_state: Literal["none", "partial", "full"] = Field(
+        ..., alias="refundState"
+    )
+    refunded_minor: int = Field(0, alias="refundedMinor", ge=0)
+    dispute_state: Literal["none", "open", "won", "lost"] = Field(
+        ..., alias="disputeState"
+    )
+    observed_at: int = Field(..., alias="observedAt", gt=0)
 
 
 class VerifyExternalEscrowRequest(BaseModel):
@@ -354,6 +433,7 @@ async def build_protocol_offer_artifact(
             body,
             settings,
             vault_launcher_id=vault_launcher_id,
+            identity_attest_root=receipt.identityAttestRoot,
             genesis_artifact=genesis_artifact,
         )
     except OmnichainEvidenceError as exc:
@@ -404,7 +484,16 @@ async def build_protocol_offer_artifact(
         artifact_hash=artifact_hash,
         protocol=_protocol_object_from_artifact(artifact, artifact_hash),
         purchase_artifact=purchase_artifact,
-        purchase_artifact_hash=purchase_artifact["artifactHash"],
+        purchase_batch=(
+            purchase_artifact
+            if purchase_artifact.get("schema") == "solslot.purchase-batch.v1"
+            else None
+        ),
+        purchase_artifact_hash=(
+            purchase_artifact["batchHash"]
+            if purchase_artifact.get("schema") == "solslot.purchase-batch.v1"
+            else purchase_artifact["artifactHash"]
+        ),
         purchase_id=purchase_artifact["purchaseId"],
         oracle_authorization=oracle_authorization,
     )
@@ -432,6 +521,79 @@ async def verify_protocol_offer_artifact(
 
 
 @router.post(
+    "/stripe-evidence",
+    response_model=dict[str, Any],
+)
+async def canonicalize_stripe_evidence(
+    body: CanonicalizeStripeEvidenceRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Canonicalize provider observations; validators re-fetch before signing."""
+
+    _require_server_to_server_token(settings, authorization)
+    if (
+        not settings.stripe_account_id
+        or body.stripe_account_id != settings.stripe_account_id
+        or body.mode != settings.stripe_mode
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Stripe evidence does not match the configured account and mode.",
+        )
+    methods = {
+        "card": StripeMethodFamily.CARD,
+        "us_bank_account": StripeMethodFamily.US_BANK_ACCOUNT,
+    }
+    funding = {
+        "not_applicable": StripeFundingType.BANK_ACCOUNT,
+        "credit": StripeFundingType.CREDIT,
+        "debit": StripeFundingType.DEBIT,
+        "prepaid": StripeFundingType.PREPAID,
+        "unknown": StripeFundingType.UNKNOWN,
+    }
+    payment_statuses = {
+        "processing": StripePaymentStatus.PROCESSING,
+        "succeeded": StripePaymentStatus.SUCCEEDED,
+        "canceled": StripePaymentStatus.CANCELED,
+    }
+    refunds = {
+        "none": StripeRefundState.NONE,
+        "partial": StripeRefundState.PARTIAL,
+        "full": StripeRefundState.FULL,
+    }
+    disputes = {
+        "none": StripeDisputeState.NONE,
+        "open": StripeDisputeState.OPEN,
+        "won": StripeDisputeState.WON,
+        "lost": StripeDisputeState.LOST,
+    }
+    try:
+        evidence = StripeSettlementEvidenceV1(
+            stripe_account_id=body.stripe_account_id,
+            livemode=body.mode == "live",
+            payment_intent_id=body.payment_intent_id,
+            event_id=body.event_id,
+            amount_minor=body.amount_minor,
+            currency=body.currency,
+            method_family=methods[body.method_family],
+            funding_type=funding[body.funding_type],
+            processing_charge_minor=body.processing_charge_minor,
+            status=payment_statuses[body.payment_status],
+            refunded_minor=body.refunded_minor,
+            refund_state=refunds[body.refund_state],
+            dispute_state=disputes[body.dispute_state],
+            observed_at=body.observed_at,
+        )
+    except (KeyError, PaymentArtifactError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    return stripe_settlement_evidence_to_json(evidence)
+
+
+@router.post(
     "/purchase-finalizations/verify",
     response_model=VerifyPurchaseFinalizationResponse,
 )
@@ -441,10 +603,18 @@ async def verify_purchase_finalization(
     authorization: Annotated[str | None, Header()] = None,
 ) -> VerifyPurchaseFinalizationResponse:
     _require_server_to_server_token(settings, authorization)
+    verification_now = body.now
+    if body.rail == "stripe":
+        protocol_expiry = _mapping(body.artifact.get("protocol")).get("expiresAt")
+        if isinstance(protocol_expiry, int) and protocol_expiry > 1:
+            verification_now = min(
+                verification_now or int(time.time()),
+                protocol_expiry - 1,
+            )
     reasons = _artifact_rejection_reasons(
         body.artifact,
         body.artifact_hash,
-        now=body.now,
+        now=verification_now,
         settings=settings,
     )
     protocol = _mapping(body.artifact.get("protocol"))
@@ -452,21 +622,59 @@ async def verify_purchase_finalization(
         reasons.append("purchase_intent_mismatch")
     if protocol.get("rail") != body.rail:
         reasons.append("rail_mismatch")
-    canonical: PurchaseArtifactV3 | None = None
-    canonical_json = body.artifact.get("purchaseArtifactV3")
+    canonical: PurchaseArtifactV2 | PurchaseArtifactV3 | PurchaseBatchV1 | None = None
+    canonical_json = (
+        body.artifact.get("purchaseBatchV1")
+        or body.artifact.get("purchaseArtifactV3")
+        or body.artifact.get("purchaseArtifactV2")
+    )
     if isinstance(canonical_json, Mapping):
         try:
-            canonical = purchase_artifact_from_json(canonical_json)
+            canonical = (
+                purchase_batch_from_json(canonical_json)
+                if canonical_json.get("schema") == "solslot.purchase-batch.v1"
+                else _purchase_artifact_from_json(canonical_json)
+            )
         except (PaymentArtifactError, TypeError, ValueError):
-            reasons.append("purchase_artifact_v3_invalid")
+            reasons.append("purchase_artifact_invalid")
     evidence_reasons = _payment_evidence_rejection_reasons(
         body.rail,
         body.payment_evidence,
     )
     reasons.extend(evidence_reasons)
     if canonical is not None and body.rail == "stripe":
-        reasons.append("stripe_settlement_receipt_required")
+        if not isinstance(canonical, (PurchaseArtifactV3, PurchaseBatchV1)):
+            reasons.append("stripe_requires_purchase_artifact_v3")
+        else:
+            try:
+                stripe_evidence = stripe_settlement_evidence_from_json(
+                    body.payment_evidence
+                )
+            except (PaymentArtifactError, TypeError, ValueError):
+                reasons.append("stripe_settlement_evidence_invalid")
+            else:
+                expected_stripe_total = (
+                    canonical.total_subtotal_minor
+                    if isinstance(canonical, PurchaseBatchV1)
+                    else canonical.subtotal_minor
+                ) + stripe_evidence.processing_charge_minor
+                if stripe_evidence.amount_minor != expected_stripe_total:
+                    reasons.append("stripe_amount_mismatch")
+                if (
+                    stripe_evidence.status
+                    != StripePaymentStatus.SUCCEEDED
+                    or stripe_evidence.refund_state
+                    != StripeRefundState.NONE
+                    or stripe_evidence.dispute_state
+                    != StripeDisputeState.NONE
+                ):
+                    reasons.append("stripe_payment_not_deliverable")
     if canonical is not None and body.rail in {"base_usdc", "evm_usdc"}:
+        canonical_item = (
+            canonical.artifacts[0]
+            if isinstance(canonical, PurchaseBatchV1)
+            else canonical
+        )
         try:
             stored = get_payment_purchase_store(
                 settings.payment_purchase_db_path
@@ -479,7 +687,7 @@ async def verify_purchase_finalization(
                 reasons.append("external_message_not_verified")
             else:
                 token_address = settings.payment_evm_usdc_tokens.get(
-                    str(canonical.rail_chain_id)
+                    str(canonical_item.rail_chain_id)
                 )
                 gateway_profile = message.get("gatewayProfile")
                 if token_address is None or not isinstance(gateway_profile, str):
@@ -488,7 +696,7 @@ async def verify_purchase_finalization(
                     try:
                         load_omnichain_evidence(
                             settings,
-                            chain_id=canonical.rail_chain_id,
+                            chain_id=canonical_item.rail_chain_id,
                             token_address=token_address,
                             gateway_profile=gateway_profile,
                         )
@@ -499,11 +707,143 @@ async def verify_purchase_finalization(
                     != message.get("globalPaymentId")
                 ):
                     reasons.append("external_global_payment_mismatch")
+    delivery_state: str | None = None
+    if (
+        not reasons
+        and body.rail in {"stripe", "base_usdc", "evm_usdc"}
+        and isinstance(canonical, (PurchaseArtifactV3, PurchaseBatchV1))
+    ):
+        try:
+            canonical_item = (
+                canonical.artifacts[0]
+                if isinstance(canonical, PurchaseBatchV1)
+                else canonical
+            )
+            canonical_hash = (
+                canonical.batch_hash
+                if isinstance(canonical, PurchaseBatchV1)
+                else canonical.artifact_hash
+            )
+            stored = get_payment_purchase_store(
+                settings.payment_purchase_db_path
+            ).get(_hex32(canonical.purchase_id))
+            if (
+                stored.purchase_intent_id != body.purchase_intent_id
+                or stored.artifact_hash != _hex32(canonical_hash)
+                or stored.offer_artifact_hash != body.artifact_hash
+                or stored.purchase_artifact != dict(canonical_json)
+            ):
+                reasons.append("external_stored_purchase_mismatch")
+            else:
+                delivery_evidence: Mapping[str, Any]
+                if body.rail == "stripe":
+                    validators = configured_validator_pubkeys(settings)
+                    receipt = (
+                        build_purchase_batch_settlement_receipt_v1(
+                            batch=canonical,
+                            provider_id=STRIPE_PAYMENT_PROVIDER_ID,
+                            external_reference_hash=(
+                                stripe_evidence.payment_reference_hash
+                            ),
+                            evidence_hash=stripe_evidence.evidence_hash,
+                            observed_at=stripe_evidence.observed_at,
+                            validator_pubkeys=validators,
+                            collected_amount_minor=stripe_evidence.amount_minor,
+                            processing_charge_minor=(
+                                stripe_evidence.processing_charge_minor
+                            ),
+                        )
+                        if isinstance(canonical, PurchaseBatchV1)
+                        else build_stripe_settlement_receipt_v1(
+                            artifact=canonical,
+                            evidence=stripe_evidence,
+                            validator_pubkeys=validators,
+                        )
+                    )
+                    delivery_evidence = body.payment_evidence
+                    payment_rail = "stripe"
+                else:
+                    if stored.external_message is None:
+                        raise PaymentArtifactError(
+                            "verified Base escrow evidence is missing"
+                        )
+                    delivery_evidence = stored.external_message
+                    token_address = settings.payment_evm_usdc_tokens.get(
+                        str(canonical_item.rail_chain_id)
+                    )
+                    gateway_profile = delivery_evidence.get(
+                        "gatewayProfile"
+                    )
+                    if token_address is None or not isinstance(
+                        gateway_profile,
+                        str,
+                    ):
+                        raise PaymentArtifactError(
+                            "reviewed Base deployment evidence is unavailable"
+                        )
+                    deployment = load_omnichain_evidence(
+                        settings,
+                        chain_id=canonical_item.rail_chain_id,
+                        token_address=token_address,
+                        gateway_profile=gateway_profile,
+                    )
+                    result_puzzle_hash = (
+                        base_result_authorization_puzzle_hash(
+                            artifact=canonical,
+                            evidence=delivery_evidence,
+                            return_puzzle_hash=bytes32.from_hexstr(
+                                deployment.return_puzzle_hash
+                            ),
+                        )
+                    )
+                    receipt = (
+                        build_base_batch_settlement_receipt(
+                            batch=canonical,
+                            evidence=delivery_evidence,
+                            validator_pubkeys=configured_validator_pubkeys(
+                                settings
+                            ),
+                            result_authorization_puzzle_hash=result_puzzle_hash,
+                        )
+                        if isinstance(canonical, PurchaseBatchV1)
+                        else build_base_settlement_receipt(
+                            artifact=canonical,
+                            evidence=delivery_evidence,
+                            result_authorization_puzzle_hash=result_puzzle_hash,
+                        )
+                    )
+                    payment_rail = "base_usdc"
+                from .stripe_delivery_store import get_stripe_delivery_store
+
+                delivery = get_stripe_delivery_store(
+                    settings.stripe_delivery_db_path
+                ).queue(
+                    purchase_id=_hex32(canonical.purchase_id),
+                    evidence=delivery_evidence,
+                    receipt_hash=_hex32(receipt.receipt_hash),
+                    payment_rail=payment_rail,
+                    delivery_kind=(
+                        "sgt"
+                        if canonical_item.delivery_kind
+                        == PurchaseDeliveryKind.SGT
+                        else "smartdeed"
+                    ),
+                )
+                delivery_state = delivery.state
+        except (PaymentPurchaseNotFound, PaymentArtifactError, ValueError):
+            reasons.append("external_delivery_queue_rejected")
     return VerifyPurchaseFinalizationResponse(
         verified=not reasons,
         artifact_hash=content_hash(body.artifact),
-        finalized_state="protocol_verified" if not reasons else "manual_review",
+        finalized_state=(
+            "paid"
+            if not reasons and body.rail == "stripe"
+            else "protocol_verified"
+            if not reasons
+            else "manual_review"
+        ),
         reasons=reasons,
+        delivery_state=delivery_state,
     )
 
 
@@ -596,8 +936,21 @@ async def verify_external_escrow(
             detail="purchase artifact is not an EVM escrow purchase",
         )
     try:
-        canonical = purchase_artifact_from_json(record.purchase_artifact)
-        canonical.assert_live(int(time.time()))
+        batch = (
+            purchase_batch_from_json(record.purchase_artifact)
+            if record.purchase_artifact.get("schema")
+            == "solslot.purchase-batch.v1"
+            else None
+        )
+        canonical_document = (
+            batch
+            if batch is not None
+            else _purchase_artifact_from_json(record.purchase_artifact)
+        )
+        canonical_document.assert_live(int(time.time()))
+        canonical = (
+            batch.artifacts[0] if batch is not None else canonical_document
+        )
     except PaymentArtifactError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -633,13 +986,27 @@ async def verify_external_escrow(
             status_code=status.HTTP_409_CONFLICT,
             detail="external payment provenance does not match the reviewed escrow rail",
         )
+    delivery_amount = batch.quantity if batch is not None else 1
+    delivery_context = canonical.collection_id
+    delivery_asset = canonical.deed_launcher_id
+    if isinstance(canonical, PurchaseArtifactV3) and batch is None:
+        delivery_amount = canonical.delivery_amount
+        delivery_context = canonical.delivery_context_hash
+        delivery_asset = canonical.delivery_asset_id
     expected = {
-        "purchaseId": _hex32(canonical.purchase_id),
-        "artifactHash": _hex32(canonical.artifact_hash),
-        "amount": canonical.rail_amount,
-        "quantity": 1,
-        "collectionId": _hex32(canonical.collection_id),
-        "deedLauncherId": _hex32(canonical.deed_launcher_id),
+        "purchaseId": _hex32(canonical_document.purchase_id),
+        "artifactHash": _hex32(
+            batch.batch_hash if batch is not None else canonical.artifact_hash
+        ),
+        "amount": (
+            batch.total_rail_amount if batch is not None else canonical.rail_amount
+        ),
+        # Preserve the reviewed escrow ABI while allowing PurchaseArtifactV3
+        # to commit either a SmartDeed or SGT delivery. For V3 these legacy
+        # wire slots carry the generic delivery tuple.
+        "quantity": delivery_amount,
+        "collectionId": _hex32(delivery_context),
+        "deedLauncherId": _hex32(delivery_asset),
         "vaultLauncherId": _hex32(canonical.vault_launcher_id),
         "destinationPuzzle": _hex32(canonical.vault_p2_puzzle_hash),
         "quoteExpiresAt": canonical.quote_expires_at,
@@ -675,9 +1042,13 @@ async def verify_external_escrow(
             **expected,
             "globalPaymentId": normalized["globalPaymentId"],
             "gatewayProfile": normalized["gatewayProfile"],
-            "baseAmountMinor": canonical.base_amount_minor,
-            "technologyFeeMinor": canonical.technology_fee_minor,
-            "subtotalMinor": canonical.subtotal_minor,
+            "usdAmountMinor": (
+                batch.total_subtotal_minor
+                if batch is not None
+                else canonical.gross_usd_amount_minor
+                if isinstance(canonical, PurchaseArtifactV3)
+                else canonical.usd_amount_minor
+            ),
             "railChainId": canonical.rail_chain_id,
             "railAssetId": _hex32(canonical.rail_asset_id),
             "railAssetDecimals": canonical.rail_asset_decimals,
@@ -733,6 +1104,8 @@ def _ingest_verified_presale_payment(
     record = get_payment_purchase_store(settings.payment_purchase_db_path).get(
         body.purchase_id
     )
+    if record.purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
+        return None
     artifact = purchase_artifact_from_json(record.purchase_artifact)
     payer = bytes32(
         b"\x00" * 12 + bytes.fromhex(body.depositor.removeprefix("0x"))
@@ -766,69 +1139,12 @@ def _ingest_verified_presale_payment(
     )
 
 
-def _active_stripe_presale_terms_hash(
-    settings: Settings,
-    *,
-    collection_workspace_id: str,
-    deed_launcher_id: bytes32,
-    now: int,
-) -> bytes32:
-    """Return the governed presale commitment for one exact Stripe deed.
-
-    Presale classification is coordinator state, not a client option. A
-    matching series outside its sale window is rejected rather than falling
-    through to a direct-purchase artifact.
-    """
-
-    from .presale_endpoints import get_presale_store
-
-    launcher = _hex32(deed_launcher_id)
-    matches: list[Mapping[str, Any]] = []
-    for series in get_presale_store(settings).list():
-        if series.get("state") != "PRESALE":
-            continue
-        terms = _mapping(series.get("terms"))
-        if terms.get("collectionWorkspaceId") != collection_workspace_id:
-            continue
-        deeds = terms.get("deeds")
-        if not isinstance(deeds, list):
-            raise PaymentArtifactError(
-                "active presale has no canonical deed allocation"
-            )
-        if any(
-            isinstance(deed, Mapping)
-            and str(deed.get("deedLauncherId") or "").lower() == launcher
-            for deed in deeds
-        ):
-            matches.append(series)
-
-    if not matches:
-        return bytes32.zeros
-    if len(matches) != 1:
-        raise PaymentArtifactError(
-            "deed belongs to more than one active presale series"
-        )
-    terms = _mapping(matches[0].get("terms"))
-    sale_open = terms.get("saleOpen")
-    sale_close = terms.get("saleClose")
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        for value in (sale_open, sale_close)
-    ):
-        raise PaymentArtifactError(
-            "active presale has invalid sale-window timestamps"
-        )
-    assert isinstance(sale_open, int) and isinstance(sale_close, int)
-    if not sale_open <= now < sale_close:
-        raise PaymentArtifactError("the governed presale sales window is closed")
-    return _bytes32_field(str(matches[0].get("termsHash") or ""), "presale.termsHash")
-
-
 def _build_canonical_payment_artifact(
     body: BuildProtocolOfferArtifactRequest,
     settings: Settings,
     *,
     vault_launcher_id: str,
+    identity_attest_root: str,
     genesis_artifact: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     now = int(time.time())
@@ -845,10 +1161,8 @@ def _build_canonical_payment_artifact(
         raise PaymentArtifactError(
             "protocol purchases require the collection metadata workspace"
         )
-    if body.payment_terms.quantity != 1:
-        raise PaymentArtifactError(
-            "primary purchases deliver exactly one governed SmartDeed"
-        )
+    if body.payment_terms.quantity > 100:
+        raise PaymentArtifactError("purchase quantity cannot exceed 100")
     if (
         body.rail in {"base_usdc", "evm_usdc"}
         and body.expires_at > now + 30 * 60
@@ -869,6 +1183,70 @@ def _build_canonical_payment_artifact(
         raise PaymentArtifactError(
             "protocol purchases require a published, allocation-locked collection"
         )
+    if body.payment_terms.quantity > 1:
+        selected_deeds = _select_purchase_deeds(
+            collection,
+            property_id=body.property_id,
+            deed_launcher_id=body.deed_launcher_id,
+            quantity=body.payment_terms.quantity,
+        )
+        child_payloads: list[dict[str, Any]] = []
+        oracle_authorization: dict[str, Any] | None = None
+        for selected in selected_deeds:
+            child_body = body.model_copy(
+                update={
+                    "property_id": str(selected["deedId"]),
+                    "deed_launcher_id": str(selected["deedLauncherId"]),
+                    "share_ppm": int(selected["sharePpm"]),
+                    "payment_terms": body.payment_terms.model_copy(
+                        update={"quantity": 1, "usd_amount_minor": None}
+                    ),
+                }
+            )
+            child, child_oracle = _build_canonical_payment_artifact(
+                child_body,
+                settings,
+                vault_launcher_id=vault_launcher_id,
+                identity_attest_root=identity_attest_root,
+                genesis_artifact=genesis_artifact,
+            )
+            if child.get("schema") != "solslot.purchase-artifact.v3":
+                raise PaymentArtifactError(
+                    "multi-deed checkout requires direct governed inventory"
+                )
+            if child_oracle is not None:
+                if oracle_authorization is None:
+                    oracle_authorization = child_oracle
+                elif child_oracle != oracle_authorization:
+                    raise PaymentArtifactError(
+                        "multi-deed checkout resolved inconsistent oracle evidence"
+                    )
+            child_payloads.append(child)
+
+        artifacts = tuple(
+            purchase_artifact_v3_from_json(value) for value in child_payloads
+        )
+        batch_nonce = bytes32(
+            hashlib.sha256(
+                b"SOLSLOT_PURCHASE_BATCH_NONCE_V1\x00"
+                + body.purchase_intent_id.encode("utf-8")
+                + bytes(artifacts[0].authorization_nonce)
+            ).digest()
+        )
+        batch = build_purchase_batch_v1(
+            batch_nonce=batch_nonce,
+            artifacts=artifacts,
+        )
+        batch.assert_live(now)
+        if (
+            body.payment_terms.usd_amount_minor is not None
+            and body.payment_terms.usd_amount_minor
+            != batch.total_subtotal_minor
+        ):
+            raise PaymentArtifactError(
+                "USD amount does not match the batched sealed price plus fees"
+            )
+        return purchase_batch_to_json(batch), oracle_authorization
     deed = next(
         (
             item
@@ -909,34 +1287,40 @@ def _build_canonical_payment_artifact(
         raise PaymentArtifactError(
             "share_ppm does not match the sealed deed allocation"
         )
-    share_ppm, base_amount_minor = _sealed_deed_price(collection, deed)
-    if (
-        body.payment_terms.usd_amount_minor is not None
-        and body.payment_terms.usd_amount_minor != base_amount_minor
-    ):
-        raise PaymentArtifactError(
-            "USD amount does not match the sealed deed allocation"
-        )
+    share_ppm, base_usd_amount_minor = _sealed_deed_price(collection, deed)
     offering = _mapping(_mapping(collection.get("dossier")).get("offering"))
-    technology_fee_bps = _nonnegative_decimal_integer(
+    fee_bps = _nonnegative_decimal_integer(
         offering.get("royaltyBps"),
         "dossier.offering.royaltyBps",
     )
-    if technology_fee_bps != TECHNOLOGY_FEE_BPS_ALPHA:
+    if fee_bps > MAX_TECHNOLOGY_FEE_BPS:
+        raise PaymentArtifactError("technology fee exceeds 1000 bps")
+    if fee_bps != ALPHA_TECHNOLOGY_FEE_BPS:
         raise PaymentArtifactError(
-            "Testnet11 direct purchases require the sealed 100-bps "
-            "technology fee"
+            "RC24 alpha collections require a 100-bps technology fee"
+        )
+    technology_fee = technology_fee_minor(
+        base_usd_amount_minor,
+        fee_bps,
+    )
+    gross_usd_amount_minor = base_usd_amount_minor + technology_fee
+    if (
+        body.payment_terms.usd_amount_minor is not None
+        and body.payment_terms.usd_amount_minor != gross_usd_amount_minor
+    ):
+        raise PaymentArtifactError(
+            "USD amount does not match the sealed price plus technology fee"
         )
     puzzle_hashes = _mapping(genesis_artifact.get("puzzleHashes"))
     protocol_treasury = _bytes32_field(
         str(puzzle_hashes.get("protocolTreasuryPuzzleHash") or ""),
-        "genesis.puzzleHashes.protocolTreasuryPuzzleHash",
+        "protocol_treasury_puzzle_hash",
     )
-    offering_treasury = _bytes32_field(
+    royalty_puzhash = _bytes32_field(
         str(offering.get("royaltyPuzhash") or ""),
         "dossier.offering.royaltyPuzhash",
     )
-    if offering_treasury != protocol_treasury:
+    if royalty_puzhash != protocol_treasury:
         raise PaymentArtifactError(
             "technology fee destination is not the trusted protocol treasury"
         )
@@ -984,6 +1368,20 @@ def _build_canonical_payment_artifact(
         )
     vault_id = _bytes32_field(vault_launcher_id, "vault_launcher_id")
     vault_p2 = puzzle_hash_for_p2_vault(vault_id)
+    zkpassport_root = _bytes32_field(
+        identity_attest_root,
+        "identity_attest_root",
+    )
+    voucher_terms_hash = _active_presale_terms_for_deed(
+        settings,
+        expected_deed_launcher,
+    )
+    is_voucher = voucher_terms_hash is not None
+    if is_voucher and body.rail not in {"chia_xch", "base_usdc", "evm_usdc"}:
+        raise PaymentArtifactError(
+            "active presale inventory is available only through governed "
+            "XCH or Base USDC vouchers"
+        )
     common = {
         "network": settings.network,
         "collection_id": collection_id,
@@ -991,13 +1389,6 @@ def _build_canonical_payment_artifact(
         "metadata_root": expected_metadata_root,
         "metadata_anchor_id": expected_metadata_anchor,
         "share_ppm": share_ppm,
-        "base_amount_minor": base_amount_minor,
-        "technology_fee_bps": technology_fee_bps,
-        "protocol_treasury_puzzle_hash": protocol_treasury,
-        "zkpassport_root": _bytes32_field(
-            body.identity_attest_root,
-            "identity_attest_root",
-        ),
         "vault_launcher_id": vault_id,
         "vault_p2_puzzle_hash": vault_p2,
         "authorization_nonce": _bytes32_field(
@@ -1008,6 +1399,17 @@ def _build_canonical_payment_artifact(
         ),
         "quote_expires_at": body.expires_at,
     }
+    if is_voucher:
+        common["usd_amount_minor"] = gross_usd_amount_minor
+    else:
+        common.update(
+            {
+                "base_usd_amount_minor": base_usd_amount_minor,
+                "technology_fee_bps": fee_bps,
+                "protocol_treasury_puzzle_hash": protocol_treasury,
+                "zkpassport_root": zkpassport_root,
+            }
+        )
 
     if body.rail == "stripe":
         if body.payment_terms.chain_id is not None:
@@ -1018,17 +1420,9 @@ def _build_canonical_payment_artifact(
             raise PaymentArtifactError(
                 "Stripe purchases must use USD minor units"
             )
-        purchase = build_stripe_purchase_artifact(
-            **common,
-            presale_terms_hash=_active_stripe_presale_terms_hash(
-                settings,
-                collection_workspace_id=collection["id"],
-                deed_launcher_id=deed_launcher_id,
-                now=now,
-            ),
-        )
+        purchase = build_stripe_purchase_artifact_v3(**common)
         purchase.assert_live(now)
-        return purchase_artifact_to_json(purchase), None
+        return purchase_artifact_v3_to_json(purchase), None
 
     if body.rail in {"base_usdc", "evm_usdc"}:
         if body.native_asset_id is not None or body.native_asset_decimals is not None:
@@ -1051,13 +1445,22 @@ def _build_canonical_payment_artifact(
             raise PaymentArtifactError(
                 "EVM chain is not enabled for protocol purchases"
             )
-        purchase = build_evm_test_usd_purchase_artifact(
+        builder = (
+            build_evm_test_usd_purchase_artifact
+            if is_voucher
+            else build_evm_test_usd_purchase_artifact_v3
+        )
+        purchase = builder(
             **common,
             chain_id=chain_id,
             token_asset_id=_evm_token_asset_id(token_address),
         )
         purchase.assert_live(now)
-        return purchase_artifact_to_json(purchase), None
+        return (
+            purchase_artifact_to_json(purchase)
+            if is_voucher
+            else purchase_artifact_v3_to_json(purchase)
+        ), None
 
     asset_id = bytes32.zeros
     if body.rail == "chia_cat":
@@ -1101,16 +1504,25 @@ def _build_canonical_payment_artifact(
         "oracle_round": authorized_round.round,
     }
     if body.rail == "chia_xch":
-        purchase = build_xch_purchase_artifact(**native_common)
+        builder = (
+            build_xch_purchase_artifact
+            if is_voucher
+            else build_xch_purchase_artifact_v3
+        )
+        purchase = builder(**native_common)
     else:
-        purchase = build_cat_purchase_artifact(
+        purchase = build_cat_purchase_artifact_v3(
             **native_common,
             cat_asset_id=asset_id,
-            cat_asset_decimals=int(body.native_asset_decimals or 0),
+            cat_decimals=int(body.native_asset_decimals or 0),
         )
     purchase.assert_live(now)
     return (
-        purchase_artifact_to_json(purchase),
+        (
+            purchase_artifact_to_json(purchase)
+            if is_voucher
+            else purchase_artifact_v3_to_json(purchase)
+        ),
         authorized_round.public_evidence(),
     )
 
@@ -1138,33 +1550,89 @@ def _build_artifact(
         "expiresAt": body.expires_at,
     }
     purchase_artifact, _oracle_authorization = canonical_payment
-    protocol["deedLauncherId"] = purchase_artifact["deedLauncherId"]
+    is_batch = purchase_artifact.get("schema") == "solslot.purchase-batch.v1"
+    is_v3 = purchase_artifact.get("schema") == "solslot.purchase-artifact.v3"
+    canonical_item = (
+        purchase_artifact["artifacts"][0] if is_batch else purchase_artifact
+    )
+    protocol["deedLauncherId"] = canonical_item["deedLauncherId"]
+    protocol["deedLauncherIds"] = (
+        [item["deedLauncherId"] for item in purchase_artifact["artifacts"]]
+        if is_batch
+        else [canonical_item["deedLauncherId"]]
+    )
     protocol["collectionWorkspaceId"] = body.collection_id
-    protocol["collectionId"] = purchase_artifact["collectionId"]
-    protocol["sharePpm"] = purchase_artifact["sharePpm"]
-    protocol["purchaseArtifactHash"] = purchase_artifact["artifactHash"]
+    protocol["collectionId"] = canonical_item["collectionId"]
+    protocol["sharePpm"] = int(canonical_item["sharePpm"])
+    protocol["quantity"] = (
+        int(purchase_artifact["quantity"])
+        if is_batch
+        else (
+            int(canonical_item["deliveryAmount"])
+            if is_v3
+            and int(canonical_item["deliveryKind"])
+            == int(PurchaseDeliveryKind.SGT)
+            else 1
+        )
+    )
+    protocol["purchaseArtifactHash"] = (
+        purchase_artifact["batchHash"]
+        if is_batch
+        else purchase_artifact["artifactHash"]
+    )
     protocol["purchaseId"] = purchase_artifact["purchaseId"]
-    purchase_kind = PurchaseKind(int(purchase_artifact["purchaseKind"]))
-    protocol["purchaseKind"] = purchase_kind.name
-    protocol["presaleTermsHash"] = purchase_artifact["presaleTermsHash"]
     payment_terms = {
         "currency": (
             "XCH" if body.rail == "chia_xch" else body.payment_terms.currency
         ),
-        "amount": purchase_artifact["railAmount"],
-        "quantity": 1,
-        "base_amount_minor": purchase_artifact["baseAmountMinor"],
-        "technology_fee_bps": purchase_artifact["technologyFeeBps"],
-        "technology_fee_minor": purchase_artifact["technologyFeeMinor"],
-        "subtotal_minor": purchase_artifact["subtotalMinor"],
-        "processing_charge_minor": "0",
-        "asset_id": purchase_artifact["railAssetId"],
-        "asset_decimals": purchase_artifact["railAssetDecimals"],
+        "amount": (
+            purchase_artifact["totalRailAmount"]
+            if is_batch
+            else purchase_artifact["railAmount"]
+        ),
+        "quantity": protocol["quantity"],
+        "usd_amount_minor": (
+            purchase_artifact["totalSubtotalMinor"]
+            if is_batch
+            else (
+                purchase_artifact["subtotalMinor"]
+                if is_v3
+                else purchase_artifact["usdAmountMinor"]
+            )
+        ),
+        "asset_id": canonical_item["railAssetId"],
+        "asset_decimals": canonical_item["railAssetDecimals"],
     }
+    if is_v3 or is_batch:
+        payment_terms.update(
+            {
+                "base_usd_amount_minor": (
+                    purchase_artifact["totalBaseAmountMinor"]
+                    if is_batch
+                    else purchase_artifact["baseAmountMinor"]
+                ),
+                "technology_fee_bps": int(
+                    canonical_item["technologyFeeBps"]
+                ),
+                "technology_fee_minor": (
+                    purchase_artifact["totalTechnologyFeeMinor"]
+                    if is_batch
+                    else purchase_artifact["technologyFeeMinor"]
+                ),
+                "gross_usd_amount_minor": (
+                    purchase_artifact["totalSubtotalMinor"]
+                    if is_batch
+                    else purchase_artifact["subtotalMinor"]
+                ),
+                "protocol_treasury_puzzle_hash": canonical_item[
+                    "protocolTreasuryPuzzleHash"
+                ],
+            }
+        )
     artifact: dict[str, Any] = {
-        "schemaVersion": 3,
+        "schemaVersion": 4 if is_batch else (3 if is_v3 else 2),
         "protocolVersion": "solslot-v2",
-        "version": 3,
+        "version": 4 if is_batch else (3 if is_v3 else 2),
         "kind": "solslot_protocol_offer",
         "network": settings.network,
         "genesisArtifactHash": genesis_artifact["artifactHash"],
@@ -1175,7 +1643,11 @@ def _build_artifact(
         "issuedAt": int(time.time()),
     }
     purchase_artifact, oracle_authorization = canonical_payment
-    artifact["purchaseArtifactV3"] = purchase_artifact
+    artifact[
+        "purchaseBatchV1"
+        if is_batch
+        else ("purchaseArtifactV3" if is_v3 else "purchaseArtifactV2")
+    ] = purchase_artifact
     if oracle_authorization is not None:
         artifact["oracleAuthorization"] = oracle_authorization
     artifact["poolLauncherId"] = launchers["pool"]
@@ -1213,7 +1685,8 @@ def _artifact_rejection_reasons(
     protocol = _mapping(artifact.get("protocol"))
     if artifact.get("kind") != "solslot_protocol_offer":
         reasons.append("kind_mismatch")
-    if artifact.get("schemaVersion") != 3:
+    schema_version = artifact.get("schemaVersion")
+    if schema_version not in {2, 3, 4}:
         reasons.append("schema_version_mismatch")
     if artifact.get("protocolVersion") != "solslot-v2":
         reasons.append("protocol_version_mismatch")
@@ -1221,7 +1694,14 @@ def _artifact_rejection_reasons(
         reasons.append("network_mismatch")
     if protocol.get("zkPassportRequired") is not True:
         reasons.append("zkpassport_required_missing")
-    canonical_json = artifact.get("purchaseArtifactV3")
+    canonical_v2_json = artifact.get("purchaseArtifactV2")
+    canonical_v3_json = artifact.get("purchaseArtifactV3")
+    canonical_batch_json = artifact.get("purchaseBatchV1")
+    canonical_json = {
+        2: canonical_v2_json,
+        3: canonical_v3_json,
+        4: canonical_batch_json,
+    }.get(schema_version)
     if protocol.get("rail") in {
         "chia_xch",
         "chia_cat",
@@ -1230,11 +1710,65 @@ def _artifact_rejection_reasons(
         "stripe",
     }:
         if not isinstance(canonical_json, Mapping):
-            reasons.append("purchase_artifact_v3_missing")
+            reasons.append(
+                "purchase_batch_v1_missing"
+                if schema_version == 4
+                else (
+                    "purchase_artifact_v3_missing"
+                    if schema_version == 3
+                    else "purchase_artifact_v2_missing"
+                )
+            )
+    if sum(
+        value is not None
+        for value in (
+            canonical_v2_json,
+            canonical_v3_json,
+            canonical_batch_json,
+        )
+    ) > 1:
+        reasons.append("multiple_purchase_artifacts")
+    if schema_version == 2 and protocol.get("rail") not in {
+        "chia_xch",
+        "base_usdc",
+        "evm_usdc",
+    }:
+        reasons.append("purchase_artifact_v2_not_voucher_rail")
     if isinstance(canonical_json, Mapping):
         try:
-            canonical = purchase_artifact_from_json(canonical_json)
-            canonical.assert_live(now or int(time.time()))
+            batch: PurchaseBatchV1 | None = None
+            if schema_version == 4:
+                batch = purchase_batch_from_json(canonical_json)
+                batch.assert_live(now or int(time.time()))
+                canonical: PurchaseArtifactV2 | PurchaseArtifactV3 = (
+                    batch.artifacts[0]
+                )
+                canonical_hash = batch.batch_hash
+                canonical_purchase_id = batch.purchase_id
+                canonical_quantity = batch.quantity
+                canonical_expiry = min(
+                    item.quote_expires_at for item in batch.artifacts
+                )
+                canonical_deed_ids = [
+                    _hex32(item.deed_launcher_id) for item in batch.artifacts
+                ]
+            else:
+                canonical = (
+                    purchase_artifact_v3_from_json(canonical_json)
+                    if schema_version == 3
+                    else purchase_artifact_from_json(canonical_json)
+                )
+                canonical.assert_live(now or int(time.time()))
+                canonical_hash = canonical.artifact_hash
+                canonical_purchase_id = canonical.purchase_id
+                canonical_quantity = (
+                    canonical.delivery_amount
+                    if isinstance(canonical, PurchaseArtifactV3)
+                    and canonical.delivery_kind == PurchaseDeliveryKind.SGT
+                    else 1
+                )
+                canonical_expiry = canonical.quote_expires_at
+                canonical_deed_ids = [_hex32(canonical.deed_launcher_id)]
             expected_pairs = (
                 (canonical.network, artifact.get("network"), "purchase_network"),
                 (
@@ -1248,7 +1782,7 @@ def _artifact_rejection_reasons(
                     "purchase_deed",
                 ),
                 (
-                    str(canonical.share_ppm),
+                    canonical.share_ppm,
                     protocol.get("sharePpm"),
                     "purchase_share",
                 ),
@@ -1258,34 +1792,30 @@ def _artifact_rejection_reasons(
                     "purchase_vault",
                 ),
                 (
-                    canonical.quote_expires_at,
+                    canonical_expiry,
                     protocol.get("expiresAt"),
                     "purchase_expiry",
                 ),
                 (
-                    _hex32(canonical.artifact_hash),
+                    _hex32(canonical_hash),
                     protocol.get("purchaseArtifactHash"),
                     "purchase_artifact_hash",
                 ),
                 (
-                    _hex32(canonical.purchase_id),
+                    _hex32(canonical_purchase_id),
                     protocol.get("purchaseId"),
                     "purchase_id",
-                ),
-                (
-                    canonical.purchase_kind.name,
-                    protocol.get("purchaseKind"),
-                    "purchase_kind",
-                ),
-                (
-                    _hex32(canonical.presale_terms_hash),
-                    protocol.get("presaleTermsHash"),
-                    "presale_terms_hash",
                 ),
             )
             for observed, expected, label in expected_pairs:
                 if observed != expected:
                     reasons.append(f"{label}_mismatch")
+            if canonical_quantity != protocol.get("quantity", 1):
+                reasons.append("purchase_quantity_mismatch")
+            if canonical_deed_ids != protocol.get(
+                "deedLauncherIds", canonical_deed_ids
+            ):
+                reasons.append("purchase_deed_set_mismatch")
             expected_rail = {
                 PaymentRail.CHIA_XCH: "chia_xch",
                 PaymentRail.CHIA_CAT: "chia_cat",
@@ -1303,6 +1833,68 @@ def _artifact_rejection_reasons(
             )
             if canonical.vault_p2_puzzle_hash != canonical_p2:
                 reasons.append("purchase_vault_p2_mismatch")
+            if isinstance(canonical, PurchaseArtifactV3):
+                payment_terms = _mapping(artifact.get("paymentTerms"))
+                receipt = _mapping(artifact.get("vaultCredentialReceipt"))
+                if canonical.technology_fee_bps != ALPHA_TECHNOLOGY_FEE_BPS:
+                    reasons.append("purchase_technology_fee_mismatch")
+                if (
+                    _hex32(canonical.zkpassport_root)
+                    != receipt.get("identityAttestRoot")
+                ):
+                    reasons.append("purchase_zkpassport_root_mismatch")
+                base_minor = (
+                    batch.total_base_amount_minor
+                    if batch is not None
+                    else canonical.base_usd_amount_minor
+                )
+                fee_minor = (
+                    batch.total_technology_fee_minor
+                    if batch is not None
+                    else canonical.technology_fee_minor
+                )
+                gross_minor = (
+                    batch.total_subtotal_minor
+                    if batch is not None
+                    else canonical.gross_usd_amount_minor
+                )
+                rail_amount = (
+                    batch.total_rail_amount
+                    if batch is not None
+                    else canonical.rail_amount
+                )
+                v3_payment_pairs = (
+                    (
+                        str(base_minor),
+                        payment_terms.get("base_usd_amount_minor"),
+                        "purchase_base_amount",
+                    ),
+                    (
+                        canonical.technology_fee_bps,
+                        payment_terms.get("technology_fee_bps"),
+                        "purchase_fee_bps",
+                    ),
+                    (
+                        str(fee_minor),
+                        payment_terms.get("technology_fee_minor"),
+                        "purchase_fee_amount",
+                    ),
+                    (
+                        str(gross_minor),
+                        payment_terms.get("gross_usd_amount_minor"),
+                        "purchase_gross_amount",
+                    ),
+                    (
+                        _hex32(canonical.protocol_treasury_puzzle_hash),
+                        payment_terms.get("protocol_treasury_puzzle_hash"),
+                        "purchase_treasury",
+                    ),
+                )
+                for observed, expected, label in v3_payment_pairs:
+                    if observed != expected:
+                        reasons.append(f"{label}_mismatch")
+                if str(rail_amount) != payment_terms.get("amount"):
+                    reasons.append("purchase_rail_amount_mismatch")
 
             if (
                 settings is not None
@@ -1327,7 +1919,15 @@ def _artifact_rejection_reasons(
                 ):
                     reasons.append("purchase_oracle_mismatch")
         except (PaymentArtifactError, PaymentQuoteError, TypeError, ValueError):
-            reasons.append("purchase_artifact_v3_invalid")
+            reasons.append(
+                "purchase_batch_v1_invalid"
+                if schema_version == 4
+                else (
+                    "purchase_artifact_v3_invalid"
+                    if schema_version == 3
+                    else "purchase_artifact_v2_invalid"
+                )
+            )
     expires_at = protocol.get("expiresAt")
     if not isinstance(expires_at, int) or expires_at <= 0:
         reasons.append("expires_at_invalid")
@@ -1376,6 +1976,29 @@ def _artifact_rejection_reasons(
         for field, expected in coordinate_pairs:
             if not expected or artifact.get(field) != expected:
                 reasons.append(f"{field}_mismatch")
+        if isinstance(canonical_json, Mapping) and schema_version in {3, 4}:
+            try:
+                canonical_v3_items = (
+                    purchase_batch_from_json(canonical_json).artifacts
+                    if schema_version == 4
+                    else (purchase_artifact_v3_from_json(canonical_json),)
+                )
+                trusted_treasury = _bytes32_field(
+                    str(
+                        _mapping(genesis_artifact.get("puzzleHashes")).get(
+                            "protocolTreasuryPuzzleHash"
+                        )
+                        or ""
+                    ),
+                    "protocol_treasury_puzzle_hash",
+                )
+                if any(
+                    item.protocol_treasury_puzzle_hash != trusted_treasury
+                    for item in canonical_v3_items
+                ):
+                    reasons.append("purchase_treasury_not_trusted")
+            except (PaymentArtifactError, TypeError, ValueError):
+                reasons.append("purchase_treasury_unverifiable")
         bridge_policy = _mapping(genesis_artifact.get("bridgePolicy"))
         if receipt.get("bridgePolicyHash") != bridge_policy.get("policyHash"):
             reasons.append("credential_bridge_policy_mismatch")
@@ -1409,6 +2032,9 @@ def _artifact_rejection_reasons(
         coordinate_values.extend(
             (protocol.get("deedLauncherId"), protocol.get("vaultLauncherId"))
         )
+        deed_launcher_ids = protocol.get("deedLauncherIds")
+        if isinstance(deed_launcher_ids, list):
+            coordinate_values.extend(deed_launcher_ids)
         if any(
             isinstance(value, str) and value.lower() in retired
             for value in coordinate_values
@@ -1432,12 +2058,128 @@ def _payment_evidence_rejection_reasons(
         if not evidence.get("tx_hash"):
             return ["base_usdc_tx_hash_missing"]
     elif rail == "stripe":
-        return ["stripe_settlement_receipt_required"]
+        try:
+            stripe_settlement_evidence_from_json(evidence)
+        except (PaymentArtifactError, TypeError, ValueError):
+            return ["stripe_settlement_evidence_invalid"]
     return []
+
+
+def _active_presale_terms_for_deed(
+    settings: Settings,
+    deed_launcher_id: bytes32,
+) -> str | None:
+    """Return the sole active voucher series containing this governed deed."""
+
+    from .presale_endpoints import get_presale_store
+
+    expected = _hex32(deed_launcher_id).lower()
+    matches: set[str] = set()
+    for series in get_presale_store(settings).list():
+        if series.get("state") != "PRESALE":
+            continue
+        terms = _mapping(series.get("terms"))
+        deeds = terms.get("deeds")
+        if not isinstance(deeds, list):
+            raise PaymentArtifactError(
+                "active presale has invalid governed deed commitments"
+            )
+        if any(
+            isinstance(item, Mapping)
+            and str(item.get("deedLauncherId") or "").lower() == expected
+            for item in deeds
+        ):
+            terms_hash = series.get("termsHash")
+            if not isinstance(terms_hash, str):
+                raise PaymentArtifactError(
+                    "active presale is missing its terms hash"
+                )
+            matches.add(terms_hash.lower())
+    if len(matches) > 1:
+        raise PaymentArtifactError(
+            "governed deed belongs to multiple active presales"
+        )
+    return next(iter(matches), None)
+
+
+def _purchase_artifact_from_json(
+    value: Mapping[str, Any],
+) -> PurchaseArtifactV2 | PurchaseArtifactV3:
+    schema = value.get("schema")
+    if schema == "solslot.purchase-artifact.v3":
+        return purchase_artifact_v3_from_json(value)
+    if schema == "solslot.purchase-artifact.v2":
+        return purchase_artifact_from_json(value)
+    raise PaymentArtifactError("purchase artifact schema is unsupported")
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _select_purchase_deeds(
+    collection: Mapping[str, Any],
+    *,
+    property_id: str,
+    deed_launcher_id: str | None,
+    quantity: int,
+) -> tuple[Mapping[str, Any], ...]:
+    """Select one exact, deterministic set of equivalent governed deeds."""
+
+    deeds = collection.get("deeds")
+    if not isinstance(deeds, list):
+        raise PaymentArtifactError("collection deed inventory is unavailable")
+    anchor = next(
+        (
+            _mapping(item)
+            for item in deeds
+            if str(_mapping(item).get("deedId") or "").casefold()
+            == property_id.casefold()
+            or str(_mapping(item).get("deedLauncherId") or "").casefold()
+            == property_id.casefold()
+        ),
+        None,
+    )
+    if anchor is None:
+        raise PaymentArtifactError(
+            "purchase deed is not in the sealed collection allocation"
+        )
+    if deed_launcher_id is not None and str(
+        anchor.get("deedLauncherId") or ""
+    ).casefold() != deed_launcher_id.casefold():
+        raise PaymentArtifactError(
+            "deed_launcher_id does not match the collection workspace"
+        )
+    unit_share = int(anchor.get("sharePpm") or 0)
+    unit_par = str(anchor.get("parValueMojos") or "")
+    eligible = [
+        _mapping(item)
+        for item in deeds
+        if int(_mapping(item).get("sharePpm") or 0) == unit_share
+        and str(_mapping(item).get("parValueMojos") or "") == unit_par
+        and bool(_mapping(item).get("deedLauncherId"))
+        and bool(_mapping(item).get("executeBundleId"))
+        and _mapping(item).get("confirmationHeight") is not None
+    ]
+    eligible.sort(
+        key=lambda item: (
+            0 if item.get("deedId") == anchor.get("deedId") else 1,
+            str(item.get("deedId") or "").casefold(),
+            str(item.get("deedLauncherId") or "").casefold(),
+        )
+    )
+    unique: list[Mapping[str, Any]] = []
+    launcher_ids: set[str] = set()
+    for item in eligible:
+        launcher = str(item.get("deedLauncherId") or "").casefold()
+        if launcher and launcher not in launcher_ids:
+            launcher_ids.add(launcher)
+            unique.append(item)
+    if len(unique) < quantity:
+        raise PaymentArtifactError(
+            f"only {len(unique)} equivalent confirmed SmartDeeds are available"
+        )
+    return tuple(unique[:quantity])
 
 
 def _sealed_deed_price(
@@ -1553,21 +2295,23 @@ def _nonnegative_decimal_integer(value: Any, label: str) -> int:
         or not value
         or not value.isascii()
         or not value.isdecimal()
-        or (len(value) > 1 and value.startswith("0"))
     ):
-        raise PaymentArtifactError(
-            f"{label} must be a canonical nonnegative decimal string"
-        )
-    return int(value)
+        raise PaymentArtifactError(f"{label} must be a decimal integer string")
+    parsed = int(value)
+    if parsed < 0:
+        raise PaymentArtifactError(f"{label} cannot be negative")
+    return parsed
 
 
 def _assert_protocol_offer_public_artifact(
     artifact: Mapping[str, Any],
 ) -> None:
     scan_target = dict(artifact)
-    # These two envelopes have strict parsers and contain intentionally public
+    # These envelopes have strict parsers and contain intentionally public
     # fields named authorizationNonce and signature. They carry no credential.
+    scan_target.pop("purchaseArtifactV2", None)
     scan_target.pop("purchaseArtifactV3", None)
+    scan_target.pop("purchaseBatchV1", None)
     scan_target.pop("oracleAuthorization", None)
     _assert_public_artifact(scan_target, "protocol_offer_artifact")
 

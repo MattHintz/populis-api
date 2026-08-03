@@ -9,24 +9,32 @@ from chia_rs.sized_bytes import bytes32
 
 from solslot_api import validator_quorum
 from solslot_api.config import Settings
-from solslot_api.faucet import AGG_SIG_ME_DATA
 from solslot_api.validator_quorum import (
-    InventoryReservationClaim,
+    PrimaryPurchaseDeedItem,
     PrimaryPurchaseClaim,
+    StripeSettlementClaim,
     ValidatorClaim,
     ValidatorQuorumError,
     VoucherSeriesPhaseClaim,
     VoucherTransitionClaim,
-    collect_inventory_reservation_quorum,
     collect_primary_purchase_quorum,
+    collect_stripe_settlement_quorum,
     collect_validator_quorum,
     collect_voucher_series_phase_quorum,
     collect_voucher_transition_quorum,
     probe_validator_health,
 )
 from solslot_puzzles.payment_artifacts_v3 import (
-    build_stripe_purchase_artifact,
-    purchase_artifact_to_json,
+    StripeDisputeState,
+    StripeFundingType,
+    StripeMethodFamily,
+    StripePaymentStatus,
+    StripeRefundState,
+    StripeSettlementEvidenceV1,
+    build_purchase_batch_v1,
+    build_stripe_purchase_artifact_v3,
+    purchase_batch_to_json,
+    stripe_settlement_evidence_to_json,
 )
 from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
 from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
@@ -97,6 +105,7 @@ def _primary_claim() -> PrimaryPurchaseClaim:
         deed_coin_id="0x" + "24" * 32,
         deed_puzzle_hash="0x" + "25" * 32,
         smart_deed_inner_hash="0x" + "26" * 32,
+        reservation_expires_at=1_800_000_300,
         protocol_puzzle_hash="0x" + "27" * 32,
         credential_vault_coin_id="0x" + "28" * 32,
         credential_identity_root="0x" + "29" * 32,
@@ -104,47 +113,6 @@ def _primary_claim() -> PrimaryPurchaseClaim:
         credential_bridge_policy_hash="0x" + "2a" * 32,
         credential_owner_auth_type=1,
         credential_owner_key="0x" + bytes(owner_key).hex(),
-    )
-
-
-def _inventory_claim() -> InventoryReservationClaim:
-    owner_key = AugSchemeMPL.key_gen(b"r" * 32).get_g1()
-    vault_launcher = bytes32(b"v" * 32)
-    purchase = build_stripe_purchase_artifact(
-        network="testnet11",
-        collection_id=bytes32(b"c" * 32),
-        deed_launcher_id=bytes32(b"d" * 32),
-        metadata_root=bytes32(b"m" * 32),
-        metadata_anchor_id=bytes32.zeros,
-        share_ppm=40_000,
-        base_amount_minor=10_000,
-        technology_fee_bps=100,
-        protocol_treasury_puzzle_hash=bytes32(b"t" * 32),
-        zkpassport_root=bytes32(b"z" * 32),
-        vault_launcher_id=vault_launcher,
-        vault_p2_puzzle_hash=puzzle_hash_for_p2_vault(vault_launcher),
-        authorization_nonce=bytes32(b"n" * 32),
-        authorization_expires_at=2_000_000_100,
-        quote_expires_at=2_000_000_000,
-    )
-    return InventoryReservationClaim(
-        network="testnet11",
-        genesis_artifact_hash="0x" + "51" * 32,
-        purchase_artifact=purchase_artifact_to_json(purchase),
-        reservation_expires_at=1_999_999_900,
-        available_coin_id="0x" + "52" * 32,
-        available_puzzle_hash="0x" + "53" * 32,
-        reserved_coin_id="0x" + "54" * 32,
-        reserved_puzzle_hash="0x" + "55" * 32,
-        smart_deed_inner_hash="0x" + "56" * 32,
-        protocol_puzzle_hash="0x" + "57" * 32,
-        credential_vault_coin_id="0x" + "58" * 32,
-        credential_identity_root="0x" + "59" * 32,
-        credential_policy_version=2,
-        credential_bridge_policy_hash="0x" + "5a" * 32,
-        credential_owner_auth_type=1,
-        credential_owner_key="0x" + bytes(owner_key).hex(),
-        validator_message="0x" + "5b" * 32,
     )
 
 
@@ -193,6 +161,81 @@ def _voucher_series_phase_claim() -> VoucherSeriesPhaseClaim:
         deed_launcher_ids=["0x" + "44" * 32, "0x" + "45" * 32],
         governance_execution_ids=["0x" + "46" * 32, "0x" + "47" * 32],
         validator_message="0x" + "48" * 32,
+    )
+
+
+def _stripe_batch_claim(keys) -> StripeSettlementClaim:
+    vault = bytes32(bytes.fromhex("51" * 32))
+    common = {
+        "network": "testnet11",
+        "collection_id": bytes32(bytes.fromhex("52" * 32)),
+        "metadata_root": bytes32(bytes.fromhex("53" * 32)),
+        "metadata_anchor_id": bytes32(bytes.fromhex("54" * 32)),
+        "share_ppm": 50_000,
+        "base_usd_amount_minor": 10_000,
+        "technology_fee_bps": 100,
+        "protocol_treasury_puzzle_hash": bytes32(bytes.fromhex("55" * 32)),
+        "zkpassport_root": bytes32(bytes.fromhex("56" * 32)),
+        "vault_launcher_id": vault,
+        "vault_p2_puzzle_hash": puzzle_hash_for_p2_vault(vault),
+        "authorization_nonce": bytes32(bytes.fromhex("57" * 32)),
+        "authorization_expires_at": 1_900_000_600,
+        "quote_expires_at": 1_900_000_300,
+    }
+    batch = build_purchase_batch_v1(
+        batch_nonce=bytes32(bytes.fromhex("58" * 32)),
+        artifacts=(
+            build_stripe_purchase_artifact_v3(
+                deed_launcher_id=bytes32(bytes.fromhex("59" * 32)),
+                **common,
+            ),
+            build_stripe_purchase_artifact_v3(
+                deed_launcher_id=bytes32(bytes.fromhex("5a" * 32)),
+                **common,
+            ),
+        ),
+    )
+    evidence = StripeSettlementEvidenceV1(
+        stripe_account_id="acct_test_batch",
+        livemode=False,
+        payment_intent_id="pi_test_batch",
+        event_id="evt_test_batch",
+        amount_minor=batch.total_subtotal_minor,
+        currency="usd",
+        method_family=StripeMethodFamily.CARD,
+        funding_type=StripeFundingType.CREDIT,
+        processing_charge_minor=0,
+        status=StripePaymentStatus.SUCCEEDED,
+        refunded_minor=0,
+        refund_state=StripeRefundState.NONE,
+        dispute_state=StripeDisputeState.NONE,
+        observed_at=1_800_000_100,
+    )
+    items = tuple(
+        PrimaryPurchaseDeedItem(
+            deed_launcher_id="0x" + child.deed_launcher_id.hex(),
+            deed_coin_id="0x" + (bytes([0x60 + index]) * 32).hex(),
+            deed_puzzle_hash="0x" + (bytes([0x62 + index]) * 32).hex(),
+            smart_deed_inner_hash="0x" + (bytes([0x64 + index]) * 32).hex(),
+            reservation_expires_at=1_900_000_200,
+        )
+        for index, child in enumerate(batch.artifacts)
+    )
+    return StripeSettlementClaim(
+        network="testnet11",
+        genesis_artifact_hash="0x" + "66" * 32,
+        purchase_artifact=purchase_batch_to_json(batch),
+        stripe_evidence=stripe_settlement_evidence_to_json(evidence),
+        receipt_coin_id="0x" + "67" * 32,
+        receipt_puzzle_hash="0x" + "68" * 32,
+        deed_items=items,
+        protocol_puzzle_hash="0x" + "55" * 32,
+        credential_vault_coin_id="0x" + "69" * 32,
+        credential_identity_root="0x" + "56" * 32,
+        credential_policy_version=2,
+        credential_bridge_policy_hash="0x" + "6a" * 32,
+        credential_owner_auth_type=1,
+        credential_owner_key="0x" + bytes(keys[0].get_g1()).hex(),
     )
 
 
@@ -280,29 +323,6 @@ async def test_any_two_independent_signers_reach_quorum():
 
 
 @pytest.mark.asyncio
-async def test_inventory_reservation_uses_two_independent_signers():
-    keys = _keys()
-    claim = _inventory_claim()
-    async with _client(keys, claim, failures={1}) as client:
-        result = await collect_inventory_reservation_quorum(
-            _settings(keys),
-            claim,
-            client=client,
-        )
-    assert result.signer_indices == (0, 2)
-    assert AugSchemeMPL.aggregate_verify(
-        [keys[0].get_g1(), keys[2].get_g1()],
-        [claim.signature_message(), claim.signature_message()],
-        result.aggregated_signature,
-    )
-    assert claim.signature_message() == (
-        bytes.fromhex(claim.validator_message[2:])
-        + bytes.fromhex(claim.available_coin_id[2:])
-        + AGG_SIG_ME_DATA["testnet11"]
-    )
-
-
-@pytest.mark.asyncio
 async def test_primary_purchase_collects_two_signers_for_deed_coin_message():
     keys = _keys()
     claim = _primary_claim()
@@ -334,6 +354,53 @@ async def test_primary_purchase_collects_two_signers_for_deed_coin_message():
     assert AugSchemeMPL.aggregate_verify(
         [keys[0].get_g1(), keys[1].get_g1()],
         [claim.signature_message(), claim.signature_message()],
+        result.aggregated_signature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stripe_batch_quorum_signs_one_exact_two_deed_receipt():
+    keys = _keys()
+    claim = _stripe_batch_claim(keys)
+    pubkeys = tuple(bytes(key.get_g1()) for key in keys)
+    messages = claim.signature_messages(pubkeys)  # type: ignore[arg-type]
+    assert len(messages) == 1
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        index = int(request.url.host.split("-")[1].split(".")[0])
+        body = json.loads(request.content)
+        assert body["claim"] == claim.model_dump(mode="json")
+        signature = AugSchemeMPL.aggregate(
+            [AugSchemeMPL.sign(keys[index], message) for message in messages]
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claimHash": claim.canonical_hash(),
+                "signerIndex": index,
+                "validatorPubkey": "0x" + bytes(keys[index].get_g1()).hex(),
+                "signature": "0x" + bytes(signature).hex(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await collect_stripe_settlement_quorum(
+            _settings(keys),
+            claim,
+            client=client,
+        )
+
+    assert result.signer_indices == (0, 1)
+    with pytest.raises(ValueError, match="canonical deed order"):
+        StripeSettlementClaim(
+            **{
+                **claim.model_dump(mode="python"),
+                "deed_items": tuple(reversed(claim.deed_items)),
+            }
+        )
+    assert AugSchemeMPL.aggregate_verify(
+        [keys[0].get_g1(), keys[1].get_g1()],
+        [messages[0], messages[0]],
         result.aggregated_signature,
     )
 
@@ -399,59 +466,6 @@ def test_voucher_redemption_binds_the_governed_deed_without_owner_signature() ->
         )
     with pytest.raises(ValueError, match="exact deed evidence"):
         VoucherTransitionClaim.model_validate({**payload, "buyer_offer": None})
-
-
-def test_stripe_v3_redemption_binds_receipt_deed_and_reservation_expiry() -> None:
-    payload = _voucher_transition_claim().model_dump(mode="json")
-    payload.update(
-        voucher_commitment={
-            **payload["voucher_commitment"],
-            "schema": "solslot.voucher-commitment.v3",
-            "paymentRail": 3,
-        },
-        action=3,
-        owner_authorization="",
-        deed_coin_id="0x" + "51" * 32,
-        deed_puzzle_hash="0x" + "52" * 32,
-        smart_deed_inner_hash="0x" + "53" * 32,
-        protocol_puzzle_hash="0x" + "54" * 32,
-        buyer_offer="offer1" + "55" * 16,
-        payment_evidence={"schema": "solslot.stripe-settlement-evidence.v1"},
-        external_settlement_evidence_hash="0x" + "56" * 32,
-        external_validator_message="0x" + "57" * 32,
-        reservation_expires_at=1_800_086_400,
-    )
-    claim = VoucherTransitionClaim.model_validate(payload)
-    messages = claim.signature_messages()
-
-    assert len(messages) == 4
-    assert len(set(messages)) == 4
-    assert bytes.fromhex(claim.external_validator_message[2:]) in messages[2]
-    assert bytes.fromhex(claim.deed_coin_id[2:]) in messages[3]
-
-    with pytest.raises(ValueError, match="exact reservation expiry"):
-        VoucherTransitionClaim.model_validate(
-            {**payload, "reservation_expires_at": None}
-        )
-
-
-def test_stripe_v3_refund_binds_receipt_without_deed_or_reservation() -> None:
-    payload = _voucher_transition_claim().model_dump(mode="json")
-    payload.update(
-        voucher_commitment={
-            **payload["voucher_commitment"],
-            "schema": "solslot.voucher-commitment.v3",
-            "paymentRail": 3,
-        },
-        payment_evidence={"schema": "solslot.stripe-settlement-evidence.v1"},
-        external_settlement_evidence_hash="0x" + "58" * 32,
-        external_validator_message="0x" + "59" * 32,
-    )
-    claim = VoucherTransitionClaim.model_validate(payload)
-
-    assert len(claim.signature_messages()) == 3
-    assert claim.deed_coin_id is None
-    assert claim.reservation_expires_at is None
 
 
 def test_expired_refund_forbids_owner_and_deed_evidence() -> None:
@@ -650,7 +664,6 @@ def _health_client(
                 "artifactHash": artifact_hash,
                 "artifactReady": artifact_hash is not None,
                 "ledgerReady": True,
-                "stripeSettlementReady": True,
             },
         )
 

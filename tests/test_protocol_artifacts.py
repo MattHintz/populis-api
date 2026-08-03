@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import time
+from types import SimpleNamespace
 
 import pytest
 from chia_rs import AugSchemeMPL
@@ -14,23 +15,40 @@ from fastapi.testclient import TestClient
 
 from solslot_api.app import app
 from solslot_api.config import get_settings, validate_server_hardening_at_startup
+from solslot_api.payment_purchase_store import get_payment_purchase_store
 from solslot_api.payment_quotes import SNAPSHOT_SCHEMA
-from solslot_api.presale_endpoints import get_presale_store
+from solslot_api.protocol_artifacts import (
+    VerifyExternalEscrowWebhookRequest,
+    verify_external_escrow,
+)
 from solslot_puzzles.payment_artifacts_v2 import (
     OracleObservationV1,
+    PaymentRail,
     build_oracle_round,
     oracle_operator_set_root,
     oracle_round_signature_message,
     oracle_round_to_json,
+    purchase_artifact_from_json,
 )
 from solslot_puzzles.payment_artifacts_v3 import (
-    purchase_artifact_from_json,
+    StripeDisputeState,
+    StripeFundingType,
+    StripeMethodFamily,
+    StripePaymentStatus,
+    StripeRefundState,
+    StripeSettlementEvidenceV1,
+    build_sgt_purchase_artifact_v3,
+    purchase_artifact_v3_to_json,
+    purchase_artifact_v3_from_json,
+    purchase_batch_from_json,
+    stripe_settlement_evidence_to_json,
 )
 from solslot_api.zkpassport_enrollments import (
     AttestationProof,
     EnrollmentRecord,
     VaultCredentialReceipt,
 )
+from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
 
 
 VAULT_ID = "0x" + "22" * 32
@@ -41,15 +59,15 @@ BRIDGE_POLICY = "0x" + "c1" * 32
 def _active_genesis_artifact() -> dict:
     return {
         "artifactHash": "0x" + "d1" * 32,
+        "puzzleHashes": {
+            "protocolTreasuryPuzzleHash": "0x" + "42" * 32,
+        },
         "launcherIds": {
             "pool": "0x" + "aa" * 32,
             "protocolConfig": "0x" + "bb" * 32,
             "vaultVersionRegistry": "0x" + "cc" * 32,
         },
         "bridgePolicy": {"policyHash": BRIDGE_POLICY},
-        "puzzleHashes": {
-            "protocolTreasuryPuzzleHash": "0x" + "42" * 32,
-        },
         "retiredCoordinates": ["0x" + "e1" * 32],
     }
 
@@ -75,8 +93,8 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
         str(tmp_path / "payment-purchases.db"),
     )
     monkeypatch.setenv(
-        "SOLSLOT_ADMIN_DB_PATH",
-        str(tmp_path / "admin-desk.db"),
+        "SOLSLOT_STRIPE_DELIVERY_DB_PATH",
+        str(tmp_path / "stripe-deliveries.db"),
     )
     monkeypatch.setenv("SOLSLOT_COLLECTION_METADATA_ENABLED", "true")
 
@@ -89,6 +107,10 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "solslot_api.protocol_artifacts.get_collection_store",
         lambda _settings: Store(),
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._active_presale_terms_for_deed",
+        lambda _settings, _deed_launcher_id: None,
     )
 
     def confirmed_enrollment(_settings, vault_launcher_id):
@@ -187,8 +209,13 @@ def _published_collection(
                 },
                 {
                     "deedId": "US-TX-AUSTIN-002",
-                    "sharePpm": 975_000,
-                    "parValueMojos": "9750000000000",
+                    "sharePpm": 25_000,
+                    "parValueMojos": "250000000000",
+                },
+                {
+                    "deedId": "US-TX-AUSTIN-003",
+                    "sharePpm": 950_000,
+                    "parValueMojos": "9500000000000",
                 },
             ],
         },
@@ -200,7 +227,15 @@ def _published_collection(
                 "parValueMojos": "250000000000",
                 "executeBundleId": "0x" + "31" * 32,
                 "confirmationHeight": 12346,
-            }
+            },
+            {
+                "deedId": "US-TX-AUSTIN-002",
+                "deedLauncherId": "0x" + "15" * 32,
+                "sharePpm": 25_000,
+                "parValueMojos": "250000000000",
+                "executeBundleId": "0x" + "32" * 32,
+                "confirmationHeight": 12347,
+            },
         ],
     }
 
@@ -773,6 +808,26 @@ def _configure_external_quote(
             }
         ),
     )
+    validator_pubkeys = [
+        "0x" + bytes(
+            AugSchemeMPL.key_gen(bytes([seed]) * 32).get_g1()
+        ).hex()
+        for seed in (91, 92, 93)
+    ]
+    monkeypatch.setenv(
+        "SOLSLOT_ZKPASSPORT_VALIDATOR_PUBKEYS",
+        json.dumps(validator_pubkeys),
+    )
+    monkeypatch.setenv(
+        "SOLSLOT_ZKPASSPORT_VALIDATOR_URLS",
+        json.dumps(
+            [
+                "https://validator-1.invalid",
+                "https://validator-2.invalid",
+                "https://validator-3.invalid",
+            ]
+        ),
+    )
 
     class Store:
         @staticmethod
@@ -1078,8 +1133,6 @@ def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
         assert body["artifact_hash"].startswith("sha256:")
         assert body["protocol"]["zkPassportRequired"] is True
         assert body["protocol"]["artifactHash"] == body["artifact_hash"]
-        assert body["protocol"]["purchaseKind"] == "DIRECT"
-        assert body["protocol"]["presaleTermsHash"] == "0x" + "00" * 32
 
         verified = client.post(
             "/protocol/offer-artifacts/verify",
@@ -1090,77 +1143,6 @@ def test_builds_and_verifies_protocol_offer_artifact(monkeypatch, tmp_path):
         )
         assert verified.status_code == 200, verified.text
         assert verified.json()["valid"] is True
-
-
-def test_stripe_presale_kind_is_derived_from_exact_governed_series(
-    monkeypatch,
-    tmp_path,
-):
-    now = int(time.time())
-    settings = get_settings()
-    terms_hash = "0x" + "91" * 32
-    get_presale_store(settings).create(
-        {
-            "termsHash": terms_hash,
-            "seriesSingletonId": "0x" + "92" * 32,
-            "collectionWorkspaceId": "SOL-LOT-AUSTIN-ALPHA",
-            "collectionId": "0x" + "93" * 32,
-            "saleOpen": now - 60,
-            "saleClose": now + 3_600,
-            "deeds": [
-                {
-                    "deedLauncherId": "0x" + "11" * 32,
-                }
-            ],
-        }
-    )
-
-    with TestClient(app) as client:
-        built = client.post(
-            "/protocol/offer-artifacts",
-            json=_request(
-                purchase_intent_id="pi_presale_exact_deed",
-                expires_at=now + 900,
-            ),
-        )
-
-    assert built.status_code == 200, built.text
-    body = built.json()
-    assert body["purchase_artifact"]["purchaseKind"] == 2
-    assert body["purchase_artifact"]["presaleTermsHash"] == terms_hash
-    assert body["protocol"]["purchaseKind"] == "PRESALE"
-    assert body["protocol"]["presaleTermsHash"] == terms_hash
-
-
-def test_closed_stripe_presale_cannot_fall_through_to_direct_purchase(
-    monkeypatch,
-    tmp_path,
-):
-    now = int(time.time())
-    settings = get_settings()
-    get_presale_store(settings).create(
-        {
-            "termsHash": "0x" + "94" * 32,
-            "seriesSingletonId": "0x" + "95" * 32,
-            "collectionWorkspaceId": "SOL-LOT-AUSTIN-ALPHA",
-            "collectionId": "0x" + "96" * 32,
-            "saleOpen": now - 3_600,
-            "saleClose": now - 1,
-            "deeds": [{"deedLauncherId": "0x" + "11" * 32}],
-        }
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/protocol/offer-artifacts",
-            json=_request(
-                purchase_intent_id="pi_closed_presale",
-                expires_at=now + 900,
-            ),
-        )
-
-    assert response.status_code == 409
-    assert "presale sales window is closed" in response.text
 
 
 @pytest.mark.parametrize(
@@ -1205,10 +1187,12 @@ def test_builds_native_xch_offer_from_server_authorized_quote(
         )
         assert built.status_code == 200, built.text
         body = built.json()
-        canonical = purchase_artifact_from_json(body["purchase_artifact"])
-        assert canonical.base_amount_minor == 125_000
+        canonical = purchase_artifact_v3_from_json(
+            body["purchase_artifact"]
+        )
+        assert canonical.base_usd_amount_minor == 125_000
         assert canonical.technology_fee_minor == 1_250
-        assert canonical.subtotal_minor == 126_250
+        assert canonical.gross_usd_amount_minor == 126_250
         assert canonical.rail_amount > 0
         assert body["purchase_artifact_hash"] == (
             "0x" + bytes(canonical.artifact_hash).hex()
@@ -1230,6 +1214,65 @@ def test_builds_native_xch_offer_from_server_authorized_quote(
         )
         assert verified.status_code == 200, verified.text
         assert verified.json()["valid"] is True, verified.json()
+
+
+def test_builds_one_canonical_native_batch_for_multiple_smartdeeds(
+    monkeypatch,
+    tmp_path,
+):
+    now = int(time.time())
+    _configure_native_quote(monkeypatch, tmp_path, now)
+    request = _request(
+        rail="chia_xch",
+        purchase_intent_id="pi_xch_batch",
+        expires_at=now + 240,
+        payment_terms={"currency": "XCH", "quantity": 2},
+        authorization_nonce="0x" + "16" * 32,
+        authorization_expires_at=now + 600,
+    )
+    request.pop("deed_launcher_id")
+    request.pop("share_ppm")
+
+    with TestClient(app) as client:
+        built = client.post("/protocol/offer-artifacts", json=request)
+        assert built.status_code == 200, built.text
+        body = built.json()
+        batch = purchase_batch_from_json(body["purchase_batch"])
+        assert batch.quantity == 2
+        assert len(batch.artifacts) == 2
+        assert len({item.deed_launcher_id for item in batch.artifacts}) == 2
+        assert body["protocol"]["quantity"] == 2
+        assert body["protocol"]["deedLauncherIds"] == [
+            "0x" + bytes(item.deed_launcher_id).hex()
+            for item in batch.artifacts
+        ]
+        assert body["purchase_artifact_hash"] == (
+            "0x" + bytes(batch.batch_hash).hex()
+        )
+        assert body["artifact"]["paymentTerms"]["amount"] == str(
+            batch.total_rail_amount
+        )
+
+        verified = client.post(
+            "/protocol/offer-artifacts/verify",
+            json={
+                "artifact": body["artifact"],
+                "artifact_hash": body["artifact_hash"],
+                "now": now,
+            },
+        )
+        assert verified.status_code == 200, verified.text
+        assert verified.json()["valid"] is True, verified.json()
+
+
+def test_multi_smartdeed_checkout_fails_when_equivalent_inventory_is_short():
+    with TestClient(app) as client:
+        response = client.post(
+            "/protocol/offer-artifacts",
+            json=_request(payment_terms={"currency": "USD", "quantity": 3}),
+        )
+    assert response.status_code == 409
+    assert "only 2 equivalent confirmed SmartDeeds" in response.text
 
 
 def test_quote_price_uses_target_raise_share_not_chia_par_value(
@@ -1454,7 +1497,7 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
             json={
                 "escrowMessage": {
                     **message,
-                    "amount": int(message["amount"]) - 1,
+                    "amount": str(int(message["amount"]) - 1),
                 },
                 "source": source,
             },
@@ -1517,6 +1560,13 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         )
         assert finalized.status_code == 200, finalized.text
         assert finalized.json()["verified"] is True
+        assert finalized.json()["delivery_state"] == "PAYMENT_VERIFIED"
+        delivery = client.get(
+            "/protocol/stripe-deliveries/" + purchase["purchaseId"]
+        )
+        assert delivery.status_code == 200, delivery.text
+        assert delivery.json()["paymentRail"] == "base_usdc"
+        assert delivery.json()["state"] == "PAYMENT_VERIFIED"
 
         monkeypatch.setenv("SOLSLOT_PAYMENT_OMNICHAIN_ENABLED", "false")
         get_settings.cache_clear()
@@ -1554,7 +1604,99 @@ def test_external_escrow_message_is_exactly_verified_and_bound(
         assert "another external payment" in replay.text
 
 
-def test_finalization_rejects_browser_supplied_stripe_evidence(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_base_escrow_verifier_binds_generic_sgt_delivery_commitment(
+    monkeypatch,
+    tmp_path,
+):
+    now = int(time.time())
+    token = "0x" + "ab" * 20
+    launcher = bytes32(b"\x71" * 32)
+    purchase = build_sgt_purchase_artifact_v3(
+        network="testnet11",
+        sgt_asset_id=bytes32(b"\x72" * 32),
+        sale_id=bytes32(b"\x73" * 32),
+        sgt_amount=2_500,
+        base_usd_amount_minor=50_000,
+        technology_fee_bps=100,
+        protocol_treasury_puzzle_hash=bytes32(b"\x74" * 32),
+        zkpassport_root=bytes32(b"\x75" * 32),
+        rail=PaymentRail.EVM_TEST_USD,
+        rail_chain_id=84532,
+        rail_asset_id=bytes32(b"\x00" * 12 + bytes.fromhex(token[2:])),
+        rail_asset_decimals=6,
+        vault_launcher_id=launcher,
+        vault_p2_puzzle_hash=puzzle_hash_for_p2_vault(launcher),
+        authorization_nonce=bytes32(b"\x76" * 32),
+        authorization_expires_at=now + 600,
+        quote_expires_at=now + 600,
+    )
+    purchase_json = purchase_artifact_v3_to_json(purchase)
+    settings = SimpleNamespace(
+        payment_purchase_db_path=str(tmp_path / "sgt-base.db"),
+        payment_evm_usdc_tokens={"84532": token},
+    )
+    get_payment_purchase_store(settings.payment_purchase_db_path).save(
+        purchase_intent_id="pi_sgt_base_test",
+        rail="base_usdc",
+        offer_artifact_hash="sha256:" + "77" * 32,
+        offer_artifact={"purchaseArtifactV3": purchase_json},
+        purchase_artifact=purchase_json,
+        created_at=now,
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._require_omnichain_ingest_token",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts.load_omnichain_evidence",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            spoke_address="0x" + "78" * 20,
+            confirmations=12,
+        ),
+    )
+    payload = VerifyExternalEscrowWebhookRequest.model_validate(
+        {
+            "escrowMessage": {
+                "gatewayProfile": "bse",
+                "globalPaymentId": "0x" + "79" * 32,
+                "localPaymentId": "0x" + "7a" * 32,
+                "depositor": "0x" + "7b" * 20,
+                "settlementToken": token,
+                "purchaseId": purchase_json["purchaseId"],
+                "artifactHash": purchase_json["artifactHash"],
+                "amount": purchase.rail_amount,
+                "quantity": purchase.delivery_amount,
+                "collectionId": purchase_json["deliveryContextHash"],
+                "deedLauncherId": purchase_json["deliveryAssetId"],
+                "vaultLauncherId": purchase_json["vaultLauncherId"],
+                "destinationPuzzle": purchase_json["vaultP2PuzzleHash"],
+                "quoteExpiresAt": purchase.quote_expires_at,
+            },
+            "source": {
+                "chainId": 84532,
+                "spoke": "0x" + "78" * 20,
+                "transactionHash": "0x" + "7c" * 32,
+                "blockNumber": 456,
+                "blockHash": "0x" + "7d" * 32,
+                "blockTimestamp": now,
+                "logIndex": 1,
+                "confirmations": 12,
+            },
+        }
+    )
+
+    result = await verify_external_escrow(payload, settings, "Bearer callback")
+
+    assert result.verified is True
+    assert result.fulfillment["quantity"] == 2_500
+    assert result.fulfillment["collectionId"] == purchase_json["deliveryContextHash"]
+    assert result.fulfillment["deedLauncherId"] == purchase_json["deliveryAssetId"]
+
+
+def test_finalization_accepts_exact_deliverable_stripe_settlement_evidence(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
     _configure_external_quote(monkeypatch, tmp_path)
     now = int(time.time())
@@ -1576,6 +1718,24 @@ def test_finalization_rejects_browser_supplied_stripe_evidence(monkeypatch, tmp_
         assert built.status_code == 200, built.text
         built = built.json()
         assert built["purchase_artifact"]["railAmount"] == "126250"
+        evidence = stripe_settlement_evidence_to_json(
+            StripeSettlementEvidenceV1(
+                stripe_account_id="acct_test_solslot",
+                livemode=False,
+                payment_intent_id="pi_test_123",
+                event_id="evt_test_123",
+                amount_minor=126_250,
+                currency="usd",
+                method_family=StripeMethodFamily.CARD,
+                funding_type=StripeFundingType.CREDIT,
+                processing_charge_minor=0,
+                status=StripePaymentStatus.SUCCEEDED,
+                refunded_minor=0,
+                refund_state=StripeRefundState.NONE,
+                dispute_state=StripeDisputeState.NONE,
+                observed_at=now,
+            )
+        )
         finalization = client.post(
             "/protocol/purchase-finalizations/verify",
             json={
@@ -1583,20 +1743,39 @@ def test_finalization_rejects_browser_supplied_stripe_evidence(monkeypatch, tmp_
                 "artifact_hash": built["artifact_hash"],
                 "rail": "stripe",
                 "purchase_intent_id": "pi_stripe",
-                "payment_evidence": {
-                    "checkout_session_id": "cs_test_123",
-                    "amount_total": 126_250,
-                    "currency": "usd",
-                },
+                "payment_evidence": evidence,
             },
         )
         assert finalization.status_code == 200, finalization.text
-        assert finalization.json()["verified"] is False
-        assert finalization.json()["finalized_state"] == "manual_review"
-        assert "stripe_settlement_receipt_required" in (
-            finalization.json()["reasons"]
+        assert finalization.json()["verified"] is True
+        assert finalization.json()["finalized_state"] == "paid"
+        assert finalization.json()["delivery_state"] == "PAYMENT_VERIFIED"
+        delivery = client.get(
+            "/protocol/stripe-deliveries/"
+            + built["purchase_artifact"]["purchaseId"]
         )
+        assert delivery.status_code == 200, delivery.text
+        assert delivery.json()["state"] == "PAYMENT_VERIFIED"
+        assert delivery.json()["purchaseId"] == built["purchase_artifact"]["purchaseId"]
 
+        mismatched_evidence = stripe_settlement_evidence_to_json(
+            StripeSettlementEvidenceV1(
+                stripe_account_id="acct_test_solslot",
+                livemode=False,
+                payment_intent_id="pi_test_456",
+                event_id="evt_test_456",
+                amount_minor=124_999,
+                currency="usd",
+                method_family=StripeMethodFamily.CARD,
+                funding_type=StripeFundingType.CREDIT,
+                processing_charge_minor=0,
+                status=StripePaymentStatus.SUCCEEDED,
+                refunded_minor=0,
+                refund_state=StripeRefundState.NONE,
+                dispute_state=StripeDisputeState.NONE,
+                observed_at=now,
+            )
+        )
         mismatched = client.post(
             "/protocol/purchase-finalizations/verify",
             json={
@@ -1604,18 +1783,12 @@ def test_finalization_rejects_browser_supplied_stripe_evidence(monkeypatch, tmp_
                 "artifact_hash": built["artifact_hash"],
                 "rail": "stripe",
                 "purchase_intent_id": "pi_stripe",
-                "payment_evidence": {
-                    "payment_intent_id": "pi_test_123",
-                    "amount_received": 124_999,
-                    "currency": "usd",
-                },
+                "payment_evidence": mismatched_evidence,
             },
         )
         assert mismatched.status_code == 200
         assert mismatched.json()["verified"] is False
-        assert "stripe_settlement_receipt_required" in (
-            mismatched.json()["reasons"]
-        )
+        assert "stripe_amount_mismatch" in mismatched.json()["reasons"]
 
 
 def test_build_and_finalization_can_require_server_token(monkeypatch, tmp_path):

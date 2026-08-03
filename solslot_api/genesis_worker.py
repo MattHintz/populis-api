@@ -156,6 +156,20 @@ def _build_plan(
                 "trustedProtocolTreasuryPuzzleHash",
             )
         ),
+        company_sgt_sale_treasury_puzzle_hash=bytes32(
+            _hex_bytes(
+                body["companySgtSaleTreasuryPuzzleHash"],
+                32,
+                "companySgtSaleTreasuryPuzzleHash",
+            )
+        ),
+        wusdc_b_asset_id=bytes32(
+            _hex_bytes(
+                body["wusdcBAssetId"],
+                32,
+                "wusdcBAssetId",
+            )
+        ),
         trusted_governance_rewards_puzzle_hash=bytes32(
             _hex_bytes(
                 body["trustedGovernanceRewardsPuzzleHash"],

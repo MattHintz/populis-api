@@ -468,8 +468,9 @@ jobs:
             Environment=SOLSLOT_PRESALE_ENABLED=false
             Environment=SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED=false
             Environment=SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=false
-            Environment=SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED=false
-            Environment=SOLSLOT_PAYMENT_STRIPE_LIVEMODE=false
+            Environment=SOLSLOT_STRIPE_SETTLEMENT_ENABLED=false
+            Environment=SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED=false
+            Environment=SOLSLOT_STRIPE_MODE=test
             Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
             Environment=SOLSLOT_LAUNCH_CONTROL_ENABLED=true
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
@@ -485,6 +486,7 @@ jobs:
             Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry_v2.db
             Environment=SOLSLOT_ADMIN_DB_PATH=$state_dir/admin_desk_v2.db
             Environment=SOLSLOT_PAYMENT_PURCHASE_DB_PATH=$state_dir/payment_purchases_v2.db
+            Environment=SOLSLOT_STRIPE_DELIVERY_DB_PATH=$state_dir/stripe_deliveries_v1.db
             Environment=SOLSLOT_DEPLOYMENT_MANIFEST_PATH=$state_dir/deployment_manifest_v2.json
             Environment=SOLSLOT_BOOTSTRAP_MANIFEST_PATH=$state_dir/bootstrap_manifest_v2.json
             ExecStart=

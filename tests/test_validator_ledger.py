@@ -51,24 +51,15 @@ def test_validator_ledger_uses_wal_and_passes_integrity_check(tmp_path) -> None:
     assert journal_mode.lower() == "wal"
 
 
-def test_validator_ledger_migrates_current_signature_schema() -> None:
+def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
     ledger = ValidatorLedger(":memory:")
     try:
         version = ledger._conn.execute("PRAGMA user_version").fetchone()[0]
         table = ledger._conn.execute(
             "SELECT name FROM sqlite_master WHERE name = 'voucher_series_phase_signatures'"
         ).fetchone()
-        reservation_table = ledger._conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE name = 'inventory_reservation_signatures'"
-        ).fetchone()
-        extension_table = ledger._conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE name = 'inventory_extension_signatures'"
-        ).fetchone()
-        release_table = ledger._conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE name = 'inventory_release_signatures'"
+        stripe_table = ledger._conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'stripe_settlement_signatures'"
         ).fetchone()
         columns = {
             row[1]
@@ -76,21 +67,37 @@ def test_validator_ledger_migrates_current_signature_schema() -> None:
                 "PRAGMA table_info(voucher_transition_signatures)"
             ).fetchall()
         }
-        stripe_columns = {
-            row[1]
-            for row in ledger._conn.execute(
-                "PRAGMA table_info(stripe_settlement_signatures)"
-            ).fetchall()
-        }
     finally:
         ledger.close()
-    assert version == SCHEMA_VERSION == 11
+    assert version == SCHEMA_VERSION == 9
     assert table is not None
-    assert reservation_table is not None
-    assert extension_table is not None
-    assert release_table is not None
+    assert stripe_table is not None
     assert "deed_coin_id" in columns
-    assert "expected_deed_output_coin_id" in stripe_columns
+
+
+def test_inventory_reservation_retry_is_exact_and_rebinding_fails_closed() -> None:
+    ledger = ValidatorLedger(":memory:")
+    kwargs = {
+        "claim_hash": "0x" + "15" * 32,
+        "canonical_claim": '{"reservation":"one"}',
+        "purchase_id": "0x" + "16" * 32,
+        "available_coin_id": "0x" + "17" * 32,
+        "signature": "0x" + "18" * 96,
+    }
+    try:
+        first = ledger.record_inventory_reservation_or_recover(**kwargs)
+        assert ledger.record_inventory_reservation_or_recover(**kwargs) == first
+        with pytest.raises(ValidatorLedgerConflict, match="already reserved"):
+            ledger.record_inventory_reservation_or_recover(
+                **{
+                    **kwargs,
+                    "claim_hash": "0x" + "19" * 32,
+                    "canonical_claim": '{"reservation":"changed"}',
+                    "purchase_id": "0x" + "1a" * 32,
+                }
+            )
+    finally:
+        ledger.close()
 
 
 def test_primary_purchase_retry_recovers_the_original_signature() -> None:
@@ -132,71 +139,117 @@ def test_validator_will_not_sign_one_deed_for_two_primary_purchases() -> None:
         ledger.close()
 
 
-def _inventory_reservation_record(
-    ledger: ValidatorLedger,
-    *,
-    claim: str = "61",
-    purchase: str = "62",
-    artifact: str = "63",
-    available: str = "64",
-    reserved: str = "65",
-    expires_at: int = 2_000,
-) -> str:
-    return ledger.record_inventory_reservation_or_recover(
-        claim_hash="0x" + claim * 32,
-        canonical_claim='{"reservation":"' + claim + '"}',
-        purchase_id="0x" + purchase * 32,
-        artifact_hash="0x" + artifact * 32,
-        available_coin_id="0x" + available * 32,
-        reserved_coin_id="0x" + reserved * 32,
-        reservation_expires_at=expires_at,
-        signature="0x" + "66" * 96,
-    )
-
-
-def test_inventory_reservation_is_idempotent_and_exclusive(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr("solslot_api.validator_ledger.time.time", lambda: 1_000)
+def test_primary_purchase_batch_is_recorded_atomically() -> None:
     ledger = ValidatorLedger(":memory:")
+    values = {
+        "claim_hashes": ("0x" + "41" * 32, "0x" + "42" * 32),
+        "canonical_claims": (
+            '{"batch":"one","item":0}',
+            '{"batch":"one","item":1}',
+        ),
+        "purchase_ids": ("0x" + "43" * 32, "0x" + "44" * 32),
+        "deed_coin_ids": ("0x" + "45" * 32, "0x" + "46" * 32),
+        "signatures": ("0x" + "47" * 96, "0x" + "48" * 96),
+    }
     try:
-        first = _inventory_reservation_record(ledger)
-        assert _inventory_reservation_record(ledger) == first
-        with pytest.raises(ValidatorLedgerConflict, match="live reservation"):
-            _inventory_reservation_record(
-                ledger,
-                claim="67",
-                purchase="68",
-                artifact="69",
-                available="64",
-                reserved="6a",
+        first = ledger.record_primary_purchase_batch_or_recover(**values)
+        assert ledger.record_primary_purchase_batch_or_recover(**values) == first
+        count = ledger._conn.execute(
+            "SELECT COUNT(*) FROM primary_purchase_signatures"
+        ).fetchone()[0]
+        with pytest.raises(ValidatorLedgerConflict, match="already authorized"):
+            ledger.record_primary_purchase_batch_or_recover(
+                **{
+                    **values,
+                    "claim_hashes": (
+                        "0x" + "49" * 32,
+                        "0x" + "4a" * 32,
+                    ),
+                    "canonical_claims": (
+                        '{"batch":"two","item":0}',
+                        '{"batch":"two","item":1}',
+                    ),
+                    "purchase_ids": (
+                        "0x" + "4b" * 32,
+                        "0x" + "4c" * 32,
+                    ),
+                }
+            )
+        assert ledger._conn.execute(
+            "SELECT COUNT(*) FROM primary_purchase_signatures"
+        ).fetchone()[0] == count
+    finally:
+        ledger.close()
+
+
+def test_stripe_settlement_retry_is_exact_and_rebinding_fails_closed() -> None:
+    ledger = ValidatorLedger(":memory:")
+    kwargs = {
+        "claim_hash": "0x" + "28" * 32,
+        "canonical_claim": '{"stripe":"one"}',
+        "purchase_id": "0x" + "29" * 32,
+        "payment_intent_id": "pi_test_one",
+        "receipt_coin_id": "0x" + "2a" * 32,
+        "deed_coin_id": "0x" + "2b" * 32,
+        "signature": "0x" + "2c" * 96,
+    }
+    try:
+        first = ledger.record_stripe_settlement_or_recover(**kwargs)
+        assert ledger.record_stripe_settlement_or_recover(**kwargs) == first
+        with pytest.raises(ValidatorLedgerConflict, match="already authorized"):
+            ledger.record_stripe_settlement_or_recover(
+                **{
+                    **kwargs,
+                    "claim_hash": "0x" + "2d" * 32,
+                    "canonical_claim": '{"stripe":"changed"}',
+                    "receipt_coin_id": "0x" + "2e" * 32,
+                }
             )
     finally:
         ledger.close()
 
 
-def test_expired_off_chain_reservation_can_be_replaced(monkeypatch) -> None:
-    now = 1_000
-    monkeypatch.setattr(
-        "solslot_api.validator_ledger.time.time",
-        lambda: now,
-    )
+def test_stripe_batch_settlement_is_atomic_and_idempotent() -> None:
     ledger = ValidatorLedger(":memory:")
+    kwargs = {
+        "claim_hash": "0x" + "51" * 32,
+        "canonical_claim": '{"stripeBatch":"one"}',
+        "purchase_id": "0x" + "52" * 32,
+        "payment_intent_id": "pi_test_batch_one",
+        "receipt_coin_id": "0x" + "53" * 32,
+        "delivery_coin_ids": (
+            "0x" + "54" * 32,
+            "0x" + "55" * 32,
+        ),
+        "signature": "0x" + "56" * 96,
+    }
     try:
-        _inventory_reservation_record(ledger, expires_at=1_001)
-        now = 1_001
-        replacement = _inventory_reservation_record(
-            ledger,
-            claim="67",
-            purchase="68",
-            artifact="69",
-            available="64",
-            reserved="6a",
-            expires_at=2_000,
-        )
+        first = ledger.record_stripe_settlement_batch_or_recover(**kwargs)
+        assert ledger.record_stripe_settlement_batch_or_recover(**kwargs) == first
+        rows = ledger._conn.execute(
+            """
+            SELECT delivery_coin_id
+            FROM stripe_settlement_delivery_locks
+            ORDER BY rowid
+            """
+        ).fetchall()
+        assert tuple(str(row[0]) for row in rows) == kwargs["delivery_coin_ids"]
+        with pytest.raises(ValidatorLedgerConflict, match="already authorized"):
+            ledger.record_stripe_settlement_batch_or_recover(
+                **{
+                    **kwargs,
+                    "claim_hash": "0x" + "57" * 32,
+                    "canonical_claim": '{"stripeBatch":"changed"}',
+                    "purchase_id": "0x" + "58" * 32,
+                    "payment_intent_id": "pi_test_batch_two",
+                    "receipt_coin_id": "0x" + "59" * 32,
+                }
+            )
+        assert ledger._conn.execute(
+            "SELECT COUNT(*) FROM stripe_settlement_signatures"
+        ).fetchone()[0] == 1
     finally:
         ledger.close()
-    assert replacement == "0x" + "66" * 96
 
 
 def _voucher_transition_record(

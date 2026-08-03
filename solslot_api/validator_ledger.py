@@ -5,10 +5,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 9
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -158,7 +159,6 @@ class ValidatorLedger:
                         canonical_claim TEXT NOT NULL,
                         purchase_id TEXT NOT NULL UNIQUE,
                         payment_intent_id TEXT NOT NULL UNIQUE,
-                        event_id TEXT NOT NULL UNIQUE,
                         receipt_coin_id TEXT NOT NULL UNIQUE,
                         deed_coin_id TEXT NOT NULL UNIQUE,
                         signature TEXT NOT NULL,
@@ -177,17 +177,10 @@ class ValidatorLedger:
                         claim_hash TEXT PRIMARY KEY,
                         canonical_claim TEXT NOT NULL,
                         purchase_id TEXT NOT NULL UNIQUE,
-                        artifact_hash TEXT NOT NULL UNIQUE,
-                        available_coin_id TEXT NOT NULL,
-                        reserved_coin_id TEXT NOT NULL UNIQUE,
-                        reservation_expires_at INTEGER NOT NULL,
+                        available_coin_id TEXT NOT NULL UNIQUE,
                         signature TEXT NOT NULL,
                         signed_at INTEGER NOT NULL
                     );
-                    CREATE INDEX inventory_reservation_available
-                        ON inventory_reservation_signatures(
-                            available_coin_id, reservation_expires_at
-                        );
                     PRAGMA user_version = 8;
                     COMMIT;
                     """
@@ -197,65 +190,19 @@ class ValidatorLedger:
                 self._conn.executescript(
                     """
                     BEGIN IMMEDIATE;
-                    ALTER TABLE stripe_settlement_signatures
-                        ADD COLUMN expected_deed_output_coin_id TEXT;
-                    CREATE UNIQUE INDEX stripe_settlement_output_once
-                        ON stripe_settlement_signatures(
-                            expected_deed_output_coin_id
-                        )
-                        WHERE expected_deed_output_coin_id IS NOT NULL;
+                    CREATE TABLE stripe_settlement_delivery_locks (
+                        delivery_coin_id TEXT PRIMARY KEY,
+                        claim_hash TEXT NOT NULL
+                    );
+                    INSERT OR IGNORE INTO stripe_settlement_delivery_locks(
+                        delivery_coin_id, claim_hash
+                    )
+                    SELECT deed_coin_id, claim_hash
+                    FROM stripe_settlement_signatures;
                     PRAGMA user_version = 9;
                     COMMIT;
                     """
                 )
-                version = 9
-            if version < 10:
-                self._conn.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    CREATE TABLE inventory_extension_signatures (
-                        claim_hash TEXT PRIMARY KEY,
-                        canonical_claim TEXT NOT NULL,
-                        purchase_id TEXT NOT NULL,
-                        phase TEXT NOT NULL,
-                        current_coin_id TEXT NOT NULL UNIQUE,
-                        next_coin_id TEXT NOT NULL UNIQUE,
-                        signature TEXT NOT NULL,
-                        signed_at INTEGER NOT NULL,
-                        UNIQUE(purchase_id, phase),
-                        CHECK (phase IN ('PROCESSING', 'SETTLEMENT'))
-                    );
-                    PRAGMA user_version = 10;
-                    COMMIT;
-                    """
-                )
-                version = 10
-            if version < 11:
-                self._conn.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    CREATE TABLE inventory_release_signatures (
-                        claim_hash TEXT PRIMARY KEY,
-                        canonical_claim TEXT NOT NULL,
-                        purchase_id TEXT NOT NULL UNIQUE,
-                        reason TEXT NOT NULL,
-                        current_coin_id TEXT NOT NULL UNIQUE,
-                        next_coin_id TEXT NOT NULL UNIQUE,
-                        signature TEXT NOT NULL,
-                        signed_at INTEGER NOT NULL,
-                        CHECK (
-                            reason IN (
-                                'PAYMENT_FAILED',
-                                'DELIVERY_TIMEOUT',
-                                'PRESALE_REFUND'
-                            )
-                        )
-                    );
-                    PRAGMA user_version = 11;
-                    COMMIT;
-                    """
-                )
-                version = 11
 
     def record_or_recover(
         self,
@@ -306,6 +253,95 @@ class ValidatorLedger:
                 self._conn.execute("ROLLBACK")
                 raise ValidatorLedgerConflict(
                     "Nullifier, bridge coin, EVM event, or vault action was already signed."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def record_stripe_settlement_batch_or_recover(
+        self,
+        *,
+        claim_hash: str,
+        canonical_claim: str,
+        purchase_id: str,
+        payment_intent_id: str,
+        receipt_coin_id: str,
+        delivery_coin_ids: Sequence[str],
+        signature: str,
+    ) -> str:
+        """Bind one external payment and receipt to every deed atomically."""
+
+        delivery_ids = tuple(delivery_coin_ids)
+        if not delivery_ids or len(delivery_ids) > 100:
+            raise ValueError("Stripe batch requires 1..100 delivery coin IDs")
+        if len(set(delivery_ids)) != len(delivery_ids):
+            raise ValueError("Stripe batch delivery coin IDs must be unique")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT canonical_claim, signature
+                    FROM stripe_settlement_signatures
+                    WHERE claim_hash = ?
+                    """,
+                    (claim_hash,),
+                ).fetchone()
+                if existing is not None:
+                    locked = tuple(
+                        str(row[0])
+                        for row in self._conn.execute(
+                            """
+                            SELECT delivery_coin_id
+                            FROM stripe_settlement_delivery_locks
+                            WHERE claim_hash = ?
+                            ORDER BY rowid
+                            """,
+                            (claim_hash,),
+                        ).fetchall()
+                    )
+                    if (
+                        existing["canonical_claim"] != canonical_claim
+                        or locked != delivery_ids
+                    ):
+                        raise ValidatorLedgerConflict(
+                            "Stripe batch retry differs from recorded evidence."
+                        )
+                    self._conn.execute("COMMIT")
+                    return str(existing["signature"])
+                self._conn.execute(
+                    """
+                    INSERT INTO stripe_settlement_signatures(
+                        claim_hash, canonical_claim, purchase_id,
+                        payment_intent_id, receipt_coin_id, deed_coin_id,
+                        signature, signed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_hash,
+                        canonical_claim,
+                        purchase_id,
+                        payment_intent_id,
+                        receipt_coin_id,
+                        delivery_ids[0],
+                        signature,
+                        int(time.time()),
+                    ),
+                )
+                self._conn.executemany(
+                    """
+                    INSERT INTO stripe_settlement_delivery_locks(
+                        delivery_coin_id, claim_hash
+                    ) VALUES (?, ?)
+                    """,
+                    ((delivery_id, claim_hash) for delivery_id in delivery_ids),
+                )
+                self._conn.execute("COMMIT")
+                return signature
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Stripe payment, receipt, purchase, or delivery coin was already authorized."
                 ) from exc
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -372,19 +408,93 @@ class ValidatorLedger:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    def record_primary_purchase_batch_or_recover(
+        self,
+        *,
+        claim_hashes: Sequence[str],
+        canonical_claims: Sequence[str],
+        purchase_ids: Sequence[str],
+        deed_coin_ids: Sequence[str],
+        signatures: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Record every deed authorization in one atomic ledger transaction."""
+
+        lengths = {
+            len(claim_hashes),
+            len(canonical_claims),
+            len(purchase_ids),
+            len(deed_coin_ids),
+            len(signatures),
+        }
+        if lengths == {0} or len(lengths) != 1:
+            raise ValidatorLedgerConflict(
+                "Purchase batch authorization evidence is incomplete."
+            )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            recovered: list[str] = []
+            try:
+                for claim_hash, canonical_claim, purchase_id, deed_coin_id, signature in zip(
+                    claim_hashes,
+                    canonical_claims,
+                    purchase_ids,
+                    deed_coin_ids,
+                    signatures,
+                    strict=True,
+                ):
+                    existing = self._conn.execute(
+                        """
+                        SELECT canonical_claim, signature
+                        FROM primary_purchase_signatures
+                        WHERE claim_hash = ?
+                        """,
+                        (claim_hash,),
+                    ).fetchone()
+                    if existing is not None:
+                        if existing["canonical_claim"] != canonical_claim:
+                            raise ValidatorLedgerConflict(
+                                "Purchase batch claim collides with different evidence."
+                            )
+                        recovered.append(str(existing["signature"]))
+                        continue
+                    self._conn.execute(
+                        """
+                        INSERT INTO primary_purchase_signatures(
+                            claim_hash, canonical_claim, purchase_id,
+                            deed_coin_id, signature, signed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            claim_hash,
+                            canonical_claim,
+                            purchase_id,
+                            deed_coin_id,
+                            signature,
+                            int(time.time()),
+                        ),
+                    )
+                    recovered.append(signature)
+                self._conn.execute("COMMIT")
+                return tuple(recovered)
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Purchase or SmartDeed coin was already authorized."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def record_inventory_reservation_or_recover(
         self,
         *,
         claim_hash: str,
         canonical_claim: str,
         purchase_id: str,
-        artifact_hash: str,
         available_coin_id: str,
-        reserved_coin_id: str,
-        reservation_expires_at: int,
         signature: str,
     ) -> str:
-        """Record one live reservation or recover an exact retry."""
+        """Record one exact inventory reservation or recover an exact retry."""
 
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -393,53 +503,29 @@ class ValidatorLedger:
                     """
                     SELECT canonical_claim, signature
                     FROM inventory_reservation_signatures
-                    WHERE claim_hash=?
+                    WHERE claim_hash = ?
                     """,
                     (claim_hash,),
                 ).fetchone()
                 if existing is not None:
                     if existing["canonical_claim"] != canonical_claim:
                         raise ValidatorLedgerConflict(
-                            "Reservation claim hash collides with different "
-                            "evidence."
+                            "Reservation claim hash collides with different evidence."
                         )
                     self._conn.execute("COMMIT")
                     return str(existing["signature"])
-                active = self._conn.execute(
-                    """
-                    SELECT reservation_expires_at
-                    FROM inventory_reservation_signatures
-                    WHERE available_coin_id=?
-                    ORDER BY reservation_expires_at DESC
-                    LIMIT 1
-                    """,
-                    (available_coin_id,),
-                ).fetchone()
-                if (
-                    active is not None
-                    and int(active["reservation_expires_at"])
-                    > int(time.time())
-                ):
-                    raise ValidatorLedgerConflict(
-                        "Available SmartDeed coin already has a live "
-                        "reservation authorization."
-                    )
                 self._conn.execute(
                     """
                     INSERT INTO inventory_reservation_signatures(
                         claim_hash, canonical_claim, purchase_id,
-                        artifact_hash, available_coin_id, reserved_coin_id,
-                        reservation_expires_at, signature, signed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        available_coin_id, signature, signed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         claim_hash,
                         canonical_claim,
                         purchase_id,
-                        artifact_hash,
                         available_coin_id,
-                        reserved_coin_id,
-                        reservation_expires_at,
                         signature,
                         int(time.time()),
                     ),
@@ -449,196 +535,7 @@ class ValidatorLedger:
             except sqlite3.IntegrityError as exc:
                 self._conn.execute("ROLLBACK")
                 raise ValidatorLedgerConflict(
-                    "Purchase, artifact, or reserved SmartDeed coin was "
-                    "already authorized."
-                ) from exc
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-
-    def record_inventory_extension_or_recover(
-        self,
-        *,
-        claim_hash: str,
-        canonical_claim: str,
-        purchase_id: str,
-        phase: str,
-        current_coin_id: str,
-        next_coin_id: str,
-        signature: str,
-    ) -> str:
-        """Record one exact extension phase or recover an exact retry."""
-
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self._conn.execute(
-                    """
-                    SELECT canonical_claim, signature
-                    FROM inventory_extension_signatures
-                    WHERE claim_hash = ?
-                    """,
-                    (claim_hash,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["canonical_claim"] != canonical_claim:
-                        raise ValidatorLedgerConflict(
-                            "Extension claim hash collides with different evidence."
-                        )
-                    self._conn.execute("COMMIT")
-                    return str(existing["signature"])
-                self._conn.execute(
-                    """
-                    INSERT INTO inventory_extension_signatures(
-                        claim_hash, canonical_claim, purchase_id, phase,
-                        current_coin_id, next_coin_id, signature, signed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        claim_hash,
-                        canonical_claim,
-                        purchase_id,
-                        phase,
-                        current_coin_id,
-                        next_coin_id,
-                        signature,
-                        int(time.time()),
-                    ),
-                )
-                self._conn.execute("COMMIT")
-                return signature
-            except sqlite3.IntegrityError as exc:
-                self._conn.execute("ROLLBACK")
-                raise ValidatorLedgerConflict(
-                    "Purchase, extension phase, or reservation coin was "
-                    "already authorized."
-                ) from exc
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-
-    def record_inventory_release_or_recover(
-        self,
-        *,
-        claim_hash: str,
-        canonical_claim: str,
-        purchase_id: str,
-        reason: str,
-        current_coin_id: str,
-        next_coin_id: str,
-        signature: str,
-    ) -> str:
-        """Record one terminal inventory release or recover an exact retry."""
-
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self._conn.execute(
-                    """
-                    SELECT canonical_claim, signature
-                    FROM inventory_release_signatures
-                    WHERE claim_hash = ?
-                    """,
-                    (claim_hash,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["canonical_claim"] != canonical_claim:
-                        raise ValidatorLedgerConflict(
-                            "Release claim hash collides with different evidence."
-                        )
-                    self._conn.execute("COMMIT")
-                    return str(existing["signature"])
-                self._conn.execute(
-                    """
-                    INSERT INTO inventory_release_signatures(
-                        claim_hash, canonical_claim, purchase_id, reason,
-                        current_coin_id, next_coin_id, signature, signed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        claim_hash,
-                        canonical_claim,
-                        purchase_id,
-                        reason,
-                        current_coin_id,
-                        next_coin_id,
-                        signature,
-                        int(time.time()),
-                    ),
-                )
-                self._conn.execute("COMMIT")
-                return signature
-            except sqlite3.IntegrityError as exc:
-                self._conn.execute("ROLLBACK")
-                raise ValidatorLedgerConflict(
-                    "Purchase or reservation coin was already released."
-                ) from exc
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-
-    def record_stripe_settlement_or_recover(
-        self,
-        *,
-        claim_hash: str,
-        canonical_claim: str,
-        purchase_id: str,
-        payment_intent_id: str,
-        event_id: str,
-        receipt_coin_id: str,
-        deed_coin_id: str,
-        expected_deed_output_coin_id: str,
-        signature: str,
-    ) -> str:
-        """Record one receipt-bound Stripe delivery or recover an exact retry."""
-
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self._conn.execute(
-                    """
-                    SELECT canonical_claim, signature
-                    FROM stripe_settlement_signatures
-                    WHERE claim_hash = ?
-                    """,
-                    (claim_hash,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["canonical_claim"] != canonical_claim:
-                        raise ValidatorLedgerConflict(
-                            "Stripe claim hash collides with different evidence."
-                        )
-                    self._conn.execute("COMMIT")
-                    return str(existing["signature"])
-                self._conn.execute(
-                    """
-                    INSERT INTO stripe_settlement_signatures(
-                        claim_hash, canonical_claim, purchase_id,
-                        payment_intent_id, event_id, receipt_coin_id,
-                        deed_coin_id, expected_deed_output_coin_id,
-                        signature, signed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        claim_hash,
-                        canonical_claim,
-                        purchase_id,
-                        payment_intent_id,
-                        event_id,
-                        receipt_coin_id,
-                        deed_coin_id,
-                        expected_deed_output_coin_id,
-                        signature,
-                        int(time.time()),
-                    ),
-                )
-                self._conn.execute("COMMIT")
-                return signature
-            except sqlite3.IntegrityError as exc:
-                self._conn.execute("ROLLBACK")
-                raise ValidatorLedgerConflict(
-                    "Stripe payment, event, receipt, purchase, or SmartDeed "
-                    "was already authorized."
+                    "Purchase or available SmartDeed coin was already reserved."
                 ) from exc
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -697,6 +594,85 @@ class ValidatorLedger:
                 self._conn.execute("ROLLBACK")
                 raise ValidatorLedgerConflict(
                     "Payment, series coin, or purchase launcher was already authorized."
+                ) from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def record_stripe_settlement_or_recover(
+        self,
+        *,
+        claim_hash: str,
+        canonical_claim: str,
+        purchase_id: str,
+        payment_intent_id: str,
+        receipt_coin_id: str,
+        delivery_coin_id: str | None = None,
+        signature: str,
+        deed_coin_id: str | None = None,
+    ) -> str:
+        """Record one exact paid delivery or recover an identical retry."""
+
+        delivery_ids = {
+            value
+            for value in (delivery_coin_id, deed_coin_id)
+            if value is not None
+        }
+        if len(delivery_ids) != 1:
+            raise ValueError("exactly one Stripe delivery coin ID is required")
+        canonical_delivery_coin_id = delivery_ids.pop()
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT canonical_claim, signature
+                    FROM stripe_settlement_signatures
+                    WHERE claim_hash = ?
+                    """,
+                    (claim_hash,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["canonical_claim"] != canonical_claim:
+                        raise ValidatorLedgerConflict(
+                            "Stripe claim hash collides with different evidence."
+                        )
+                    self._conn.execute("COMMIT")
+                    return str(existing["signature"])
+                self._conn.execute(
+                    """
+                    INSERT INTO stripe_settlement_signatures(
+                        claim_hash,canonical_claim,purchase_id,
+                        payment_intent_id,receipt_coin_id,deed_coin_id,
+                        signature,signed_at
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        claim_hash,
+                        canonical_claim,
+                        purchase_id,
+                        payment_intent_id,
+                        receipt_coin_id,
+                        canonical_delivery_coin_id,
+                        signature,
+                        int(time.time()),
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO stripe_settlement_delivery_locks(
+                        delivery_coin_id, claim_hash
+                    ) VALUES (?, ?)
+                    """,
+                    (canonical_delivery_coin_id, claim_hash),
+                )
+                self._conn.execute("COMMIT")
+                return signature
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise ValidatorLedgerConflict(
+                    "Stripe payment, receipt, purchase, or delivery coin was already authorized."
                 ) from exc
             except Exception:
                 self._conn.execute("ROLLBACK")

@@ -1,4 +1,4 @@
-"""Fail-closed client for the fixed RC24 settlement rehearsal coordinator."""
+"""Fail-closed client for the fixed RC26 settlement rehearsal coordinator."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .service_urls import valid_internal_service_url
 
 
 MAX_RESPONSE_BYTES = 256 * 1024
-SETTLEMENT_REHEARSAL_KIND = "solslot-rc24-settlement-rehearsal"
+SETTLEMENT_REHEARSAL_KIND = "solslot-rc26-settlement-rehearsal"
 HEX32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
@@ -419,7 +419,7 @@ def require_completed_rehearsal(
     )
     healthy = (
         evidence.get("schemaVersion") == 2
-            and evidence.get("kind") == SETTLEMENT_REHEARSAL_KIND
+        and evidence.get("kind") == SETTLEMENT_REHEARSAL_KIND
         and evidence.get("releaseTag") == settings.launch_release_tag
         and hmac.compare_digest(
             str(evidence.get("configHash") or "").lower(),

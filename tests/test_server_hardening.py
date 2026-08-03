@@ -87,6 +87,20 @@ def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
 
 
+def test_sgt_allocations_require_release_bound_company_treasury() -> None:
+    with pytest.raises(RuntimeError, match="SGT_COMPANY_TREASURY"):
+        validate_server_hardening_at_startup(
+            _staging(sgt_allocations_enabled=True)
+        )
+    validate_server_hardening_at_startup(
+        _staging(
+            sgt_allocations_enabled=True,
+            sgt_company_treasury_puzzle_hash="0x" + "19" * 32,
+            sgt_wusdc_b_asset_id="0x" + "20" * 32,
+        )
+    )
+
+
 def test_guided_launch_requires_a_separate_owner_claim_token() -> None:
     common = {
         "launch_control_enabled": True,
@@ -113,27 +127,6 @@ def test_customer_bridge_and_liquidity_cannot_execute_on_testnet() -> None:
     with pytest.raises(RuntimeError, match="liquidity execution is mainnet-only"):
         validate_server_hardening_at_startup(
             _staging(sols_liquidity_enabled=True)
-        )
-
-
-def test_rc24_stripe_fulfillment_rejects_live_mode() -> None:
-    with pytest.raises(RuntimeError, match="requires Stripe test mode"):
-        validate_server_hardening_at_startup(
-            Settings(
-                runtime_environment="test",
-                network="testnet11",
-                alpha_writes_enabled=True,
-                minting_enabled=True,
-                protocol_fee_funding_enabled=True,
-                chia_primary_url="https://127.0.0.1:8555",
-                faucet_master_sk_hex="11" * 32,
-                stripe_smartdeed_fulfillment_enabled=True,
-                payment_stripe_livemode=True,
-                payment_stripe_account_id="acct_test_rc24",
-                payment_kos_executor_url="http://127.0.0.1:8080",
-                payment_kos_executor_private_key_file="/run/secrets/kos.key",
-                payment_kos_executor_public_key="0x" + "22" * 48,
-            )
         )
 
 

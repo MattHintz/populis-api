@@ -58,11 +58,13 @@ except ModuleNotFoundError as e:
         raise
     admin_roster_update_router = None
 from .mint_endpoints import router as mint_endpoints_router
+from .governance_endpoints import router as governance_endpoints_router
+from .funded_redemptions import router as funded_redemptions_router
 from .collection_endpoints import router as collection_endpoints_router
+from .admin_sales import router as admin_sales_router
 from .protocol_artifacts import router as protocol_artifacts_router
 from .native_purchases import router as native_purchases_router
-from .stripe_payments import router as stripe_payments_router
-from .stripe_fulfillment import router as stripe_fulfillment_router
+from .stripe_deliveries import router as stripe_deliveries_router
 from .presale_endpoints import router as presale_router
 from .presale_endpoints import get_presale_store
 from .payment_purchase_store import get_payment_purchase_store
@@ -183,12 +185,20 @@ def _warm_chia_puzzle_templates() -> None:
     from solslot_puzzles.vault_version_registry_driver import (
         vault_version_registry_inner_mod,
     )
+    from solslot_puzzles.funded_redemption_v1 import (
+        p2_deed_redemption_v1_mod,
+    )
+    from solslot_puzzles.redemption_treasury_v1 import (
+        redemption_treasury_v1_mod,
+    )
     for mod in (
         admin_authority_v3_inner_mod(),
         mint_proposal_inner_v2_mod(),
         property_registry_inner_mod(),
         protocol_config_inner_mod(),
         vault_version_registry_inner_mod(),
+        p2_deed_redemption_v1_mod(),
+        redemption_treasury_v1_mod(),
     ):
         bytes(mod)
         mod.get_tree_hash()
@@ -304,23 +314,48 @@ async def lifespan(app: FastAPI):
             ),
         )
 
+    app.state.voucher_issuance_worker = None
+    app.state.stripe_delivery_worker = None
     app.state.kos_exact_executor = None
-    if settings.stripe_smartdeed_fulfillment_enabled:
+    if settings.stripe_delivery_worker_enabled:
+        if app.state.faucet is None or app.state.protocol_submitter is None:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the faucet "
+                "and protocol fee funding."
+            )
+        from .stripe_delivery_store import get_stripe_delivery_store
+        from .stripe_delivery_worker import (
+            StripeDeliveryWorker,
+            StripeDeliveryWorkerConfig,
+        )
+
         app.state.kos_exact_executor = KeyOfSolomonExactExecutor(
             url=str(settings.payment_kos_executor_url),
             private_key_file=str(
                 settings.payment_kos_executor_private_key_file
             ),
-            expected_public_key=str(
-                settings.payment_kos_executor_public_key
-            ),
+            expected_public_key=str(settings.payment_kos_executor_public_key),
             timeout_seconds=settings.payment_kos_executor_timeout_seconds,
             mtls_ca_path=settings.payment_kos_executor_mtls_ca_path,
             mtls_cert_path=settings.payment_kos_executor_mtls_cert_path,
             mtls_key_path=settings.payment_kos_executor_mtls_key_path,
         )
 
-    app.state.voucher_issuance_worker = None
+        stripe_worker = StripeDeliveryWorker(
+            settings=settings,
+            faucet=app.state.faucet,
+            provider=app.state.coinset,
+            submitter=app.state.protocol_submitter,
+            exact_executor=app.state.kos_exact_executor,
+            store=get_stripe_delivery_store(settings.stripe_delivery_db_path),
+            config=StripeDeliveryWorkerConfig(
+                enabled=True,
+                interval_seconds=settings.stripe_delivery_interval_seconds,
+                lease_seconds=settings.stripe_delivery_lease_seconds,
+            ),
+        )
+        await stripe_worker.start()
+        app.state.stripe_delivery_worker = stripe_worker
     if settings.voucher_issuance_worker_enabled:
         if app.state.faucet is None:
             raise RuntimeError(
@@ -341,8 +376,6 @@ async def lifespan(app: FastAPI):
                 enabled=True,
                 interval_seconds=settings.voucher_issuance_interval_seconds,
             ),
-            submitter=app.state.protocol_submitter,
-            exact_executor=app.state.kos_exact_executor,
         )
         await voucher_worker.start()
         app.state.voucher_issuance_worker = voucher_worker
@@ -376,11 +409,23 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if app.state.stripe_delivery_worker is not None:
+            await app.state.stripe_delivery_worker.stop()
         if app.state.voucher_issuance_worker is not None:
             await app.state.voucher_issuance_worker.stop()
         if app.state.faucet_worker is not None:
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()
+        # Lifespan services may retain thread-affine chia_rs Program/LazyNode
+        # values. Release every owned reference on this event-loop thread so a
+        # later TestClient or server restart cannot finalize it on another one.
+        app.state.stripe_delivery_worker = None
+        app.state.voucher_issuance_worker = None
+        app.state.faucet_worker = None
+        app.state.kos_exact_executor = None
+        app.state.protocol_submitter = None
+        app.state.faucet = None
+        app.state.coinset = None
 
 
 _server_settings = get_settings()
@@ -422,11 +467,13 @@ app.include_router(omnichain_ownership_activation_router)
 if admin_roster_update_router is not None:
     app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
+app.include_router(governance_endpoints_router)
+app.include_router(funded_redemptions_router)
 app.include_router(collection_endpoints_router)
+app.include_router(admin_sales_router)
 app.include_router(protocol_artifacts_router)
 app.include_router(native_purchases_router)
-app.include_router(stripe_payments_router)
-app.include_router(stripe_fulfillment_router)
+app.include_router(stripe_deliveries_router)
 app.include_router(presale_router)
 app.include_router(alpha_observability_router)
 app.include_router(alpha_metrics_router)

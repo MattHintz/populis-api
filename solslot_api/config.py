@@ -38,6 +38,8 @@ SECRET_ENV_FILE_KEYS = frozenset(
         "SOLSLOT_VAULT_SESSION_JWT_SECRET",
         "SOLSLOT_ZKPASSPORT_RELAYER_PRIVATE_KEY_HEX",
         "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN",
+        "SOLSLOT_PURCHASE_OPERATIONS_TOKEN",
+        "SOLSLOT_PAYMENT_KOS_EXECUTOR_PRIVATE_KEY_FILE",
         "SOLSLOT_PAYMENT_OMNICHAIN_INGEST_TOKEN",
         "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY",
         "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN",
@@ -93,6 +95,23 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         raise RuntimeError(
             "SOLSLOT_CHIA_PRIMARY_REQUIRED requires SOLSLOT_CHIA_PRIMARY_URL."
         )
+    if bool(settings.purchase_operations_service_url) != bool(
+        settings.purchase_operations_token
+    ):
+        raise RuntimeError(
+            "Purchase operations require both SOLSLOT_PURCHASE_OPERATIONS_SERVICE_URL "
+            "and SOLSLOT_PURCHASE_OPERATIONS_TOKEN."
+        )
+    if settings.purchase_operations_service_url:
+        if not valid_internal_service_url(settings.purchase_operations_service_url):
+            raise RuntimeError(
+                "SOLSLOT_PURCHASE_OPERATIONS_SERVICE_URL must use HTTPS or "
+                "loopback-only HTTP."
+            )
+        if len(settings.purchase_operations_token or "") < 32:
+            raise RuntimeError(
+                "SOLSLOT_PURCHASE_OPERATIONS_TOKEN must contain at least 32 characters."
+            )
     for label, url in (
         ("SOLSLOT_CHIA_PRIMARY_URL", settings.chia_primary_url),
         ("SOLSLOT_CHIA_FALLBACK_URL", settings.effective_chia_fallback_url()),
@@ -133,10 +152,89 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "SOLSLOT_PROTOCOL_MINIMUM_FEE_MOJOS cannot exceed "
                 "SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS."
             )
+    if settings.stripe_delivery_worker_enabled:
+        if not (
+            settings.stripe_settlement_enabled
+            or settings.payment_omnichain_enabled
+        ):
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires "
+                "Stripe settlement or the reviewed omnichain rail."
+            )
+        if not settings.protocol_fee_funding_enabled:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires "
+                "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED."
+            )
+        if not (
+            settings.payment_kos_executor_url
+            and settings.payment_kos_executor_private_key_file
+            and settings.payment_kos_executor_public_key
+        ):
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the exact "
+                "Key of Solomon executor URL, request key file, and public key."
+            )
+        if not valid_internal_service_url(settings.payment_kos_executor_url):
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_URL must use HTTPS or "
+                "loopback-only HTTP."
+            )
+        try:
+            kos_public_key = bytes.fromhex(
+                settings.payment_kos_executor_public_key.removeprefix("0x")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY is not valid hex."
+            ) from exc
+        if len(kos_public_key) != 48:
+            raise RuntimeError(
+                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY must be 48 bytes."
+            )
+        kos_mtls = (
+            settings.payment_kos_executor_mtls_ca_path,
+            settings.payment_kos_executor_mtls_cert_path,
+            settings.payment_kos_executor_mtls_key_path,
+        )
+        if any(kos_mtls) and not all(kos_mtls):
+            raise RuntimeError(
+                "Key of Solomon mTLS requires CA, certificate, and key paths."
+            )
+        if (
+            settings.runtime_environment in {"staging", "production"}
+            and settings.payment_kos_executor_url.startswith("https://")
+            and not all(kos_mtls)
+        ):
+            raise RuntimeError(
+                "Remote Key of Solomon execution requires mTLS in hosted environments."
+            )
 
     if settings.minting_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_MINTING_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+    if settings.sgt_allocations_enabled:
+        value = (settings.sgt_company_treasury_puzzle_hash or "").removeprefix("0x")
+        if len(value) != 64:
+            raise RuntimeError(
+                "SOLSLOT_SGT_ALLOCATIONS_ENABLED requires the release-bound "
+                "SOLSLOT_SGT_COMPANY_TREASURY_PUZZLE_HASH."
+            )
+        wusdc_b = (settings.sgt_wusdc_b_asset_id or "").removeprefix("0x")
+        if len(wusdc_b) != 64:
+            raise RuntimeError(
+                "SOLSLOT_SGT_ALLOCATIONS_ENABLED requires the release-bound "
+                "SOLSLOT_SGT_WUSDC_B_ASSET_ID."
+            )
+    if settings.funded_redemptions_enabled and not settings.alpha_writes_enabled:
+        raise RuntimeError(
+            "SOLSLOT_FUNDED_REDEMPTIONS_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+    if settings.funded_redemptions_enabled and not settings.sgt_allocations_enabled:
+        raise RuntimeError(
+            "SOLSLOT_FUNDED_REDEMPTIONS_ENABLED requires "
+            "SOLSLOT_SGT_ALLOCATIONS_ENABLED."
         )
     if settings.presale_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
@@ -341,73 +439,6 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "preflight, deployment, Warp portal, Samuel, governance, "
                 f"ownership, and activation evidence: {exc}"
             ) from exc
-
-    if settings.stripe_smartdeed_fulfillment_enabled:
-        if settings.network != "testnet11":
-            raise RuntimeError(
-                "RC24 Stripe SmartDeed fulfillment is restricted to Testnet11."
-            )
-        if settings.payment_stripe_livemode:
-            raise RuntimeError(
-                "RC24 Stripe SmartDeed fulfillment requires Stripe test mode."
-            )
-        if not settings.alpha_writes_enabled or not settings.minting_enabled:
-            raise RuntimeError(
-                "SOLSLOT_STRIPE_SMARTDEED_FULFILLMENT_ENABLED requires alpha "
-                "writes and minting."
-            )
-        if not settings.protocol_fee_funding_enabled:
-            raise RuntimeError(
-                "Stripe SmartDeed fulfillment requires bounded protocol fee "
-                "funding."
-            )
-        if (
-            not settings.payment_stripe_account_id
-            or not settings.payment_kos_executor_url
-            or not settings.payment_kos_executor_private_key_file
-            or not settings.payment_kos_executor_public_key
-        ):
-            raise RuntimeError(
-                "Stripe SmartDeed fulfillment requires the Stripe account and "
-                "exact Key of Solomon executor configuration."
-            )
-        if not valid_internal_service_url(
-            settings.payment_kos_executor_url
-        ):
-            raise RuntimeError(
-                "SOLSLOT_PAYMENT_KOS_EXECUTOR_URL must use HTTPS or "
-                "loopback-only HTTP."
-            )
-        try:
-            public_key = bytes.fromhex(
-                settings.payment_kos_executor_public_key.removeprefix("0x")
-            )
-        except ValueError as exc:
-            raise RuntimeError(
-                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY is not valid hex."
-            ) from exc
-        if len(public_key) != 48:
-            raise RuntimeError(
-                "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY must be 48 bytes."
-            )
-        kos_mtls = (
-            settings.payment_kos_executor_mtls_ca_path,
-            settings.payment_kos_executor_mtls_cert_path,
-            settings.payment_kos_executor_mtls_key_path,
-        )
-        if any(kos_mtls) and not all(kos_mtls):
-            raise RuntimeError(
-                "KoS exact executor mTLS requires CA, certificate, and key."
-            )
-        if (
-            settings.runtime_environment in {"staging", "production"}
-            and settings.payment_kos_executor_url.startswith("https://")
-            and not all(kos_mtls)
-        ):
-            raise RuntimeError(
-                "Remote KoS exact execution requires mTLS in "
-                "staging/production."
-            )
 
     if settings.runtime_environment not in {"staging", "production"}:
         return
@@ -648,7 +679,8 @@ class Settings(BaseSettings):
         "zkpassport_verifier_adapter_address",
         "zkpassport_emitter_address",
         "protocol_artifact_api_token",
-        "payment_stripe_account_id",
+        "purchase_operations_service_url",
+        "purchase_operations_token",
         "payment_kos_executor_url",
         "payment_kos_executor_private_key_file",
         "payment_kos_executor_public_key",
@@ -818,6 +850,19 @@ class Settings(BaseSettings):
     # testnet they are pinned here.  Vaults must reference the same pool.
     pool_launcher_id: Optional[str] = None
     governance_launcher_id: Optional[str] = None
+    # Dedicated company proceeds destination for governed SGT sales. Fresh
+    # release evidence must bind this value; it is intentionally distinct from
+    # the protocol's non-withdrawable treasury.
+    sgt_company_treasury_puzzle_hash: Optional[str] = None
+    sgt_allocations_enabled: bool = False
+    # Governed collection redemptions funded by the protocol's immutable
+    # wUSDC.b treasury. This remains independently gated from ordinary SGT
+    # allocations so a release can prepare and review proposals while the
+    # customer acceptance path stays closed.
+    funded_redemptions_enabled: bool = False
+    # Exact Warp wUSDC.b CAT used by governed SGT sale offers. Administrators
+    # select the named rail; browsers never supply a CAT asset ID.
+    sgt_wusdc_b_asset_id: Optional[str] = None
     # Retained only as an offline evidence/recovery input. Active runtime
     # coordinates come exclusively from the signed RC23 V4 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
@@ -837,15 +882,15 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc24-20260730"
+    launch_release_tag: str = "solslot-v2-alpha-rc26-20260803"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc24.json"
+        "./state/source-freeze-evidence-rc26.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
-    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc24.json"
+    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc26.json"
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc24.json"
+        "./state/settlement-rehearsal-rc26.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None
@@ -1003,6 +1048,10 @@ class Settings(BaseSettings):
     # wallets, portals, and auditors can recompute artifact hashes without
     # holding any service credential.
     protocol_artifact_api_token: Optional[str] = None
+    # Read-only bridge from the coordinator's admin JWT boundary to the
+    # durable customer purchase ledger. HTTP is permitted only on loopback.
+    purchase_operations_service_url: Optional[str] = None
+    purchase_operations_token: Optional[str] = None
     # H-system generated oracle snapshots for XCH/CAT purchase offers.
     # The browser never supplies prices. Each strict CLVM round in this file
     # must carry a 2-of-3 BLS authorization from this dedicated roster.
@@ -1016,34 +1065,21 @@ class Settings(BaseSettings):
     # 0x-prefixed 20-byte token addresses as values.
     payment_purchase_db_path: str = "./state/payment_purchases_v2.db"
     payment_evm_usdc_tokens: dict[str, str] = Field(default_factory=dict)
-    # Stripe secrets remain in Telonium and the independent validators. The
-    # coordinator accepts only normalized, server-authenticated event evidence.
-    payment_stripe_account_id: Optional[str] = None
-    payment_stripe_api_version: str = "2026-02-25.clover"
-    payment_stripe_livemode: bool = False
-    stripe_smartdeed_fulfillment_enabled: bool = False
-    payment_stripe_credit_surcharge_enabled: bool = False
-    payment_stripe_credit_surcharge_bps: int = Field(0, ge=0, le=300)
-    payment_stripe_credit_surcharge_fixed_minor: int = Field(
-        0,
-        ge=0,
-        le=10_000,
-    )
-    payment_stripe_credit_surcharge_cap_bps: int = Field(
-        300,
-        ge=0,
-        le=300,
-    )
-    # The coordinator signs only exact execution envelopes. KoS remains the
-    # durable submit/retry boundary and receives no Stripe credential.
+    # Stripe fulfillment is a post-mint direct rail. The API stores no Stripe
+    # secret; each isolated validator uses its own restricted read-only key.
+    stripe_settlement_enabled: bool = False
+    stripe_account_id: Optional[str] = None
+    stripe_mode: Literal["test", "live"] = "test"
+    stripe_delivery_db_path: str = "./state/stripe_deliveries_v1.db"
+    stripe_delivery_worker_enabled: bool = False
+    stripe_delivery_interval_seconds: float = Field(15.0, ge=5.0, le=300.0)
+    stripe_delivery_lease_seconds: int = Field(60, ge=30, le=600)
+    # The coordinator signs only exact execution envelopes. Key of Solomon
+    # receives no payment credential and is the sole submit/retry boundary.
     payment_kos_executor_url: Optional[str] = None
     payment_kos_executor_private_key_file: Optional[str] = None
     payment_kos_executor_public_key: Optional[str] = None
-    payment_kos_executor_timeout_seconds: float = Field(
-        30.0,
-        gt=0,
-        le=120,
-    )
+    payment_kos_executor_timeout_seconds: float = Field(30.0, gt=0, le=120.0)
     payment_kos_executor_mtls_ca_path: Optional[str] = None
     payment_kos_executor_mtls_cert_path: Optional[str] = None
     payment_kos_executor_mtls_key_path: Optional[str] = None

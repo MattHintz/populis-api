@@ -17,9 +17,6 @@ EXPECTED_OWNER_PLUS_ONE = {
     "/presales": "presale.create",
     "/presales/{terms_hash}/cancel": "presale.cancel",
     "/presales/{terms_hash}/launch": "presale.launch",
-    "/protocol/stripe/admin/purchases/{purchase_id}/resolve-dispute": (
-        "stripe.dispute.resolve"
-    ),
 }
 
 

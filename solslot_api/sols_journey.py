@@ -1,12 +1,19 @@
 """Customer-facing RC22 portfolio and action snapshot."""
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Mapping
 
+from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
+from chia_rs.sized_bytes import bytes32
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from solslot_puzzles.vault_driver import AUTH_TYPE_BLS
+from solslot_puzzles.protocol_deployment import singleton_struct
+from solslot_puzzles.sgt_driver import (
+    sgt_free_inner_puzzle,
+    sgt_locked_inner_mod,
+)
+from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, puzzle_hash_for_p2_vault
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 from .collection_store import CollectionStore, get_collection_store
@@ -16,6 +23,7 @@ from .presale_endpoints import get_presale_store
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
+    load_signed_public_artifact,
 )
 from .sols_market import SolsMarketReader
 from .sols_swap_store import SolsSwapStore
@@ -99,6 +107,55 @@ def _capability(
     }
 
 
+def _bytes32(value: Any, label: str) -> bytes32:
+    text = str(value or "").removeprefix("0x")
+    if len(text) != 64:
+        raise ValueError(f"{label} must be a 32-byte hex value")
+    return bytes32.fromhex(text)
+
+
+async def _vault_sgt_balance(
+    reader: SolsMarketReader,
+    artifact: dict[str, Any],
+    vault_launcher_id: str,
+) -> int:
+    """Return free SGT held by the canonical vault-bound CAT puzzle."""
+    plan_candidate = artifact.get("genesisPlan", artifact)
+    if not isinstance(plan_candidate, Mapping):
+        raise ValueError("signed genesis plan is missing")
+    launchers = plan_candidate.get("launcherIds")
+    permanent_rules = plan_candidate.get("permanentRules")
+    if not isinstance(launchers, Mapping) or not isinstance(permanent_rules, Mapping):
+        raise ValueError("signed SGT coordinates are incomplete")
+    sgt_tail = _bytes32(
+        artifact.get("sgtTailHash") or permanent_rules.get("sgtTailHash"),
+        "SGT tail hash",
+    )
+    tracker_struct = singleton_struct(
+        _bytes32(launchers.get("governance"), "governance launcher")
+    )
+    vault_launcher = _bytes32(vault_launcher_id, "vault launcher")
+    free_inner = sgt_free_inner_puzzle(
+        bytes32(sgt_locked_inner_mod().get_tree_hash()),
+        tracker_struct,
+        puzzle_hash_for_p2_vault(vault_launcher),
+    )
+    full_puzzle = construct_cat_puzzle(CAT_MOD, sgt_tail, free_inner)
+    records = await reader.provider.get_coin_records_by_puzzle_hash(
+        "0x" + full_puzzle.get_tree_hash().hex(),
+        include_spent=False,
+    )
+    return sum(
+        int(item["coin"]["amount"])
+        for item in records
+        if isinstance(item, Mapping)
+        and isinstance(item.get("coin"), Mapping)
+        and int(item.get("confirmed_block_index") or 0) > 0
+        and int(item.get("spent_block_index") or 0) == 0
+        and not bool(item.get("spent"))
+    )
+
+
 def _recommended_action(
     *,
     eligible: bool,
@@ -106,7 +163,7 @@ def _recommended_action(
     vouchers: list[dict[str, Any]],
     holdings: list[dict[str, Any]],
     opportunities: list[dict[str, Any]],
-    bls_vault: bool,
+    swap_vault: bool,
 ) -> dict[str, Any]:
     pending = next(
         (
@@ -143,7 +200,7 @@ def _recommended_action(
             "label": "Verify your vault",
             "path": "/my-solslot?view=verify",
         }
-    if bls_vault and opportunities:
+    if swap_vault and opportunities:
         return {
             "kind": "CHOOSE_DEED",
             "label": "Choose a SmartDeed",
@@ -216,22 +273,47 @@ async def customer_journey_snapshot(
         ) from exc
 
     balance: str | None = None
-    balance_coverage = "UNAVAILABLE_FOR_EVM_VAULT"
+    balance_coverage = "AWAITING_SIGNED_GENESIS"
     tail_hash = market.get("asset", {}).get("tailHash")
-    if record.auth_type == AUTH_TYPE_BLS and isinstance(tail_hash, str):
+    if isinstance(tail_hash, str):
         try:
             balance = str(
-                await reader.registered_bls_balance(
-                    bytes(record.owner_pubkey),
-                    tail_hash,
+                await reader.vault_sols_balance(
+                    session.vault_launcher_id,
                 )
             )
-            balance_coverage = "REGISTERED_OWNER_KEY"
+            balance_coverage = "VAULT_BOUND_CAT"
         except (ChiaProviderError, TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"Sols balance verification failed closed: {exc}",
             ) from exc
+
+    sgt_balance: str | None = None
+    sgt_coverage = "AWAITING_SIGNED_GENESIS"
+    try:
+        artifact = load_signed_public_artifact(settings)
+        sgt_balance = str(
+            await _vault_sgt_balance(
+                reader,
+                artifact,
+                session.vault_launcher_id,
+            )
+        )
+        sgt_coverage = "P2_VAULT_FREE_BALANCE"
+    except PublicArtifactMissing:
+        pass
+    except (
+        ChiaProviderError,
+        PublicArtifactError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"SGT balance verification failed closed: {exc}",
+        ) from exc
 
     vouchers = get_presale_store(settings).vouchers_for_vault(
         session.vault_launcher_id
@@ -250,8 +332,8 @@ async def customer_journey_snapshot(
     holdings = list(holdings_view["holdings"])
     opportunities = list(market.get("opportunities") or [])
     bls_vault = record.auth_type == AUTH_TYPE_BLS
-    swap_ready = eligible and bls_vault and bool(opportunities)
-    reverse_swap_ready = eligible and bls_vault and bool(holdings)
+    swap_ready = eligible and bool(opportunities)
+    reverse_swap_ready = eligible and bool(holdings)
     capabilities = {
         "primaryPurchase": _capability(
             available=eligible,
@@ -266,8 +348,7 @@ async def customer_journey_snapshot(
                 None
                 if swap_ready
                 else (
-                    "A verified Chia or Google vault and live Pool V4 "
-                    "inventory are required."
+                    "A verified vault and live Pool V4 inventory are required."
                 )
             ),
             path="/swap/sols-to-deed",
@@ -275,21 +356,13 @@ async def customer_journey_snapshot(
         "deedToSols": _capability(
             available=reverse_swap_ready,
             state=(
-                "AVAILABLE"
-                if reverse_swap_ready
-                else "WAITING" if bls_vault else "NOT_YET_AVAILABLE"
+                "AVAILABLE" if reverse_swap_ready else "WAITING"
             ),
             reason=(
                 None
                 if reverse_swap_ready
                 else (
                     "A verified SmartDeed holding is required."
-                    if bls_vault
-                    else (
-                        "EVM vault payouts require the governed Warp wSOLS "
-                        "route. Native Testnet11 swaps use a Chia or Google "
-                        "vault."
-                    )
                 )
             ),
             path="/swap/deed-to-sols",
@@ -345,6 +418,8 @@ async def customer_journey_snapshot(
         balances={
             "solsMojos": balance,
             "solsCoverage": balance_coverage,
+            "sgtMojos": sgt_balance,
+            "sgtCoverage": sgt_coverage,
         },
         holdings=holdings,
         vouchers=vouchers,
@@ -358,7 +433,7 @@ async def customer_journey_snapshot(
             vouchers=vouchers,
             holdings=holdings,
             opportunities=opportunities,
-            bls_vault=bls_vault,
+            swap_vault=True,
         ),
         verification={
             "holdingsSource": holdings_view["source"],

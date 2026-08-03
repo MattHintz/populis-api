@@ -27,7 +27,6 @@ from chia.wallet.cat_wallet.cat_utils import (
     get_innerpuzzle_from_puzzle,
 )
 from chia.wallet.lineage_proof import LineageProof
-from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
     SINGLETON_MOD,
@@ -53,7 +52,10 @@ from solslot_puzzles.protocol_statutes_v1 import (
     PermanentRules,
     ScopedPause,
 )
-from solslot_puzzles.sols_economics_v3 import SolsEconomicState
+from solslot_puzzles.sols_economics_v3 import (
+    SolsEconomicState,
+    quote_sols_to_deed,
+)
 from solslot_puzzles.sols_pool_v4 import (
     PoolInventoryRecord,
     SolsPoolStateV4,
@@ -66,8 +68,12 @@ from solslot_puzzles.sols_swap_v4_driver import (
     aggregate_sols_to_deed_swap,
     build_deed_to_sols_protocol_offer,
     build_sols_to_deed_protocol_offer,
-    prepare_sols_buyer_offer,
+    prepare_vault_sols_buyer_offer,
     validate_sols_buyer_offer,
+)
+from solslot_puzzles.vault_sols_v1 import (
+    puzzle_for_vault_sols_cat,
+    puzzle_for_vault_sols_inner,
 )
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
@@ -91,7 +97,6 @@ from .credential_auth import (
 from .evm_auth import recover_evm_signer
 from .faucet import AGG_SIG_ME_DATA, Faucet
 from .launch_gates import require_operation_gate
-from .payment_purchase_store import get_payment_purchase_store
 from .protocol_submission import (
     ProtocolBundleSubmitter,
     ProtocolSubmissionError,
@@ -121,7 +126,6 @@ from .vault_eligibility import ApprovedVault, require_current_approved_vault
 router = APIRouter(prefix="/sols", tags=["sols-secondary-swaps"])
 
 SOLS_SWAP_QUOTE_TTL_SECONDS = 600
-MAX_WALLET_PUBLIC_KEYS = 100
 
 
 class SolsSwapModel(BaseModel):
@@ -135,28 +139,10 @@ class PrepareSolsSwapRequest(SolsSwapModel):
         min_length=66,
         max_length=66,
     )
-    payment_public_keys: list[str] = Field(
-        alias="paymentPublicKeys",
-        default_factory=list,
-        max_length=MAX_WALLET_PUBLIC_KEYS,
-    )
-
     @field_validator("deed_launcher_id")
     @classmethod
     def validate_deed_launcher_id(cls, value: str) -> str:
         return _hex32_text(value, "deedLauncherId")
-
-    @field_validator("payment_public_keys")
-    @classmethod
-    def validate_payment_public_keys(cls, values: list[str]) -> list[str]:
-        normalized: list[str] = []
-        for value in values:
-            raw = _hex_bytes(value, 48, "paymentPublicKeys")
-            G1Element.from_bytes(raw)
-            encoded = "0x" + raw.hex()
-            if encoded not in normalized:
-                normalized.append(encoded)
-        return normalized
 
 
 class PrepareSolsSwapResponse(SolsSwapModel):
@@ -165,7 +151,7 @@ class PrepareSolsSwapResponse(SolsSwapModel):
     operation_hash: str = Field(alias="operationHash")
     deed_launcher_id: str = Field(alias="deedLauncherId")
     vault_launcher_id: str = Field(alias="vaultLauncherId")
-    buyer_offer: str = Field(alias="buyerOffer")
+    buyer_offer: str | None = Field(default=None, alias="buyerOffer")
     signing_coin_spends: list[dict[str, Any]] = Field(alias="signingCoinSpends")
     selected_payment_public_key: str | None = Field(
         default=None,
@@ -210,12 +196,13 @@ class CompleteSolsSwapRequest(SolsSwapModel):
         max_length=66,
     )
     quote_expires_at: int = Field(alias="quoteExpiresAt", gt=0)
-    buyer_offer: str = Field(
+    buyer_offer: str | None = Field(
+        default=None,
         alias="buyerOffer",
-        min_length=16,
         max_length=2_000_000,
     )
-    aggregated_signature: str = Field(
+    aggregated_signature: str | None = Field(
+        default=None,
         alias="aggregatedSignature",
         min_length=194,
         max_length=194,
@@ -267,9 +254,8 @@ class SolsSwapOperationResponse(SolsSwapModel):
 
 
 @dataclass(frozen=True)
-class SolsPaymentCoin:
+class VaultSolsPaymentCoin:
     coin: Coin
-    public_key: bytes
     lineage: LineageProof
 
 
@@ -292,6 +278,8 @@ class SolsSwapContext:
     vault_lineage: LineageProof
     custody_coin: Coin
     custody_lineage: LineageProof
+    payment_coin: Coin
+    payment_lineage: LineageProof
     receipt: Any
 
 
@@ -350,11 +338,6 @@ async def prepare_sols_swap(
             request=request,
             settings=settings,
         )
-    if not body.payment_public_keys:
-        raise HTTPException(
-            status_code=422,
-            detail="A Chia payment key is required to spend Sols.",
-        )
     try:
         context = await _load_swap_context(
             settings=settings,
@@ -366,25 +349,14 @@ async def prepare_sols_swap(
         quote = context.receipt.sols_to_deed_quote
         if quote is None:
             raise SolsSwapOfferError("Sols-to-deed quote is unavailable")
-        payment = await _select_sols_payment_coin(
-            request.app.state.coinset,
-            context.config.permanent_rules.sols_tail_hash,
-            body.payment_public_keys,
-            quote.buyer_total_sols_mojos,
-        )
-        if payment is None:
-            raise SolsSwapOfferError(
-                "No single confirmed Sols coin can cover this swap."
-            )
-        buyer = prepare_sols_buyer_offer(
-            payment_coin=payment.coin,
-            payment_public_key=payment.public_key,
-            payment_lineage_proof=payment.lineage,
+        buyer = prepare_vault_sols_buyer_offer(
+            payment_coin=context.payment_coin,
+            payment_lineage_proof=context.payment_lineage,
             receipt=context.receipt,
             config=context.config,
             vault_launcher_id=context.vault_record.launcher_id,
         )
-        signing_spends = list(buyer.offer.coin_spends())
+        signing_spends: list[CoinSpend] = []
         vault_typed_data: dict[str, Any] | None = None
         if context.vault_record.auth_type == AUTH_TYPE_BLS:
             protocol = _build_protocol_offer(context, signature_data=None)
@@ -437,8 +409,8 @@ async def prepare_sols_swap(
         vaultLauncherId=_hex32(context.vault_record.launcher_id),
         buyerOffer=buyer.offer.to_bech32(),
         signingCoinSpends=[_coin_spend_json(item) for item in signing_spends],
-        selectedPaymentPublicKey="0x" + payment.public_key.hex(),
-        selectedPaymentCoinId=_hex32(payment.coin.name()),
+        selectedPaymentPublicKey=None,
+        selectedPaymentCoinId=_hex32(context.payment_coin.name()),
         quoteExpiresAt=context.receipt.quote_expires_at,
         principalSolsMojos=str(quote.principal_sols_mojos),
         protocolFeeSolsMojos=str(
@@ -479,13 +451,6 @@ async def _prepare_deed_to_sols_swap(
     request: Request,
     settings: Settings,
 ) -> PrepareSolsSwapResponse:
-    if not body.payment_public_keys:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Choose the registered Chia receive key for the Sols payout."
-            ),
-        )
     faucet = getattr(request.app.state, "faucet", None)
     if not isinstance(faucet, Faucet):
         raise HTTPException(
@@ -494,14 +459,6 @@ async def _prepare_deed_to_sols_swap(
                 "The protocol fountain is unavailable. No deed was moved."
             ),
         )
-    payout_key = _hex_bytes(
-        body.payment_public_keys[0],
-        48,
-        "paymentPublicKeys",
-    )
-    payout_hash = bytes32(
-        puzzle_for_pk(G1Element.from_bytes(payout_key)).get_tree_hash()
-    )
     try:
         context = await _load_reverse_swap_context(
             settings=settings,
@@ -509,13 +466,13 @@ async def _prepare_deed_to_sols_swap(
             faucet=faucet,
             vault_launcher_id=vault_launcher_id,
             deed_launcher_id=body.deed_launcher_id,
-            seller_sols_puzzle_hash=payout_hash,
-            payout_public_key=payout_key,
+            seller_sols_puzzle_hash=None,
             quote_expires_at=None,
         )
-        protocol = _build_reverse_protocol_offer(
-            context,
-            signature_data=None,
+        protocol = (
+            _build_reverse_protocol_offer(context, signature_data=None)
+            if context.vault_record.auth_type == AUTH_TYPE_BLS
+            else None
         )
         quote = context.receipt.deed_to_sols_quote
         if quote is None:
@@ -549,7 +506,9 @@ async def _prepare_deed_to_sols_swap(
             expected_pool_output_coin_id=_hex32(
                 expected_pool_output.name()
             ),
-            destination_puzzle_hash=_hex32(payout_hash),
+            destination_puzzle_hash=_hex32(
+                context.receipt.counterparty_puzzle_hash
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -559,9 +518,13 @@ async def _prepare_deed_to_sols_swap(
         operationHash=_hex32(context.receipt.operation_hash),
         deedLauncherId=_hex32(context.receipt.record.deed_launcher_id),
         vaultLauncherId=_hex32(context.vault_record.launcher_id),
-        buyerOffer=protocol.offer.to_bech32(),
-        signingCoinSpends=[_coin_spend_json(protocol.vault_spend)],
-        selectedPaymentPublicKey="0x" + payout_key.hex(),
+        buyerOffer=(protocol.offer.to_bech32() if protocol else None),
+        signingCoinSpends=(
+            [_coin_spend_json(protocol.vault_spend)]
+            if protocol is not None
+            else []
+        ),
+        selectedPaymentPublicKey=None,
         selectedPaymentCoinId=_hex32(context.reserve_coin.name()),
         quoteExpiresAt=context.receipt.quote_expires_at,
         principalSolsMojos=str(quote.seller_sols_mojos),
@@ -569,10 +532,23 @@ async def _prepare_deed_to_sols_swap(
         sgtRewardsFeeSolsMojos="0",
         totalSolsMojos=str(quote.seller_sols_mojos),
         destinationP2VaultHash=None,
-        destinationPuzzleHash=_hex32(payout_hash),
+        destinationPuzzleHash=_hex32(
+            context.receipt.counterparty_puzzle_hash
+        ),
         freshSolsMojosMinted=str(quote.fresh_sols_mojos_minted),
-        vaultAuthType="chia_bls",
-        vaultTypedData=None,
+        vaultAuthType=(
+            "chia_bls"
+            if context.vault_record.auth_type == AUTH_TYPE_BLS
+            else "evm"
+        ),
+        vaultTypedData=(
+            None
+            if context.vault_record.auth_type == AUTH_TYPE_BLS
+            else eip712_typed_data_for_sols_swap(
+                context.receipt.operation_hash,
+                context.vault_coin.name(),
+            )
+        ),
         review={
             "network": settings.network,
             "direction": "DEED_TO_SOLS",
@@ -589,7 +565,9 @@ async def _prepare_deed_to_sols_swap(
             "freshSolsMojosMinted": str(
                 quote.fresh_sols_mojos_minted
             ),
-            "destinationPuzzleHash": _hex32(payout_hash),
+            "destinationPuzzleHash": _hex32(
+                context.receipt.counterparty_puzzle_hash
+            ),
             "quoteExpiresAt": context.receipt.quote_expires_at,
             "atomic": True,
             "reversibleAfterSubmission": False,
@@ -638,18 +616,28 @@ async def complete_sols_swap(
     lock = _swap_lock(request)
     async with lock:
         try:
+            if body.buyer_offer is None:
+                raise SolsSwapOfferError(
+                    "Prepared Sols payment offer is required."
+                )
+            unsigned = Offer.from_bech32(body.buyer_offer)
+            buyer_spends = tuple(unsigned.coin_spends())
+            if len(buyer_spends) != 1:
+                raise SolsSwapOfferError(
+                    "Prepared buyer offer must spend one Sols coin."
+                )
             context = await _load_swap_context(
                 settings=settings,
                 provider=request.app.state.coinset,
                 vault_launcher_id=vault_launcher_id,
                 deed_launcher_id=body.deed_launcher_id,
                 quote_expires_at=body.quote_expires_at,
+                sols_payment_coin_id=buyer_spends[0].coin.name(),
             )
             if _hex32(context.receipt.operation_hash) != body.operation_hash:
                 raise SolsSwapOfferError(
                     "Swap operation no longer matches current chain state."
                 )
-            unsigned = Offer.from_bech32(body.buyer_offer)
             if unsigned.aggregated_signature() != G2Element():
                 raise SolsSwapOfferError("Prepared buyer offer must be unsigned.")
             validate_sols_buyer_offer(
@@ -663,11 +651,29 @@ async def complete_sols_swap(
                 context,
                 signature_data=signature_data,
             )
-            wallet_signature = G2Element.from_bytes(
-                _hex_bytes(
-                    body.aggregated_signature,
-                    96,
-                    "aggregatedSignature",
+            if (
+                context.vault_record.auth_type == AUTH_TYPE_BLS
+                and body.aggregated_signature is None
+            ):
+                raise SolsSwapOfferError(
+                    "Chia vault aggregate signature is required."
+                )
+            if (
+                context.vault_record.auth_type == AUTH_TYPE_SECP256K1
+                and body.aggregated_signature is not None
+            ):
+                raise SolsSwapOfferError(
+                    "EVM vault swaps cannot add a Chia wallet signature."
+                )
+            wallet_signature = (
+                G2Element()
+                if body.aggregated_signature is None
+                else G2Element.from_bytes(
+                    _hex_bytes(
+                        body.aggregated_signature,
+                        96,
+                        "aggregatedSignature",
+                    )
                 )
             )
             signed_buyer = Offer(
@@ -787,35 +793,62 @@ async def _complete_deed_to_sols_swap(
                 vault_launcher_id=vault_launcher_id,
                 deed_launcher_id=body.deed_launcher_id,
                 seller_sols_puzzle_hash=payout_hash,
-                payout_public_key=None,
                 quote_expires_at=body.quote_expires_at,
             )
             if _hex32(context.receipt.operation_hash) != body.operation_hash:
                 raise SolsSwapOfferError(
                     "Swap operation no longer matches current chain state."
                 )
-            unsigned = Offer.from_bech32(body.buyer_offer)
-            if unsigned.aggregated_signature() != G2Element():
-                raise SolsSwapOfferError(
-                    "Prepared protocol offer must be unsigned."
+            if context.vault_record.auth_type == AUTH_TYPE_BLS:
+                if body.buyer_offer is None:
+                    raise SolsSwapOfferError(
+                        "Prepared protocol offer is required."
+                    )
+                unsigned = Offer.from_bech32(body.buyer_offer)
+                if unsigned.aggregated_signature() != G2Element():
+                    raise SolsSwapOfferError(
+                        "Prepared protocol offer must be unsigned."
+                    )
+                expected_unsigned = _build_reverse_protocol_offer(
+                    context,
+                    signature_data=None,
                 )
+                if unsigned.name() != expected_unsigned.offer.name():
+                    raise SolsSwapOfferError(
+                        "Prepared protocol offer does not match live chain state."
+                    )
+            elif body.buyer_offer is not None:
+                raise SolsSwapOfferError(
+                    "EVM vault settlement is rebuilt from its signed receipt."
+                )
+            signature_data = _vault_signature_data(context, body)
             protocol = _build_reverse_protocol_offer(
                 context,
-                signature_data=None,
+                signature_data=signature_data,
             )
-            if unsigned.name() != protocol.offer.name():
+            if (
+                context.vault_record.auth_type == AUTH_TYPE_BLS
+                and body.aggregated_signature is None
+            ):
                 raise SolsSwapOfferError(
-                    "Prepared protocol offer does not match live chain state."
+                    "Chia vault aggregate signature is required."
                 )
-            if body.vault_owner_authorization is not None:
+            if (
+                context.vault_record.auth_type == AUTH_TYPE_SECP256K1
+                and body.aggregated_signature is not None
+            ):
                 raise SolsSwapOfferError(
-                    "Native SmartDeed-to-Sols swaps use BLS vault approval."
+                    "EVM vault swaps cannot add a Chia wallet signature."
                 )
-            wallet_signature = G2Element.from_bytes(
-                _hex_bytes(
-                    body.aggregated_signature,
-                    96,
-                    "aggregatedSignature",
+            wallet_signature = (
+                G2Element()
+                if body.aggregated_signature is None
+                else G2Element.from_bytes(
+                    _hex_bytes(
+                        body.aggregated_signature,
+                        96,
+                        "aggregatedSignature",
+                    )
                 )
             )
             reserve_signature = G2Element.from_bytes(
@@ -941,20 +974,6 @@ def _authorize_swap(
         )
 
 
-def _require_deed_not_in_stripe_dispute(
-    settings: Settings,
-    deed_launcher_id: str,
-) -> None:
-    dispute = get_payment_purchase_store(
-        settings.payment_purchase_db_path
-    ).get_stripe_dispute_for_deed(deed_launcher_id)
-    if dispute is not None:
-        raise SolsSwapOfferError(
-            "This SmartDeed is paused while its Stripe payment dispute is "
-            "reviewed. Its vault custody has not changed."
-        )
-
-
 async def _load_swap_context(
     *,
     settings: Settings,
@@ -962,8 +981,8 @@ async def _load_swap_context(
     vault_launcher_id: str,
     deed_launcher_id: str,
     quote_expires_at: int | None,
+    sols_payment_coin_id: bytes32 | None = None,
 ) -> SolsSwapContext:
-    _require_deed_not_in_stripe_dispute(settings, deed_launcher_id)
     now = int(time())
     if quote_expires_at is not None and (
         quote_expires_at <= now
@@ -1081,6 +1100,24 @@ async def _load_swap_context(
         raise SolsSwapOfferError(
             "Approved vault coin does not match registered RC22 ownership."
         )
+    quote = quote_sols_to_deed(
+        pool_state.economics,
+        deed_value_micro_usd=record.deed_value_micro_usd,
+        exchange_fee_bps=statutes.parameters.exchange_fee_bps,
+        protocol_fee_bps=statutes.parameters.protocol_fee_bps,
+        sgt_rewards_fee_bps=statutes.parameters.sgt_rewards_fee_bps,
+    )
+    payment = await _select_vault_sols_payment_coin(
+        provider=provider,
+        config=config,
+        vault_launcher_id=vault_record.launcher_id,
+        required_amount=quote.buyer_total_sols_mojos,
+        required_coin_id=sols_payment_coin_id,
+    )
+    if payment is None:
+        raise SolsSwapOfferError(
+            "No confirmed Sols coin in this vault can cover the swap."
+        )
     receipt = prepare_sols_to_deed(
         pool_coin_id=pool_coin.name(),
         state=pool_state,
@@ -1092,6 +1129,7 @@ async def _load_swap_context(
         pause=pause,
         vault_launcher_id=vault_record.launcher_id,
         vault_coin_id=vault_coin.name(),
+        sols_payment_coin_id=payment.coin.name(),
         destination_p2_vault_hash=puzzle_hash_for_p2_vault(
             vault_record.launcher_id
         ),
@@ -1115,6 +1153,8 @@ async def _load_swap_context(
         vault_lineage=vault_lineage,
         custody_coin=custody_coin,
         custody_lineage=custody_lineage,
+        payment_coin=payment.coin,
+        payment_lineage=payment.lineage,
         receipt=receipt,
     )
 
@@ -1170,11 +1210,9 @@ async def _load_reverse_swap_context(
     faucet: Faucet,
     vault_launcher_id: str,
     deed_launcher_id: str,
-    seller_sols_puzzle_hash: bytes32,
-    payout_public_key: bytes | None,
+    seller_sols_puzzle_hash: bytes32 | None,
     quote_expires_at: int | None,
 ) -> ReverseSolsSwapContext:
-    _require_deed_not_in_stripe_dispute(settings, deed_launcher_id)
     now = int(time())
     if quote_expires_at is not None and (
         quote_expires_at <= now
@@ -1209,26 +1247,23 @@ async def _load_reverse_swap_context(
         vault_launcher_id,
     )
     vault_record = require_vault_record(approved.launcher_id)
-    if vault_record.auth_type != AUTH_TYPE_BLS:
-        raise SolsSwapOfferError(
-            "This vault can deposit a SmartDeed only after the governed "
-            "Warp wSOLS payout route is active. Use a Chia or Google vault "
-            "for native Testnet11 Sols."
-        )
+    if vault_record.auth_type not in (AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1):
+        raise SolsSwapOfferError("Vault owner authorization is unsupported.")
     owner_key = bytes(vault_record.owner_pubkey)
-    if len(owner_key) != 48:
-        raise SolsSwapOfferError("Registered Chia vault key is malformed.")
-    if payout_public_key is not None and payout_public_key != owner_key:
-        raise SolsSwapOfferError(
-            "Sols must be paid to the vault's registered Chia key."
-        )
     expected_payout = bytes32(
-        puzzle_for_pk(G1Element.from_bytes(owner_key)).get_tree_hash()
+        puzzle_for_vault_sols_inner(
+            config=config,
+            vault_launcher_id=vault_record.launcher_id,
+        ).get_tree_hash()
     )
-    if seller_sols_puzzle_hash != expected_payout:
+    if (
+        seller_sols_puzzle_hash is not None
+        and seller_sols_puzzle_hash != expected_payout
+    ):
         raise SolsSwapOfferError(
-            "Sols payout does not match the vault's registered Chia key."
+            "Sols payout does not match the vault-bound custody puzzle."
         )
+    seller_sols_puzzle_hash = expected_payout
 
     vault_coin, vault_lineage = await _confirmed_coin_and_lineage(
         provider,
@@ -1689,7 +1724,7 @@ async def _confirmed_cat_lineage(
 
 
 def _vault_signature_data(
-    context: SolsSwapContext,
+    context: SolsSwapContext | ReverseSolsSwapContext,
     body: CompleteSolsSwapRequest,
 ) -> bytes | None:
     record = context.vault_record
@@ -1716,32 +1751,43 @@ def _vault_signature_data(
     return compact_signature_from_evm(body.vault_owner_authorization)
 
 
-async def _select_sols_payment_coin(
+async def _select_vault_sols_payment_coin(
+    *,
     provider: ChiaProvider,
-    sols_tail_hash: bytes32,
-    payment_public_keys: list[str],
+    config: PoolV4Config,
+    vault_launcher_id: bytes32,
     required_amount: int,
-) -> SolsPaymentCoin | None:
-    candidates: list[tuple[Coin, bytes]] = []
-    for encoded in payment_public_keys:
-        key = _hex_bytes(encoded, 48, "paymentPublicKeys")
-        inner = puzzle_for_pk(G1Element.from_bytes(key))
-        cat = construct_cat_puzzle(CAT_MOD, sols_tail_hash, inner)
-        records = await provider.get_coin_records_by_puzzle_hash(
-            _hex32(cat.get_tree_hash()),
-            include_spent=False,
-        )
-        for record in records:
-            coin = _coin_from_record(record)
-            if (
-                coin is not None
-                and _record_is_unspent_coin(record, coin)
-                and int(coin.amount) >= required_amount
-            ):
-                candidates.append((coin, key))
-    for coin, key in sorted(
+    required_coin_id: bytes32 | None = None,
+) -> VaultSolsPaymentCoin | None:
+    inner = puzzle_for_vault_sols_inner(
+        config=config,
+        vault_launcher_id=vault_launcher_id,
+    )
+    cat = puzzle_for_vault_sols_cat(
+        config=config,
+        vault_launcher_id=vault_launcher_id,
+    )
+    records = await provider.get_coin_records_by_puzzle_hash(
+        _hex32(cat.get_tree_hash()),
+        include_spent=False,
+    )
+    candidates: list[Coin] = []
+    for record in records:
+        coin = _coin_from_record(record)
+        if (
+            coin is None
+            or not _record_is_unspent_coin(record, coin)
+            or int(coin.amount) < required_amount
+            or (
+                required_coin_id is not None
+                and coin.name() != required_coin_id
+            )
+        ):
+            continue
+        candidates.append(coin)
+    for coin in sorted(
         candidates,
-        key=lambda item: (int(item[0].amount), bytes(item[0].name())),
+        key=lambda item: (int(item.amount), bytes(item.name())),
     ):
         if await provider.get_mempool_items_by_coin_name(_hex32(coin.name())):
             continue
@@ -1749,25 +1795,17 @@ async def _select_sols_payment_coin(
             confirmed = await _confirmed_unspent_coin(
                 provider,
                 _hex32(coin.name()),
-                "Sols payment coin",
+                "vault Sols payment coin",
             )
             lineage = await _confirmed_cat_lineage(
                 provider=provider,
                 coin=confirmed,
-                expected_inner_hash=bytes32(
-                    puzzle_for_pk(G1Element.from_bytes(key)).get_tree_hash()
-                ),
-                expected_tail_hash=sols_tail_hash,
+                expected_inner_hash=bytes32(inner.get_tree_hash()),
+                expected_tail_hash=config.permanent_rules.sols_tail_hash,
             )
-        except ValueError:
+        except (ValueError, SolsSwapOfferError):
             continue
-        except SolsSwapOfferError:
-            continue
-        return SolsPaymentCoin(
-            coin=confirmed,
-            public_key=key,
-            lineage=lineage,
-        )
+        return VaultSolsPaymentCoin(coin=confirmed, lineage=lineage)
     return None
 
 
@@ -1957,7 +1995,13 @@ def _verify_aggregate_signature(
                 additional_data,
             )
         )
-    if not pairs or not AugSchemeMPL.aggregate_verify(
+    if not pairs:
+        if bundle.aggregated_signature != G2Element():
+            raise SolsSwapOfferError(
+                "Unexpected Chia signature on a signature-free swap."
+            )
+        return
+    if not AugSchemeMPL.aggregate_verify(
         [item[0] for item in pairs],
         [item[1] for item in pairs],
         bundle.aggregated_signature,

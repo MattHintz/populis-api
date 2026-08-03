@@ -6,11 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from chia.types.blockchain_format.program import Program
-from chia.types.blockchain_format.coin import Coin
 from chia.types.coin_spend import make_spend
 from chia_rs import G2Element, SpendBundle
-from chia_rs.sized_bytes import bytes32
-from chia_rs.sized_ints import uint64
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 from .faucet import Faucet
@@ -111,12 +108,7 @@ class ProtocolBundleSubmitter:
             Awaitable[Mapping[str, Any] | None],
         ],
     ) -> dict[str, Any]:
-        """Fund one exact bundle and keep the fee coin locked through dispatch.
-
-        Key of Solomon owns submission and retry for asynchronous payment
-        rails. The callback must durably accept the exact prepared bundle
-        before returning.
-        """
+        """Fund, persist, and hand one exact bundle to its sole executor."""
 
         async with self._lock:
             prepared = await self._prepare_locked(protocol_bundle_json)
@@ -130,99 +122,10 @@ class ProtocolBundleSubmitter:
                     submission_attempted=True,
                 ) from exc
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "status": "DISPATCHED",
             "network": self.faucet.network,
             **prepared.to_json(),
-            "feeTargetSeconds": self.policy.target_seconds,
-            "feeTillPuzzleHash": self.faucet.address_hex,
-            "dispatchResult": dict(dispatch_result or {}),
-        }
-
-    async def prepare_funded_output_and_dispatch(
-        self,
-        *,
-        output_puzzle_hash: bytes32,
-        amount: int,
-        dispatcher: Callable[
-            [PreparedProtocolBundle, Coin],
-            Awaitable[Mapping[str, Any] | None],
-        ],
-    ) -> dict[str, Any]:
-        """Create one exact technical output and fund its medium fee.
-
-        Receipt funding and fee selection share the same lock, preventing the
-        faucet worker or another protocol write from selecting either input
-        before Key of Solomon durably accepts the final bundle.
-        """
-
-        if amount < 1 or amount > self.policy.maximum_funding_coin_mojos:
-            raise ProtocolSubmissionError(
-                "funded protocol output amount is outside the configured cap"
-            )
-        async with self._lock:
-            source = await self._select_fee_coin(
-                amount,
-                excluded_coin_ids=set(),
-            )
-            conditions = [
-                Program.to([CREATE_COIN, output_puzzle_hash, amount])
-            ]
-            change = int(source.amount) - amount
-            if change:
-                conditions.append(
-                    Program.to(
-                        [
-                            CREATE_COIN,
-                            self.faucet.address_puzzle_hash,
-                            change,
-                        ]
-                    )
-                )
-            condition_program = Program.to(conditions)
-            delegated = Program.to((1, condition_program))
-            solution = Program.to([0, delegated, Program.to(0)])
-            source_spend = make_spend(
-                source,
-                self.faucet.key.puzzle,
-                solution,
-            )
-            source_signature = G2Element.from_bytes(
-                self.faucet.sign_delegated_spend(
-                    source,
-                    condition_program,
-                )
-            )
-            protocol_bundle = SpendBundle(
-                [source_spend],
-                source_signature,
-            )
-            output_coin = Coin(
-                bytes32(source.name()),
-                output_puzzle_hash,
-                uint64(amount),
-            )
-            prepared = await self._prepare_locked(
-                protocol_bundle.to_json_dict()
-            )
-            try:
-                dispatch_result = await dispatcher(prepared, output_coin)
-            except ProtocolSubmissionError:
-                raise
-            except Exception as exc:
-                raise ProtocolSubmissionError(
-                    "exact protocol executor did not accept the funded output",
-                    submission_attempted=True,
-                ) from exc
-        return {
-            "schemaVersion": 1,
-            "status": "DISPATCHED",
-            "network": self.faucet.network,
-            **prepared.to_json(),
-            "expectedOutputCoinId": "0x" + output_coin.name().hex(),
-            "expectedOutputPuzzleHash": (
-                "0x" + output_coin.puzzle_hash.hex()
-            ),
             "feeTargetSeconds": self.policy.target_seconds,
             "feeTillPuzzleHash": self.faucet.address_hex,
             "dispatchResult": dict(dispatch_result or {}),
@@ -237,19 +140,13 @@ class ProtocolBundleSubmitter:
         try:
             protocol_bundle = SpendBundle.from_json_dict(protocol_bundle_json)
         except Exception as exc:
-            raise ProtocolSubmissionError(
-                "protocol spend bundle is malformed"
-            ) from exc
+            raise ProtocolSubmissionError("protocol spend bundle is malformed") from exc
         if not protocol_bundle.coin_spends:
-            raise ProtocolSubmissionError(
-                "protocol spend bundle has no coin spends"
-            )
+            raise ProtocolSubmissionError("protocol spend bundle has no coin spends")
         try:
             existing_fee = sum(
                 int(coin.amount) for coin in protocol_bundle.removals()
-            ) - sum(
-                int(coin.amount) for coin in protocol_bundle.additions()
-            )
+            ) - sum(int(coin.amount) for coin in protocol_bundle.additions())
         except Exception as exc:
             raise ProtocolSubmissionError(
                 "protocol spend bundle conditions cannot be evaluated"
@@ -402,8 +299,8 @@ class ProtocolBundleSubmitter:
 
 
 __all__ = [
+    "PreparedProtocolBundle",
     "ProtocolBundleSubmitter",
     "ProtocolFeePolicy",
-    "PreparedProtocolBundle",
     "ProtocolSubmissionError",
 ]
