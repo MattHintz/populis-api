@@ -83,8 +83,7 @@ def _signed_artifact(manifest: dict) -> dict:
     }
 
 
-@pytest.fixture
-def client(monkeypatch, tmp_path):
+def _configure_test_runtime(monkeypatch, tmp_path) -> None:
     manifest_path = tmp_path / "deployment_manifest_v2.json"
     manifest = _v2_manifest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -97,6 +96,11 @@ def client(monkeypatch, tmp_path):
         lambda _settings: _signed_artifact(manifest),
     )
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def client(monkeypatch, tmp_path):
+    _configure_test_runtime(monkeypatch, tmp_path)
     # `with` triggers Starlette's lifespan (populates app.state).
     with TestClient(app) as c:
         yield c
@@ -119,6 +123,25 @@ def test_health(client: TestClient) -> None:
     body = r.json()
     assert "network" in body
     assert body["network"] in ("testnet11", "mainnet")
+
+
+def test_lifespan_releases_thread_owned_chia_services(monkeypatch, tmp_path) -> None:
+    _configure_test_runtime(monkeypatch, tmp_path)
+
+    with TestClient(app):
+        assert app.state.coinset is not None
+
+    for name in (
+        "coinset",
+        "faucet",
+        "protocol_submitter",
+        "kos_exact_executor",
+        "stripe_delivery_worker",
+        "voucher_issuance_worker",
+        "faucet_worker",
+    ):
+        assert getattr(app.state, name) is None
+    get_settings.cache_clear()
 
 
 def test_chia_provider_status_reports_unconfigured_primary_as_degraded(

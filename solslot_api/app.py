@@ -416,6 +416,16 @@ async def lifespan(app: FastAPI):
         if app.state.faucet_worker is not None:
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()
+        # Lifespan services may retain thread-affine chia_rs Program/LazyNode
+        # values. Release every owned reference on this event-loop thread so a
+        # later TestClient or server restart cannot finalize it on another one.
+        app.state.stripe_delivery_worker = None
+        app.state.voucher_issuance_worker = None
+        app.state.faucet_worker = None
+        app.state.kos_exact_executor = None
+        app.state.protocol_submitter = None
+        app.state.faucet = None
+        app.state.coinset = None
 
 
 _server_settings = get_settings()
