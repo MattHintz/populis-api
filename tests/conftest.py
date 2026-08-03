@@ -19,9 +19,11 @@ the empty masked state at test end.
 """
 from __future__ import annotations
 
+import gc
 import os
 
 import pytest
+from starlette.testclient import TestClient
 
 
 # String-typed admin env vars.  Pre-emptively masked to "" so
@@ -70,7 +72,7 @@ os.environ["SOLSLOT_ADMIN_OPERATION_APPROVALS_ENABLED"] = "false"
 
 
 @pytest.fixture(autouse=True)
-def _admin_state_reset():
+def _admin_state_reset(request):
     """Clear cached state between tests so per-test env changes
     actually re-flow through ``get_settings``.
 
@@ -105,6 +107,11 @@ def _admin_state_reset():
         reset_collection_store_for_tests()
     except ImportError:
         pass
+    if TestClient in vars(request.module).values():
+        # Finalize request/task cycles on pytest's owning thread before another
+        # Starlette portal thread starts. This makes chia_rs thread-affinity
+        # leaks deterministic without penalizing pure unit-test modules.
+        gc.collect()
 
     yield
 

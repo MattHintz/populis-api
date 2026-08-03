@@ -71,13 +71,9 @@ jobs:
           PY
 
       - name: Test
-        # Starlette TestClient closes its anyio portal on a different thread
-        # from pytest. Ignore only chia_rs's known thread-affine teardown
-        # notice; every other unraisable exception remains fatal.
         run: >-
           python -m pytest tests -q
-          -W 'error::pytest.PytestUnraisableExceptionWarning'
-          -W 'ignore:(?s)Exception ignored in. None.*LazyNode is unsendable.*:pytest.PytestUnraisableExceptionWarning'
+          -W error::pytest.PytestUnraisableExceptionWarning
 
       - name: Namespace gate
         run: python scripts/check_namespace.py --paths .
