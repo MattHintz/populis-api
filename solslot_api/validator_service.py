@@ -44,6 +44,7 @@ from solslot_puzzles.vault_driver import (
     puzzle_hash_for_p2_vault,
 )
 from solslot_puzzles.mint_publish_driver import (
+    deed_launcher_puzzle_hash,
     deed_singleton_struct,
 )
 from solslot_puzzles.payment_artifacts_v2 import (
@@ -740,10 +741,16 @@ def verify_inventory_reservation_claim(
             "reservation differs from signed treasury or validator roster"
         )
     try:
+        did_struct = singleton_struct(
+            bytes32.fromhex(str(launchers["did"]).removeprefix("0x"))
+        )
         terms = PrimaryMintTermsV3.for_artifact(
             artifact=purchase,
             smart_deed_inner_hash=bytes32.fromhex(
                 claim.smart_deed_inner_hash.removeprefix("0x")
+            ),
+            deed_launcher_puzzle_hash=deed_launcher_puzzle_hash(
+                protocol_did_singleton_struct=did_struct
             ),
             protocol_puzhash=purchase.protocol_treasury_puzzle_hash,
             validator_pubkeys=tuple(
@@ -754,11 +761,7 @@ def verify_inventory_reservation_claim(
         )
         deed_struct = deed_singleton_struct(
             deed_launcher_id=purchase.deed_launcher_id,
-            protocol_did_singleton_struct=singleton_struct(
-                bytes32.fromhex(
-                    str(launchers["did"]).removeprefix("0x")
-                )
-            ),
+            protocol_did_singleton_struct=did_struct,
         )
         available_puzzle = SINGLETON_MOD.curry(
             deed_struct,
@@ -1003,11 +1006,15 @@ def verify_primary_purchase_claim(
         )
         did_struct = singleton_struct(did_launcher)
         terms_list = []
+        deed_structs = []
         for child, item in zip(purchases, deed_items, strict=True):
             terms = PrimaryMintTermsV3.for_artifact(
                 artifact=child,
                 smart_deed_inner_hash=bytes32.fromhex(
                     item.smart_deed_inner_hash.removeprefix("0x")
+                ),
+                deed_launcher_puzzle_hash=deed_launcher_puzzle_hash(
+                    protocol_did_singleton_struct=did_struct
                 ),
                 protocol_puzhash=protocol_puzhash,
                 validator_pubkeys=validator_pubkeys,
@@ -1017,6 +1024,7 @@ def verify_primary_purchase_claim(
                 deed_launcher_id=child.deed_launcher_id,
                 protocol_did_singleton_struct=did_struct,
             )
+            deed_structs.append(deed_struct)
             reservation = InventoryReservationV1(
                 artifact=child,
                 expires_at=item.reservation_expires_at,
@@ -1074,12 +1082,14 @@ def verify_primary_purchase_claim(
                 buyer_offer=buyer_offer,
                 artifact=purchase,
                 terms=terms_list[0],
+                deed_singleton_struct=deed_structs[0],
             )
         else:
             validate_chia_buyer_batch_offer_v3(
                 buyer_offer=buyer_offer,
                 batch=batch,
                 terms=tuple(terms_list),
+                deed_singleton_structs=tuple(deed_structs),
             )
         if len(buyer_offer.coin_spends()) != 1 or buyer_offer.fees() != 0:
             raise ValueError("buyer offer must use one zero-fee payment coin")
@@ -1786,6 +1796,9 @@ def verify_stripe_settlement_claim(
                 artifact=child,
                 smart_deed_inner_hash=bytes32.fromhex(
                     item.smart_deed_inner_hash.removeprefix("0x")
+                ),
+                deed_launcher_puzzle_hash=deed_launcher_puzzle_hash(
+                    protocol_did_singleton_struct=did_struct
                 ),
                 protocol_puzhash=child.protocol_treasury_puzzle_hash,
                 validator_pubkeys=validator_pubkeys,  # type: ignore[arg-type]

@@ -48,6 +48,7 @@ from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
 from solslot_api.config import Settings
 from solslot_api.external_settlement import build_base_settlement_receipt
 from solslot_api.faucet import Faucet
+from solslot_api.governed_output_index import GovernedOutputExpectation
 from solslot_api.stripe_delivery_store import (
     DELIVERY_PREPARED,
     DELIVERY_SGT,
@@ -123,13 +124,37 @@ class FakeExactExecutor:
 
 def _worker(tmp_path, provider, submitter, store):
     return StripeDeliveryWorker(
-        settings=Settings(),
+        settings=Settings(
+            _env_file=None,
+            payment_purchase_db_path=str(tmp_path / "purchase-index.db"),
+        ),
         faucet=Faucet.from_seed_hex("01" * 32, "testnet11"),
         provider=provider,
         submitter=submitter,
         exact_executor=FakeExactExecutor(),
         store=store,
         config=StripeDeliveryWorkerConfig(enabled=True),
+    )
+
+
+def _index_smartdeeds(worker, operation, bundle, outputs):
+    worker._prepare_governed_index(
+        operation=operation,
+        artifact_hash=_hex(_b32(89)),
+        delivery_kind="smartdeed",
+        quantity=len(outputs),
+        bundle=bundle,
+        outputs=tuple(
+            GovernedOutputExpectation(
+                ordinal=index,
+                deed_launcher_id=_hex(_b32(90 + index)),
+                coin_id=_hex(coin.name()),
+                parent_coin_id=_hex(coin.parent_coin_info),
+                puzzle_hash=_hex(coin.puzzle_hash),
+                amount=1,
+            )
+            for index, coin in enumerate(outputs)
+        ),
     )
 
 
@@ -271,9 +296,9 @@ async def test_prepared_delivery_finalizes_only_one_atomic_block(tmp_path):
         treasury_output, confirmed=30
     )
 
-    finalized = await _worker(
-        tmp_path, provider, submitter, store
-    )._confirm_delivery(operation)
+    worker = _worker(tmp_path, provider, submitter, store)
+    _index_smartdeeds(worker, operation, bundle, (deed_output,))
+    finalized = await worker._confirm_delivery(operation)
 
     assert finalized.state == FINALIZED
     assert finalized.confirmation_height == 30
@@ -361,12 +386,14 @@ async def test_two_deed_delivery_confirms_every_output_in_one_block(tmp_path):
     for coin in (*delivery_outputs, *treasury_outputs):
         provider.records[_hex(coin.name())] = _record(coin, confirmed=50)
 
-    finalized = await _worker(
+    worker = _worker(
         tmp_path,
         provider,
         FakeSubmitter(),
         store,
-    )._confirm_delivery(operation)
+    )
+    _index_smartdeeds(worker, operation, bundle, delivery_outputs)
+    finalized = await worker._confirm_delivery(operation)
 
     assert finalized.state == FINALIZED
     assert finalized.confirmation_height == 50

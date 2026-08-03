@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -122,15 +123,30 @@ def test_admin_reconcile_advances_only_the_normalized_stored_purchase(
 
         async def reconcile_once(self, value: str):
             self.reconciled.append(value)
-            return object()
+            return SimpleNamespace(purchase_id=value)
+
+    class _OutputIndex:
+        requested: list[str] = []
+
+        def outputs(self, value: str):
+            self.requested.append(value)
+            return (SimpleNamespace(coin_id="0x" + "44" * 32),)
 
     worker = _Worker()
+    output_index = _OutputIndex()
     monkeypatch.setattr("solslot_api.admin_sales.StripeDeliveryWorker", _Worker)
     monkeypatch.setattr(
+        "solslot_api.admin_sales.get_governed_output_index",
+        lambda _path: output_index,
+    )
+    monkeypatch.setattr(
         "solslot_api.admin_sales.serialize_stripe_delivery",
-        lambda _operation: {
+        lambda _operation, *, governed_outputs: {
             "purchaseId": purchase_id.lower(),
             "state": "DELIVERY_SUBMITTED",
+            "governedDeliveryCoinIds": [
+                output.coin_id for output in governed_outputs
+            ],
         },
     )
     client = _client(Settings(runtime_environment="test"))
@@ -142,7 +158,11 @@ def test_admin_reconcile_advances_only_the_normalized_stored_purchase(
         )
         assert response.status_code == 200
         assert response.json()["state"] == "DELIVERY_SUBMITTED"
+        assert response.json()["governedDeliveryCoinIds"] == [
+            "0x" + "44" * 32
+        ]
         assert worker.reconciled == [purchase_id.lower()]
+        assert output_index.requested == [purchase_id.lower()]
     finally:
         client.close()
 

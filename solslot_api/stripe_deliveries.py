@@ -11,6 +11,10 @@ from web3.logs import DISCARD
 from .config import Settings, get_settings
 from .credential_auth import require_minting_writes
 from .launch_gates import require_operation_gate
+from .governed_output_index import (
+    GovernedOutputRecord,
+    get_governed_output_index,
+)
 from .protocol_artifacts import _require_server_to_server_token
 from .omnichain_evidence import OmnichainEvidenceError, load_omnichain_evidence
 from .presale_endpoints import (
@@ -46,7 +50,10 @@ async def stripe_delivery_status(
         ).get(normalize_purchase_id(purchase_id))
     except StripeDeliveryNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return serialize_stripe_delivery(operation)
+    outputs = get_governed_output_index(
+        settings.payment_purchase_db_path
+    ).outputs(operation.purchase_id)
+    return serialize_stripe_delivery(operation, governed_outputs=outputs)
 
 
 @router.post("/{purchase_id}/reconcile")
@@ -76,7 +83,10 @@ async def reconcile_stripe_delivery(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The signed purchase window is closed.",
         )
-    return serialize_stripe_delivery(operation)
+    outputs = get_governed_output_index(
+        settings.payment_purchase_db_path
+    ).outputs(operation.purchase_id)
+    return serialize_stripe_delivery(operation, governed_outputs=outputs)
 
 
 @router.get("/base-settlements/by-payment/{global_payment_id}")
@@ -154,7 +164,11 @@ async def acknowledge_base_direct_settlement(
     return _settlement_envelope(operation)
 
 
-def serialize_stripe_delivery(operation: StripeDeliveryOperation) -> dict[str, Any]:
+def serialize_stripe_delivery(
+    operation: StripeDeliveryOperation,
+    *,
+    governed_outputs: tuple[GovernedOutputRecord, ...] = (),
+) -> dict[str, Any]:
     return {
         "schemaVersion": 3,
         "purchaseId": operation.purchase_id,
@@ -165,9 +179,31 @@ def serialize_stripe_delivery(operation: StripeDeliveryOperation) -> dict[str, A
         "receiptCoinId": operation.receipt_coin_id,
         "deliveryBundleId": operation.delivery_bundle_id,
         "expectedSmartDeedCoinId": operation.expected_deed_output_coin_id,
+        "expectedSmartDeedCoinIds": list(
+            operation.expected_delivery_output_coin_ids
+        ) if operation.delivery_kind == "smartdeed" else [],
         "expectedSgtCoinId": operation.expected_sgt_output_coin_id,
         "expectedDeliveryCoinId": operation.expected_delivery_output_coin_id,
+        "expectedDeliveryCoinIds": list(
+            operation.expected_delivery_output_coin_ids
+        ),
         "expectedCoordinationCoinId": operation.expected_treasury_output_coin_id,
+        "expectedCoordinationCoinIds": list(
+            operation.expected_treasury_output_coin_ids
+        ),
+        "governedDeliveryOutputs": [
+            {
+                "ordinal": output.ordinal,
+                "deedLauncherId": output.deed_launcher_id,
+                "coinId": output.coin_id,
+                "parentCoinId": output.parent_coin_id,
+                "puzzleHash": output.puzzle_hash,
+                "amount": str(output.amount),
+                "confirmationHeight": output.confirmation_height,
+                "chainConfirmed": output.confirmation_height is not None,
+            }
+            for output in governed_outputs
+        ],
         "expectedTreasuryCoinId": (
             operation.expected_treasury_output_coin_id
             if operation.payment_rail != PAYMENT_RAIL_BASE_USDC

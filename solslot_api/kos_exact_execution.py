@@ -16,6 +16,8 @@ from .protocol_submission import PreparedProtocolBundle, ProtocolSubmissionError
 
 
 _DOMAIN = b"SOLSLOT_KOS_EXACT_EXECUTION_V2"
+MAX_EXACT_INPUTS = 102
+MAX_EXACT_OUTPUTS = 200
 
 
 class ExactExecutionAction(IntEnum):
@@ -171,8 +173,11 @@ def exact_execution_digest(
     expected_outputs: tuple[ExactExecutionOutput, ...],
     fee_mojos: int,
 ) -> bytes:
-    if not required_input_coin_ids or len(required_input_coin_ids) > 100:
-        raise ValueError("exact execution requires 1..100 input coins")
+    if (
+        not required_input_coin_ids
+        or len(required_input_coin_ids) > MAX_EXACT_INPUTS
+    ):
+        raise ValueError("exact execution requires 1..102 input coins")
     if len(set(required_input_coin_ids)) != len(required_input_coin_ids):
         raise ValueError("exact execution input coin IDs must be unique")
     if tuple(sorted(required_input_coin_ids, key=bytes)) != required_input_coin_ids:
@@ -205,8 +210,8 @@ def exact_execution_digest(
 def _canonical_outputs(
     outputs: tuple[ExactExecutionOutput, ...],
 ) -> tuple[ExactExecutionOutput, ...]:
-    if not outputs or len(outputs) > 100:
-        raise ValueError("exact execution requires 1..100 expected outputs")
+    if not outputs or len(outputs) > MAX_EXACT_OUTPUTS:
+        raise ValueError("exact execution requires 1..200 expected outputs")
     if len({output.coin_id for output in outputs}) != len(outputs):
         raise ValueError("exact execution output coin IDs must be unique")
     for output in outputs:

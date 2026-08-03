@@ -19,7 +19,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD
 from chia.wallet.trading.offer import Offer
 from chia.wallet.uncurried_puzzle import uncurry_puzzle
 from chia.wallet.wallet_spend_bundle import WalletSpendBundle
-from chia_rs import AugSchemeMPL, G1Element, G2Element
+from chia_rs import AugSchemeMPL, G1Element, G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
@@ -55,6 +55,7 @@ from solslot_puzzles.stripe_settlement_v1_driver import (
 )
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.protocol_deployment import singleton_struct
+from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 
 from .collection_store import CollectionNotFound, get_collection_store
 from .config import Settings, get_settings
@@ -62,6 +63,15 @@ from .credential_auth import require_minting_writes
 from .faucet import AGG_SIG_ME_DATA
 from .mint_endpoints import get_mint_proposal_store
 from .launch_gates import require_operation_gate
+from .governed_output_index import (
+    GovernedOutputConflict,
+    GovernedOutputExpectation,
+    GovernedOutputNotFound,
+    find_exact_governed_descendant,
+    get_governed_output_index,
+    reconcile_governed_delivery,
+    serialize_governed_delivery,
+)
 from .payment_purchase_store import (
     PaymentPurchaseConflict,
     PaymentPurchaseNotFound,
@@ -158,6 +168,36 @@ class CompleteNativePurchaseResponse(NativePurchaseModel):
     deed_launcher_ids: list[str] = Field(
         alias="deedLauncherIds",
         default_factory=list,
+    )
+    expected_delivery_coin_ids: list[str] = Field(
+        alias="expectedDeliveryCoinIds",
+        default_factory=list,
+    )
+
+
+@router.get("/{purchase_id}")
+async def native_purchase_status(
+    purchase_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Reconstruct one native purchase from every committed deed output."""
+
+    _require_server_to_server_token(settings, authorization)
+    normalized = "0x" + _hex_bytes(purchase_id, 32, "purchaseId").hex()
+    index = get_governed_output_index(settings.payment_purchase_db_path)
+    try:
+        operation = await reconcile_governed_delivery(
+            index,
+            request.app.state.coinset,
+            normalized,
+        )
+    except GovernedOutputNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return serialize_governed_delivery(
+        operation,
+        index.outputs(normalized),
     )
 
 
@@ -460,6 +500,7 @@ async def prepare_native_purchase(
                 payment_public_key=selected[1],
                 artifact=first.purchase,
                 terms=first.terms,
+                deed_singleton_struct=first.deed_struct,
                 cat_lineage_proof=selected[2],
             )
         else:
@@ -468,6 +509,9 @@ async def prepare_native_purchase(
                 payment_public_key=selected[1],
                 batch=group.batch,
                 terms=tuple(context.terms for context in group.contexts),
+                deed_singleton_structs=tuple(
+                    context.deed_struct for context in group.contexts
+                ),
                 cat_lineage_proof=selected[2],
             )
     except PaymentArtifactError as exc:
@@ -531,12 +575,16 @@ async def complete_native_purchase(
                 buyer_offer=buyer_offer,
                 artifact=first.purchase,
                 terms=first.terms,
+                deed_singleton_struct=first.deed_struct,
             )
         else:
             validate_chia_buyer_batch_offer_v3(
                 buyer_offer=buyer_offer,
                 batch=group.batch,
                 terms=tuple(context.terms for context in group.contexts),
+                deed_singleton_structs=tuple(
+                    context.deed_struct for context in group.contexts
+                ),
             )
         _verify_buyer_signature(buyer_offer, settings.network)
         if len(buyer_offer.coin_spends()) != 1 or buyer_offer.fees() != 0:
@@ -661,6 +709,36 @@ async def complete_native_purchase(
             ]
         ),
     )
+    output_index = get_governed_output_index(
+        settings.payment_purchase_db_path
+    )
+    try:
+        delivery_outputs = _governed_smartdeed_outputs(
+            group,
+            signed_spend,
+        )
+        output_index.prepare(
+            purchase_id=group.stored.purchase_id,
+            artifact_hash=(
+                _hex32(group.batch.batch_hash)
+                if group.batch is not None
+                else _hex32(first.purchase.artifact_hash)
+            ),
+            rail=(
+                "chia_xch"
+                if first.purchase.rail == PaymentRail.CHIA_XCH
+                else "chia_cat"
+            ),
+            delivery_kind="smartdeed",
+            quantity=group.quantity,
+            input_coin_ids=tuple(
+                _hex32(coin.name()) for coin in signed_spend.removals()
+            ),
+            protocol_bundle_id=_hex32(signed_spend.name()),
+            outputs=delivery_outputs,
+        )
+    except (GovernedOutputConflict, PaymentArtifactError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     submitter = getattr(request.app.state, "protocol_submitter", None)
     if not isinstance(submitter, ProtocolBundleSubmitter):
         raise HTTPException(
@@ -677,6 +755,25 @@ async def complete_native_purchase(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"The atomic purchase was not accepted into the local mempool: {exc}",
         ) from exc
+    try:
+        exact_bundle = SpendBundle.from_json_dict(result["spendBundle"])
+        _require_exact_governed_outputs(exact_bundle, delivery_outputs)
+        output_index.bind_submission(
+            group.stored.purchase_id,
+            spend_bundle_id=str(result["spendBundleId"]),
+            input_coin_ids=tuple(
+                _hex32(coin.name()) for coin in exact_bundle.removals()
+            ),
+            mempool_observed_at=str(result["mempoolObservedAt"]),
+        )
+    except (KeyError, GovernedOutputConflict, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The submitted native purchase differs from its governed "
+                f"delivery index: {exc}"
+            ),
+        ) from exc
     return CompleteNativePurchaseResponse(
         purchaseId=group.stored.purchase_id,
         transactionId=str(result["spendBundleId"]),
@@ -690,7 +787,61 @@ async def complete_native_purchase(
         mempoolObservedAt=str(result["mempoolObservedAt"]),
         quantity=group.quantity,
         deedLauncherIds=group.deed_launcher_ids,
+        expectedDeliveryCoinIds=[
+            output.coin_id for output in delivery_outputs
+        ],
     )
+
+
+def _governed_smartdeed_outputs(
+    group: NativePurchaseGroup,
+    bundle: WalletSpendBundle,
+) -> tuple[GovernedOutputExpectation, ...]:
+    outputs: list[GovernedOutputExpectation] = []
+    for ordinal, context in enumerate(group.contexts):
+        vault = SINGLETON_MOD.curry(
+            context.deed_struct,
+            puzzle_for_p2_vault(context.purchase.vault_launcher_id),
+        )
+        coin = find_exact_governed_descendant(
+            bundle,
+            ancestor_coin_id=context.deed_coin.name(),
+            puzzle_hash=bytes32(vault.get_tree_hash()),
+            amount=1,
+            label="vault SmartDeed",
+        )
+        outputs.append(
+            GovernedOutputExpectation(
+                ordinal=ordinal,
+                deed_launcher_id=_hex32(
+                    context.purchase.deed_launcher_id
+                ),
+                coin_id=_hex32(coin.name()),
+                parent_coin_id=_hex32(coin.parent_coin_info),
+                puzzle_hash=_hex32(coin.puzzle_hash),
+                amount=1,
+            )
+        )
+    return tuple(outputs)
+
+
+def _require_exact_governed_outputs(
+    bundle: SpendBundle,
+    outputs: tuple[GovernedOutputExpectation, ...],
+) -> None:
+    additions = {
+        _hex32(coin.name()): coin for coin in bundle.additions()
+    }
+    for output in outputs:
+        coin = additions.get(output.coin_id)
+        if coin is None or (
+            _hex32(coin.parent_coin_info) != output.parent_coin_id
+            or _hex32(coin.puzzle_hash) != output.puzzle_hash
+            or int(coin.amount) != output.amount
+        ):
+            raise PaymentArtifactError(
+                "fee-funded bundle changed a governed SmartDeed output"
+            )
 
 
 async def _submit_inventory_reservation(
@@ -1074,6 +1225,9 @@ async def _load_context(
                     32,
                     "smartDeedInnerPuzzleHash",
                 )
+            ),
+            deed_launcher_puzzle_hash=deed_launcher_puzzle_hash(
+                protocol_did_singleton_struct=did_struct
             ),
             protocol_puzhash=protocol_puzhash,
             validator_pubkeys=validator_pubkeys,

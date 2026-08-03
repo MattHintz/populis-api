@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from solslot_api.governed_output_index import GovernedOutputRecord
 from solslot_api.stripe_deliveries import serialize_stripe_delivery
 
 from solslot_api.stripe_delivery_store import (
@@ -226,10 +227,36 @@ def test_base_delivery_requires_terminal_external_settlement(tmp_path) -> None:
         confirmation_height=456,
     )
     assert pending.state == EXTERNAL_SETTLEMENT_PENDING
-    serialized = serialize_stripe_delivery(pending)
+    governed_output = GovernedOutputRecord(
+        ordinal=0,
+        deed_launcher_id=_hex("2b"),
+        coin_id=_hex("27"),
+        parent_coin_id=_hex("2c"),
+        puzzle_hash=_hex("2d"),
+        amount=1,
+        purchase_id=purchase_id,
+        delivery_kind="smartdeed",
+        confirmation_height=456,
+    )
+    serialized = serialize_stripe_delivery(
+        pending,
+        governed_outputs=(governed_output,),
+    )
     assert serialized["expectedTreasuryCoinId"] is None
     assert serialized["expectedResultAuthorizationCoinId"] == _hex("28")
     assert serialized["expectedCoordinationCoinId"] == _hex("28")
+    assert serialized["governedDeliveryOutputs"] == [
+        {
+            "ordinal": 0,
+            "deedLauncherId": _hex("2b"),
+            "coinId": _hex("27"),
+            "parentCoinId": _hex("2c"),
+            "puzzleHash": _hex("2d"),
+            "amount": "1",
+            "confirmationHeight": 456,
+            "chainConfirmed": True,
+        }
+    ]
     with pytest.raises(
         StripeDeliveryConflict,
         match="requires confirmed external settlement",

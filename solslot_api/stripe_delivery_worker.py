@@ -67,6 +67,14 @@ from .governance_sale_offer import (
     reconstruct_governed_sale_coin,
     reconstruct_governed_sale_lineage,
 )
+from .governed_output_index import (
+    CONFIRMED as GOVERNED_CONFIRMED,
+    GovernedOutputConflict,
+    GovernedOutputExpectation,
+    find_exact_governed_descendant,
+    get_governed_output_index,
+    reconcile_governed_delivery,
+)
 from .kos_exact_execution import (
     ExactExecutionAction,
     ExactExecutionOutput,
@@ -137,6 +145,9 @@ class StripeDeliveryWorker:
         self.submitter = submitter
         self.exact_executor = exact_executor
         self.store = store
+        self.output_index = get_governed_output_index(
+            settings.payment_purchase_db_path
+        )
         self.config = config
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -675,6 +686,7 @@ class StripeDeliveryWorker:
             receipt_spend=receipt_spend,
             receipt=receipt,
             terms=context.terms,
+            deed_singleton_struct=context.deed_struct,
         )
         primary = build_stripe_primary_offer_v5(
             receipt_offer=buyer_offer,
@@ -699,12 +711,16 @@ class StripeDeliveryWorker:
             context.deed_struct,
             puzzle_for_p2_vault(purchase.vault_launcher_id),
         )
-        deed_output = _one_output(
-            additions,
-            puzzle_hash=bytes32(vault_full.get_tree_hash()),
-            amount=1,
-            label="vault SmartDeed",
-        )
+        try:
+            deed_output = find_exact_governed_descendant(
+                signed,
+                ancestor_coin_id=context.deed_coin.name(),
+                puzzle_hash=bytes32(vault_full.get_tree_hash()),
+                amount=1,
+                label="vault SmartDeed",
+            )
+        except GovernedOutputConflict as exc:
+            raise StripeDeliveryManualReview(str(exc)) from exc
         treasury_output = _one_output(
             additions,
             puzzle_hash=(
@@ -719,10 +735,23 @@ class StripeDeliveryWorker:
                 else "receipt treasury"
             ),
         )
-        if deed_output.parent_coin_info != context.deed_coin.name():
-            raise StripeDeliveryManualReview(
-                "SmartDeed successor is not descended from the governed deed"
-            )
+        self._prepare_governed_index(
+            operation=operation,
+            artifact_hash=_hex32(purchase.artifact_hash),
+            delivery_kind="smartdeed",
+            quantity=1,
+            bundle=signed,
+            outputs=(
+                GovernedOutputExpectation(
+                    ordinal=0,
+                    deed_launcher_id=_hex32(purchase.deed_launcher_id),
+                    coin_id=_hex32(deed_output.name()),
+                    parent_coin_id=_hex32(deed_output.parent_coin_info),
+                    puzzle_hash=_hex32(deed_output.puzzle_hash),
+                    amount=1,
+                ),
+            ),
+        )
         return self.store.record_delivery_prepared(
             operation.purchase_id,
             protocol_bundle=signed.to_json_dict(),
@@ -831,6 +860,9 @@ class StripeDeliveryWorker:
             receipt_spend=receipt_spend,
             receipt=receipt,
             terms=item_terms,
+            deed_singleton_structs=tuple(
+                context.deed_struct for context in group.contexts
+            ),
         )
         primary = build_external_primary_batch_offer_v5(
             receipt_offer=receipt_offer,
@@ -865,15 +897,18 @@ class StripeDeliveryWorker:
                 context.deed_struct,
                 puzzle_for_p2_vault(batch.vault_launcher_id),
             )
-            delivery_outputs.append(
-                _one_child_output(
-                    additions,
-                    parent_coin_id=context.deed_coin.name(),
-                    puzzle_hash=bytes32(vault_full.get_tree_hash()),
-                    amount=1,
-                    label="vault SmartDeed",
+            try:
+                delivery_outputs.append(
+                    find_exact_governed_descendant(
+                        signed,
+                        ancestor_coin_id=context.deed_coin.name(),
+                        puzzle_hash=bytes32(vault_full.get_tree_hash()),
+                        amount=1,
+                        label="vault SmartDeed",
+                    )
                 )
-            )
+            except GovernedOutputConflict as exc:
+                raise StripeDeliveryManualReview(str(exc)) from exc
             treasury_outputs.append(
                 _one_child_output(
                     additions,
@@ -889,6 +924,28 @@ class StripeDeliveryWorker:
             )
         delivery_ids = tuple(_hex32(coin.name()) for coin in delivery_outputs)
         treasury_ids = tuple(_hex32(coin.name()) for coin in treasury_outputs)
+        self._prepare_governed_index(
+            operation=operation,
+            artifact_hash=_hex32(batch.batch_hash),
+            delivery_kind="smartdeed",
+            quantity=batch.quantity,
+            bundle=signed,
+            outputs=tuple(
+                GovernedOutputExpectation(
+                    ordinal=ordinal,
+                    deed_launcher_id=_hex32(
+                        context.purchase.deed_launcher_id
+                    ),
+                    coin_id=_hex32(coin.name()),
+                    parent_coin_id=_hex32(coin.parent_coin_info),
+                    puzzle_hash=_hex32(coin.puzzle_hash),
+                    amount=1,
+                )
+                for ordinal, (context, coin) in enumerate(
+                    zip(group.contexts, delivery_outputs, strict=True)
+                )
+            ),
+        )
         return self.store.record_delivery_prepared(
             operation.purchase_id,
             protocol_bundle=signed.to_json_dict(),
@@ -1051,12 +1108,16 @@ class StripeDeliveryWorker:
             recipient_inner,
         )
         additions = signed.additions()
-        sgt_output = _one_output(
-            additions,
-            puzzle_hash=bytes32(recipient_full.get_tree_hash()),
-            amount=terms.sgt_amount,
-            label="vault SGT",
-        )
+        try:
+            sgt_output = find_exact_governed_descendant(
+                signed,
+                ancestor_coin_id=chain.sale_coin.name(),
+                puzzle_hash=bytes32(recipient_full.get_tree_hash()),
+                amount=terms.sgt_amount,
+                label="vault SGT",
+            )
+        except GovernedOutputConflict as exc:
+            raise StripeDeliveryManualReview(str(exc)) from exc
         treasury_output = _one_output(
             additions,
             puzzle_hash=(
@@ -1071,14 +1132,26 @@ class StripeDeliveryWorker:
                 else "receipt treasury"
             ),
         )
-        if sgt_output.parent_coin_info != chain.sale_coin.name():
-            raise StripeDeliveryManualReview(
-                "SGT successor is not descended from the governed sale coin"
-            )
         if treasury_output.parent_coin_info != receipt_coin.name():
             raise StripeDeliveryManualReview(
                 "receipt treasury output is not descended from the receipt"
             )
+        self._prepare_governed_index(
+            operation=operation,
+            artifact_hash=_hex32(purchase.artifact_hash),
+            delivery_kind="sgt",
+            quantity=terms.sgt_amount,
+            bundle=signed,
+            outputs=(
+                GovernedOutputExpectation(
+                    ordinal=0,
+                    coin_id=_hex32(sgt_output.name()),
+                    parent_coin_id=_hex32(sgt_output.parent_coin_info),
+                    puzzle_hash=_hex32(sgt_output.puzzle_hash),
+                    amount=terms.sgt_amount,
+                ),
+            ),
+        )
         return self.store.record_delivery_prepared(
             operation.purchase_id,
             protocol_bundle=signed.to_json_dict(),
@@ -1087,13 +1160,65 @@ class StripeDeliveryWorker:
             signer_indices=quorum.signer_indices,
         )
 
+    def _prepare_governed_index(
+        self,
+        *,
+        operation: StripeDeliveryOperation,
+        artifact_hash: str,
+        delivery_kind: str,
+        quantity: int,
+        bundle: WalletSpendBundle,
+        outputs: tuple[GovernedOutputExpectation, ...],
+    ) -> None:
+        try:
+            self.output_index.prepare(
+                purchase_id=operation.purchase_id,
+                artifact_hash=artifact_hash,
+                rail=operation.payment_rail,
+                delivery_kind=delivery_kind,
+                quantity=quantity,
+                input_coin_ids=tuple(
+                    _hex32(coin.name()) for coin in bundle.removals()
+                ),
+                protocol_bundle_id=_hex32(bundle.name()),
+                outputs=outputs,
+            )
+        except (GovernedOutputConflict, ValueError) as exc:
+            raise StripeDeliveryManualReview(
+                f"governed delivery index rejected the prepared bundle: {exc}"
+            ) from exc
+
+    def _bind_governed_submission(
+        self,
+        operation: StripeDeliveryOperation,
+        prepared: PreparedProtocolBundle,
+        *,
+        mempool_observed_at: str,
+    ) -> None:
+        try:
+            self.output_index.bind_submission(
+                operation.purchase_id,
+                spend_bundle_id=_hex32(prepared.bundle.name()),
+                input_coin_ids=tuple(
+                    _hex32(coin.name())
+                    for coin in prepared.bundle.removals()
+                ),
+                mempool_observed_at=mempool_observed_at,
+            )
+        except (GovernedOutputConflict, ValueError) as exc:
+            raise StripeDeliveryManualReview(
+                f"exact submitted bundle conflicts with its governed index: {exc}"
+            ) from exc
+
     async def _submit_or_recover_delivery(
         self,
         operation: StripeDeliveryOperation,
     ) -> StripeDeliveryOperation:
         confirmation = await self._delivery_confirmation(operation)
         if confirmation is not None:
-            return self._record_delivery_confirmation(operation, confirmation)
+            return await self._record_delivery_confirmation(
+                operation, confirmation
+            )
         if operation.delivery_bundle is None:
             raise StripeDeliveryManualReview("prepared delivery bundle is missing")
         bundle = SpendBundle.from_json_dict(operation.delivery_bundle)
@@ -1115,6 +1240,12 @@ class StripeDeliveryWorker:
                     raise StripeDeliveryManualReview(
                         "delivery input is reserved by a different mempool bundle"
                     )
+                observed_at = _utc_now()
+                self._bind_governed_submission(
+                    operation,
+                    prepared,
+                    mempool_observed_at=observed_at,
+                )
                 return self.store.record_delivery_submission(
                     operation.purchase_id,
                     bundle_id=pending_id,
@@ -1124,7 +1255,7 @@ class StripeDeliveryWorker:
                     treasury_output_coin_ids=treasury_output_ids,
                     signer_indices=operation.signer_indices,
                     fee_mojos=prepared.fee_mojos,
-                    mempool_observed_at=_utc_now(),
+                    mempool_observed_at=observed_at,
                 )
         input_records = [
             await self.provider.get_coin_record_by_name(coin_id)
@@ -1143,6 +1274,7 @@ class StripeDeliveryWorker:
                 expected_output_ids,
             ),
         )
+        exact_prepared: PreparedProtocolBundle
         if operation.delivery_exact_bundle is None:
             async def dispatch(prepared: PreparedProtocolBundle):
                 self.store.bind_delivery_exact_bundle(
@@ -1155,20 +1287,41 @@ class StripeDeliveryWorker:
                 operation.delivery_bundle,
                 dispatch,
             )
+            refreshed = self.store.get(operation.purchase_id)
+            if refreshed.delivery_exact_bundle is None:
+                raise StripeDeliveryManualReview(
+                    "exact KoS delivery bundle was not persisted"
+                )
+            exact_prepared = _prepared_from_binding(
+                refreshed.delivery_exact_bundle
+            )
         else:
-            prepared = _prepared_from_binding(operation.delivery_exact_bundle)
-            await self.exact_executor.dispatch(request, prepared)
-            result = prepared.to_json()
+            exact_prepared = _prepared_from_binding(
+                operation.delivery_exact_bundle
+            )
+            await self.exact_executor.dispatch(request, exact_prepared)
+            result = exact_prepared.to_json()
+        result_bundle_id = _normalize_hex32(str(result["spendBundleId"]))
+        if result_bundle_id != _hex32(exact_prepared.bundle.name()):
+            raise StripeDeliveryManualReview(
+                "KoS returned a different exact delivery bundle ID"
+            )
+        observed_at = _utc_now()
+        self._bind_governed_submission(
+            operation,
+            exact_prepared,
+            mempool_observed_at=observed_at,
+        )
         return self.store.record_delivery_submission(
             operation.purchase_id,
-            bundle_id=str(result["spendBundleId"]).lower(),
+            bundle_id=result_bundle_id,
             delivery_output_coin_id=delivery_output_ids[0],
             delivery_output_coin_ids=delivery_output_ids,
             treasury_output_coin_id=treasury_output_ids[0],
             treasury_output_coin_ids=treasury_output_ids,
             signer_indices=operation.signer_indices,
             fee_mojos=int(result["feeMojos"]),
-            mempool_observed_at=_utc_now(),
+            mempool_observed_at=observed_at,
         )
 
     def _exact_execution_request(
@@ -1203,13 +1356,27 @@ class StripeDeliveryWorker:
         confirmation = await self._delivery_confirmation(operation)
         if confirmation is None:
             return self.store.release_lease(operation.purchase_id)
-        return self._record_delivery_confirmation(operation, confirmation)
+        return await self._record_delivery_confirmation(
+            operation, confirmation
+        )
 
-    def _record_delivery_confirmation(
+    async def _record_delivery_confirmation(
         self,
         operation: StripeDeliveryOperation,
         confirmation_height: int,
     ) -> StripeDeliveryOperation:
+        indexed = await reconcile_governed_delivery(
+            self.output_index,
+            self.provider,
+            operation.purchase_id,
+        )
+        if (
+            indexed.state != GOVERNED_CONFIRMED
+            or indexed.confirmation_height != confirmation_height
+        ):
+            raise StripeDeliveryManualReview(
+                "governed outputs are not fully confirmed with the delivery"
+            )
         confirmed = self.store.record_delivery_confirmed(
             operation.purchase_id,
             confirmation_height=confirmation_height,
@@ -1242,8 +1409,10 @@ class StripeDeliveryWorker:
             if operation.delivery_exact_bundle is not None
             else SpendBundle.from_json_dict(operation.delivery_bundle)
         )
-        bundle_output_ids = {_hex32(coin.name()) for coin in bundle.additions()}
-        if any(coin_id not in bundle_output_ids for coin_id in output_ids):
+        bundle_outputs = {
+            _hex32(coin.name()): coin for coin in bundle.additions()
+        }
+        if any(coin_id not in bundle_outputs for coin_id in output_ids):
             raise StripeDeliveryManualReview(
                 "stored delivery output manifest differs from the exact bundle"
             )
@@ -1253,6 +1422,13 @@ class StripeDeliveryWorker:
         ]
         if any(not _is_confirmed(record) for record in output_records):
             return None
+        for coin_id, record in zip(output_ids, output_records, strict=True):
+            expected = bundle_outputs[coin_id]
+            actual = _coin_from_record(record)
+            if actual is None or actual != expected or _hex32(actual.name()) != coin_id:
+                raise StripeDeliveryManualReview(
+                    "confirmed delivery coin differs from the exact bundle"
+                )
         heights = {
             int(record.get("confirmed_block_index") or 0)
             for record in output_records
@@ -1268,6 +1444,14 @@ class StripeDeliveryWorker:
         ]
         if any(not _is_spent(record) for record in input_records):
             return None
+        for expected, record in zip(
+            bundle.removals(), input_records, strict=True
+        ):
+            actual = _coin_from_record(record)
+            if actual is None or actual != expected:
+                raise StripeDeliveryManualReview(
+                    "spent delivery input differs from the exact bundle"
+                )
         spent_heights = {
             int(record.get("spent_block_index") or 0)
             for record in input_records

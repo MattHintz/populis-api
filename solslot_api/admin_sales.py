@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
+from .governed_output_index import get_governed_output_index
 from .stripe_deliveries import normalize_purchase_id, serialize_stripe_delivery
 from .stripe_delivery_store import StripeDeliveryNotFound
 from .stripe_delivery_worker import StripeDeliveryWorker
@@ -115,6 +116,7 @@ async def list_purchase_operations(
 async def reconcile_purchase_operation(
     purchase_id: str,
     request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
     _claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
 ) -> dict[str, Any]:
     """Advance only the immutable purchase already stored by the coordinator."""
@@ -135,4 +137,7 @@ async def reconcile_purchase_operation(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The signed purchase window is closed.",
         )
-    return serialize_stripe_delivery(operation)
+    outputs = get_governed_output_index(
+        settings.payment_purchase_db_path
+    ).outputs(operation.purchase_id)
+    return serialize_stripe_delivery(operation, governed_outputs=outputs)

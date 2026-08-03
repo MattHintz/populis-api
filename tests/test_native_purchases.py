@@ -102,6 +102,7 @@ class FakeProtocolSubmitter(ProtocolBundleSubmitter):
             "feeTargetSeconds": 300,
             "submissionProvider": "primary",
             "mempoolObservedAt": "2026-07-27T14:30:00Z",
+            "spendBundle": bundle,
         }
 
 
@@ -163,6 +164,9 @@ def _context(
     terms = PrimaryMintTermsV3.for_artifact(
         artifact=artifact,
         smart_deed_inner_hash=_b32(18),
+        deed_launcher_puzzle_hash=deed_launcher_puzzle_hash(
+            protocol_did_singleton_struct=protocol_did
+        ),
         protocol_puzhash=artifact.protocol_treasury_puzzle_hash,
         validator_pubkeys=tuple(bytes(key.get_g1()) for key in validator_keys),
         provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
@@ -277,7 +281,10 @@ def test_purchase_terms_must_match_the_governed_proposal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(monkeypatch):
+async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(
+    monkeypatch,
+    tmp_path,
+):
     payment_key = AugSchemeMPL.key_gen(b"p" * 32)
     validator_keys = tuple(
         AugSchemeMPL.key_gen(bytes([seed]) * 32) for seed in (31, 32, 33)
@@ -300,6 +307,7 @@ async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(monkey
         alpha_writes_enabled=True,
         minting_enabled=True,
         protocol_artifact_api_token="test-token",
+        payment_purchase_db_path=str(tmp_path / "native-purchases.db"),
     )
 
     async def load_context_group(*_args, **_kwargs):
@@ -391,11 +399,15 @@ async def test_one_prompt_native_purchase_builds_and_submits_atomic_offer(monkey
     assert completed.fee_target_seconds == 300
     assert completed.submission_provider == "primary"
     assert completed.mempool_observed_at == "2026-07-27T14:30:00Z"
+    assert len(completed.expected_delivery_coin_ids) == 1
     assert submitter.submitted is not None
 
 
 @pytest.mark.asyncio
-async def test_quantity_two_submits_one_atomic_multi_deed_purchase(monkeypatch):
+async def test_quantity_two_submits_one_atomic_multi_deed_purchase(
+    monkeypatch,
+    tmp_path,
+):
     payment_key = AugSchemeMPL.key_gen(b"r" * 32)
     validator_keys = tuple(
         AugSchemeMPL.key_gen(bytes([seed]) * 32) for seed in (51, 52, 53)
@@ -455,6 +467,7 @@ async def test_quantity_two_submits_one_atomic_multi_deed_purchase(monkeypatch):
         alpha_writes_enabled=True,
         minting_enabled=True,
         protocol_artifact_api_token="test-token",
+        payment_purchase_db_path=str(tmp_path / "native-batch.db"),
     )
 
     async def load_context_group(*_args, **_kwargs):
@@ -544,5 +557,7 @@ async def test_quantity_two_submits_one_atomic_multi_deed_purchase(monkeypatch):
     assert quorum_calls == 1
     assert completed.quantity == 2
     assert completed.deed_launcher_ids == prepared.deed_launcher_ids
+    assert len(completed.expected_delivery_coin_ids) == 2
+    assert len(set(completed.expected_delivery_coin_ids)) == 2
     assert completed.transaction_id == "0x" + "99" * 32
     assert submitter.submitted is not None
