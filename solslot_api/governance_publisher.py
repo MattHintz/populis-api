@@ -428,7 +428,11 @@ async def build_governance_publication(
     elif record.publication_coadmin_slot != coadmin_slot:
         raise ValueError("a different coadministrator is already assigned")
     deadline = timestamp + int(parameters.get("votingWindowSeconds"))
-    requested_sgt = int(record.bill.get("sgtAmount") or 0)
+    requested_sgt = (
+        int(parameters.get("minProposalStake"))
+        if record.kind == "FUNDED_REDEMPTION"
+        else int(record.bill.get("sgtAmount") or 0)
+    )
     if requested_sgt <= 0 or requested_sgt > int(reserve_coin.amount):
         raise ValueError("SGT allocation exceeds the confirmed company reserve")
     if record.kind == "SGT_SALE" and int(record.bill.get("expiresAt") or 0) <= deadline:

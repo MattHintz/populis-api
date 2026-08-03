@@ -227,6 +227,15 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "SOLSLOT_SGT_ALLOCATIONS_ENABLED requires the release-bound "
                 "SOLSLOT_SGT_WUSDC_B_ASSET_ID."
             )
+    if settings.funded_redemptions_enabled and not settings.alpha_writes_enabled:
+        raise RuntimeError(
+            "SOLSLOT_FUNDED_REDEMPTIONS_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
+        )
+    if settings.funded_redemptions_enabled and not settings.sgt_allocations_enabled:
+        raise RuntimeError(
+            "SOLSLOT_FUNDED_REDEMPTIONS_ENABLED requires "
+            "SOLSLOT_SGT_ALLOCATIONS_ENABLED."
+        )
     if settings.presale_enabled and not settings.alpha_writes_enabled:
         raise RuntimeError(
             "SOLSLOT_PRESALE_ENABLED requires SOLSLOT_ALPHA_WRITES_ENABLED."
@@ -846,6 +855,11 @@ class Settings(BaseSettings):
     # the protocol's non-withdrawable treasury.
     sgt_company_treasury_puzzle_hash: Optional[str] = None
     sgt_allocations_enabled: bool = False
+    # Governed collection redemptions funded by the protocol's immutable
+    # wUSDC.b treasury. This remains independently gated from ordinary SGT
+    # allocations so a release can prepare and review proposals while the
+    # customer acceptance path stays closed.
+    funded_redemptions_enabled: bool = False
     # Exact Warp wUSDC.b CAT used by governed SGT sale offers. Administrators
     # select the named rail; browsers never supply a CAT asset ID.
     sgt_wusdc_b_asset_id: Optional[str] = None

@@ -60,6 +60,7 @@ except ModuleNotFoundError as e:
     admin_roster_update_router = None
 from .mint_endpoints import router as mint_endpoints_router
 from .governance_endpoints import router as governance_endpoints_router
+from .funded_redemptions import router as funded_redemptions_router
 from .collection_endpoints import router as collection_endpoints_router
 from .admin_sales import router as admin_sales_router
 from .protocol_artifacts import router as protocol_artifacts_router
@@ -185,12 +186,20 @@ def _warm_chia_puzzle_templates() -> None:
     from solslot_puzzles.vault_version_registry_driver import (
         vault_version_registry_inner_mod,
     )
+    from solslot_puzzles.funded_redemption_v1 import (
+        p2_deed_redemption_v1_mod,
+    )
+    from solslot_puzzles.redemption_treasury_v1 import (
+        redemption_treasury_v1_mod,
+    )
     for mod in (
         admin_authority_v3_inner_mod(),
         mint_proposal_inner_v2_mod(),
         property_registry_inner_mod(),
         protocol_config_inner_mod(),
         vault_version_registry_inner_mod(),
+        p2_deed_redemption_v1_mod(),
+        redemption_treasury_v1_mod(),
     ):
         bytes(mod)
         mod.get_tree_hash()
@@ -454,6 +463,7 @@ if admin_roster_update_router is not None:
     app.include_router(admin_roster_update_router)
 app.include_router(mint_endpoints_router)
 app.include_router(governance_endpoints_router)
+app.include_router(funded_redemptions_router)
 app.include_router(collection_endpoints_router)
 app.include_router(admin_sales_router)
 app.include_router(protocol_artifacts_router)

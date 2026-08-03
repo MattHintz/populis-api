@@ -39,8 +39,18 @@ from solslot_puzzles.sgt_driver import (
 )
 from solslot_puzzles.sgt_reserve_driver import (
     build_reserve_execute_spends,
+    build_reserve_release_spend,
     sgt_cat_puzzle,
     sgt_reserve_inner_puzzle,
+)
+from solslot_puzzles.funded_redemption_v1 import (
+    FundedRedemptionAllocation,
+    FundedRedemptionPlanV1,
+)
+from solslot_puzzles.redemption_treasury_v1 import (
+    fund_redemption_leaves,
+    redemption_treasury_inner_puzzle,
+    redemption_treasury_puzzle,
 )
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
@@ -58,6 +68,7 @@ from solslot_puzzles.vault_v2_driver import (
 
 from .admin_key_changes import _verified_evidence_context
 from .credential_auth import require_vault_record
+from .funded_redemption_store import get_funded_redemption_store
 from .governance_queue import GovernanceQueueRecord
 from .sols_swaps import _confirmed_cat_lineage, _confirmed_coin_and_lineage
 from .vault_eligibility import ApprovedVault, require_current_approved_vault
@@ -83,6 +94,7 @@ class AllocationExecutionBuild:
     bundle: SpendBundle | None
     locked_reserve_coin_id: str | None
     expected_output_coin_ids: tuple[str, ...]
+    blocker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +153,33 @@ def _program(value: object, label: str) -> Program:
         return Program.from_bytes(bytes.fromhex(str(value).removeprefix("0x")))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} is malformed") from exc
+
+
+def _funded_redemption_plan(record: GovernanceQueueRecord) -> FundedRedemptionPlanV1:
+    if record.kind != "FUNDED_REDEMPTION":
+        raise ValueError("proposal is not a funded redemption")
+    allocations_value = record.bill.get("allocations")
+    if not isinstance(allocations_value, list):
+        raise ValueError("funded redemption allocations are unavailable")
+    allocations = tuple(
+        FundedRedemptionAllocation(
+            deed_launcher_id=_b32(item.get("deedLauncherId"), "deed launcher ID"),
+            deed_commitment=_b32(item.get("deedCommitment"), "deed commitment"),
+            share_ppm=int(item.get("sharePpm")),
+            payment_amount=int(item.get("paymentAmount")),
+        )
+        for item in allocations_value
+        if isinstance(item, Mapping)
+    )
+    if len(allocations) != len(allocations_value):
+        raise ValueError("funded redemption allocation is malformed")
+    return FundedRedemptionPlanV1(
+        collection_id=_b32(record.bill.get("collectionId"), "collection ID"),
+        settlement_id=_b32(record.bill.get("settlementId"), "settlement ID"),
+        payment_asset_id=_b32(record.bill.get("paymentAssetId"), "payment asset ID"),
+        total_payment_amount=int(record.bill.get("totalPaymentAmount")),
+        allocations=allocations,
+    ).validate()
 
 
 def _tracker_solution(value: Mapping[str, Any]) -> tuple[int, list[Program]]:
@@ -394,9 +433,15 @@ async def build_allocation_execution(
         reserve_commitment_index = 9
     elif len(bill_values) == 6 and bill_values[0].as_atom() == b"G":
         reserve_commitment_index = 5
+    elif len(bill_values) == 7 and bill_values[0].as_atom() == b"D":
+        reserve_commitment_index = None
     else:
-        raise ValueError("queued bill is not an exact SGT sale or grant")
-    if bytes32(bill_values[reserve_commitment_index].as_atom()) != reserve_inner_hash:
+        raise ValueError("queued bill is not an exact allocation or funded redemption")
+    if (
+        reserve_commitment_index is not None
+        and bytes32(bill_values[reserve_commitment_index].as_atom())
+        != reserve_inner_hash
+    ):
         raise ValueError("SGT bill is not bound to the canonical reserve")
     locked_inner = sgt_locked_inner_puzzle(
         bytes32(sgt_free_inner_mod().get_tree_hash()),
@@ -468,6 +513,126 @@ async def build_allocation_execution(
         tracker_launcher_id=tracker_launcher,
         lineage_proof=lineage_proof_for_coinsol(tracker_parent_spend),
     )
+    if record.kind == "FUNDED_REDEMPTION":
+        redemption_plan = _funded_redemption_plan(record)
+        trusted_wusdc = _b32(
+            _mapping(plan.get("trustedAssets"), "trustedAssets").get(
+                "wusdcBAssetId"
+            ),
+            "trusted wUSDC.b asset ID",
+        )
+        if redemption_plan.payment_asset_id != trusted_wusdc:
+            raise ValueError("funded redemption does not use trusted wUSDC.b")
+        if bytes32(bill.get_tree_hash()) != bytes32(
+            Program.to(
+                [
+                    b"D",
+                    redemption_plan.collection_id,
+                    redemption_plan.settlement_id,
+                    redemption_plan.payment_asset_id,
+                    redemption_plan.total_payment_amount,
+                    redemption_plan.deed_count,
+                    redemption_plan.allocations_root,
+                ]
+            ).get_tree_hash()
+        ):
+            raise ValueError("funded redemption plan does not reproduce its bill")
+        deed_launcher_hash = _b32(
+            puzzles.get("deedLauncherPuzzleHash"),
+            "deed launcher puzzle hash",
+        )
+        treasury_inner = redemption_treasury_inner_puzzle(
+            governance_singleton_struct=tracker_struct,
+            payment_asset_id=trusted_wusdc,
+            deed_launcher_puzzle_hash=deed_launcher_hash,
+        )
+        treasury_full = redemption_treasury_puzzle(
+            governance_singleton_struct=tracker_struct,
+            payment_asset_id=trusted_wusdc,
+            deed_launcher_puzzle_hash=deed_launcher_hash,
+        )
+        funding_store = get_funded_redemption_store(str(settings.admin_db_path))
+        funding = funding_store.get_funding(record.id)
+        if funding is None:
+            return AllocationExecutionBuild(
+                chain,
+                None,
+                _hex32(locked_coin.name()),
+                (),
+                "The approved settlement still needs its exact wUSDC.b funding output.",
+            )
+        if (
+            funding.payment_asset_id.lower() != _hex32(trusted_wusdc)
+            or int(funding.payment_amount) != redemption_plan.total_payment_amount
+        ):
+            raise ValueError("stored redemption funding changes the governed terms")
+        treasury_record = await provider.get_coin_record_by_name(
+            funding.expected_funding_coin_id
+        )
+        treasury_coin = (
+            _coin(treasury_record)
+            if isinstance(treasury_record, Mapping)
+            else None
+        )
+        confirmed_height = int(
+            (treasury_record or {}).get("confirmed_block_index") or 0
+        )
+        spent_height = int((treasury_record or {}).get("spent_block_index") or 0)
+        if (
+            treasury_coin is None
+            or confirmed_height <= 0
+            or spent_height != 0
+        ):
+            return AllocationExecutionBuild(
+                chain,
+                None,
+                _hex32(locked_coin.name()),
+                (),
+                "The exact wUSDC.b funding transaction is waiting for confirmation.",
+            )
+        if (
+            treasury_coin.puzzle_hash != treasury_full.get_tree_hash()
+            or int(treasury_coin.amount) != redemption_plan.total_payment_amount
+        ):
+            raise ValueError("confirmed redemption funding output changed")
+        if funding.status != "CONFIRMED":
+            funding_store.mark_funding_confirmed(record.id, confirmed_height)
+        treasury_lineage = await _confirmed_cat_lineage(
+            provider=provider,
+            coin=treasury_coin,
+            expected_inner_hash=bytes32(treasury_inner.get_tree_hash()),
+            expected_tail_hash=trusted_wusdc,
+        )
+        funded = fund_redemption_leaves(
+            treasury_coin=treasury_coin,
+            treasury_lineage_proof=treasury_lineage,
+            governance_singleton_struct=tracker_struct,
+            governance_inner_puzzle_hash=bytes32(tracker_inner.get_tree_hash()),
+            plan=redemption_plan,
+            deed_launcher_puzzle_hash=deed_launcher_hash,
+        )
+        reserve_release = build_reserve_release_spend(
+            locked_reserve_coin=locked_coin,
+            locked_reserve_lineage_proof=locked_lineage,
+            proposal_tracker_struct=tracker_struct,
+            reserve_owner_inner_hash=reserve_inner_hash,
+            sgt_tail_hash=sgt_tail,
+            bill=bill,
+            voting_deadline=chain.voting_deadline,
+            tracker_inner_puzzle_hash=bytes32(tracker_inner.get_tree_hash()),
+        )
+        bundle = SpendBundle(
+            [tracker_spend, reserve_release, *funded.spend_bundle.coin_spends],
+            G2Element(),
+        )
+        return AllocationExecutionBuild(
+            chain=chain,
+            bundle=bundle,
+            locked_reserve_coin_id=_hex32(locked_coin.name()),
+            expected_output_coin_ids=tuple(
+                _hex32(coin.name()) for coin in funded.leaf_coins
+            ),
+        )
     locked_spend, allocation_spend = build_reserve_execute_spends(
         locked_reserve_coin=locked_coin,
         locked_reserve_lineage_proof=locked_lineage,

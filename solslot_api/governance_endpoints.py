@@ -1532,6 +1532,7 @@ async def reconcile_publication(
                 **({"confirmedHeight": chain.confirmed_height} if chain.confirmed_height is not None else {}),
                 **({"voteTally": str(chain.vote_tally)} if chain.vote_tally is not None else {}),
                 **({"votingDeadline": chain.voting_deadline} if chain.voting_deadline is not None else {}),
+                **({"executionBlocker": execution.blocker} if execution.blocker else {}),
             }
         if chain.state == "EXECUTED":
             if record.execution_bundle_id is None or not record.expected_output_coin_ids:
@@ -1599,6 +1600,8 @@ async def execute_allocation(
             settings=settings,
         )
         if build.chain.state != "AWAITING_EXECUTE" or build.bundle is None:
+            if build.blocker:
+                raise GovernanceQueueConflict(build.blocker)
             raise GovernanceQueueConflict(
                 f"proposal is {build.chain.state.lower().replace('_', ' ')}"
             )

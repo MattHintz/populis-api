@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 
-ProposalKind = Literal["SGT_SALE", "SGT_GRANT"]
+ProposalKind = Literal["SGT_SALE", "SGT_GRANT", "FUNDED_REDEMPTION"]
 ProposalState = Literal[
     "DRAFT", "READY", "ACTIVE", "EXECUTED", "FAILED", "CANCELED"
 ]
@@ -111,11 +111,23 @@ class GovernanceQueueStore:
 
     def _migrate(self) -> None:
         with self._txn() as cursor:
+            existing = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='governance_proposal_queue'"
+            ).fetchone()
+            if existing is not None and "FUNDED_REDEMPTION" not in str(existing[0]):
+                # SQLite cannot widen a CHECK constraint in place. Preserve every
+                # queue row and signature while rebuilding only the constrained
+                # tables; the audit ledger remains untouched.
+                cursor.execute("ALTER TABLE governance_queue_signatures RENAME TO governance_queue_signatures_v1")
+                cursor.execute("ALTER TABLE governance_proposal_queue RENAME TO governance_proposal_queue_v1")
             cursor.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS governance_proposal_queue (
                     id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL CHECK (kind IN ('SGT_SALE','SGT_GRANT')),
+                    kind TEXT NOT NULL CHECK (
+                        kind IN ('SGT_SALE','SGT_GRANT','FUNDED_REDEMPTION')
+                    ),
                     state TEXT NOT NULL CHECK (
                         state IN ('DRAFT','READY','ACTIVE','EXECUTED','FAILED','CANCELED')
                     ),
@@ -162,6 +174,41 @@ class GovernanceQueueStore:
                 );
                 """
             )
+            if existing is not None and "FUNDED_REDEMPTION" not in str(existing[0]):
+                old_columns = {
+                    str(row[1])
+                    for row in cursor.execute(
+                        "PRAGMA table_info(governance_proposal_queue_v1)"
+                    ).fetchall()
+                }
+                new_columns = [
+                    str(row[1])
+                    for row in cursor.execute(
+                        "PRAGMA table_info(governance_proposal_queue)"
+                    ).fetchall()
+                ]
+                shared = [column for column in new_columns if column in old_columns]
+                names = ",".join(shared)
+                cursor.execute(
+                    f"INSERT INTO governance_proposal_queue ({names}) "
+                    f"SELECT {names} FROM governance_proposal_queue_v1"
+                )
+                cursor.execute(
+                    "INSERT INTO governance_queue_signatures "
+                    "SELECT * FROM governance_queue_signatures_v1"
+                )
+                cursor.execute("DROP TABLE governance_queue_signatures_v1")
+                cursor.execute("DROP TABLE governance_proposal_queue_v1")
+                # The original named indexes followed the renamed table and
+                # were removed with it, so recreate them on the widened queue.
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_governance_one_active "
+                    "ON governance_proposal_queue(state) WHERE state='ACTIVE'"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_governance_queue_order "
+                    "ON governance_proposal_queue(state, queue_position, created_at)"
+                )
             self._ensure_column(cursor, "governance_proposal_queue", "activation_bundle_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "proposal_coin_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "completion_bundle_id", "TEXT")
