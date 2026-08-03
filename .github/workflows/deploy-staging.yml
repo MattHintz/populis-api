@@ -471,6 +471,12 @@ jobs:
             Environment=SOLSLOT_API_DOCS_ENABLED=false
             Environment=SOLSLOT_ALPHA_WRITES_ENABLED=false
             Environment=SOLSLOT_MINTING_ENABLED=false
+            Environment=SOLSLOT_COLLECTION_MINTING_ENABLED=false
+            Environment=SOLSLOT_PRESALE_ENABLED=false
+            Environment=SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED=false
+            Environment=SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED=false
+            Environment=SOLSLOT_STRIPE_SETTLEMENT_ENABLED=false
+            Environment=SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED=false
             Environment=SOLSLOT_CEREMONY_MODE_ENABLED=false
             Environment=SOLSLOT_BOOTSTRAP_COOKIE_SECURE=true
             Environment=SOLSLOT_VAULT_SESSION_COOKIE_SECURE=true
@@ -483,6 +489,7 @@ jobs:
             Environment=SOLSLOT_CHALLENGE_STORE_PATH=$state_dir/challenges_v2.db
             Environment=SOLSLOT_ZKPASSPORT_LEDGER_DB_PATH=$state_dir/zkpassport_v2.db
             Environment=SOLSLOT_VAULT_REGISTRY_PATH=$state_dir/vault_registry_v2.db
+            Environment=SOLSLOT_STRIPE_DELIVERY_DB_PATH=$state_dir/stripe_deliveries_v1.db
             Environment=SOLSLOT_ADMIN_DB_PATH=$state_dir/admin_desk_v2.db
             Environment=SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_ACTIVATION_ENABLED=$OWNERSHIP_ACTIVATION_ENABLED
             Environment="SOLSLOT_PAYMENT_OMNICHAIN_OWNERSHIP_SAFE_OPERATION_PATH=$ownership_operation_file"

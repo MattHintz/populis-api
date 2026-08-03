@@ -29,7 +29,7 @@ def _settings(tmp_path) -> Settings:
 def _evidence(settings: Settings) -> dict:
     return {
         "schemaVersion": 2,
-        "kind": "solslot-rc23-settlement-rehearsal",
+        "kind": "solslot-rc26-settlement-rehearsal",
         "releaseTag": settings.launch_release_tag,
         "configHash": CONFIG_HASH,
         "network": "testnet11-base-sepolia",

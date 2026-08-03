@@ -26,6 +26,7 @@ def _settings(tmp_path) -> Settings:
     return Settings(
         runtime_environment="test",
         network="testnet11",
+        launch_release_tag="solslot-v2-alpha-rc26-20260803",
         launch_rehearsal_service_url="https://rehearsal.example",
         launch_rehearsal_service_token="service-token-that-is-long-enough",
         launch_rehearsal_config_hash=CONFIG_HASH,
@@ -46,8 +47,8 @@ def test_rehearsal_service_url_allows_only_tls_or_loopback() -> None:
 def _evidence() -> dict:
     return {
         "schemaVersion": 2,
-        "kind": "solslot-rc23-settlement-rehearsal",
-        "releaseTag": "solslot-v2-alpha-rc23-20260729",
+        "kind": "solslot-rc26-settlement-rehearsal",
+        "releaseTag": "solslot-v2-alpha-rc26-20260803",
         "configHash": CONFIG_HASH,
         "network": "testnet11-base-sepolia",
         "success": True,

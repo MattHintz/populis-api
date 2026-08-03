@@ -45,3 +45,4 @@ Thumbs.db
 *.db-shm
 *.sqlite
 *.sqlite3
+.pymon

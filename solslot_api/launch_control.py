@@ -416,15 +416,15 @@ def _read_json_file(path_value: str | None, label: str) -> tuple[dict[str, Any],
 
 def _load_release_evidence(settings: Settings) -> dict[str, Any]:
     evidence, digest = _read_json_file(
-        settings.launch_source_evidence_path, "RC23 source evidence"
+        settings.launch_source_evidence_path, "RC26 source evidence"
     )
     if settings.launch_source_evidence_sha256:
         expected = settings.launch_source_evidence_sha256.removeprefix("0x").lower()
         if not secrets.compare_digest(digest, expected):
-            raise GenesisConflict("RC23 source evidence checksum changed")
+            raise GenesisConflict("RC26 source evidence checksum changed")
     if (
         evidence.get("schemaVersion") != 5
-        or evidence.get("kind") != "solslot-rc23-launch-source-evidence"
+        or evidence.get("kind") != "solslot-rc26-launch-source-evidence"
         or evidence.get("network") != "testnet11"
         or evidence.get("releaseTag") != settings.launch_release_tag
         or evidence.get("releaseId") != settings.launch_release_tag
@@ -433,7 +433,7 @@ def _load_release_evidence(settings: Settings) -> dict[str, Any]:
         or evidence.get("testOnly") is not True
     ):
         raise GenesisConflict(
-            "RC23 source evidence is incomplete or targets another release"
+            "RC26 source evidence is incomplete or targets another release"
         )
     source_manifest = evidence.get("sourceManifest")
     if (
@@ -452,25 +452,25 @@ def _load_release_evidence(settings: Settings) -> dict[str, Any]:
         != _source_manifest_hash(source_manifest)
     ):
         raise GenesisConflict(
-            "RC23 source manifest checksum or release binding is invalid"
+            "RC26 source manifest checksum or release binding is invalid"
         )
     shas = source_manifest.get("sourceShas")
     if not isinstance(shas, Mapping) or set(shas) != set(SOURCE_KEYS):
         raise GenesisConflict(
-            "RC23 evidence does not freeze all nine source commits"
+            "RC26 evidence does not freeze all nine source commits"
         )
     normalized_shas: dict[str, str] = {}
     for key in SOURCE_KEYS:
         value = str(shas[key]).lower()
         if len(value) != 40:
             raise GenesisConflict(
-                f"RC23 source commit {key} is not a full SHA"
+                f"RC26 source commit {key} is not a full SHA"
             )
         try:
             int(value, 16)
         except ValueError as exc:
             raise GenesisConflict(
-                f"RC23 source commit {key} is invalid"
+                f"RC26 source commit {key} is invalid"
             ) from exc
         normalized_shas[key] = value
     dependencies = source_manifest.get("dependencies")
@@ -489,20 +489,20 @@ def _load_release_evidence(settings: Settings) -> dict[str, Any]:
         != RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX
     ):
         raise GenesisConflict(
-            "RC23 source manifest does not bind the pinned recovery SDK"
+            "RC26 source manifest does not bind the pinned recovery SDK"
         )
     if source_manifest.get(
         "authoritySourceCommitment"
     ) != _authority_source_commitment(normalized_shas):
         raise GenesisConflict(
-            "RC23 Authority V3 source commitment is invalid"
+            "RC26 Authority V3 source commitment is invalid"
         )
     sources = source_manifest.get("sources")
     if not isinstance(sources, Mapping) or set(sources) != set(
         SOURCE_KEYS
     ):
         raise GenesisConflict(
-            "RC23 source records are incomplete"
+            "RC26 source records are incomplete"
         )
     release_branch = (
         "release/testnet-alpha-"
@@ -522,7 +522,7 @@ def _load_release_evidence(settings: Settings) -> dict[str, Any]:
             )
         ):
             raise GenesisConflict(
-                f"RC23 source record {key} is not release-bound"
+                f"RC26 source record {key} is not release-bound"
             )
     return {
         "releaseTag": evidence["releaseTag"],
@@ -541,7 +541,7 @@ def _load_release_evidence(settings: Settings) -> dict[str, Any]:
 
 def _plan_template_evidence(settings: Settings) -> dict[str, Any]:
     template, digest = _read_json_file(
-        settings.launch_plan_template_path, "RC23 launch plan template"
+        settings.launch_plan_template_path, "RC26 launch plan template"
     )
     template["fundingCoinIds"] = PLACEHOLDER_FUNDING_IDS
     plan = PlanRequest.model_validate(template)
@@ -1977,7 +1977,7 @@ async def guided_start_settlement_rehearsal(
         record = store.get(session.ceremony_id)
         release_hash = str(record["draft"].get("releaseEvidenceHash") or "")
         if not HEX32_RE.fullmatch(release_hash):
-            raise GenesisConflict("the RC23 release evidence hash is unavailable")
+            raise GenesisConflict("the RC26 release evidence hash is unavailable")
         remote = await start_rehearsal(
             settings,
             ceremony_id=session.ceremony_id,
@@ -2455,7 +2455,7 @@ async def build_guided_plan(
         if not funding or funding["state"] != "confirmed":
             raise GenesisConflict("confirm the fixed ceremony funding first")
         template, _ = _read_json_file(
-            settings.launch_plan_template_path, "RC23 launch plan template"
+            settings.launch_plan_template_path, "RC26 launch plan template"
         )
         template["fundingCoinIds"] = dict(funding["plan"]["fundingCoinIds"])
         body = PlanRequest.model_validate(template)
