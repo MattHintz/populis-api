@@ -25,7 +25,6 @@ Removed endpoints:
 from __future__ import annotations
 
 import base64
-import gc
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -417,10 +416,6 @@ async def lifespan(app: FastAPI):
         if app.state.faucet_worker is not None:
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()
-        # chia_rs Program/LazyNode values are thread-affine.  Collect request
-        # cycles before this event-loop thread exits so their finalizers never
-        # run later on an unrelated server or test-runner thread.
-        gc.collect()
 
 
 _server_settings = get_settings()
