@@ -14,14 +14,11 @@ from typing import Annotated, Any, Literal, Mapping, Optional
 
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
-from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
-from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
     SINGLETON_MOD,
     SINGLETON_MOD_HASH,
 )
-from chia_rs import G1Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -59,12 +56,13 @@ from solslot_puzzles.sols_pool_v4 import (
     canonical_inventory,
     inventory_root,
 )
-from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, puzzle_for_p2_vault
+from solslot_puzzles.vault_driver import puzzle_for_p2_vault
+from solslot_puzzles.vault_sols_v1 import puzzle_for_vault_sols_cat
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 from .collection_store import CollectionStore, get_collection_store
 from .config import Settings, get_settings
-from .credential_auth import require_vault_record, verify_vault_session
+from .credential_auth import verify_vault_session
 from .public_artifact import (
     PublicArtifactError,
     PublicArtifactMissing,
@@ -1775,28 +1773,41 @@ class SolsMarketReader:
             "provider": self.provider.status(),
         }
 
-    async def registered_bls_balance(
-        self,
-        owner_public_key: bytes,
-        pool_token_tail_hash: str,
-    ) -> int:
-        """Return Sols held by the vault's registered BLS payment key.
-
-        Sols CATs use ordinary wallet payment puzzles. They are not held by the
-        deed-only p2_vault puzzle.
-        """
-        inner = puzzle_for_pk(G1Element.from_bytes(owner_public_key))
-        cat = construct_cat_puzzle(
-            CAT_MOD,
-            bytes32.fromhex(
-                _hex32(pool_token_tail_hash, "pool token tail").removeprefix("0x")
-            ),
-            inner,
+    async def vault_sols_balance(self, vault_launcher_id: str) -> int:
+        """Return Sols held by the canonical Pool V4 vault custody puzzle."""
+        artifact = load_signed_public_artifact(self.settings)
+        pool_tip = await _singleton_tip(
+            self.provider,
+            str(artifact["launcherIds"]["pool"]),
+        )
+        if pool_tip is None:
+            raise ValueError("Pool V4 launcher is not confirmed")
+        pool_solution = await _latest_solution(self.provider, pool_tip)
+        config = (
+            _pool_config(pool_solution, artifact, pool_tip)
+            if pool_solution is not None
+            else _initial_pool_config(artifact, pool_tip)
+        )
+        vault_launcher = bytes32.fromhex(
+            _hex32(vault_launcher_id, "vault launcher").removeprefix("0x")
+        )
+        cat = puzzle_for_vault_sols_cat(
+            config=config,
+            vault_launcher_id=vault_launcher,
         )
         records = await self.provider.get_coin_records_by_puzzle_hash(
-            _hex(cat.get_tree_hash()), include_spent=False
+            _hex(cat.get_tree_hash()),
+            include_spent=False,
         )
-        return sum(int(item["coin"]["amount"]) for item in records)
+        return sum(
+            int(item["coin"]["amount"])
+            for item in records
+            if isinstance(item, Mapping)
+            and isinstance(item.get("coin"), Mapping)
+            and int(item.get("confirmed_block_index") or 0) > 0
+            and int(item.get("spent_block_index") or 0) == 0
+            and not bool(item.get("spent"))
+        )
 
     async def vault_holdings(
         self,
@@ -2744,17 +2755,10 @@ async def vault_sols_opportunities(
         settings,
         session.vault_launcher_id,
     )
-    record = require_vault_record(session.vault_launcher_id)
     try:
         snapshot = await reader.snapshot()
-        tail_hash = str(snapshot["asset"]["tailHash"])
-        balance = (
-            await reader.registered_bls_balance(
-                bytes(record.owner_pubkey),
-                tail_hash,
-            )
-            if record.auth_type == AUTH_TYPE_BLS
-            else 0
+        balance = await reader.vault_sols_balance(
+            approved.launcher_id,
         )
     except (
         ChiaProviderError,
@@ -2767,20 +2771,6 @@ async def vault_sols_opportunities(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"SOLS vault verification failed closed: {exc}",
         ) from exc
-    if record.auth_type != AUTH_TYPE_BLS:
-        return {
-            **snapshot,
-            "vault": {
-                "launcherId": approved.launcher_id,
-                "eligible": False,
-                "reason": "SOLS swaps currently require a Chia or Google BLS vault.",
-                "balanceSolsMojos": str(balance),
-                "balanceCoverage": "UNAVAILABLE_FOR_EVM_VAULT",
-                "identityConfirmed": True,
-            },
-            "opportunities": [],
-            "verifiedOpportunityCount": 0,
-        }
     return {
         **snapshot,
         "vault": {
@@ -2788,7 +2778,7 @@ async def vault_sols_opportunities(
             "eligible": True,
             "reason": None,
             "balanceSolsMojos": str(balance),
-            "balanceCoverage": "REGISTERED_OWNER_KEY",
+            "balanceCoverage": "VAULT_BOUND_CAT",
             "identityConfirmed": True,
         },
         "opportunities": [

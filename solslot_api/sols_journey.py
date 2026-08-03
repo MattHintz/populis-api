@@ -163,7 +163,7 @@ def _recommended_action(
     vouchers: list[dict[str, Any]],
     holdings: list[dict[str, Any]],
     opportunities: list[dict[str, Any]],
-    bls_vault: bool,
+    swap_vault: bool,
 ) -> dict[str, Any]:
     pending = next(
         (
@@ -200,7 +200,7 @@ def _recommended_action(
             "label": "Verify your vault",
             "path": "/my-solslot?view=verify",
         }
-    if bls_vault and opportunities:
+    if swap_vault and opportunities:
         return {
             "kind": "CHOOSE_DEED",
             "label": "Choose a SmartDeed",
@@ -273,17 +273,16 @@ async def customer_journey_snapshot(
         ) from exc
 
     balance: str | None = None
-    balance_coverage = "UNAVAILABLE_FOR_EVM_VAULT"
+    balance_coverage = "AWAITING_SIGNED_GENESIS"
     tail_hash = market.get("asset", {}).get("tailHash")
-    if record.auth_type == AUTH_TYPE_BLS and isinstance(tail_hash, str):
+    if isinstance(tail_hash, str):
         try:
             balance = str(
-                await reader.registered_bls_balance(
-                    bytes(record.owner_pubkey),
-                    tail_hash,
+                await reader.vault_sols_balance(
+                    session.vault_launcher_id,
                 )
             )
-            balance_coverage = "REGISTERED_OWNER_KEY"
+            balance_coverage = "VAULT_BOUND_CAT"
         except (ChiaProviderError, TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -333,8 +332,8 @@ async def customer_journey_snapshot(
     holdings = list(holdings_view["holdings"])
     opportunities = list(market.get("opportunities") or [])
     bls_vault = record.auth_type == AUTH_TYPE_BLS
-    swap_ready = eligible and bls_vault and bool(opportunities)
-    reverse_swap_ready = eligible and bls_vault and bool(holdings)
+    swap_ready = eligible and bool(opportunities)
+    reverse_swap_ready = eligible and bool(holdings)
     capabilities = {
         "primaryPurchase": _capability(
             available=eligible,
@@ -349,8 +348,7 @@ async def customer_journey_snapshot(
                 None
                 if swap_ready
                 else (
-                    "A verified Chia or Google vault and live Pool V4 "
-                    "inventory are required."
+                    "A verified vault and live Pool V4 inventory are required."
                 )
             ),
             path="/swap/sols-to-deed",
@@ -358,21 +356,13 @@ async def customer_journey_snapshot(
         "deedToSols": _capability(
             available=reverse_swap_ready,
             state=(
-                "AVAILABLE"
-                if reverse_swap_ready
-                else "WAITING" if bls_vault else "NOT_YET_AVAILABLE"
+                "AVAILABLE" if reverse_swap_ready else "WAITING"
             ),
             reason=(
                 None
                 if reverse_swap_ready
                 else (
                     "A verified SmartDeed holding is required."
-                    if bls_vault
-                    else (
-                        "EVM vault payouts require the governed Warp wSOLS "
-                        "route. Native Testnet11 swaps use a Chia or Google "
-                        "vault."
-                    )
                 )
             ),
             path="/swap/deed-to-sols",
@@ -443,7 +433,7 @@ async def customer_journey_snapshot(
             vouchers=vouchers,
             holdings=holdings,
             opportunities=opportunities,
-            bls_vault=bls_vault,
+            swap_vault=True,
         ),
         verification={
             "holdingsSource": holdings_view["source"],
