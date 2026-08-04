@@ -43,7 +43,10 @@ from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseArtifactV3,
     PurchaseKind,
     StripeSettlementReceiptV1,
+    purchase_artifact_v3_from_json,
     purchase_artifact_v3_to_json,
+    stripe_evidence_to_json,
+    stripe_receipt_from_json,
     stripe_receipt_to_json,
 )
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
@@ -75,10 +78,16 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     validate_xch_voucher_offer,
 )
 from solslot_puzzles.voucher_presale_v3 import (
+    VoucherV3Error,
     build_stripe_voucher_commitment,
     stripe_original_payer,
     validate_stripe_voucher_purchase,
     voucher_commitment_v3_to_json,
+    voucher_commitment_v3_from_json,
+)
+from solslot_puzzles.voucher_presale_v3_driver import (
+    build_stripe_voucher_terminal_spends,
+    stripe_voucher_evidence_message,
 )
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
@@ -139,6 +148,9 @@ HEX32_PATTERN = r"^0x[0-9a-fA-F]{64}$"
 SERIES_SCHEMA = "solslot.refundable-voucher-series.v2"
 BASE_SETTLEMENT_AUTHORIZATION_SCHEMA = (
     "solslot.base-voucher-settlement-authorization.v2"
+)
+STRIPE_REFUND_AUTHORIZATION_SCHEMA = (
+    "solslot.stripe-voucher-refund-authorization.v1"
 )
 BASE_SEPOLIA_CHAIN_ID = 84532
 BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e"
@@ -372,11 +384,36 @@ class BaseVoucherRefundChainEvidence(ApiModel):
     confirmed_height: int = Field(gt=0)
 
 
+class StripeVoucherRefundChainEvidence(ApiModel):
+    action: int = Field(ge=1, le=4)
+    evidence_id: str = Field(min_length=8, max_length=256)
+    spend_bundle_id: str = Field(pattern=HEX32_PATTERN)
+    external_settlement_evidence_hash: str = Field(pattern=HEX32_PATTERN)
+    terminal_voucher_coin_id: str = Field(pattern=HEX32_PATTERN)
+    series_input_coin_id: str = Field(pattern=HEX32_PATTERN)
+    series_input_parent_coin_id: str = Field(pattern=HEX32_PATTERN)
+    series_output_coin_id: str = Field(pattern=HEX32_PATTERN)
+    series_output_inner_puzzle_hash: str = Field(pattern=HEX32_PATTERN)
+    vault_input_coin_id: str | None = Field(default=None, pattern=HEX32_PATTERN)
+    vault_output_coin_id: str | None = Field(default=None, pattern=HEX32_PATTERN)
+    confirmed_height: int = Field(gt=0)
+
+
 class BaseSettlementRelayEvidenceRequest(ApiModel):
     warp_message_id: str = Field(pattern=HEX32_PATTERN)
     base_transaction_hash: str = Field(pattern=HEX32_PATTERN)
     confirmed_block_number: int = Field(gt=0)
     confirmed_at: int = Field(gt=0)
+
+
+class StripeRefundCompletionRequest(ApiModel):
+    payment_intent_id: str = Field(min_length=8, max_length=128)
+    refund_id: str = Field(min_length=8, max_length=128)
+    event_id: str | None = Field(default=None, min_length=8, max_length=128)
+    refunded_minor: int = Field(gt=0)
+    currency: Literal["usd"] = "usd"
+    livemode: bool
+    observed_at: int = Field(gt=0)
 
 
 class VoucherSeriesPhaseChainEvidence(ApiModel):
@@ -559,6 +596,21 @@ class PresaleStore:
             );
             CREATE INDEX IF NOT EXISTS idx_base_settlement_v2_state
               ON base_settlement_authorizations_v2(state, created_at);
+            CREATE TABLE IF NOT EXISTS stripe_refund_authorizations_v3 (
+              authorization_id TEXT PRIMARY KEY NOT NULL,
+              terms_hash TEXT NOT NULL,
+              serial INTEGER NOT NULL,
+              purchase_id TEXT NOT NULL UNIQUE,
+              authorization_json TEXT NOT NULL,
+              state TEXT NOT NULL CHECK (state IN ('PENDING','COMPLETED')),
+              created_at INTEGER NOT NULL,
+              completed_at INTEGER,
+              completion_json TEXT,
+              FOREIGN KEY (terms_hash, serial)
+                REFERENCES voucher_records_v2(terms_hash, serial)
+            );
+            CREATE INDEX IF NOT EXISTS idx_stripe_refund_v3_state
+              ON stripe_refund_authorizations_v3(state, created_at);
             """
         )
         columns = {
@@ -1728,10 +1780,10 @@ class PresaleStore:
             raise ValueError("voucher delivery window has not expired")
         if voucher["vaultLauncherId"] != vault_launcher_id.lower():
             raise ValueError("refund session does not own this voucher")
-        # Native XCH remains ESCROWED until the owner-authorized atomic bundle
-        # is accepted by the node. External rails enter REFUNDING when their
-        # off-chain refund request is durably recorded.
-        if voucher["paymentRail"] != "CHIA_XCH":
+        # XCH and Stripe V3 remain in their current state until the exact
+        # owner-authorized terminal bundle is accepted by the node. Base uses
+        # its separate escrow coordinator and records REFUNDING immediately.
+        if voucher["paymentRail"] == "BASE_SEPOLIA_USDC":
             self._set_voucher_state(
                 series["termsHash"], serial, expected=expected_state, new="REFUNDING"
             )
@@ -1978,6 +2030,133 @@ class PresaleStore:
             for row in rows
         ]
 
+    def record_stripe_refund_submission(
+        self,
+        terms_hash: str,
+        serial: int,
+        *,
+        action: VoucherAction,
+        spend_bundle_id: str,
+        external_settlement_evidence_hash: str,
+        terminal_voucher_coin_id: str,
+        series_input_coin_id: str,
+        series_output_coin_id: str,
+        vault_input_coin_id: str | None = None,
+        vault_output_coin_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind a Stripe refund only after its exact V3 bundle is accepted."""
+        series = self.get(terms_hash)
+        now = int(time.time())
+        owner_authorized = action in {
+            VoucherAction.REFUND_PRESALE,
+            VoucherAction.REFUND_CANCELED,
+        }
+        if action == VoucherAction.REFUND_EXPIRED:
+            if (
+                series["state"] != "LIVE"
+                or now < int(series["deliveryDeadline"] or 0)
+            ):
+                raise ValueError(
+                    "Stripe automatic refund requires an expired LIVE series"
+                )
+            if vault_input_coin_id is not None or vault_output_coin_id is not None:
+                raise ValueError("automatic refund cannot carry a vault co-spend")
+            expected_state = "REDEEMING"
+        elif owner_authorized:
+            if vault_input_coin_id is None or vault_output_coin_id is None:
+                raise ValueError("owner refund requires exact vault chain bindings")
+            expected_state = "REDEEMING" if series["state"] == "LIVE" else "ESCROWED"
+        else:
+            raise ValueError("Stripe refund action is invalid")
+        normalized = {
+            "refund_action": int(action),
+            "refund_bundle_id": spend_bundle_id.lower(),
+            "terminal_voucher_coin_id": terminal_voucher_coin_id.lower(),
+            "refund_series_input_coin_id": series_input_coin_id.lower(),
+            "refund_series_output_coin_id": series_output_coin_id.lower(),
+            "refund_vault_input_coin_id": (
+                vault_input_coin_id.lower() if vault_input_coin_id else None
+            ),
+            "refund_vault_output_coin_id": (
+                vault_output_coin_id.lower() if vault_output_coin_id else None
+            ),
+            "external_settlement_evidence_hash": (
+                external_settlement_evidence_hash.lower()
+            ),
+        }
+        with self.txn() as cur:
+            row = cur.execute(
+                "SELECT * FROM voucher_records_v2 WHERE terms_hash=? AND serial=?",
+                (series["termsHash"].lower(), serial),
+            ).fetchone()
+            if row is None:
+                raise KeyError(serial)
+            exact_retry = row["state"] == "REFUNDING" and all(
+                row[field] == value for field, value in normalized.items()
+            )
+            if exact_retry:
+                return self.voucher(series["termsHash"], serial)
+            if row["payment_rail"] != "STRIPE_USD" or row["state"] != expected_state:
+                raise ValueError(
+                    "Stripe refund requires the exact unspent voucher state"
+                )
+            if any(row[field] is not None for field in normalized):
+                raise ValueError("Stripe voucher refund is already bound")
+            if (
+                series["chainState"]["currentCoinId"]
+                != normalized["refund_series_input_coin_id"]
+            ):
+                raise ValueError("refund does not spend the current series coin")
+            updated = cur.execute(
+                """
+                UPDATE voucher_records_v2
+                SET state='REFUNDING', refund_action=?, refund_bundle_id=?,
+                    terminal_voucher_coin_id=?,
+                    refund_series_input_coin_id=?, refund_series_output_coin_id=?,
+                    refund_vault_input_coin_id=?, refund_vault_output_coin_id=?,
+                    external_settlement_evidence_hash=?,
+                    refund_submitted_at=?, updated_at=?
+                WHERE terms_hash=? AND serial=? AND state=?
+                """,
+                (
+                    normalized["refund_action"],
+                    normalized["refund_bundle_id"],
+                    normalized["terminal_voucher_coin_id"],
+                    normalized["refund_series_input_coin_id"],
+                    normalized["refund_series_output_coin_id"],
+                    normalized["refund_vault_input_coin_id"],
+                    normalized["refund_vault_output_coin_id"],
+                    normalized["external_settlement_evidence_hash"],
+                    now,
+                    now,
+                    series["termsHash"].lower(),
+                    serial,
+                    expected_state,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise ValueError("series changed during Stripe refund submission")
+        return self.voucher(series["termsHash"], serial)
+
+    def pending_stripe_refunds(
+        self,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        rows = self._conn.execute(
+            """
+            SELECT terms_hash, serial FROM voucher_records_v2
+            WHERE payment_rail='STRIPE_USD' AND state='REFUNDING'
+              AND refund_bundle_id IS NOT NULL
+            ORDER BY refund_submitted_at, terms_hash, serial
+            """
+        ).fetchall()
+        return [
+            (
+                self._get_series(row["terms_hash"]),
+                self.voucher(row["terms_hash"], row["serial"]),
+            )
+            for row in rows
+        ]
+
     def confirm_base_refund(
         self,
         terms_hash: str,
@@ -2092,6 +2271,227 @@ class PresaleStore:
                 now=now,
             )
         return self.voucher(series["termsHash"], serial)
+
+    def confirm_stripe_refund(
+        self,
+        terms_hash: str,
+        serial: int,
+        evidence: StripeVoucherRefundChainEvidence,
+    ) -> dict[str, Any]:
+        """Authorize the exact fiat refund only after V3 terminal confirmation."""
+        series = self.get(terms_hash)
+        now = int(time.time())
+        expected = {
+            "refund_action": evidence.action,
+            "refund_bundle_id": evidence.spend_bundle_id.lower(),
+            "terminal_voucher_coin_id": evidence.terminal_voucher_coin_id.lower(),
+            "refund_series_input_coin_id": evidence.series_input_coin_id.lower(),
+            "refund_series_output_coin_id": evidence.series_output_coin_id.lower(),
+            "refund_vault_input_coin_id": (
+                evidence.vault_input_coin_id.lower()
+                if evidence.vault_input_coin_id
+                else None
+            ),
+            "refund_vault_output_coin_id": (
+                evidence.vault_output_coin_id.lower()
+                if evidence.vault_output_coin_id
+                else None
+            ),
+            "external_settlement_evidence_hash": (
+                evidence.external_settlement_evidence_hash.lower()
+            ),
+        }
+        owner_authorized = evidence.action in {
+            int(VoucherAction.REFUND_PRESALE),
+            int(VoucherAction.REFUND_CANCELED),
+        }
+        if evidence.action == int(VoucherAction.REFUND_EXPIRED):
+            if evidence.vault_input_coin_id or evidence.vault_output_coin_id:
+                raise ValueError("automatic Stripe refund cannot include a vault")
+        elif owner_authorized:
+            if not evidence.vault_input_coin_id or not evidence.vault_output_coin_id:
+                raise ValueError("owner Stripe refund requires a vault successor")
+        else:
+            raise ValueError("Stripe refund evidence action is invalid")
+        with self.txn() as cur:
+            chain = cur.execute(
+                """
+                SELECT current_coin_id, current_inner_puzzle_hash
+                FROM presale_series_v2 WHERE terms_hash=?
+                """,
+                (series["termsHash"].lower(),),
+            ).fetchone()
+            row = cur.execute(
+                "SELECT * FROM voucher_records_v2 WHERE terms_hash=? AND serial=?",
+                (series["termsHash"].lower(), serial),
+            ).fetchone()
+            if row is None:
+                raise KeyError(serial)
+            if (
+                row["payment_rail"] != "STRIPE_USD"
+                or row["state"] != "REFUNDING"
+                or any(row[field] != value for field, value in expected.items())
+            ):
+                raise ValueError(
+                    "Stripe refund evidence differs from submitted chain outputs"
+                )
+            if chain is None or chain["current_coin_id"] != expected[
+                "refund_series_input_coin_id"
+            ]:
+                raise ValueError("Stripe refund does not spend the current series coin")
+            receipt_json = json.loads(row["settlement_receipt_json"] or "null")
+            if not isinstance(receipt_json, dict):
+                raise ValueError("Stripe voucher settlement receipt is missing")
+            receipt = stripe_receipt_from_json(receipt_json)
+            if (
+                _hex32(receipt.artifact.purchase_id) != row["purchase_id"]
+                or receipt.evidence.payment_intent_id == ""
+                or receipt.evidence.amount_minor != row["payment_principal"]
+                or _hex32(receipt.evidence.evidence_hash)
+                != expected["external_settlement_evidence_hash"]
+            ):
+                raise ValueError("Stripe refund receipt commitments changed")
+            authorization_body = {
+                "schema": STRIPE_REFUND_AUTHORIZATION_SCHEMA,
+                "termsHash": series["termsHash"].lower(),
+                "serial": serial,
+                "purchaseId": row["purchase_id"],
+                "purchaseArtifactHash": _hex32(receipt.artifact.artifact_hash),
+                "paymentIntentId": receipt.evidence.payment_intent_id,
+                "amountMinor": str(receipt.evidence.amount_minor),
+                "currency": "usd",
+                "globalPaymentId": row["global_payment_id"],
+                "terminalBundleId": evidence.spend_bundle_id.lower(),
+                "terminalEvidenceHash": (
+                    evidence.external_settlement_evidence_hash.lower()
+                ),
+                "confirmedHeight": evidence.confirmed_height,
+            }
+            authorization_id = "0x" + hashlib.sha256(
+                _json(authorization_body).encode("ascii")
+            ).hexdigest()
+            authorization = {
+                **authorization_body,
+                "authorizationId": authorization_id,
+            }
+            voucher_updated = cur.execute(
+                """
+                UPDATE voucher_records_v2
+                SET state='REFUNDED', refund_evidence_id=?,
+                    refund_confirmed_height=?, updated_at=?
+                WHERE terms_hash=? AND serial=? AND state='REFUNDING'
+                """,
+                (
+                    evidence.evidence_id,
+                    evidence.confirmed_height,
+                    now,
+                    series["termsHash"].lower(),
+                    serial,
+                ),
+            ).rowcount
+            series_updated = cur.execute(
+                """
+                UPDATE presale_series_v2
+                SET current_coin_id=?, current_inner_puzzle_hash=?,
+                    lineage_parent_name=?, lineage_inner_puzzle_hash=?,
+                    refunded_count=refunded_count+1, updated_at=?
+                WHERE terms_hash=? AND current_coin_id=?
+                """,
+                (
+                    evidence.series_output_coin_id.lower(),
+                    evidence.series_output_inner_puzzle_hash.lower(),
+                    evidence.series_input_parent_coin_id.lower(),
+                    chain["current_inner_puzzle_hash"],
+                    now,
+                    series["termsHash"].lower(),
+                    evidence.series_input_coin_id.lower(),
+                ),
+            ).rowcount
+            if voucher_updated != 1 or series_updated != 1:
+                raise ValueError("series state changed during Stripe refund confirmation")
+            cur.execute(
+                """
+                INSERT INTO stripe_refund_authorizations_v3(
+                  authorization_id, terms_hash, serial, purchase_id,
+                  authorization_json, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+                """,
+                (
+                    authorization_id,
+                    series["termsHash"].lower(),
+                    serial,
+                    row["purchase_id"],
+                    _json(authorization),
+                    now,
+                ),
+            )
+        return self.voucher(series["termsHash"], serial)
+
+    def pending_stripe_refund_authorizations(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        rows = self._conn.execute(
+            """
+            SELECT authorization_json FROM stripe_refund_authorizations_v3
+            WHERE state='PENDING' ORDER BY created_at LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [json.loads(row["authorization_json"]) for row in rows]
+
+    def complete_stripe_refund_authorization(
+        self,
+        authorization_id: str,
+        completion: StripeRefundCompletionRequest,
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        completion_json = completion.model_dump(by_alias=True)
+        with self.txn() as cur:
+            row = cur.execute(
+                """
+                SELECT * FROM stripe_refund_authorizations_v3
+                WHERE authorization_id=?
+                """,
+                (authorization_id.lower(),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(authorization_id)
+            authorization = json.loads(row["authorization_json"])
+            expected_amount = int(authorization["amountMinor"])
+            if (
+                completion.payment_intent_id
+                != authorization["paymentIntentId"]
+                or completion.refunded_minor != expected_amount
+                or completion.currency != authorization["currency"]
+            ):
+                raise ValueError("Stripe refund completion changes the authorization")
+            if row["state"] == "COMPLETED":
+                if json.loads(row["completion_json"]) != completion_json:
+                    raise ValueError("Stripe refund completion evidence changed")
+                return {
+                    "authorization": authorization,
+                    "state": "COMPLETED",
+                    "completion": completion_json,
+                }
+            updated = cur.execute(
+                """
+                UPDATE stripe_refund_authorizations_v3
+                SET state='COMPLETED', completed_at=?, completion_json=?
+                WHERE authorization_id=? AND state='PENDING'
+                """,
+                (now, _json(completion_json), authorization_id.lower()),
+            ).rowcount
+            if updated != 1:
+                raise ValueError("Stripe refund authorization changed")
+        return {
+            "authorization": authorization,
+            "state": "COMPLETED",
+            "completion": completion_json,
+        }
 
     def confirm_native_refund(
         self,
@@ -2236,6 +2636,26 @@ class PresaleStore:
             for row in rows
         ]
 
+    def pending_stripe_redemptions(
+        self,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        rows = self._conn.execute(
+            """
+            SELECT v.terms_hash, v.serial FROM voucher_records_v2 v
+            JOIN presale_series_v2 s ON s.terms_hash=v.terms_hash
+            WHERE v.payment_rail='STRIPE_USD' AND v.state='REDEEMING'
+              AND s.state='LIVE' AND s.phase_confirmed_height IS NOT NULL
+            ORDER BY v.created_at, v.terms_hash, v.serial
+            """
+        ).fetchall()
+        return [
+            (
+                self._get_series(row["terms_hash"]),
+                self.voucher(row["terms_hash"], row["serial"]),
+            )
+            for row in rows
+        ]
+
     def record_redemption_submission(
         self,
         terms_hash: str,
@@ -2288,10 +2708,13 @@ class PresaleStore:
                     raise ValueError(
                         "native redemption cannot carry external settlement evidence"
                     )
-            elif row["payment_rail"] == "BASE_SEPOLIA_USDC":
+            elif row["payment_rail"] in {
+                "BASE_SEPOLIA_USDC",
+                "STRIPE_USD",
+            }:
                 if external_settlement_evidence_hash is None:
                     raise ValueError(
-                        "Base redemption requires external settlement evidence"
+                        "external redemption requires settlement evidence"
                     )
             else:
                 raise ValueError("voucher redemption rail is unsupported")
@@ -2380,7 +2803,8 @@ class PresaleStore:
                 row["payment_rail"] == "CHIA_XCH"
                 and evidence.external_settlement_evidence_hash is not None
             ) or (
-                row["payment_rail"] == "BASE_SEPOLIA_USDC"
+                row["payment_rail"]
+                in {"BASE_SEPOLIA_USDC", "STRIPE_USD"}
                 and evidence.external_settlement_evidence_hash is None
             ):
                 raise ValueError(
@@ -2681,7 +3105,11 @@ class PresaleStore:
     ) -> dict[str, Any]:
         series = self.get(terms_hash)
         voucher = self.voucher(series["termsHash"], serial)
-        if voucher["paymentRail"] in {"CHIA_XCH", "BASE_SEPOLIA_USDC"}:
+        if voucher["paymentRail"] in {
+            "CHIA_XCH",
+            "BASE_SEPOLIA_USDC",
+            "STRIPE_USD",
+        }:
             raise ValueError(
                 "voucher refund requires exact atomic Chia confirmation"
             )
@@ -2879,7 +3307,11 @@ class PresaleStore:
     ) -> dict[str, Any]:
         series = self.get(terms_hash)
         voucher = self.voucher(series["termsHash"], serial)
-        if voucher["paymentRail"] in {"CHIA_XCH", "BASE_SEPOLIA_USDC"}:
+        if voucher["paymentRail"] in {
+            "CHIA_XCH",
+            "BASE_SEPOLIA_USDC",
+            "STRIPE_USD",
+        }:
             raise ValueError(
                 "voucher delivery requires exact atomic Chia confirmation"
             )
@@ -4100,7 +4532,7 @@ def response_or_404(call):
         raise HTTPException(status_code=404, detail="presale or voucher not found") from exc
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="duplicate presale or payment evidence") from exc
-    except (ValueError, VoucherV2Error) as exc:
+    except (ValueError, VoucherV2Error, VoucherV3Error) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -4108,6 +4540,66 @@ def _public_presale(series: dict[str, Any]) -> dict[str, Any]:
     public = dict(series)
     public.pop("vouchers", None)
     return public
+
+
+@router.get("/stripe-refunds/pending")
+def pending_stripe_refunds(
+    store: Annotated[PresaleStore, Depends(get_presale_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[Optional[str], Header()] = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    if not settings.protocol_artifact_api_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="protocol artifact bearer authentication is not configured",
+        )
+    _require_server_to_server_token(settings, authorization)
+    return {
+        "schema": STRIPE_REFUND_AUTHORIZATION_SCHEMA,
+        "authorizations": response_or_404(
+            lambda: store.pending_stripe_refund_authorizations(limit=limit)
+        ),
+    }
+
+
+@router.post("/stripe-refunds/{authorization_id}/completion")
+def complete_stripe_refund(
+    authorization_id: str,
+    body: StripeRefundCompletionRequest,
+    store: Annotated[PresaleStore, Depends(get_presale_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> dict[str, Any]:
+    if not settings.protocol_artifact_api_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="protocol artifact bearer authentication is not configured",
+        )
+    _require_server_to_server_token(settings, authorization)
+    if (
+        len(authorization_id) != 66
+        or not authorization_id.startswith("0x")
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in authorization_id[2:]
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="authorization ID must be a 32-byte hex value",
+        )
+    if body.livemode != (settings.stripe_mode == "live"):
+        raise HTTPException(
+            status_code=409,
+            detail="Stripe refund completion uses the wrong account mode",
+        )
+    return response_or_404(
+        lambda: store.complete_stripe_refund_authorization(
+            authorization_id,
+            body,
+        )
+    )
 
 
 @router.get("/base-settlements/pending")
@@ -4685,10 +5177,15 @@ async def request_voucher_refund(
     voucher = response_or_404(lambda: store.voucher(terms_hash, serial))
     session = verify_vault_session(settings, request, voucher["vaultLauncherId"])
     approved = require_current_approved_vault(settings, session.vault_launcher_id)
-    if voucher["paymentRail"] != "CHIA_XCH":
+    if voucher["paymentRail"] == "BASE_SEPOLIA_USDC":
         raise HTTPException(
             status_code=409,
             detail="Base USDC refunds use the escrow refund coordinator.",
+        )
+    if voucher["paymentRail"] not in {"CHIA_XCH", "STRIPE_USD"}:
+        raise HTTPException(
+            status_code=409,
+            detail="This voucher payment rail cannot use the refund flow.",
         )
     eligible = response_or_404(
         lambda: store.request_refund(
@@ -4771,7 +5268,7 @@ async def complete_voucher_refund(
         "series": str(series["chainState"]["currentCoinId"] or "").lower(),
     }
     if (
-        voucher_json["paymentRail"] != "CHIA_XCH"
+        voucher_json["paymentRail"] not in {"CHIA_XCH", "STRIPE_USD"}
         or body.voucher_coin_id.lower() != expected_ids["voucher"]
         or body.series_coin_id.lower() != expected_ids["series"]
     ):
@@ -4780,12 +5277,34 @@ async def complete_voucher_refund(
             detail="Refund chain inputs changed after wallet review.",
         )
     try:
+        is_stripe = voucher_json["paymentRail"] == "STRIPE_USD"
         terms = _series_program(series["terms"])
-        voucher = voucher_commitment_from_json(voucher_json["commitment"])
         stored_purchase = get_payment_purchase_store(
             settings.payment_purchase_db_path
         ).get(str(voucher_json["purchaseId"]))
-        purchase = purchase_artifact_from_json(stored_purchase.purchase_artifact)
+        if is_stripe:
+            voucher = voucher_commitment_v3_from_json(
+                voucher_json["commitment"]
+            )
+            purchase = purchase_artifact_v3_from_json(
+                stored_purchase.purchase_artifact
+            )
+            receipt_json = voucher_json.get("settlementReceipt")
+            if not isinstance(receipt_json, dict):
+                raise ValueError("Stripe voucher settlement receipt is missing")
+            stripe_receipt = stripe_receipt_from_json(receipt_json)
+            if stripe_receipt.artifact != purchase:
+                raise ValueError("Stripe voucher receipt changed")
+            terminal_evidence_hash = stripe_receipt.evidence.evidence_hash
+        else:
+            voucher = voucher_commitment_from_json(
+                voucher_json["commitment"]
+            )
+            purchase = purchase_artifact_from_json(
+                stored_purchase.purchase_artifact
+            )
+            stripe_receipt = None
+            terminal_evidence_hash = None
         state = _chain_series_state(series)
         refund_action = _voucher_refund_action(
             series,
@@ -4811,7 +5330,7 @@ async def complete_voucher_refund(
             or _hex32(payment_coin.name())
             != str(voucher_json["paymentCommitmentCoinId"]).lower()
         ):
-            raise ValueError("voucher XCH escrow coin is not confirmed and unspent")
+            raise ValueError("voucher receipt coin is not confirmed and unspent")
         (
             vault_coin,
             _vault_lineage,
@@ -4828,21 +5347,49 @@ async def complete_voucher_refund(
             current_timestamp=body.current_timestamp,
             owner_authorization=body.owner_authorization,
         )
-        provisional = build_xch_voucher_terminal_spends(
-            terms=terms,
-            state=state,
-            series_coin=series_coin,
-            series_lineage_proof=series_lineage,
-            voucher=voucher,
-            purchase=purchase,
-            voucher_launcher_id=_b32(voucher_json["voucherLauncherId"], nonzero=True),
-            voucher_coin=voucher_coin,
-            voucher_lineage_proof=voucher_lineage,
-            payment_coin=payment_coin,
-            vault_coin_id=vault_coin.name(),
-            vault_inner_puzzle_hash=vault_inner_hash,
-            action=refund_action,
-            signer_indices=tuple(range(settings.zkpassport_validator_threshold)),
+        provisional = (
+            build_stripe_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                artifact=purchase,
+                voucher_launcher_id=_b32(
+                    voucher_json["voucherLauncherId"], nonzero=True
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                receipt_coin=payment_coin,
+                vault_coin_id=vault_coin.name(),
+                vault_inner_puzzle_hash=vault_inner_hash,
+                action=refund_action,
+                terminal_evidence_hash=terminal_evidence_hash,
+                signer_indices=tuple(
+                    range(settings.zkpassport_validator_threshold)
+                ),
+            )
+            if is_stripe and terminal_evidence_hash is not None
+            else build_xch_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                purchase=purchase,
+                voucher_launcher_id=_b32(
+                    voucher_json["voucherLauncherId"], nonzero=True
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                payment_coin=payment_coin,
+                vault_coin_id=vault_coin.name(),
+                vault_inner_puzzle_hash=vault_inner_hash,
+                action=refund_action,
+                signer_indices=tuple(
+                    range(settings.zkpassport_validator_threshold)
+                ),
+            )
         )
         genesis = load_signed_public_artifact(settings)
         claim = VoucherTransitionClaim(
@@ -4870,24 +5417,63 @@ async def complete_voucher_refund(
             ),
             current_timestamp=body.current_timestamp,
             action=int(refund_action),
+            payment_evidence=(
+                stripe_evidence_to_json(stripe_receipt.evidence)
+                if stripe_receipt is not None
+                else None
+            ),
+            external_settlement_evidence_hash=(
+                _hex32(terminal_evidence_hash)
+                if terminal_evidence_hash is not None
+                else None
+            ),
+            external_validator_message=(
+                _hex32(provisional.receipt_validator_message)
+                if is_stripe
+                else None
+            ),
             validator_message=_hex32(provisional.validator_message),
         )
         quorum = await collect_voucher_transition_quorum(settings, claim)
-        terminal = build_xch_voucher_terminal_spends(
-            terms=terms,
-            state=state,
-            series_coin=series_coin,
-            series_lineage_proof=series_lineage,
-            voucher=voucher,
-            purchase=purchase,
-            voucher_launcher_id=_b32(voucher_json["voucherLauncherId"], nonzero=True),
-            voucher_coin=voucher_coin,
-            voucher_lineage_proof=voucher_lineage,
-            payment_coin=payment_coin,
-            vault_coin_id=vault_coin.name(),
-            vault_inner_puzzle_hash=vault_inner_hash,
-            action=refund_action,
-            signer_indices=quorum.signer_indices,
+        terminal = (
+            build_stripe_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                artifact=purchase,
+                voucher_launcher_id=_b32(
+                    voucher_json["voucherLauncherId"], nonzero=True
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                receipt_coin=payment_coin,
+                vault_coin_id=vault_coin.name(),
+                vault_inner_puzzle_hash=vault_inner_hash,
+                action=refund_action,
+                terminal_evidence_hash=terminal_evidence_hash,
+                signer_indices=quorum.signer_indices,
+            )
+            if is_stripe and terminal_evidence_hash is not None
+            else build_xch_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                purchase=purchase,
+                voucher_launcher_id=_b32(
+                    voucher_json["voucherLauncherId"], nonzero=True
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                payment_coin=payment_coin,
+                vault_coin_id=vault_coin.name(),
+                vault_inner_puzzle_hash=vault_inner_hash,
+                action=refund_action,
+                signer_indices=quorum.signer_indices,
+            )
         )
         if terminal.validator_message != provisional.validator_message:
             raise VoucherV2Error("refund transition changed after quorum selection")
@@ -4905,6 +5491,7 @@ async def complete_voucher_refund(
         PublicArtifactError,
         ValidatorQuorumError,
         VoucherV2Error,
+        VoucherV3Error,
         TypeError,
         ValueError,
     ) as exc:
@@ -4919,27 +5506,56 @@ async def complete_voucher_refund(
     if not result.get("success") and network_status not in {"SUCCESS", "PENDING"}:
         raise HTTPException(
             status_code=502,
-            detail="The atomic XCH voucher refund was rejected by the Chia node.",
+            detail="The atomic voucher refund was rejected by the Chia node.",
         )
     next_vault_coin = Coin(
         vault_coin.name(),
         vault_coin.puzzle_hash,
         uint64(1),
     )
-    submitted = response_or_404(
-        lambda: store.record_native_refund_submission(
-            series["termsHash"],
-            serial,
-            action=refund_action,
-            spend_bundle_id=_hex32(bundle.name()),
-            refund_output_coin_id=_hex32(terminal.settlement_coin.name()),
-            terminal_voucher_coin_id=_hex32(terminal.terminal_voucher_coin.name()),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
-            vault_input_coin_id=_hex32(vault_coin.name()),
-            vault_output_coin_id=_hex32(next_vault_coin.name()),
+    if is_stripe:
+        assert terminal_evidence_hash is not None
+        submitted = response_or_404(
+            lambda: store.record_stripe_refund_submission(
+                series["termsHash"],
+                serial,
+                action=refund_action,
+                spend_bundle_id=_hex32(bundle.name()),
+                external_settlement_evidence_hash=_hex32(
+                    terminal_evidence_hash
+                ),
+                terminal_voucher_coin_id=_hex32(
+                    terminal.terminal_voucher_coin.name()
+                ),
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(
+                    terminal.next_series_coin.name()
+                ),
+                vault_input_coin_id=_hex32(vault_coin.name()),
+                vault_output_coin_id=_hex32(next_vault_coin.name()),
+            )
         )
-    )
+    else:
+        submitted = response_or_404(
+            lambda: store.record_native_refund_submission(
+                series["termsHash"],
+                serial,
+                action=refund_action,
+                spend_bundle_id=_hex32(bundle.name()),
+                refund_output_coin_id=_hex32(
+                    terminal.settlement_coin.name()
+                ),
+                terminal_voucher_coin_id=_hex32(
+                    terminal.terminal_voucher_coin.name()
+                ),
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(
+                    terminal.next_series_coin.name()
+                ),
+                vault_input_coin_id=_hex32(vault_coin.name()),
+                vault_output_coin_id=_hex32(next_vault_coin.name()),
+            )
+        )
     return CompleteVoucherRefundResponse(
         termsHash=series["termsHash"],
         serial=serial,

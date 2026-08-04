@@ -132,6 +132,10 @@ from solslot_puzzles.voucher_presale_v3 import (
 )
 from solslot_puzzles.voucher_presale_v3_driver import (
     build_stripe_voucher_issuance_spends,
+    build_stripe_voucher_primary_offer_v5,
+    build_stripe_voucher_terminal_spends,
+    prepare_stripe_voucher_redemption_offer,
+    stripe_voucher_evidence_message,
 )
 
 from .config import Settings
@@ -2667,10 +2671,39 @@ def verify_voucher_transition_claim(
         raise ValidatorEvidenceError("voucher transition does not match active genesis")
     if abs(int(time.time()) - claim.current_timestamp) > settings.claim_clock_skew_seconds:
         raise ValidatorEvidenceError("voucher owner authorization timestamp is stale")
+    is_stripe = (
+        claim.voucher_commitment.get("schema")
+        == "solslot.voucher-commitment.v3"
+    )
     try:
         terms = series_terms_from_json(claim.series_terms)
-        voucher = voucher_commitment_from_json(claim.voucher_commitment)
-        purchase = purchase_artifact_from_json(claim.purchase_artifact)
+        if is_stripe:
+            voucher = voucher_commitment_v3_from_json(
+                claim.voucher_commitment
+            )
+            purchase = purchase_artifact_v3_from_json(
+                claim.purchase_artifact
+            )
+            if claim.payment_evidence is None:
+                raise ValueError("Stripe terminal evidence is missing")
+            stripe_evidence = stripe_settlement_evidence_from_json(
+                claim.payment_evidence
+            )
+            receipt = build_stripe_settlement_receipt_v1(
+                artifact=purchase,
+                evidence=stripe_evidence,
+                validator_pubkeys=tuple(
+                    bytes.fromhex(value.removeprefix("0x"))
+                    for value in settings.roster_pubkeys
+                ),  # type: ignore[arg-type]
+            )
+        else:
+            voucher = voucher_commitment_from_json(
+                claim.voucher_commitment
+            )
+            purchase = purchase_artifact_from_json(
+                claim.purchase_artifact
+            )
         state = VoucherSeriesStateV2(
             sold_count=claim.series_sold_count,
             redeemed_count=claim.series_redeemed_count,
@@ -2679,19 +2712,73 @@ def verify_voucher_transition_claim(
             launched_at=claim.series_launched_at,
         )
         action = VoucherAction(claim.action)
-    except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+    except (
+        PaymentArtifactError,
+        VoucherV2Error,
+        VoucherV3Error,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise ValidatorEvidenceError("voucher transition commitments are invalid") from exc
     is_base = (
+        not is_stripe
+        and
         voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC
         and purchase.rail == PaymentRail.EVM_TEST_USD
     )
     is_native = (
+        not is_stripe
+        and
         voucher.payment_rail == VoucherPaymentRail.CHIA_XCH
         and purchase.rail == PaymentRail.CHIA_XCH
     )
-    if not is_base and not is_native:
+    if is_stripe and (
+        voucher.payment_rail != VoucherPaymentRailV3.STRIPE_USD
+        or purchase.rail != PaymentRail.STRIPE
+        or purchase.purchase_kind != PurchaseKind.PRESALE
+        or receipt.artifact != purchase
+    ):
+        raise ValidatorEvidenceError(
+            "Stripe voucher transition payment rail is inconsistent"
+        )
+    if not is_base and not is_native and not is_stripe:
         raise ValidatorEvidenceError("voucher transition payment rail is inconsistent")
-    if is_base:
+    if is_stripe:
+        if (
+            claim.external_settlement_evidence_hash is None
+            or claim.external_validator_message is None
+        ):
+            raise ValidatorEvidenceError(
+                "Stripe voucher transition has no authenticated payment evidence"
+            )
+        expected_evidence_hash = "0x" + bytes(
+            stripe_evidence.evidence_hash
+        ).hex()
+        if claim.external_settlement_evidence_hash != expected_evidence_hash:
+            raise ValidatorEvidenceError(
+                "Stripe voucher settlement evidence hash changed"
+            )
+        expected_validator_message = stripe_voucher_evidence_message(
+            terms=terms,
+            voucher=voucher,
+            artifact=purchase,
+            action=action,
+            terminal_evidence_hash=stripe_evidence.evidence_hash,
+        )
+        if claim.external_validator_message != "0x" + bytes(
+            expected_validator_message
+        ).hex():
+            raise ValidatorEvidenceError(
+                "Stripe voucher settlement validator message changed"
+            )
+        _verify_stripe_provider_evidence(
+            settings,
+            SimpleNamespace(
+                stripe_evidence=claim.payment_evidence,
+                purchase_artifact=claim.purchase_artifact,
+            ),
+        )
+    elif is_base:
         if (
             claim.payment_evidence is None
             or claim.external_settlement_evidence_hash is None
@@ -2929,7 +3016,46 @@ def verify_voucher_transition_claim(
         vault_inner_puzzle_hash = bytes32(vault_args[1].get_tree_hash())
 
     try:
-        if is_base:
+        if is_stripe:
+            assert claim.external_settlement_evidence_hash is not None
+            transition = build_stripe_voucher_terminal_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                artifact=purchase,
+                voucher_launcher_id=bytes32.fromhex(
+                    claim.voucher_launcher_id.removeprefix("0x")
+                ),
+                voucher_coin=voucher_coin,
+                voucher_lineage_proof=voucher_lineage,
+                receipt_coin=payment_coin,
+                vault_coin_id=(
+                    vault_coin_id
+                    if action
+                    in {
+                        VoucherAction.REFUND_PRESALE,
+                        VoucherAction.REFUND_CANCELED,
+                    }
+                    else bytes32.zeros
+                ),
+                vault_inner_puzzle_hash=(
+                    vault_inner_puzzle_hash
+                    if action
+                    in {
+                        VoucherAction.REFUND_PRESALE,
+                        VoucherAction.REFUND_CANCELED,
+                    }
+                    else bytes32.zeros
+                ),
+                action=action,
+                terminal_evidence_hash=bytes32.fromhex(
+                    claim.external_settlement_evidence_hash.removeprefix("0x")
+                ),
+                signer_indices=(0, 1),
+            )
+        elif is_base:
             assert claim.external_settlement_evidence_hash is not None
             transition = build_base_voucher_terminal_spends(
                 terms=terms,
@@ -2987,7 +3113,13 @@ def verify_voucher_transition_claim(
                 action=action,
                 signer_indices=(0, 1),
             )
-    except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+    except (
+        PaymentArtifactError,
+        VoucherV2Error,
+        VoucherV3Error,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise ValidatorEvidenceError("voucher terminal spends cannot be re-derived") from exc
     if "0x" + bytes(transition.validator_message).hex() != claim.validator_message:
         raise ValidatorEvidenceError("voucher transition validator message changed")
@@ -3007,23 +3139,6 @@ def verify_voucher_transition_claim(
                 "voucher redemption deed evidence is incomplete"
             )
         try:
-            mint_terms = PrimaryMintTermsV2(
-                network=purchase.network,
-                smart_deed_inner_hash=bytes32.fromhex(
-                    claim.smart_deed_inner_hash.removeprefix("0x")  # type: ignore[union-attr]
-                ),
-                deed_launcher_id=purchase.deed_launcher_id,
-                collection_id=purchase.collection_id,
-                metadata_root=purchase.metadata_root,
-                metadata_anchor_id=purchase.metadata_anchor_id,
-                share_ppm=purchase.share_ppm,
-                usd_amount_minor=purchase.usd_amount_minor,
-                protocol_puzhash=bytes32.fromhex(
-                    claim.protocol_puzzle_hash.removeprefix("0x")  # type: ignore[union-attr]
-                ),
-                validator_pubkeys=terms.validator_pubkeys,
-                provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
-            )
             did_struct = singleton_struct(
                 bytes32.fromhex(
                     str(artifact["launcherIds"]["did"]).removeprefix("0x")
@@ -3033,10 +3148,53 @@ def verify_voucher_transition_claim(
                 deed_launcher_id=purchase.deed_launcher_id,
                 protocol_did_singleton_struct=did_struct,
             )
-            expected_deed_puzzle = SINGLETON_MOD.curry(
-                deed_struct,
-                make_mint_offer_v4_inner(mint_terms),
-            )
+            if is_stripe:
+                assert claim.reservation_expires_at is not None
+                mint_terms = PrimaryMintTermsV3.for_artifact(
+                    artifact=purchase,
+                    smart_deed_inner_hash=bytes32.fromhex(
+                        claim.smart_deed_inner_hash.removeprefix("0x")  # type: ignore[union-attr]
+                    ),
+                    deed_launcher_puzzle_hash=deed_launcher_puzzle_hash(
+                        protocol_did_singleton_struct=did_struct
+                    ),
+                    protocol_puzhash=bytes32.fromhex(
+                        claim.protocol_puzzle_hash.removeprefix("0x")  # type: ignore[union-attr]
+                    ),
+                    validator_pubkeys=terms.validator_pubkeys,
+                    provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+                )
+                reservation = InventoryReservationV1(
+                    artifact=purchase,
+                    expires_at=claim.reservation_expires_at,
+                )
+                expected_deed_puzzle = SINGLETON_MOD.curry(
+                    deed_struct,
+                    make_mint_offer_v5_inner(mint_terms, reservation),
+                )
+            else:
+                mint_terms = PrimaryMintTermsV2(
+                    network=purchase.network,
+                    smart_deed_inner_hash=bytes32.fromhex(
+                        claim.smart_deed_inner_hash.removeprefix("0x")  # type: ignore[union-attr]
+                    ),
+                    deed_launcher_id=purchase.deed_launcher_id,
+                    collection_id=purchase.collection_id,
+                    metadata_root=purchase.metadata_root,
+                    metadata_anchor_id=purchase.metadata_anchor_id,
+                    share_ppm=purchase.share_ppm,
+                    usd_amount_minor=purchase.usd_amount_minor,
+                    protocol_puzhash=bytes32.fromhex(
+                        claim.protocol_puzzle_hash.removeprefix("0x")  # type: ignore[union-attr]
+                    ),
+                    validator_pubkeys=terms.validator_pubkeys,
+                    provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+                )
+                reservation = None
+                expected_deed_puzzle = SINGLETON_MOD.curry(
+                    deed_struct,
+                    make_mint_offer_v4_inner(mint_terms),
+                )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValidatorEvidenceError(
                 "voucher redemption mint terms cannot be reconstructed"
@@ -3055,7 +3213,7 @@ def verify_voucher_transition_claim(
             "voucher redemption SmartDeed coin",
         )
         if (
-            deed_coin.parent_coin_info != purchase.deed_launcher_id
+            (not is_stripe and deed_coin.parent_coin_info != purchase.deed_launcher_id)
             or deed_coin.puzzle_hash != expected_deed_puzzle.get_tree_hash()
             or int(deed_coin.amount) != 1
         ):
@@ -3064,7 +3222,15 @@ def verify_voucher_transition_claim(
             )
         try:
             expected_buyer_offer = (
-                prepare_base_voucher_redemption_offer(
+                prepare_stripe_voucher_redemption_offer(
+                    terminal=transition,
+                    receipt_coin=payment_coin,
+                    artifact=purchase,
+                    terms=mint_terms,
+                    deed_singleton_struct=deed_struct,
+                )
+                if is_stripe
+                else prepare_base_voucher_redemption_offer(
                     terminal_coin_spends=transition.coin_spends,
                     receipt_coin=payment_coin,
                     artifact=purchase,
@@ -3088,6 +3254,20 @@ def verify_voucher_transition_claim(
             ):
                 raise ValueError("voucher buyer offer differs from terminal spends")
             primary = (
+                build_stripe_voucher_primary_offer_v5(
+                    voucher_offer=claimed_buyer_offer,
+                    terminal=transition,
+                    receipt_coin=payment_coin,
+                    receipt=receipt,
+                    deed_coin=deed_coin,
+                    deed_singleton_struct=deed_struct,
+                    lineage_proof=deed_lineage,
+                    signer_indices=(0, 1),
+                    terms=mint_terms,
+                    reservation=reservation,
+                )
+                if is_stripe
+                else
                 build_universal_primary_offer_v4(
                     buyer_offer=claimed_buyer_offer,
                     deed_coin=deed_coin,

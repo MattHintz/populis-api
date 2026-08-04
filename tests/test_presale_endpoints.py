@@ -39,6 +39,8 @@ from solslot_api.presale_endpoints import (
     PresaleCreateRequest,
     PresaleStore,
     RefundEvidenceRequest,
+    StripeRefundCompletionRequest,
+    StripeVoucherRefundChainEvidence,
     VoucherIssuanceChainEvidence,
     VoucherIssuanceEvidenceRequest,
     VoucherSeriesPhaseChainEvidence,
@@ -715,6 +717,172 @@ def test_final_stripe_presale_payment_creates_v3_voucher_once() -> None:
     assert voucher["settlementReceipt"]["receiptHash"] == hex32(
         receipt.receipt_hash
     )
+
+
+def stripe_escrowed_voucher(
+    *, now: int
+) -> tuple[PresaleStore, dict[str, object], StripeSettlementEvidenceV1]:
+    current_terms = terms(now)
+    store = PresaleStore(":memory:")
+    create_series(store, current_terms)
+    vault = approved_vault()
+    deed = current_terms["deeds"][0]  # type: ignore[index]
+    artifact = build_stripe_purchase_artifact_v3(
+        network="testnet11",
+        collection_id=bytes32.from_hexstr(str(current_terms["collectionId"])),
+        deed_launcher_id=bytes32.from_hexstr(str(deed["deedLauncherId"])),
+        metadata_root=bytes32.from_hexstr(str(current_terms["metadataRoot"])),
+        metadata_anchor_id=bytes32.from_hexstr(
+            str(current_terms["metadataAnchorId"])
+        ),
+        share_ppm=int(deed["sharePpm"]),
+        base_usd_amount_minor=int(deed["basePriceMinor"]),
+        technology_fee_bps=int(current_terms["technologyFeeBps"]),
+        protocol_treasury_puzzle_hash=bytes32.from_hexstr(
+            str(current_terms["trustedProtocolTreasury"])
+        ),
+        zkpassport_root=b32(42),
+        vault_launcher_id=bytes32.from_hexstr(vault.launcher_id),
+        vault_p2_puzzle_hash=bytes32.from_hexstr(vault.p2_puzzle_hash),
+        authorization_nonce=b32(53),
+        authorization_expires_at=now + 600,
+        quote_expires_at=now + 100,
+        presale_terms_hash=bytes32.from_hexstr(
+            str(current_terms["termsHash"])
+        ),
+    )
+    payment = StripeSettlementEvidenceV1(
+        stripe_account_id="acct_testnet_alpha",
+        livemode=False,
+        payment_intent_id="pi_stripe_refund_alpha",
+        event_id="evt_stripe_refund_alpha",
+        amount_minor=artifact.subtotal_minor,
+        currency="usd",
+        method_family=StripeMethodFamily.US_BANK_ACCOUNT,
+        funding_type=StripeFundingType.BANK_ACCOUNT,
+        processing_charge_minor=0,
+        status=StripePaymentStatus.SUCCEEDED,
+        refunded_minor=0,
+        refund_state=StripeRefundState.NONE,
+        dispute_state=StripeDisputeState.NONE,
+        observed_at=now + 2,
+    )
+    receipt = build_stripe_settlement_receipt_v1(
+        artifact=artifact,
+        evidence=payment,
+        validator_pubkeys=tuple(
+            bytes.fromhex(str(value).removeprefix("0x"))
+            for value in current_terms["validatorPubkeys"]  # type: ignore[index]
+        ),
+    )
+    artifact_json_v3 = purchase_artifact_v3_to_json(artifact)
+    stored = StoredPaymentPurchase(
+        purchase_id=str(artifact_json_v3["purchaseId"]),
+        artifact_hash=str(artifact_json_v3["artifactHash"]),
+        purchase_intent_id="pi_stripe_refund_alpha",
+        rail="stripe",
+        quote_expires_at=artifact.quote_expires_at,
+        offer_artifact_hash=hex32(71),
+        offer_artifact={},
+        purchase_artifact=artifact_json_v3,
+        external_message=None,
+    )
+    store.ingest_stripe_payment(
+        str(current_terms["termsHash"]),
+        artifact=artifact,
+        receipt=receipt,
+        evidence_id=payment.event_id,
+        issued_purchase=stored,
+    )
+    confirm_issuance(store, current_terms)
+    return store, current_terms, payment
+
+
+def test_stripe_refund_requires_terminal_chain_evidence_before_fiat() -> None:
+    now = int(time.time())
+    store, current_terms, payment = stripe_escrowed_voucher(now=now)
+    terms_hash = str(current_terms["termsHash"])
+    requested = store.request_refund(
+        terms_hash,
+        0,
+        vault_launcher_id=approved_vault().launcher_id,
+        now_seconds=now + 10,
+    )
+    assert requested["state"] == "ESCROWED"
+
+    series = store.get(terms_hash)
+    current_coin_id = str(series["chainState"]["currentCoinId"])
+    next_state = VoucherSeriesStateV2(sold_count=1, refunded_count=1)
+    next_inner = curry_series(series_terms_from_json(current_terms), next_state)
+    evidence_hash = hex32(payment.evidence_hash)
+    store.record_stripe_refund_submission(
+        terms_hash,
+        0,
+        action=VoucherAction.REFUND_PRESALE,
+        spend_bundle_id=hex32(201),
+        external_settlement_evidence_hash=evidence_hash,
+        terminal_voucher_coin_id=hex32(202),
+        series_input_coin_id=current_coin_id,
+        series_output_coin_id=hex32(203),
+        vault_input_coin_id=hex32(204),
+        vault_output_coin_id=hex32(205),
+    )
+    confirmed = store.confirm_stripe_refund(
+        terms_hash,
+        0,
+        StripeVoucherRefundChainEvidence(
+            action=int(VoucherAction.REFUND_PRESALE),
+            evidenceId="chia:stripe-refund-confirmed",
+            spendBundleId=hex32(201),
+            externalSettlementEvidenceHash=evidence_hash,
+            terminalVoucherCoinId=hex32(202),
+            seriesInputCoinId=current_coin_id,
+            seriesInputParentCoinId=hex32(206),
+            seriesOutputCoinId=hex32(203),
+            seriesOutputInnerPuzzleHash=hex32(next_inner.get_tree_hash()),
+            vaultInputCoinId=hex32(204),
+            vaultOutputCoinId=hex32(205),
+            confirmedHeight=300,
+        ),
+    )
+    assert confirmed["state"] == "REFUNDED"
+    pending = store.pending_stripe_refund_authorizations()
+    assert len(pending) == 1
+    authorization = pending[0]
+    assert authorization["paymentIntentId"] == payment.payment_intent_id
+    assert authorization["amountMinor"] == str(payment.amount_minor)
+
+    completed = store.complete_stripe_refund_authorization(
+        authorization["authorizationId"],
+        StripeRefundCompletionRequest(
+            paymentIntentId=payment.payment_intent_id,
+            refundId="re_stripe_refund_alpha",
+            refundedMinor=payment.amount_minor,
+            currency="usd",
+            livemode=False,
+            observedAt=now + 20,
+        ),
+    )
+    assert completed["state"] == "COMPLETED"
+    assert store.pending_stripe_refund_authorizations() == []
+
+
+def test_generic_delivery_cannot_complete_a_stripe_voucher() -> None:
+    now = int(time.time())
+    store, current_terms, _payment = stripe_escrowed_voucher(now=now)
+    with pytest.raises(ValueError, match="exact atomic Chia confirmation"):
+        store.complete_delivery(
+            str(current_terms["termsHash"]),
+            0,
+            DeliveryEvidenceRequest(
+                evidenceId="generic-stripe-delivery",
+                outputCoinId=hex32(210),
+                deedLauncherId=str(
+                    current_terms["deeds"][0]["deedLauncherId"]  # type: ignore[index]
+                ),
+                vaultP2PuzzleHash=approved_vault().p2_puzzle_hash,
+            ),
+        )
 
 
 def create_series(
@@ -2616,6 +2784,74 @@ async def test_stripe_ach_voucher_worker_submits_exact_v3_issuance(
     )
     assert submitted["voucherOutputCoinId"] == hex32(voucher_coin.name())
     assert submitted["paymentCommitmentCoinId"] == hex32(receipt_coin.name())
+
+
+@pytest.mark.asyncio
+async def test_worker_advances_stripe_redemption_from_the_shared_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    series = {
+        "termsHash": hex32(220),
+        "state": "LIVE",
+        "deliveryDeadline": int(time.time()) + 300,
+    }
+    voucher = {
+        "serial": 4,
+        "paymentRail": "STRIPE_USD",
+        "redemptionBundleId": None,
+    }
+
+    class QueueOnlyStore:
+        def pending_issuance(self):
+            return []
+
+        def pending_native_refunds(self):
+            return []
+
+        def pending_base_refunds(self):
+            return []
+
+        def pending_stripe_refunds(self):
+            return []
+
+        def pending_native_redemptions(self):
+            return []
+
+        def pending_base_redemptions(self):
+            return []
+
+        def pending_stripe_redemptions(self):
+            return [(series, voucher)]
+
+        def pending_phase_transitions(self):
+            return []
+
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    worker = VoucherIssuanceWorker(
+        settings=Settings(runtime_environment="test", network="testnet11"),
+        faucet=faucet,
+        coinset=FakeCoinset(Coin(b32(221), faucet.address_puzzle_hash, uint64(20))),
+        presales=QueueOnlyStore(),  # type: ignore[arg-type]
+        purchases=SimpleNamespace(),  # type: ignore[arg-type]
+        config=VoucherIssuanceWorkerConfig(enabled=True),
+    )
+    submitted: list[tuple[dict, dict]] = []
+
+    async def submit(current_series, current_voucher):
+        submitted.append((current_series, current_voucher))
+        return True
+
+    monkeypatch.setattr(worker, "_submit_stripe_redemption", submit)
+    results = await worker.reconcile_once()
+
+    assert submitted == [(series, voucher)]
+    assert results == [
+        {
+            "termsHash": hex32(220),
+            "serial": 4,
+            "status": "STRIPE_REDEMPTION_SUBMITTED",
+        }
+    ]
 
 
 @pytest.mark.asyncio
