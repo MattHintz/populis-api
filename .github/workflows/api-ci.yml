@@ -17,7 +17,7 @@ env:
   # RC27 preserves the frozen Pool V4 hash and permits delayed ACH settlement
   # only for the exact Stripe voucher artifact committed before payment.
   # Keep CI reproducible without advancing deployment environment pins.
-  PROTOCOL_REF: 64ac9cef0ade34e8f6b38061c8e3c17aba401d3f
+  PROTOCOL_REF: 22ca133b516247a6c223b6cc960652e1d2201183
 
 jobs:
   verify:
