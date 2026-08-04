@@ -63,6 +63,7 @@ async def prepare_and_dispatch_stripe_terminal(
     purchase_id: bytes32,
     artifact_hash: bytes32,
     claim_hash: bytes32,
+    signer_indices: tuple[int, ...],
     protocol_bundle: SpendBundle,
     expected_outputs: Mapping[str, Coin],
     bindings: Mapping[str, Any],
@@ -88,6 +89,7 @@ async def prepare_and_dispatch_stripe_terminal(
             voucher_action=voucher_action,
             request=request,
             prepared=prepared,
+            signer_indices=signer_indices,
             role_outputs=role_outputs,
             bindings=bindings,
         )
@@ -151,6 +153,7 @@ def parse_stripe_terminal_execution(
             "persisted Stripe voucher action is invalid"
         ) from exc
     _validate_mode(mode, voucher_action)
+    _signer_indices(document.get("signerIndices"))
     request = _request_from_json(document.get("request"))
     prepared = _prepared_from_json(document.get("prepared"))
     if (
@@ -216,6 +219,7 @@ def _document(
     voucher_action: int,
     request: ExactExecutionRequest,
     prepared: PreparedProtocolBundle,
+    signer_indices: tuple[int, ...],
     role_outputs: Mapping[str, Coin],
     bindings: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -223,6 +227,7 @@ def _document(
         "schema": SCHEMA,
         "mode": mode,
         "voucherAction": voucher_action,
+        "signerIndices": _signer_indices(signer_indices),
         "request": {
             "action": int(request.action),
             "purchaseId": _hex32(request.purchase_id),
@@ -323,6 +328,22 @@ def _execution_output(coin: Coin) -> ExactExecutionOutput:
 def _validate_mode(mode: str, voucher_action: int) -> None:
     if mode not in _MODE_ACTIONS or voucher_action not in _MODE_ACTIONS[mode]:
         raise ValueError("Stripe voucher terminal mode does not match its action")
+
+
+def _signer_indices(value: Any) -> list[int]:
+    if not isinstance(value, (list, tuple)):
+        raise ProtocolSubmissionError("Stripe voucher signer indices are missing")
+    normalized = list(value)
+    if (
+        len(normalized) < 2
+        or len(normalized) > 3
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in normalized)
+        or normalized != sorted(normalized)
+        or len(set(normalized)) != len(normalized)
+        or any(item < 0 or item > 2 for item in normalized)
+    ):
+        raise ProtocolSubmissionError("Stripe voucher signer indices are invalid")
+    return normalized
 
 
 def _b32(value: Any) -> bytes32:

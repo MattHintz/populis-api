@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -44,13 +45,105 @@ def test_rehearsal_service_url_allows_only_tls_or_loopback() -> None:
     assert not valid_internal_service_url("https://user:secret@rehearsal.example")
 
 
+def _lane(seed: int, *, lane: str) -> dict:
+    def value(offset: int) -> str:
+        return "0x" + f"{seed + offset:02x}" * 32
+
+    delivery = lane == "delivery"
+    roles = (
+        {
+            "coordination": value(20),
+            "deed": value(21),
+            "series": value(22),
+            "terminalVoucher": value(23),
+        }
+        if delivery
+        else {
+            "series": value(22),
+            "terminalVoucher": value(23),
+            "vault": value(24),
+        }
+    )
+    chain = (
+        {
+            "confirmationHeight": 500 + seed,
+            "deedOutputCoinId": roles["deed"],
+            "seriesOutputCoinId": roles["series"],
+            "terminalVoucherCoinId": roles["terminalVoucher"],
+            "coordinationCoinId": roles["coordination"],
+        }
+        if delivery
+        else {
+            "confirmationHeight": 500 + seed,
+            "seriesOutputCoinId": roles["series"],
+            "terminalVoucherCoinId": roles["terminalVoucher"],
+            "vaultOutputCoinId": roles["vault"],
+        }
+    )
+    result = {
+        "success": True,
+        "purchaseId": value(1),
+        "artifactHash": value(2),
+        "paymentIntentId": f"pi_rehearsal_{seed:02d}",
+        "eventId": f"evt_rehearsal_{seed:02d}",
+        "baseAmountMinor": "10000",
+        "technologyFeeMinor": "100",
+        "processingChargeMinor": "0",
+        "amountMinor": "10100",
+        "approvedVaultLauncherId": value(3),
+        "deedLauncherId": value(4),
+        "zkPassportRoot": value(5),
+        "settlementReceiptHash": value(6),
+        "signerIndices": [0, 2],
+        "voucher": {
+            "serial": seed,
+            "signerIndices": [0, 1],
+            "issuanceBundleId": value(7),
+            "voucherCoinId": value(8),
+            "paymentCommitmentCoinId": value(9),
+            "issuanceConfirmedHeight": 400 + seed,
+        },
+        "execution": {
+            "schema": "solslot.stripe-voucher-terminal-execution.v1",
+            "mode": "REDEEM" if delivery else "REFUND_OWNER",
+            "action": 7,
+            "spendBundleId": value(10),
+            "feeCoinId": value(11),
+            "feeMojos": "42",
+            "mempoolObservedAt": 1785844800,
+            "outputRoles": roles,
+        },
+        "chain": chain,
+    }
+    if not delivery:
+        result.update(
+            {
+                "exactRefund": True,
+                "stripeRefund": {
+                    "refundId": f"re_rehearsal_{seed:02d}",
+                    "refundedMinor": "10100",
+                    "currency": "usd",
+                    "livemode": False,
+                    "observedAt": 1_775_000_000 + seed,
+                },
+            }
+        )
+    return result
+
+
 def _evidence() -> dict:
     return {
-        "schemaVersion": 2,
-        "kind": "solslot-rc26-settlement-rehearsal",
+        "schemaVersion": 3,
+        "kind": "solslot-rc27-stripe-voucher-rehearsal",
         "releaseTag": "solslot-v2-alpha-rc26-20260803",
         "configHash": CONFIG_HASH,
-        "network": "testnet11-base-sepolia",
+        "network": "testnet11",
+        "stripe": {
+            "accountId": "acct_testnet_alpha",
+            "mode": "test",
+            "livemode": False,
+            "apiVersion": "2026-07-29.clover",
+        },
         "success": True,
         "validatorThreshold": 2,
         "validators": [
@@ -59,8 +152,8 @@ def _evidence() -> dict:
             {"id": "validator-3"},
         ],
         "lanes": {
-            "delivery": {"success": True},
-            "refund": {"success": True, "exactRefund": True},
+            "delivery": _lane(1, lane="delivery"),
+            "refund": _lane(40, lane="refund"),
         },
     }
 
@@ -98,7 +191,7 @@ def test_completed_rehearsal_requires_signed_delivery_and_exact_refund(tmp_path)
         validate_status(_signed_status(tampered), settings=settings)
 
 
-def test_rehearsal_rejects_non_base_or_value_bearing_wallet_transaction(tmp_path) -> None:
+def test_stripe_rehearsal_rejects_any_wallet_transaction(tmp_path) -> None:
     settings = _settings(tmp_path)
     value = {
         "jobId": "rehearsal_job_0001",
@@ -113,8 +206,40 @@ def test_rehearsal_rejects_non_base_or_value_bearing_wallet_transaction(tmp_path
             "data": "0x1234",
         },
     }
-    with pytest.raises(LaunchRehearsalError, match="not Base Sepolia safe"):
+    with pytest.raises(LaunchRehearsalError, match="must not return a wallet transaction"):
         validate_status(value, settings=settings)
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement", "message"),
+    [
+        (("stripe", "livemode"), True, "release or validator evidence"),
+        (("lanes", "delivery", "signerIndices"), [0], "validator quorum"),
+        (("lanes", "delivery", "execution", "feeMojos"), "0", "medium-speed fee"),
+        (("lanes", "delivery", "chain", "deedOutputCoinId"), "0x" + "fe" * 32, "outputs differ"),
+        (("lanes", "refund", "exactRefund"), False, "not exact"),
+        (("lanes", "refund", "stripeRefund", "refundedMinor"), "10099", "not an exact"),
+    ],
+)
+def test_rehearsal_rejects_altered_terminal_evidence(
+    tmp_path, path, replacement, message
+) -> None:
+    evidence = deepcopy(_evidence())
+    target = evidence
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+    with pytest.raises(LaunchRehearsalError, match=message):
+        validate_status(_signed_status(evidence), settings=_settings(tmp_path))
+
+
+def test_rehearsal_requires_distinct_delivery_and_refund_vouchers(tmp_path) -> None:
+    evidence = _evidence()
+    evidence["lanes"]["refund"]["purchaseId"] = evidence["lanes"]["delivery"][
+        "purchaseId"
+    ]
+    with pytest.raises(LaunchRehearsalError, match="distinct Stripe vouchers"):
+        validate_status(_signed_status(evidence), settings=_settings(tmp_path))
 
 
 def test_rehearsal_rejects_impossible_guided_progress(tmp_path) -> None:

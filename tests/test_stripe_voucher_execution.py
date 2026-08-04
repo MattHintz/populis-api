@@ -144,6 +144,7 @@ async def test_terminal_execution_is_persisted_before_dispatch_and_resumes_exact
             purchase_id=purchase_id,
             artifact_hash=artifact_hash,
             claim_hash=b32(33),
+            signer_indices=(0, 1),
             protocol_bundle=prepared.bundle,
             expected_outputs=roles,
             bindings={
@@ -194,6 +195,7 @@ async def test_terminal_resume_rejects_relabeling_and_unbound_inputs() -> None:
         purchase_id=b32(31),
         artifact_hash=b32(32),
         claim_hash=b32(33),
+        signer_indices=(0, 2),
         protocol_bundle=prepared.bundle,
         expected_outputs=roles,
         bindings={

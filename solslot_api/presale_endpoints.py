@@ -121,7 +121,10 @@ from .payment_purchase_store import (
     StoredPaymentPurchase,
     get_payment_purchase_store,
 )
-from .stripe_voucher_execution import prepare_and_dispatch_stripe_terminal
+from .stripe_voucher_execution import (
+    parse_stripe_terminal_execution,
+    prepare_and_dispatch_stripe_terminal,
+)
 from .protocol_artifacts import (
     _artifact_rejection_reasons,
     _require_server_to_server_token,
@@ -541,6 +544,7 @@ class PresaleStore:
               payment_evidence_id TEXT NOT NULL,
               issuance_evidence_id TEXT,
               issuance_bundle_id TEXT,
+              issuance_signer_indices_json TEXT,
               funding_bundle_id TEXT,
               purchase_launcher_coin_id TEXT,
               purchase_launcher_puzzle_hash TEXT,
@@ -662,6 +666,7 @@ class PresaleStore:
         voucher_text_columns = (
             "purchase_artifact_json",
             "settlement_receipt_json",
+            "issuance_signer_indices_json",
             "refund_bundle_id",
             "refund_output_coin_id",
             "terminal_voucher_coin_id",
@@ -743,6 +748,7 @@ class PresaleStore:
                   payment_evidence_id TEXT NOT NULL,
                   issuance_evidence_id TEXT,
                   issuance_bundle_id TEXT,
+                  issuance_signer_indices_json TEXT,
                   funding_bundle_id TEXT,
                   purchase_launcher_coin_id TEXT,
                   purchase_launcher_puzzle_hash TEXT,
@@ -1714,14 +1720,17 @@ class PresaleStore:
         payment_commitment_coin_id: str,
         series_input_coin_id: str,
         series_output_coin_id: str,
+        signer_indices: tuple[int, ...],
     ) -> dict[str, Any]:
         series = self._get_series(terms_hash)
+        normalized_signers = _validator_signer_indices(signer_indices)
         now = int(time.time())
         with self.txn() as cur:
             updated = cur.execute(
                 """
                 UPDATE voucher_records_v2
                 SET state='ISSUANCE_SUBMITTED', issuance_bundle_id=?,
+                    issuance_signer_indices_json=?,
                     voucher_launcher_id=?, voucher_output_coin_id=?,
                     payment_commitment_coin_id=?, series_input_coin_id=?,
                     series_output_coin_id=?, updated_at=?
@@ -1730,6 +1739,7 @@ class PresaleStore:
                 """,
                 (
                     issuance_bundle_id.lower(),
+                    _json(normalized_signers),
                     voucher_launcher_id.lower(),
                     voucher_output_coin_id.lower(),
                     payment_commitment_coin_id.lower(),
@@ -2610,6 +2620,68 @@ class PresaleStore:
             (limit,),
         ).fetchall()
         return [json.loads(row["authorization_json"]) for row in rows]
+
+    def stripe_rehearsal_candidates(
+        self,
+        *,
+        created_after: int,
+        vault_launcher_id: str,
+        collection_id: str,
+    ) -> dict[str, Any]:
+        """Project completed production voucher paths into rehearsal evidence."""
+
+        vault_id = _hex32(_b32(vault_launcher_id, nonzero=True))
+        collection = _hex32(_b32(collection_id, nonzero=True))
+        if created_after < 1:
+            raise ValueError("rehearsal start time must be positive")
+        rows = self._conn.execute(
+            """
+            SELECT v.*, r.state AS stripe_refund_state,
+                   r.completion_json AS stripe_refund_completion_json
+            FROM voucher_records_v2 v
+            LEFT JOIN stripe_refund_authorizations_v3 r
+              ON r.purchase_id=v.purchase_id
+            WHERE v.payment_rail='STRIPE_USD'
+              AND v.created_at>=? AND v.vault_launcher_id=?
+              AND v.state IN ('REDEEMED','REFUNDED')
+            ORDER BY v.updated_at, v.terms_hash, v.serial
+            LIMIT 20
+            """,
+            (created_after, vault_id),
+        ).fetchall()
+        delivery: list[dict[str, Any]] = []
+        refund: list[dict[str, Any]] = []
+        for row in rows:
+            artifact = json.loads(row["purchase_artifact_json"] or "null")
+            if not isinstance(artifact, dict) or artifact.get("collectionId") != collection:
+                continue
+            lane = _stripe_rehearsal_lane(row, artifact)
+            if row["state"] == "REDEEMED":
+                if lane["execution"]["mode"] == "REDEEM":
+                    delivery.append(lane)
+            elif (
+                lane["execution"]["mode"] == "REFUND_OWNER"
+                and row["stripe_refund_state"] == "COMPLETED"
+                and row["stripe_refund_completion_json"]
+            ):
+                completion = json.loads(row["stripe_refund_completion_json"])
+                lane["exactRefund"] = True
+                lane["stripeRefund"] = {
+                    "refundId": completion["refundId"],
+                    "refundedMinor": str(completion["refundedMinor"]),
+                    "currency": completion["currency"],
+                    "livemode": completion["livemode"],
+                    "observedAt": completion["observedAt"],
+                }
+                refund.append(lane)
+        return {
+            "schema": "solslot.stripe-voucher-rehearsal-candidates.v1",
+            "createdAfter": created_after,
+            "vaultLauncherId": vault_id,
+            "collectionId": collection,
+            "delivery": delivery[:5],
+            "refund": refund[:5],
+        }
 
     def complete_stripe_refund_authorization(
         self,
@@ -3691,6 +3763,11 @@ class PresaleStore:
             "paymentEvidenceId": row["payment_evidence_id"],
             "issuanceEvidenceId": row["issuance_evidence_id"],
             "issuanceBundleId": row["issuance_bundle_id"],
+            "issuanceSignerIndices": (
+                json.loads(row["issuance_signer_indices_json"])
+                if row["issuance_signer_indices_json"]
+                else []
+            ),
             "fundingBundleId": row["funding_bundle_id"],
             "purchaseLauncherCoinId": row["purchase_launcher_coin_id"],
             "purchaseLauncherPuzzleHash": row["purchase_launcher_puzzle_hash"],
@@ -4898,6 +4975,30 @@ async def acknowledge_base_settlement(
     )
 
 
+@router.get("/stripe-rehearsal/candidates")
+def stripe_rehearsal_candidates(
+    created_after: int,
+    vault_launcher_id: str,
+    collection_id: str,
+    store: Annotated[PresaleStore, Depends(get_presale_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> dict[str, Any]:
+    if not settings.protocol_artifact_api_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="protocol artifact bearer authentication is not configured",
+        )
+    _require_server_to_server_token(settings, authorization)
+    return response_or_404(
+        lambda: store.stripe_rehearsal_candidates(
+            created_after=created_after,
+            vault_launcher_id=vault_launcher_id,
+            collection_id=collection_id,
+        )
+    )
+
+
 @router.post(
     "",
     status_code=201,
@@ -5745,6 +5846,7 @@ async def complete_voucher_refund(
                 purchase_id=purchase.purchase_id,
                 artifact_hash=purchase.artifact_hash,
                 claim_hash=terminal.validator_message,
+                signer_indices=quorum.signer_indices,
                 protocol_bundle=bundle,
                 expected_outputs={
                     "series": terminal.next_series_coin,
@@ -6042,6 +6144,131 @@ def _nonnegative_int(value: object, label: str) -> int:
     if parsed > 0xFFFFFFFFFFFFFFFF:
         raise ValueError(f"{label} exceeds uint64")
     return parsed
+
+
+def _stripe_rehearsal_lane(
+    row: sqlite3.Row,
+    artifact_json: dict[str, Any],
+) -> dict[str, Any]:
+    receipt_json = json.loads(row["settlement_receipt_json"] or "null")
+    execution_json = json.loads(row["terminal_exact_execution_json"] or "null")
+    if not isinstance(receipt_json, dict) or not isinstance(execution_json, dict):
+        raise ValueError("completed Stripe voucher lacks canonical settlement evidence")
+    artifact = purchase_artifact_v3_from_json(artifact_json)
+    receipt = stripe_receipt_from_json(receipt_json)
+    execution = parse_stripe_terminal_execution(
+        execution_json,
+        expected_purchase_id=artifact.purchase_id,
+        expected_artifact_hash=artifact.artifact_hash,
+    )
+    issuance_signers = _validator_signer_indices(
+        json.loads(row["issuance_signer_indices_json"] or "null")
+    )
+    terminal_signers = _validator_signer_indices(execution["signerIndices"])
+    evidence = receipt.evidence
+    if (
+        receipt.artifact != artifact
+        or row["purchase_id"] != _hex32(artifact.purchase_id)
+        or row["payment_evidence_id"] != evidence.event_id
+        or row["deed_launcher_id"] != _hex32(artifact.deed_launcher_id)
+        or row["vault_launcher_id"] != _hex32(artifact.vault_launcher_id)
+        or row["base_price_minor"] != artifact.base_amount_minor
+        or row["technology_fee_minor"] != artifact.technology_fee_minor
+        or row["processing_charge_minor"] != evidence.processing_charge_minor
+        or evidence.amount_minor
+        != artifact.subtotal_minor + evidence.processing_charge_minor
+        or row["issuance_confirmed_height"] is None
+        or row["terminal_execution_observed_at"] is None
+    ):
+        raise ValueError("completed Stripe voucher evidence changed after settlement")
+    prepared = execution["prepared"]
+    roles = execution["outputRoles"]
+    fee_mojos = int(prepared["feeMojos"])
+    if fee_mojos < 1:
+        raise ValueError("Stripe voucher rehearsal did not use the bounded fee till")
+    common = {
+        "stripeAccountId": evidence.stripe_account_id,
+        "livemode": evidence.livemode,
+        "success": True,
+        "purchaseId": _hex32(artifact.purchase_id),
+        "artifactHash": _hex32(artifact.artifact_hash),
+        "paymentIntentId": evidence.payment_intent_id,
+        "eventId": evidence.event_id,
+        "baseAmountMinor": str(artifact.base_amount_minor),
+        "technologyFeeMinor": str(artifact.technology_fee_minor),
+        "processingChargeMinor": str(evidence.processing_charge_minor),
+        "amountMinor": str(evidence.amount_minor),
+        "approvedVaultLauncherId": _hex32(artifact.vault_launcher_id),
+        "deedLauncherId": _hex32(artifact.deed_launcher_id),
+        "zkPassportRoot": _hex32(artifact.zkpassport_root),
+        "settlementReceiptHash": _hex32(receipt.receipt_hash),
+        "signerIndices": terminal_signers,
+        "voucher": {
+            "serial": int(row["serial"]),
+            "signerIndices": issuance_signers,
+            "issuanceBundleId": row["issuance_bundle_id"],
+            "voucherCoinId": row["voucher_output_coin_id"],
+            "paymentCommitmentCoinId": row["payment_commitment_coin_id"],
+            "issuanceConfirmedHeight": int(row["issuance_confirmed_height"]),
+        },
+        "execution": {
+            "schema": execution["schema"],
+            "mode": execution["mode"],
+            "action": int(execution["request"]["action"]),
+            "spendBundleId": prepared["spendBundleId"],
+            "feeCoinId": prepared["feeCoinId"],
+            "feeMojos": str(fee_mojos),
+            "mempoolObservedAt": int(row["terminal_execution_observed_at"]),
+            "outputRoles": dict(roles),
+        },
+    }
+    if row["state"] == "REDEEMED":
+        chain = {
+            "confirmationHeight": int(row["redemption_confirmed_height"] or 0),
+            "deedOutputCoinId": row["redemption_deed_output_coin_id"],
+            "seriesOutputCoinId": row["redemption_series_output_coin_id"],
+            "terminalVoucherCoinId": row["redemption_terminal_voucher_coin_id"],
+            "coordinationCoinId": row["redemption_treasury_output_coin_id"],
+        }
+    elif row["state"] == "REFUNDED":
+        chain = {
+            "confirmationHeight": int(row["refund_confirmed_height"] or 0),
+            "seriesOutputCoinId": row["refund_series_output_coin_id"],
+            "terminalVoucherCoinId": row["terminal_voucher_coin_id"],
+            "vaultOutputCoinId": row["refund_vault_output_coin_id"],
+        }
+    else:
+        raise ValueError("Stripe rehearsal voucher is not terminal")
+    role_map = {
+        "deedOutputCoinId": "deed",
+        "seriesOutputCoinId": "series",
+        "terminalVoucherCoinId": "terminalVoucher",
+        "coordinationCoinId": "coordination",
+        "vaultOutputCoinId": "vault",
+    }
+    if chain["confirmationHeight"] < 1 or any(
+        not value
+        or (field != "confirmationHeight" and value != roles[role_map[field]])
+        for field, value in chain.items()
+    ):
+        raise ValueError("confirmed Stripe voucher outputs differ from KoS execution")
+    return {**common, "chain": chain}
+
+
+def _validator_signer_indices(value: object) -> list[int]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("validator signer indices must be a sequence")
+    normalized = list(value)
+    if (
+        len(normalized) < 2
+        or len(normalized) > 3
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in normalized)
+        or normalized != sorted(normalized)
+        or len(set(normalized)) != len(normalized)
+        or any(item < 0 or item > 2 for item in normalized)
+    ):
+        raise ValueError("validator signer indices must be a unique ordered 2-of-3 quorum")
+    return normalized
 
 
 def _json(value: Any) -> str:

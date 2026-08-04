@@ -724,6 +724,7 @@ class VoucherIssuanceWorker:
             ),
             series_input_coin_id=_hex32(series_coin.name()),
             series_output_coin_id=_hex32(issuance.next_series_coin.name()),
+            signer_indices=quorum.signer_indices,
         )
         return True
 
@@ -1618,6 +1619,7 @@ class VoucherIssuanceWorker:
             purchase_id=context.purchase.purchase_id,
             artifact_hash=context.purchase.artifact_hash,
             claim_hash=terminal.validator_message,
+            signer_indices=quorum.signer_indices,
             protocol_bundle=bundle,
             expected_outputs={
                 "coordination": treasury_output,
@@ -2000,6 +2002,7 @@ class VoucherIssuanceWorker:
             purchase_id=purchase.purchase_id,
             artifact_hash=purchase.artifact_hash,
             claim_hash=terminal.validator_message,
+            signer_indices=quorum.signer_indices,
             protocol_bundle=bundle,
             expected_outputs={
                 "series": terminal.next_series_coin,

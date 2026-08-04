@@ -900,6 +900,154 @@ def test_stripe_refund_requires_terminal_chain_evidence_before_fiat() -> None:
     assert completed["state"] == "COMPLETED"
 
 
+def _rehearsal_terminal(mode: str, seed: int) -> dict[str, object]:
+    roles = (
+        {
+            "coordination": hex32(seed + 10),
+            "deed": hex32(seed + 11),
+            "series": hex32(seed + 12),
+            "terminalVoucher": hex32(seed + 13),
+        }
+        if mode == "REDEEM"
+        else {
+            "series": hex32(seed + 12),
+            "terminalVoucher": hex32(seed + 13),
+            "vault": hex32(seed + 14),
+        }
+    )
+    return {
+        "schema": "solslot.stripe-voucher-terminal-execution.v1",
+        "mode": mode,
+        "voucherAction": 3 if mode == "REDEEM" else 1,
+        "signerIndices": [0, 2],
+        "request": {
+            "action": 7,
+            "purchaseId": hex32(seed + 1),
+            "artifactHash": hex32(seed + 2),
+        },
+        "prepared": {
+            "spendBundleId": hex32(seed + 3),
+            "feeMojos": "5",
+            "feeCoinId": hex32(seed + 4),
+        },
+        "outputRoles": roles,
+        "bindings": {},
+    }
+
+
+@pytest.mark.parametrize("outcome", ["delivery", "refund"])
+def test_stripe_rehearsal_projection_requires_terminal_production_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    now = int(time.time())
+    store, current_terms, payment = stripe_escrowed_voucher(now=now)
+    terms_hash = str(current_terms["termsHash"])
+    voucher = store.voucher(terms_hash, 0)
+    artifact = voucher["purchaseArtifact"]
+    assert isinstance(artifact, dict)
+    execution = _rehearsal_terminal(
+        "REDEEM" if outcome == "delivery" else "REFUND_OWNER",
+        220,
+    )
+    execution["request"]["purchaseId"] = artifact["purchaseId"]  # type: ignore[index]
+    execution["request"]["artifactHash"] = artifact["artifactHash"]  # type: ignore[index]
+    roles = execution["outputRoles"]
+    assert isinstance(roles, dict)
+    monkeypatch.setattr(
+        "solslot_api.presale_endpoints.parse_stripe_terminal_execution",
+        lambda *_args, **_kwargs: execution,
+    )
+    with store.txn() as cur:
+        if outcome == "delivery":
+            cur.execute(
+                """
+                UPDATE voucher_records_v2
+                SET state='REDEEMED', terminal_exact_execution_json=?,
+                    terminal_execution_observed_at=?, redemption_bundle_id=?,
+                    redemption_treasury_output_coin_id=?,
+                    redemption_deed_output_coin_id=?,
+                    redemption_terminal_voucher_coin_id=?,
+                    redemption_series_output_coin_id=?,
+                    redemption_confirmed_height=?
+                WHERE terms_hash=? AND serial=0
+                """,
+                (
+                    json.dumps(execution),
+                    now + 10,
+                    execution["prepared"]["spendBundleId"],  # type: ignore[index]
+                    roles["coordination"],
+                    roles["deed"],
+                    roles["terminalVoucher"],
+                    roles["series"],
+                    300,
+                    terms_hash,
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE voucher_records_v2
+                SET state='REFUNDED', terminal_exact_execution_json=?,
+                    terminal_execution_observed_at=?, refund_bundle_id=?,
+                    terminal_voucher_coin_id=?, refund_series_output_coin_id=?,
+                    refund_vault_output_coin_id=?, refund_confirmed_height=?
+                WHERE terms_hash=? AND serial=0
+                """,
+                (
+                    json.dumps(execution),
+                    now + 10,
+                    execution["prepared"]["spendBundleId"],  # type: ignore[index]
+                    roles["terminalVoucher"],
+                    roles["series"],
+                    roles["vault"],
+                    301,
+                    terms_hash,
+                ),
+            )
+            completion = StripeRefundCompletionRequest(
+                paymentIntentId=payment.payment_intent_id,
+                refundId="re_rehearsal_projection_exact",
+                refundedMinor=payment.amount_minor,
+                currency="usd",
+                livemode=False,
+                observedAt=now + 20,
+            ).model_dump(by_alias=True)
+            cur.execute(
+                """
+                INSERT INTO stripe_refund_authorizations_v3(
+                  authorization_id, terms_hash, serial, purchase_id,
+                  authorization_json, state, created_at, completed_at,
+                  completion_json
+                ) VALUES (?, ?, 0, ?, '{}', 'COMPLETED', ?, ?, ?)
+                """,
+                (
+                    hex32(250),
+                    terms_hash,
+                    voucher["purchaseId"],
+                    now,
+                    now + 20,
+                    json.dumps(completion),
+                ),
+            )
+
+    candidates = store.stripe_rehearsal_candidates(
+        created_after=now - 1,
+        vault_launcher_id=approved_vault().launcher_id,
+        collection_id=str(current_terms["collectionId"]),
+    )
+    assert len(candidates[outcome]) == 1
+    lane = candidates[outcome][0]
+    assert lane["execution"]["action"] == 7
+    assert lane["execution"]["feeMojos"] == "5"
+    assert lane["voucher"]["signerIndices"] == [0, 1]
+    if outcome == "refund":
+        assert lane["exactRefund"] is True
+        assert lane["stripeRefund"]["refundedMinor"] == str(
+            payment.amount_minor
+        )
+
+
 def test_stripe_terminal_execution_serializes_each_singleton_series() -> None:
     now = int(time.time())
     store, current_terms, _payment = stripe_escrowed_voucher(now=now)
@@ -1135,6 +1283,7 @@ def confirm_issuance(
         payment_commitment_coin_id=hex32(134 + offset),
         series_input_coin_id=series_input,
         series_output_coin_id=series_output,
+        signer_indices=(0, 1),
     )
     return store.confirm_issuance(
         str(current_terms["termsHash"]),
@@ -3123,6 +3272,7 @@ async def test_expired_base_delivery_authorizes_exact_external_refund(
         payment_commitment_coin_id=hex32(receipt_coin.name()),
         series_input_coin_id=hex32(initial_series_coin.name()),
         series_output_coin_id=hex32(sold_series_coin.name()),
+        signer_indices=(0, 1),
     )
     store.confirm_issuance(
         str(current_terms["termsHash"]),

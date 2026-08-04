@@ -27,12 +27,99 @@ def _settings(tmp_path) -> Settings:
 
 
 def _evidence(settings: Settings) -> dict:
+    def lane(seed: int, *, delivery: bool) -> dict:
+        coin = lambda offset: "0x" + f"{seed + offset:02x}" * 32
+        roles = (
+            {
+                "coordination": coin(20),
+                "deed": coin(21),
+                "series": coin(22),
+                "terminalVoucher": coin(23),
+            }
+            if delivery
+            else {
+                "series": coin(22),
+                "terminalVoucher": coin(23),
+                "vault": coin(24),
+            }
+        )
+        result = {
+            "success": True,
+            "purchaseId": coin(1),
+            "artifactHash": coin(2),
+            "paymentIntentId": f"pi_gate_rehearsal_{seed}",
+            "eventId": f"evt_gate_rehearsal_{seed}",
+            "baseAmountMinor": "10000",
+            "technologyFeeMinor": "100",
+            "processingChargeMinor": "0",
+            "amountMinor": "10100",
+            "approvedVaultLauncherId": coin(3),
+            "deedLauncherId": coin(4),
+            "zkPassportRoot": coin(5),
+            "settlementReceiptHash": coin(6),
+            "signerIndices": [0, 1],
+            "voucher": {
+                "serial": seed,
+                "signerIndices": [0, 1],
+                "issuanceBundleId": coin(7),
+                "voucherCoinId": coin(8),
+                "paymentCommitmentCoinId": coin(9),
+                "issuanceConfirmedHeight": 400 + seed,
+            },
+            "execution": {
+                "schema": "solslot.stripe-voucher-terminal-execution.v1",
+                "mode": "REDEEM" if delivery else "REFUND_OWNER",
+                "action": 7,
+                "spendBundleId": coin(10),
+                "feeCoinId": coin(11),
+                "feeMojos": "42",
+                "mempoolObservedAt": 1785844800,
+                "outputRoles": roles,
+            },
+            "chain": (
+                {
+                    "confirmationHeight": 500 + seed,
+                    "deedOutputCoinId": roles["deed"],
+                    "seriesOutputCoinId": roles["series"],
+                    "terminalVoucherCoinId": roles["terminalVoucher"],
+                    "coordinationCoinId": roles["coordination"],
+                }
+                if delivery
+                else {
+                    "confirmationHeight": 500 + seed,
+                    "seriesOutputCoinId": roles["series"],
+                    "terminalVoucherCoinId": roles["terminalVoucher"],
+                    "vaultOutputCoinId": roles["vault"],
+                }
+            ),
+        }
+        if not delivery:
+            result.update(
+                {
+                    "exactRefund": True,
+                    "stripeRefund": {
+                        "refundId": f"re_gate_rehearsal_{seed}",
+                        "refundedMinor": "10100",
+                        "currency": "usd",
+                        "livemode": False,
+                        "observedAt": 1_775_000_000 + seed,
+                    },
+                }
+            )
+        return result
+
     return {
-        "schemaVersion": 2,
-        "kind": "solslot-rc26-settlement-rehearsal",
+        "schemaVersion": 3,
+        "kind": "solslot-rc27-stripe-voucher-rehearsal",
         "releaseTag": settings.launch_release_tag,
         "configHash": CONFIG_HASH,
-        "network": "testnet11-base-sepolia",
+        "network": "testnet11",
+        "stripe": {
+            "accountId": "acct_testnet_alpha",
+            "mode": "test",
+            "livemode": False,
+            "apiVersion": "2026-07-29.clover",
+        },
         "success": True,
         "validatorThreshold": 2,
         "validators": [
@@ -41,8 +128,8 @@ def _evidence(settings: Settings) -> dict:
             {"id": "validator-3"},
         ],
         "lanes": {
-            "delivery": {"success": True},
-            "refund": {"success": True, "exactRefund": True},
+            "delivery": lane(1, delivery=True),
+            "refund": lane(40, delivery=False),
         },
     }
 

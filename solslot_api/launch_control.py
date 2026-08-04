@@ -86,7 +86,6 @@ from .launch_rehearsal import (
     require_completed_rehearsal,
     rehearsal_status,
     start_rehearsal,
-    submit_rehearsal_transaction,
 )
 from .omnichain_ownership_activation import (
     BroadcastRequest as OwnershipBroadcastRequest,
@@ -845,10 +844,10 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
             "state": "NOT_STARTED",
             "phase": "PREPARE",
             "completedSteps": 0,
-            "step": "Ready after the governed test SmartDeed is confirmed.",
+            "step": "Ready after two governed test SmartDeeds are confirmed.",
             "message": (
-                "A coadministrator will use test USDC to prove one delivery "
-                "and one exact refund before customer payments open."
+                "A coadministrator will complete two Stripe test purchases: "
+                "one delivered to its approved vault and one fully refunded."
             ),
             "assignedRole": "coadmin",
             "walletTransaction": None,
@@ -872,7 +871,7 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
     amount_label = (
         str(review.get("amountLabel"))
         if isinstance(review, Mapping)
-        else "a fixed amount of test USDC"
+        else "two fixed Stripe test charges"
     )
     expected_outcome = (
         str(review.get("expectedOutcome"))
@@ -882,30 +881,27 @@ def _rehearsal_result(record: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
         "status": status_value,
         "decisionReceipt": {
-            "title": (
-                "Approve test USDC"
-                if status_value.get("phase") in {"APPROVE_DELIVERY", "APPROVE_REFUND"}
-                else "Send the fixed Base Sepolia test payment"
-            ),
-            "network": "Base Sepolia",
+            "title": "Verify the Stripe voucher payment path",
+            "network": "Stripe test mode and Testnet11",
             "financialEffect": (
-                f"Uses {amount_label} and test gas only. "
-                "No real funds or customer funds move."
+                f"Uses {amount_label} in Stripe test mode and Testnet11 mojos only. "
+                "No real money or customer assets move."
             ),
             "customerImpact": (
-                "Proves the reviewed payment, validator delivery, SmartDeed delivery, "
-                "and exact-refund paths before customer payments open."
+                "Proves final Stripe payment, 2-of-3 validation, voucher issuance, "
+                "KoS submission, SmartDeed delivery, and exact refund recovery."
             ),
             "reversibility": (
-                "This is a bounded test purchase. The rehearsal must prove delivery "
-                "or an exact automated refund."
+                "Both purchases use Stripe test mode. One voucher is consumed by "
+                "delivery; the second must return its exact collected test amount."
             ),
             "requiredApprovers": (
-                "One enrolled coadministrator submits each clearly labeled test-wallet step"
+                "One enrolled coadministrator runs the check; the normal validator "
+                "quorum and protocol rules authorize settlement"
             ),
             "expectedResult": (
-                f"This step expects {expected_outcome}. Three validators produce "
-                "2-of-3 evidence before the full check can pass."
+                f"This step expects {expected_outcome}. Readiness passes only after "
+                "mempool observation and confirmed Testnet11 outputs are recorded."
             ),
         },
     }
@@ -1977,7 +1973,7 @@ async def guided_start_settlement_rehearsal(
         record = store.get(session.ceremony_id)
         release_hash = str(record["draft"].get("releaseEvidenceHash") or "")
         if not HEX32_RE.fullmatch(release_hash):
-            raise GenesisConflict("the RC26 release evidence hash is unavailable")
+            raise GenesisConflict("the release evidence hash is unavailable")
         remote = await start_rehearsal(
             settings,
             ceremony_id=session.ceremony_id,
@@ -2000,29 +1996,15 @@ async def guided_submit_settlement_rehearsal_transaction(
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
+    del body, settings, store
     _require_coadmin(session)
-    launch = store.get(session.ceremony_id)
-    if launch["state"] != "locked":
-        raise HTTPException(
-            status_code=409,
-            detail="Complete genesis before submitting payment-test transactions.",
-        )
-    current = store.settlement_rehearsal(session.ceremony_id)
-    if not current:
-        raise HTTPException(status_code=409, detail="Start the settlement rehearsal first.")
-    try:
-        remote = await submit_rehearsal_transaction(
-            settings,
-            job_id=str(current["jobId"]),
-            transaction_hash=body.transaction_hash,
-        )
-        return _rehearsal_result(
-            _store_rehearsal_status(
-                settings, store, session.ceremony_id, remote
-            )
-        )
-    except (GenesisStoreError, LaunchRehearsalError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "The RC27 Stripe voucher rehearsal observes normal customer test "
+            "purchases and never asks an administrator to submit a wallet transaction."
+        ),
+    )
 
 
 @router.post("/funding/prepare")
