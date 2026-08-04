@@ -161,9 +161,18 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires "
                 "Stripe settlement or the reviewed omnichain rail."
             )
+    if (
+        settings.stripe_delivery_worker_enabled
+        or settings.voucher_issuance_worker_enabled
+    ):
+        worker_name = (
+            "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED"
+            if settings.stripe_delivery_worker_enabled
+            else "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED"
+        )
         if not settings.protocol_fee_funding_enabled:
             raise RuntimeError(
-                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires "
+                f"{worker_name} requires "
                 "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED."
             )
         if not (
@@ -172,7 +181,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             and settings.payment_kos_executor_public_key
         ):
             raise RuntimeError(
-                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the exact "
+                f"{worker_name} requires the exact "
                 "Key of Solomon executor URL, request key file, and public key."
             )
         if not valid_internal_service_url(settings.payment_kos_executor_url):

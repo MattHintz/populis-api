@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Arm or disarm the RC26 Stripe test-mode infrastructure ceiling.
+# Arm or disarm the RC27 Stripe test-mode infrastructure ceiling.
 #
 # This does not open a signed launch window. The administrator UI remains the
 # only transaction-level switch for minting, presales, and purchases.
@@ -70,6 +70,7 @@ telonium_service=telonium.service
 telonium_port=5000
 reconciler_service=solslot-stripe-reconciliation.service
 reconciler_timer=solslot-stripe-reconciliation.timer
+refund_timer=solslot-stripe-presale-refunds-production.timer
 kos_root=/opt/solslot/key-of-solomon-production
 kos_service=solslot-key-of-solomon.service
 kos_port=8793
@@ -86,7 +87,7 @@ for path in \
 done
 for service in \
   "$api_service" "$backend_service" "$telonium_service" \
-  "$reconciler_timer"; do
+  "$reconciler_timer" "$refund_timer"; do
   systemctl is-active --quiet "$service" || {
     echo "Required production unit is not active: $service" >&2
     exit 1
@@ -184,13 +185,13 @@ missing = [name for name in required_backend if not backend.get(name)]
 if missing:
     raise SystemExit("backend Stripe configuration is incomplete: " + ", ".join(missing))
 if not backend["STRIPE_SECRET_KEY"].startswith("sk_test_"):
-    raise SystemExit("RC26 rehearsal requires a Stripe test secret key")
+    raise SystemExit("RC27 rehearsal requires a Stripe test secret key")
 if not backend["STRIPE_WEBHOOK_SECRET"].startswith("whsec_"):
     raise SystemExit("Stripe webhook signing secret is malformed")
 if not backend["STRIPE_ACCOUNT_ID"].startswith("acct_"):
     raise SystemExit("Stripe account ID is malformed")
 if backend["STRIPE_API_VERSION"] != "2026-02-25.clover":
-    raise SystemExit("Stripe API version is not pinned to RC26")
+    raise SystemExit("Stripe API version is not pinned to RC27")
 for name in ("SOLSLOT_PROTOCOL_CALLBACK_TOKEN", "SOLSLOT_TELONIUM_INTERNAL_TOKEN"):
     if len(backend[name]) < 32:
         raise SystemExit(f"{name} must contain at least 32 characters")
@@ -201,7 +202,7 @@ for name in (
 ):
     value = backend.get(name, "false" if name.endswith("ENABLED") else "0").lower()
     if value not in ({"", "0", "false", "no", "off"} if name.endswith("ENABLED") else {"", "0"}):
-        raise SystemExit("credit surcharge must remain disabled for RC26 rehearsal")
+        raise SystemExit("credit surcharge must remain disabled for RC27 rehearsal")
 
 required_api = (
     "SOLSLOT_STRIPE_ACCOUNT_ID",
@@ -216,7 +217,7 @@ if missing:
 if api["SOLSLOT_STRIPE_ACCOUNT_ID"] != backend["STRIPE_ACCOUNT_ID"]:
     raise SystemExit("API and Telonium Stripe account IDs do not match")
 if api.get("SOLSLOT_STRIPE_MODE", "test").lower() != "test":
-    raise SystemExit("RC26 rehearsal cannot use Stripe live mode")
+    raise SystemExit("RC27 rehearsal cannot use Stripe live mode")
 if len(api["SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN"]) < 32:
     raise SystemExit("protocol artifact service token is too short")
 PY
@@ -248,12 +249,14 @@ if [ "$(process_env_value "$api_service" SOLSLOT_LAUNCH_CONTROL_ENABLED)" != "tr
 fi
 genesis_db="$(process_env_value "$api_service" SOLSLOT_GENESIS_DB_PATH)"
 delivery_db="$(process_env_value "$api_service" SOLSLOT_STRIPE_DELIVERY_DB_PATH)"
+admin_db="$(process_env_value "$api_service" SOLSLOT_ADMIN_DB_PATH)"
 checker="$api_root/current/scripts/check_stripe_rehearsal_ceiling.py"
 test -x "$checker"
 "$api_root/current/.venv/bin/python" "$checker" \
   --mode "$action" \
   --genesis-db "$genesis_db" \
-  --delivery-db "$delivery_db"
+  --delivery-db "$delivery_db" \
+  --admin-db "$admin_db"
 
 if [ "$action" = "arm" ]; then
   for credential in ca.crt coordinator.crt coordinator.key; do
@@ -302,7 +305,7 @@ for record in records:
     if record.get("status") != "healthy":
         raise SystemExit("a validator is unhealthy")
     if record.get("apiCommit") != api_sha or record.get("protocolCommit") != protocol_sha:
-        raise SystemExit("validator release does not match RC26")
+        raise SystemExit("validator release does not match RC27")
     if record.get("network") != "testnet11":
         raise SystemExit("validator is not on Testnet11")
     if record.get("stripeSettlementReady") is not True:
@@ -430,7 +433,8 @@ PY
 "$api_root/current/.venv/bin/python" "$checker" \
   --mode "$action" \
   --genesis-db "$genesis_db" \
-  --delivery-db "$delivery_db"
+  --delivery-db "$delivery_db" \
+  --admin-db "$admin_db"
 if [ "$action" = "arm" ]; then
   systemctl start "$reconciler_service"
   systemctl is-failed --quiet "$reconciler_service" && {

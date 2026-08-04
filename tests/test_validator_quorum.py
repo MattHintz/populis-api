@@ -441,6 +441,42 @@ def test_base_voucher_transition_uses_receipt_evidence_message() -> None:
         )
 
 
+def test_stripe_v3_redemption_binds_receipt_and_inventory_reservation() -> None:
+    payload = _voucher_transition_claim().model_dump(mode="json")
+    payload["voucher_commitment"] = {
+        **payload["voucher_commitment"],
+        "schema": "solslot.voucher-commitment.v3",
+        "paymentRail": 3,
+    }
+    payload.update(
+        action=3,
+        owner_authorization="",
+        deed_coin_id="0x" + "4c" * 32,
+        deed_puzzle_hash="0x" + "4d" * 32,
+        smart_deed_inner_hash="0x" + "4e" * 32,
+        protocol_puzzle_hash="0x" + "4f" * 32,
+        buyer_offer="offer1" + "50" * 16,
+        reservation_expires_at=1_800_172_800,
+        payment_evidence={"paymentIntentId": "pi_testnet11_presale"},
+        external_settlement_evidence_hash="0x" + "51" * 32,
+        external_validator_message="0x" + "52" * 32,
+    )
+    claim = VoucherTransitionClaim.model_validate(payload)
+    messages = claim.signature_messages()
+
+    assert len(messages) == 4
+    assert bytes.fromhex(claim.external_validator_message[2:]) in messages[2]
+    assert bytes.fromhex(claim.deed_coin_id[2:]) in messages[3]
+    with pytest.raises(ValueError, match="inventory reservation expiry"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "reservation_expires_at": None}
+        )
+    with pytest.raises(ValueError, match="authenticated settlement evidence"):
+        VoucherTransitionClaim.model_validate(
+            {**payload, "payment_evidence": None}
+        )
+
+
 def test_voucher_redemption_binds_the_governed_deed_without_owner_signature() -> None:
     payload = _voucher_transition_claim().model_dump(mode="json")
     payload.update(

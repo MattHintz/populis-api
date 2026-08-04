@@ -34,10 +34,12 @@ from solslot_puzzles.payment_artifacts_v2 import (
 from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseBatchV1,
     PurchaseArtifactV3,
+    PurchaseKind,
     purchase_artifact_v3_to_json,
     purchase_artifact_v3_from_json,
     purchase_batch_from_json,
 )
+from solslot_puzzles.voucher_presale_v2 import DELIVERY_WINDOW_SECONDS
 from solslot_puzzles.stripe_settlement_v1_driver import (
     PRIMARY_PURCHASE_PROVIDER_ID,
     InventoryReservationV1,
@@ -1237,16 +1239,41 @@ async def _load_context(
             deed_launcher_id=purchase.deed_launcher_id,
             protocol_did_singleton_struct=did_struct,
         )
+        if purchase.purchase_kind == PurchaseKind.PRESALE:
+            from .presale_endpoints import get_presale_store
+
+            series = get_presale_store(settings).get(
+                _hex32(purchase.presale_terms_hash)
+            )
+            series_terms = series.get("terms")
+            if (
+                series.get("state") not in {"PRESALE", "LIVE"}
+                or not isinstance(series_terms, Mapping)
+                or str(series.get("termsHash") or "").lower()
+                != _hex32(purchase.presale_terms_hash)
+            ):
+                raise PaymentArtifactError(
+                    "presale reservation differs from its governed series"
+                )
+            presale_reservation_expiry = int(
+                series_terms.get("launchDeadline") or 0
+            ) + DELIVERY_WINDOW_SECONDS
+            if presale_reservation_expiry <= int(time.time()):
+                raise PaymentArtifactError(
+                    "presale reservation delivery window has expired"
+                )
+        else:
+            presale_reservation_expiry = min(
+                purchase.quote_expires_at,
+                purchase.authorization_expires_at,
+            )
         reservation = InventoryReservationV1(
             artifact=purchase,
             expires_at=(
                 stored.inventory_expires_at
                 if require_inventory_reservation
                 and stored.inventory_expires_at is not None
-                else min(
-                    purchase.quote_expires_at,
-                    purchase.authorization_expires_at,
-                )
+                else presale_reservation_expiry
             ),
         )
         expected_puzzle = SINGLETON_MOD.curry(

@@ -147,6 +147,7 @@ def test_exact_bundle_binding_is_immutable_and_keeps_worker_lease(tmp_path) -> N
         exact_bundle=exact,
     )
     assert bound.receipt_funding_exact_bundle == exact
+    assert store.pending_exact_fee_coin_ids() == {_hex("37")}
     assert store.claim(
         purchase_id,
         owner="worker-b",

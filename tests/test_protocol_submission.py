@@ -251,6 +251,37 @@ async def test_fee_coin_cannot_duplicate_a_protocol_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_durable_exact_execution_reserves_its_fee_coin() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(72), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    service = submitter(provider, faucet)
+    service.add_fee_coin_reservation_source(
+        lambda: {"0x" + fee_coin.name().hex()}
+    )
+
+    with pytest.raises(ProtocolSubmissionError, match="no eligible"):
+        await service.submit(protocol_bundle().to_json_dict())
+
+    assert provider.submitted is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_durable_fee_reservation_fails_closed() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    provider = FakeProvider(
+        fee_coin=Coin(b32(73), faucet.address_puzzle_hash, uint64(100))
+    )
+    service = submitter(provider, faucet)
+    service.add_fee_coin_reservation_source(lambda: {"not-a-coin-id"})
+
+    with pytest.raises(ProtocolSubmissionError, match="reservation is malformed"):
+        await service.submit(protocol_bundle().to_json_dict())
+
+    assert provider.submitted is None
+
+
+@pytest.mark.asyncio
 async def test_protocol_fee_funding_is_fail_closed_by_default() -> None:
     faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
     provider = FakeProvider(
@@ -312,3 +343,24 @@ def test_fee_till_configuration_requires_local_node_and_existing_key() -> None:
             faucet_seed_hex="01" * 32,
         )
     )
+
+
+def test_voucher_worker_requires_fee_funding_and_exact_kos_executor() -> None:
+    with pytest.raises(RuntimeError, match="PROTOCOL_FEE_FUNDING_ENABLED"):
+        validate_server_hardening_at_startup(
+            Settings(
+                presale_enabled=True,
+                voucher_issuance_worker_enabled=True,
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="exact Key of Solomon executor"):
+        validate_server_hardening_at_startup(
+            Settings(
+                presale_enabled=True,
+                voucher_issuance_worker_enabled=True,
+                protocol_fee_funding_enabled=True,
+                chia_primary_url="https://127.0.0.1:18555",
+                faucet_seed_hex="01" * 32,
+            )
+        )

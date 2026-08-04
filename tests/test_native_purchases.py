@@ -111,8 +111,9 @@ def _context(
     validator_keys,
     *,
     deed_parent_seed: int = 22,
+    now: int | None = None,
 ) -> tuple[NativePurchaseContext, Coin]:
-    now = int(time.time())
+    now = int(time.time()) if now is None else now
     vault_launcher = _b32(8)
     protocol_did = singleton_struct(_b32(17))
     deed_launcher_parent = _b32(deed_parent_seed)
@@ -412,15 +413,18 @@ async def test_quantity_two_submits_one_atomic_multi_deed_purchase(
     validator_keys = tuple(
         AugSchemeMPL.key_gen(bytes([seed]) * 32) for seed in (51, 52, 53)
     )
+    now = int(time.time())
     first, _ = _context(
         payment_key,
         validator_keys,
         deed_parent_seed=61,
+        now=now,
     )
     second, _ = _context(
         payment_key,
         validator_keys,
         deed_parent_seed=62,
+        now=now,
     )
     contexts = tuple(
         sorted(

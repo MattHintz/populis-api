@@ -34,6 +34,7 @@ from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseDeliveryKind,
     PurchaseArtifactV3,
     PurchaseBatchV1,
+    PurchaseKind,
     STRIPE_PAYMENT_PROVIDER_ID,
     StripeDisputeState,
     StripeFundingType,
@@ -813,23 +814,45 @@ async def verify_purchase_finalization(
                         )
                     )
                     payment_rail = "base_usdc"
-                from .stripe_delivery_store import get_stripe_delivery_store
+                if (
+                    body.rail == "stripe"
+                    and isinstance(canonical, PurchaseArtifactV3)
+                    and canonical.purchase_kind == PurchaseKind.PRESALE
+                ):
+                    if canonical.delivery_kind != PurchaseDeliveryKind.SMARTDEED:
+                        raise PaymentArtifactError(
+                            "Stripe presales can issue SmartDeed vouchers only"
+                        )
+                    from .presale_endpoints import get_presale_store
 
-                delivery = get_stripe_delivery_store(
-                    settings.stripe_delivery_db_path
-                ).queue(
-                    purchase_id=_hex32(canonical.purchase_id),
-                    evidence=delivery_evidence,
-                    receipt_hash=_hex32(receipt.receipt_hash),
-                    payment_rail=payment_rail,
-                    delivery_kind=(
-                        "sgt"
-                        if canonical_item.delivery_kind
-                        == PurchaseDeliveryKind.SGT
-                        else "smartdeed"
-                    ),
-                )
-                delivery_state = delivery.state
+                    voucher_event = get_presale_store(
+                        settings
+                    ).ingest_stripe_payment(
+                        _hex32(canonical.presale_terms_hash),
+                        artifact=canonical,
+                        receipt=receipt,
+                        evidence_id=stripe_evidence.event_id,
+                        issued_purchase=stored,
+                    )
+                    delivery_state = str(voucher_event["voucherState"])
+                else:
+                    from .stripe_delivery_store import get_stripe_delivery_store
+
+                    delivery = get_stripe_delivery_store(
+                        settings.stripe_delivery_db_path
+                    ).queue(
+                        purchase_id=_hex32(canonical.purchase_id),
+                        evidence=delivery_evidence,
+                        receipt_hash=_hex32(receipt.receipt_hash),
+                        payment_rail=payment_rail,
+                        delivery_kind=(
+                            "sgt"
+                            if canonical_item.delivery_kind
+                            == PurchaseDeliveryKind.SGT
+                            else "smartdeed"
+                        ),
+                    )
+                    delivery_state = delivery.state
         except (PaymentPurchaseNotFound, PaymentArtifactError, ValueError):
             reasons.append("external_delivery_queue_rejected")
     return VerifyPurchaseFinalizationResponse(
@@ -1226,6 +1249,13 @@ def _build_canonical_payment_artifact(
         artifacts = tuple(
             purchase_artifact_v3_from_json(value) for value in child_payloads
         )
+        if any(
+            artifact.purchase_kind != PurchaseKind.DIRECT
+            for artifact in artifacts
+        ):
+            raise PaymentArtifactError(
+                "multi-deed checkout requires direct governed inventory"
+            )
         batch_nonce = bytes32(
             hashlib.sha256(
                 b"SOLSLOT_PURCHASE_BATCH_NONCE_V1\x00"
@@ -1377,10 +1407,26 @@ def _build_canonical_payment_artifact(
         expected_deed_launcher,
     )
     is_voucher = voucher_terms_hash is not None
-    if is_voucher and body.rail not in {"chia_xch", "base_usdc", "evm_usdc"}:
+    quote_expires_at = body.expires_at
+    if voucher_terms_hash is not None:
+        from .presale_endpoints import get_presale_store
+
+        active_series = get_presale_store(settings).get(voucher_terms_hash)
+        quote_expires_at = min(
+            quote_expires_at,
+            int(_mapping(active_series.get("terms")).get("saleClose") or 0),
+        )
+        if quote_expires_at <= now:
+            raise PaymentArtifactError("governed presale sales window is closed")
+    if is_voucher and body.rail not in {
+        "chia_xch",
+        "base_usdc",
+        "evm_usdc",
+        "stripe",
+    }:
         raise PaymentArtifactError(
             "active presale inventory is available only through governed "
-            "XCH or Base USDC vouchers"
+            "XCH, Base USDC, or Stripe vouchers"
         )
     common = {
         "network": settings.network,
@@ -1397,7 +1443,7 @@ def _build_canonical_payment_artifact(
         "authorization_expires_at": int(
             body.authorization_expires_at or 0
         ),
-        "quote_expires_at": body.expires_at,
+        "quote_expires_at": quote_expires_at,
     }
     if is_voucher:
         common["usd_amount_minor"] = gross_usd_amount_minor
@@ -1420,7 +1466,33 @@ def _build_canonical_payment_artifact(
             raise PaymentArtifactError(
                 "Stripe purchases must use USD minor units"
             )
-        purchase = build_stripe_purchase_artifact_v3(**common)
+        stripe_common = common
+        if is_voucher:
+            stripe_common = {
+                "network": settings.network,
+                "collection_id": collection_id,
+                "deed_launcher_id": deed_launcher_id,
+                "metadata_root": expected_metadata_root,
+                "metadata_anchor_id": expected_metadata_anchor,
+                "share_ppm": share_ppm,
+                "base_usd_amount_minor": base_usd_amount_minor,
+                "technology_fee_bps": fee_bps,
+                "protocol_treasury_puzzle_hash": protocol_treasury,
+                "zkpassport_root": zkpassport_root,
+                "vault_launcher_id": vault_id,
+                "vault_p2_puzzle_hash": vault_p2,
+                "authorization_nonce": _bytes32_field(
+                    str(body.authorization_nonce), "authorization_nonce"
+                ),
+                "authorization_expires_at": int(
+                    body.authorization_expires_at or 0
+                ),
+                "quote_expires_at": quote_expires_at,
+                "presale_terms_hash": _bytes32_field(
+                    str(voucher_terms_hash), "presale_terms_hash"
+                ),
+            }
+        purchase = build_stripe_purchase_artifact_v3(**stripe_common)
         purchase.assert_live(now)
         return purchase_artifact_v3_to_json(purchase), None
 

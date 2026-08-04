@@ -91,6 +91,11 @@ share allocation, or delivery address.
   `SOLSLOT_PAYMENT_KOS_EXECUTOR_URL`, request-key file, and matching BLS public
   key are mandatory. Key of Solomon is the sole submit/retry boundary and
   receives no Stripe or Base credential; hosted remote links require mTLS.
+  Stripe voucher redemption and refund use the same exact KoS boundary when
+  `SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED=true`: the API persists the funded
+  bundle before dispatch, serializes terminal spends per voucher-series
+  singleton, reserves its sealed fee coin, and retries only those exact bytes
+  after a restart.
   The same durable worker handles reviewed Base Sepolia USDC when
   `SOLSLOT_PAYMENT_OMNICHAIN_ENABLED=true`; Base remains pending until Samuel
   relays the one-use Chia result and the API independently verifies the final

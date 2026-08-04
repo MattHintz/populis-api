@@ -14,10 +14,10 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # RC26 adds funded redemption and vault-bound Sols custody while preserving
-  # the frozen Pool V4 hash. Keep CI on the exact reviewed protocol commit.
+  # RC27 preserves the frozen Pool V4 hash and permits delayed ACH settlement
+  # only for the exact Stripe voucher artifact committed before payment.
   # Keep CI reproducible without advancing deployment environment pins.
-  PROTOCOL_REF: 691e61cc05812b6d349631be28142de2f646c361
+  PROTOCOL_REF: 22ca133b516247a6c223b6cc960652e1d2201183
 
 jobs:
   verify:

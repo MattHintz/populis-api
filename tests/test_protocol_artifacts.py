@@ -18,11 +18,16 @@ from solslot_api.config import get_settings, validate_server_hardening_at_startu
 from solslot_api.payment_purchase_store import get_payment_purchase_store
 from solslot_api.payment_quotes import SNAPSHOT_SCHEMA
 from solslot_api.protocol_artifacts import (
+    BuildProtocolOfferArtifactRequest,
+    VerifyPurchaseFinalizationRequest,
     VerifyExternalEscrowWebhookRequest,
+    _build_canonical_payment_artifact,
     verify_external_escrow,
+    verify_purchase_finalization,
 )
 from solslot_puzzles.payment_artifacts_v2 import (
     OracleObservationV1,
+    PaymentArtifactError,
     PaymentRail,
     build_oracle_round,
     oracle_operator_set_root,
@@ -37,6 +42,7 @@ from solslot_puzzles.payment_artifacts_v3 import (
     StripePaymentStatus,
     StripeRefundState,
     StripeSettlementEvidenceV1,
+    build_stripe_purchase_artifact_v3,
     build_sgt_purchase_artifact_v3,
     purchase_artifact_v3_to_json,
     purchase_artifact_v3_from_json,
@@ -1299,6 +1305,215 @@ def test_quote_price_uses_target_raise_share_not_chia_par_value(
     assert purchase["technologyFeeMinor"] == "1250"
     assert purchase["subtotalMinor"] == "126250"
     assert purchase["baseAmountMinor"] != "250000000000"
+
+
+def test_stripe_quote_for_active_presale_is_v3_and_window_bound(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_external_quote(monkeypatch, tmp_path)
+    now = int(time.time())
+    terms_hash = "0x" + "91" * 32
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._active_presale_terms_for_deed",
+        lambda _settings, _deed_launcher_id: terms_hash,
+    )
+
+    class Presales:
+        @staticmethod
+        def get(value):
+            assert value == terms_hash
+            return {"terms": {"saleClose": now + 600}}
+
+    monkeypatch.setattr(
+        "solslot_api.presale_endpoints.get_presale_store",
+        lambda _settings: Presales(),
+    )
+    body = BuildProtocolOfferArtifactRequest.model_validate(
+        _request(
+            rail="stripe",
+            purchase_intent_id="pi_stripe_presale_v3",
+            expires_at=now + 900,
+            authorization_nonce="0x" + "17" * 32,
+            authorization_expires_at=now + 1200,
+            payment_terms={"currency": "USD", "quantity": 1},
+        )
+    )
+    purchase, _oracle = _build_canonical_payment_artifact(
+        body,
+        get_settings(),
+        vault_launcher_id=VAULT_ID,
+        identity_attest_root=IDENTITY_ROOT,
+        genesis_artifact=_active_genesis_artifact(),
+    )
+
+    assert purchase["schema"] == "solslot.purchase-artifact.v3"
+    assert purchase["purchaseKind"] == 2
+    assert purchase["presaleTermsHash"] == terms_hash
+    assert purchase["quoteExpiresAt"] == str(now + 600)
+
+
+@pytest.mark.asyncio
+async def test_stripe_presale_finalization_dispatches_only_to_voucher_v3(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    now = int(time.time())
+    vault = bytes32.from_hexstr(VAULT_ID)
+    purchase = build_stripe_purchase_artifact_v3(
+        network="testnet11",
+        collection_id=bytes32(bytes.fromhex("21" * 32)),
+        deed_launcher_id=bytes32(bytes.fromhex("22" * 32)),
+        metadata_root=bytes32(bytes.fromhex("23" * 32)),
+        metadata_anchor_id=bytes32(bytes.fromhex("24" * 32)),
+        share_ppm=25_000,
+        base_usd_amount_minor=125_000,
+        technology_fee_bps=100,
+        protocol_treasury_puzzle_hash=bytes32(bytes.fromhex("25" * 32)),
+        zkpassport_root=bytes32.from_hexstr(IDENTITY_ROOT),
+        vault_launcher_id=vault,
+        vault_p2_puzzle_hash=puzzle_hash_for_p2_vault(vault),
+        authorization_nonce=bytes32(bytes.fromhex("26" * 32)),
+        authorization_expires_at=now + 1_200,
+        quote_expires_at=now + 900,
+        presale_terms_hash=bytes32(bytes.fromhex("27" * 32)),
+    )
+    purchase_json = purchase_artifact_v3_to_json(purchase)
+    evidence = stripe_settlement_evidence_to_json(
+        StripeSettlementEvidenceV1(
+            stripe_account_id="acct_test_solslot",
+            livemode=False,
+            payment_intent_id="pi_presale_dispatch",
+            event_id="evt_presale_dispatch",
+            amount_minor=purchase.subtotal_minor,
+            currency="usd",
+            method_family=StripeMethodFamily.US_BANK_ACCOUNT,
+            funding_type=StripeFundingType.BANK_ACCOUNT,
+            processing_charge_minor=0,
+            status=StripePaymentStatus.SUCCEEDED,
+            refunded_minor=0,
+            refund_state=StripeRefundState.NONE,
+            dispute_state=StripeDisputeState.NONE,
+            observed_at=now + 10,
+        )
+    )
+    artifact_hash = "sha256:" + "28" * 32
+    outer_artifact = {
+        "protocol": {
+            "purchaseIntentId": "pi_presale_dispatch",
+            "rail": "stripe",
+            "expiresAt": now + 900,
+        },
+        "purchaseArtifactV3": purchase_json,
+    }
+    stored = SimpleNamespace(
+        purchase_intent_id="pi_presale_dispatch",
+        artifact_hash=purchase_json["artifactHash"],
+        offer_artifact_hash=artifact_hash,
+        purchase_artifact=purchase_json,
+    )
+    observed = []
+
+    class Purchases:
+        @staticmethod
+        def get(purchase_id):
+            assert purchase_id == purchase_json["purchaseId"]
+            return stored
+
+    class Presales:
+        @staticmethod
+        def ingest_stripe_payment(terms_hash, **kwargs):
+            observed.append((terms_hash, kwargs))
+            return {"voucherState": "PENDING_ISSUANCE"}
+
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._artifact_rejection_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._payment_evidence_rejection_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts.get_payment_purchase_store",
+        lambda *_args: Purchases(),
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts.configured_validator_pubkeys",
+        lambda *_args: tuple(
+            bytes(AugSchemeMPL.key_gen(bytes([seed]) * 32).get_g1())
+            for seed in (91, 92, 93)
+        ),
+    )
+    monkeypatch.setattr(
+        "solslot_api.presale_endpoints.get_presale_store",
+        lambda *_args: Presales(),
+    )
+    result = await verify_purchase_finalization(
+        VerifyPurchaseFinalizationRequest(
+            artifact=outer_artifact,
+            artifact_hash=artifact_hash,
+            rail="stripe",
+            purchase_intent_id="pi_presale_dispatch",
+            payment_evidence=evidence,
+            now=now + 10,
+        ),
+        get_settings(),
+    )
+
+    assert result.verified is True
+    assert result.delivery_state == "PENDING_ISSUANCE"
+    assert len(observed) == 1
+    terms_hash, kwargs = observed[0]
+    assert terms_hash == "0x" + "27" * 32
+    assert kwargs["artifact"] == purchase
+    assert kwargs["evidence_id"] == "evt_presale_dispatch"
+
+
+def test_stripe_presale_rejects_unsupported_multi_deed_voucher_batch(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _configure_external_quote(monkeypatch, tmp_path)
+    now = int(time.time())
+    terms_hash = "0x" + "29" * 32
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._active_presale_terms_for_deed",
+        lambda _settings, _deed_launcher_id: terms_hash,
+    )
+
+    class Presales:
+        @staticmethod
+        def get(value):
+            assert value == terms_hash
+            return {"terms": {"saleClose": now + 600}}
+
+    monkeypatch.setattr(
+        "solslot_api.presale_endpoints.get_presale_store",
+        lambda _settings: Presales(),
+    )
+    body = BuildProtocolOfferArtifactRequest.model_validate(
+        _request(
+            rail="stripe",
+            purchase_intent_id="pi_stripe_presale_batch",
+            expires_at=now + 900,
+            authorization_nonce="0x" + "2a" * 32,
+            authorization_expires_at=now + 1200,
+            payment_terms={"currency": "USD", "quantity": 2},
+        )
+    )
+
+    with pytest.raises(
+        PaymentArtifactError,
+        match="multi-deed checkout requires direct governed inventory",
+    ):
+        _build_canonical_payment_artifact(
+            body,
+            get_settings(),
+            vault_launcher_id=VAULT_ID,
+            identity_attest_root=IDENTITY_ROOT,
+            genesis_artifact=_active_genesis_artifact(),
+        )
 
 
 @pytest.mark.parametrize(
