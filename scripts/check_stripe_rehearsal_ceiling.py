@@ -18,7 +18,9 @@ from typing import Any
 
 
 _GATE_NAMES = ("minting", "presale", "purchases")
-_TERMINAL_STATES = frozenset({"FINALIZED"})
+_DIRECT_TERMINAL_STATES = frozenset({"FINALIZED"})
+_VOUCHER_TERMINAL_STATES = frozenset({"REFUNDED", "REDEEMED"})
+_REFUND_TERMINAL_STATES = frozenset({"COMPLETED"})
 
 
 class CeilingCheckError(RuntimeError):
@@ -104,7 +106,7 @@ def _stripe_operation_summary(delivery_db: str) -> dict[str, Any]:
     nonterminal = {
         state: count
         for state, count in counts.items()
-        if state not in _TERMINAL_STATES and count > 0
+        if state not in _DIRECT_TERMINAL_STATES and count > 0
     }
     return {
         "counts": counts,
@@ -113,23 +115,89 @@ def _stripe_operation_summary(delivery_db: str) -> dict[str, Any]:
     }
 
 
-def check_transition(*, mode: str, genesis_db: str, delivery_db: str) -> dict[str, Any]:
+def _stripe_voucher_summary(admin_db: str) -> dict[str, Any]:
+    with _read_only_connection(admin_db) as connection:
+        _require_table(connection, "voucher_records_v2")
+        _require_table(connection, "stripe_refund_authorizations_v3")
+        voucher_rows = connection.execute(
+            "SELECT state,COUNT(*) AS operation_count "
+            "FROM voucher_records_v2 WHERE payment_rail='STRIPE_USD' "
+            "GROUP BY state ORDER BY state"
+        ).fetchall()
+        refund_rows = connection.execute(
+            "SELECT state,COUNT(*) AS operation_count "
+            "FROM stripe_refund_authorizations_v3 "
+            "GROUP BY state ORDER BY state"
+        ).fetchall()
+    voucher_counts = {
+        str(row["state"]): int(row["operation_count"]) for row in voucher_rows
+    }
+    refund_counts = {
+        str(row["state"]): int(row["operation_count"]) for row in refund_rows
+    }
+    nonterminal_vouchers = {
+        state: count
+        for state, count in voucher_counts.items()
+        if state not in _VOUCHER_TERMINAL_STATES and count > 0
+    }
+    nonterminal_refunds = {
+        state: count
+        for state, count in refund_counts.items()
+        if state not in _REFUND_TERMINAL_STATES and count > 0
+    }
+    return {
+        "voucherCounts": voucher_counts,
+        "refundAuthorizationCounts": refund_counts,
+        "nonterminalVouchers": nonterminal_vouchers,
+        "nonterminalRefundAuthorizations": nonterminal_refunds,
+        "nonterminalCount": (
+            sum(nonterminal_vouchers.values())
+            + sum(nonterminal_refunds.values())
+        ),
+    }
+
+
+def check_transition(
+    *,
+    mode: str,
+    genesis_db: str,
+    delivery_db: str,
+    admin_db: str,
+) -> dict[str, Any]:
     gates = _closed_launch_gates(genesis_db)
     operations = _stripe_operation_summary(delivery_db)
-    if mode == "disarm" and operations["nonterminalCount"]:
-        states = ", ".join(
-            f"{state}={count}"
-            for state, count in sorted(operations["nonterminal"].items())
-        )
+    vouchers = _stripe_voucher_summary(admin_db)
+    if mode == "disarm" and (
+        operations["nonterminalCount"] or vouchers["nonterminalCount"]
+    ):
+        states = [
+            *(
+                f"direct:{state}={count}"
+                for state, count in sorted(operations["nonterminal"].items())
+            ),
+            *(
+                f"voucher:{state}={count}"
+                for state, count in sorted(
+                    vouchers["nonterminalVouchers"].items()
+                )
+            ),
+            *(
+                f"refund:{state}={count}"
+                for state, count in sorted(
+                    vouchers["nonterminalRefundAuthorizations"].items()
+                )
+            ),
+        ]
         raise CeilingCheckError(
             "Stripe workers must remain armed until every accepted operation is "
-            f"terminal: {states}"
+            f"terminal: {', '.join(states)}"
         )
     return {
         "ok": True,
         "mode": mode,
         "launch": gates,
         "stripeOperations": operations,
+        "stripeVouchers": vouchers,
     }
 
 
@@ -138,6 +206,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("arm", "disarm"), required=True)
     parser.add_argument("--genesis-db", required=True)
     parser.add_argument("--delivery-db", required=True)
+    parser.add_argument("--admin-db", required=True)
     return parser
 
 
@@ -148,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             genesis_db=args.genesis_db,
             delivery_db=args.delivery_db,
+            admin_db=args.admin_db,
         )
     except (CeilingCheckError, sqlite3.Error) as exc:
         print(f"Stripe rehearsal ceiling check failed: {exc}", file=sys.stderr)
