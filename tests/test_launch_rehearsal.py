@@ -27,7 +27,7 @@ def _settings(tmp_path) -> Settings:
     return Settings(
         runtime_environment="test",
         network="testnet11",
-        launch_release_tag="solslot-v2-alpha-rc26-20260803",
+        launch_release_tag="solslot-v2-alpha-rc27-20260804",
         launch_rehearsal_service_url="https://rehearsal.example",
         launch_rehearsal_service_token="service-token-that-is-long-enough",
         launch_rehearsal_config_hash=CONFIG_HASH,
@@ -135,7 +135,7 @@ def _evidence() -> dict:
     return {
         "schemaVersion": 3,
         "kind": "solslot-rc27-stripe-voucher-rehearsal",
-        "releaseTag": "solslot-v2-alpha-rc26-20260803",
+        "releaseTag": "solslot-v2-alpha-rc27-20260804",
         "configHash": CONFIG_HASH,
         "network": "testnet11",
         "stripe": {
