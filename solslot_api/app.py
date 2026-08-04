@@ -314,21 +314,29 @@ async def lifespan(app: FastAPI):
             ),
         )
 
+    stripe_delivery_store = None
+    presale_store = None
+    if app.state.protocol_submitter is not None:
+        from .stripe_delivery_store import get_stripe_delivery_store
+
+        stripe_delivery_store = get_stripe_delivery_store(
+            settings.stripe_delivery_db_path
+        )
+        presale_store = get_presale_store(settings)
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
+            stripe_delivery_store.pending_exact_fee_coin_ids
+        )
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
+            presale_store.pending_stripe_terminal_fee_coin_ids
+        )
+
     app.state.voucher_issuance_worker = None
     app.state.stripe_delivery_worker = None
     app.state.kos_exact_executor = None
-    if settings.stripe_delivery_worker_enabled:
-        if app.state.faucet is None or app.state.protocol_submitter is None:
-            raise RuntimeError(
-                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the faucet "
-                "and protocol fee funding."
-            )
-        from .stripe_delivery_store import get_stripe_delivery_store
-        from .stripe_delivery_worker import (
-            StripeDeliveryWorker,
-            StripeDeliveryWorkerConfig,
-        )
-
+    if (
+        settings.stripe_delivery_worker_enabled
+        or settings.voucher_issuance_worker_enabled
+    ):
         app.state.kos_exact_executor = KeyOfSolomonExactExecutor(
             url=str(settings.payment_kos_executor_url),
             private_key_file=str(
@@ -340,6 +348,28 @@ async def lifespan(app: FastAPI):
             mtls_cert_path=settings.payment_kos_executor_mtls_cert_path,
             mtls_key_path=settings.payment_kos_executor_mtls_key_path,
         )
+    if settings.stripe_delivery_worker_enabled:
+        if app.state.faucet is None or app.state.protocol_submitter is None:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED requires the faucet "
+                "and protocol fee funding."
+            )
+
+    if settings.voucher_issuance_worker_enabled:
+        if (
+            app.state.faucet is None
+            or app.state.protocol_submitter is None
+            or app.state.kos_exact_executor is None
+        ):
+            raise RuntimeError(
+                "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED requires the faucet, "
+                "protocol fee funding, and exact KoS executor."
+            )
+    if settings.stripe_delivery_worker_enabled:
+        from .stripe_delivery_worker import (
+            StripeDeliveryWorker,
+            StripeDeliveryWorkerConfig,
+        )
 
         stripe_worker = StripeDeliveryWorker(
             settings=settings,
@@ -347,7 +377,7 @@ async def lifespan(app: FastAPI):
             provider=app.state.coinset,
             submitter=app.state.protocol_submitter,
             exact_executor=app.state.kos_exact_executor,
-            store=get_stripe_delivery_store(settings.stripe_delivery_db_path),
+            store=stripe_delivery_store,
             config=StripeDeliveryWorkerConfig(
                 enabled=True,
                 interval_seconds=settings.stripe_delivery_interval_seconds,
@@ -357,10 +387,6 @@ async def lifespan(app: FastAPI):
         await stripe_worker.start()
         app.state.stripe_delivery_worker = stripe_worker
     if settings.voucher_issuance_worker_enabled:
-        if app.state.faucet is None:
-            raise RuntimeError(
-                "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED requires a faucet key."
-            )
         from .voucher_issuance_worker import (
             VoucherIssuanceWorker,
             VoucherIssuanceWorkerConfig,
@@ -370,8 +396,10 @@ async def lifespan(app: FastAPI):
             settings=settings,
             faucet=app.state.faucet,
             coinset=app.state.coinset,
-            presales=get_presale_store(settings),
+            presales=presale_store,
             purchases=get_payment_purchase_store(settings.payment_purchase_db_path),
+            submitter=app.state.protocol_submitter,
+            exact_executor=app.state.kos_exact_executor,
             config=VoucherIssuanceWorkerConfig(
                 enabled=True,
                 interval_seconds=settings.voucher_issuance_interval_seconds,

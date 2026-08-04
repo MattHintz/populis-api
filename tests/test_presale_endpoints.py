@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -815,7 +816,25 @@ def test_stripe_refund_requires_terminal_chain_evidence_before_fiat() -> None:
     next_state = VoucherSeriesStateV2(sold_count=1, refunded_count=1)
     next_inner = curry_series(series_terms_from_json(current_terms), next_state)
     evidence_hash = hex32(payment.evidence_hash)
-    store.record_stripe_refund_submission(
+    store.bind_stripe_terminal_execution(
+        terms_hash,
+        0,
+        {
+            "schema": "solslot.stripe-voucher-terminal-execution.v1",
+            "mode": "REFUND_OWNER",
+            "voucherAction": int(VoucherAction.REFUND_PRESALE),
+            "prepared": {
+                "spendBundleId": hex32(201),
+                "feeMojos": "5",
+                "feeCoinId": hex32(206),
+                "spendBundle": {},
+            },
+            "request": {},
+            "outputRoles": {},
+            "bindings": {},
+        },
+    )
+    submitted = store.record_stripe_refund_submission(
         terms_hash,
         0,
         action=VoucherAction.REFUND_PRESALE,
@@ -826,7 +845,22 @@ def test_stripe_refund_requires_terminal_chain_evidence_before_fiat() -> None:
         series_output_coin_id=hex32(203),
         vault_input_coin_id=hex32(204),
         vault_output_coin_id=hex32(205),
+        execution_observed_at=now + 11,
     )
+    retried = store.record_stripe_refund_submission(
+        terms_hash,
+        0,
+        action=VoucherAction.REFUND_PRESALE,
+        spend_bundle_id=hex32(201),
+        external_settlement_evidence_hash=evidence_hash,
+        terminal_voucher_coin_id=hex32(202),
+        series_input_coin_id=current_coin_id,
+        series_output_coin_id=hex32(203),
+        vault_input_coin_id=hex32(204),
+        vault_output_coin_id=hex32(205),
+        execution_observed_at=now + 99,
+    )
+    assert retried == submitted
     confirmed = store.confirm_stripe_refund(
         terms_hash,
         0,
@@ -864,6 +898,59 @@ def test_stripe_refund_requires_terminal_chain_evidence_before_fiat() -> None:
         ),
     )
     assert completed["state"] == "COMPLETED"
+
+
+def test_stripe_terminal_execution_serializes_each_singleton_series() -> None:
+    now = int(time.time())
+    store, current_terms, _payment = stripe_escrowed_voucher(now=now)
+    terms_hash = str(current_terms["termsHash"])
+    execution = {
+        "schema": "solslot.stripe-voucher-terminal-execution.v1",
+        "mode": "REDEEM",
+        "voucherAction": int(VoucherAction.REDEEM),
+        "prepared": {
+            "spendBundleId": hex32(210),
+            "feeMojos": "5",
+            "feeCoinId": hex32(211),
+            "spendBundle": {},
+        },
+        "request": {},
+        "outputRoles": {},
+        "bindings": {},
+    }
+    store.bind_stripe_terminal_execution(terms_hash, 0, execution)
+    assert store.pending_stripe_terminal_fee_coin_ids() == {hex32(211)}
+    second_deed = current_terms["deeds"][1]  # type: ignore[index]
+    store._conn.execute(
+        """
+        INSERT INTO voucher_records_v2(
+          terms_hash, serial, deed_launcher_id, payment_rail,
+          payment_principal, base_price_minor, technology_fee_bps,
+          technology_fee_minor, gross_price_minor, original_payer,
+          vault_launcher_id, vault_p2_puzzle_hash, purchase_id,
+          global_payment_id, commitment_hash, commitment_json, state,
+          payment_evidence_id, created_at, updated_at
+        ) VALUES (?, 1, ?, 'STRIPE_USD', 103, 100, 250, 3, 103, ?, ?, ?,
+                  ?, ?, ?, '{}', 'ESCROWED', 'evt-second', ?, ?)
+        """,
+        (
+            terms_hash.lower(),
+            str(second_deed["deedLauncherId"]).lower(),
+            hex32(212),
+            approved_vault().launcher_id,
+            approved_vault().p2_puzzle_hash,
+            hex32(213),
+            hex32(214),
+            hex32(215),
+            now,
+            now,
+        ),
+    )
+
+    competing = deepcopy(execution)
+    competing["prepared"]["spendBundleId"] = hex32(216)
+    with pytest.raises(ValueError, match="singleton series"):
+        store.bind_stripe_terminal_execution(terms_hash, 1, competing)
     assert store.pending_stripe_refund_authorizations() == []
 
 
@@ -2805,6 +2892,9 @@ async def test_worker_advances_stripe_redemption_from_the_shared_queue(
         def pending_issuance(self):
             return []
 
+        def pending_stripe_terminal_executions(self):
+            return []
+
         def pending_native_refunds(self):
             return []
 
@@ -2850,6 +2940,81 @@ async def test_worker_advances_stripe_redemption_from_the_shared_queue(
             "termsHash": hex32(220),
             "serial": 4,
             "status": "STRIPE_REDEMPTION_SUBMITTED",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_never_replaces_an_exact_stripe_redemption_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    series = {
+        "termsHash": hex32(222),
+        "state": "LIVE",
+        "deliveryDeadline": int(time.time()) - 1,
+    }
+    voucher = {
+        "serial": 5,
+        "paymentRail": "STRIPE_USD",
+        "redemptionBundleId": hex32(223),
+        "terminalExactExecution": {"mode": "REDEEM"},
+    }
+
+    class QueueOnlyStore:
+        def pending_issuance(self):
+            return []
+
+        def pending_stripe_terminal_executions(self):
+            return []
+
+        def pending_native_refunds(self):
+            return []
+
+        def pending_base_refunds(self):
+            return []
+
+        def pending_stripe_refunds(self):
+            return []
+
+        def pending_native_redemptions(self):
+            return []
+
+        def pending_base_redemptions(self):
+            return []
+
+        def pending_stripe_redemptions(self):
+            return [(series, voucher)]
+
+        def pending_phase_transitions(self):
+            return []
+
+    worker = VoucherIssuanceWorker(
+        settings=Settings(runtime_environment="test", network="testnet11"),
+        faucet=Faucet.from_seed_hex("01" * 32, "testnet11"),
+        coinset=SimpleNamespace(),  # type: ignore[arg-type]
+        presales=QueueOnlyStore(),  # type: ignore[arg-type]
+        purchases=SimpleNamespace(),  # type: ignore[arg-type]
+        config=VoucherIssuanceWorkerConfig(enabled=True),
+    )
+    refunds: list[int] = []
+
+    async def confirm(_series, _voucher):
+        return False
+
+    async def refund(_series, current_voucher):
+        refunds.append(int(current_voucher["serial"]))
+
+    monkeypatch.setattr(worker, "_confirm_stripe_redemption_if_ready", confirm)
+    monkeypatch.setattr(worker, "_submit_stripe_expired_refund", refund)
+
+    results = await worker.reconcile_once()
+
+    assert refunds == []
+    assert results == [
+        {
+            "termsHash": hex32(222),
+            "serial": 5,
+            "status": "STRIPE_REDEMPTION_CONFIRMING",
         }
     ]
 

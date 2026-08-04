@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -69,6 +70,18 @@ class ProtocolBundleSubmitter:
         self.faucet = faucet
         self.policy = policy
         self._lock = asyncio.Lock()
+        self._fee_coin_reservation_sources: list[
+            Callable[[], Iterable[str | bytes]]
+        ] = []
+
+    def add_fee_coin_reservation_source(
+        self,
+        source: Callable[[], Iterable[str | bytes]],
+    ) -> None:
+        """Exclude fee coins sealed in durable exact executions."""
+
+        if source not in self._fee_coin_reservation_sources:
+            self._fee_coin_reservation_sources.append(source)
 
     async def submit(self, protocol_bundle_json: dict[str, Any]) -> dict[str, Any]:
         # Production keeps one worker for faucet-backed writes. Holding this
@@ -222,6 +235,7 @@ class ProtocolBundleSubmitter:
         except ChiaProviderError as exc:
             raise ProtocolSubmissionError(str(exc)) from exc
 
+        reserved_coin_ids = self._reserved_fee_coin_ids()
         available: list[dict[str, Any]] = []
         for record in records:
             try:
@@ -235,6 +249,8 @@ class ProtocolBundleSubmitter:
             if coin is None:
                 continue
             if bytes(coin.name()) in excluded_coin_ids:
+                continue
+            if bytes(coin.name()) in reserved_coin_ids:
                 continue
             try:
                 pending = await self.provider.get_mempool_items_by_coin_name(
@@ -255,6 +271,32 @@ class ProtocolBundleSubmitter:
                 "protocol fee till has no eligible confirmed, unreserved coin"
             )
         return selected
+
+    def _reserved_fee_coin_ids(self) -> set[bytes]:
+        reserved: set[bytes] = set()
+        for source in self._fee_coin_reservation_sources:
+            try:
+                values = source()
+                for value in values:
+                    if isinstance(value, bytes):
+                        raw = value
+                    elif isinstance(value, str):
+                        normalized = value.removeprefix("0x")
+                        raw = bytes.fromhex(normalized)
+                    else:
+                        raise TypeError("fee coin reservation is not bytes or hex")
+                    if len(raw) != 32:
+                        raise ValueError("fee coin reservation is not bytes32")
+                    reserved.add(raw)
+            except (TypeError, ValueError) as exc:
+                raise ProtocolSubmissionError(
+                    "durable fee coin reservation is malformed"
+                ) from exc
+            except Exception as exc:
+                raise ProtocolSubmissionError(
+                    "durable fee coin reservations are unavailable"
+                ) from exc
+        return reserved
 
     async def _converge_fee(
         self,

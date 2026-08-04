@@ -67,7 +67,9 @@ from solslot_puzzles.primary_purchase_v2_driver import (
 
 from .config import Settings
 from .faucet import Faucet
+from .kos_exact_execution import KeyOfSolomonExactExecutor
 from .payment_purchase_store import PaymentPurchaseStore
+from .protocol_submission import ProtocolBundleSubmitter
 from .presale_endpoints import (
     BaseVoucherRefundChainEvidence,
     PresaleStore,
@@ -80,6 +82,10 @@ from .presale_endpoints import (
 from .presale_endpoints import _confirmed_coin_and_lineage
 from .native_purchases import _load_context
 from .public_artifact import load_signed_public_artifact
+from .stripe_voucher_execution import (
+    prepare_and_dispatch_stripe_terminal,
+    resume_stripe_terminal,
+)
 from .validator_quorum import (
     ValidatorQuorumError,
     VoucherIssuanceClaim,
@@ -112,6 +118,8 @@ class VoucherIssuanceWorker:
         presales: PresaleStore,
         purchases: PaymentPurchaseStore,
         config: VoucherIssuanceWorkerConfig,
+        submitter: ProtocolBundleSubmitter | None = None,
+        exact_executor: KeyOfSolomonExactExecutor | None = None,
     ) -> None:
         self.settings = settings
         self.faucet = faucet
@@ -119,6 +127,8 @@ class VoucherIssuanceWorker:
         self.presales = presales
         self.purchases = purchases
         self.config = config
+        self.submitter = submitter
+        self.exact_executor = exact_executor
         self._task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
 
@@ -177,6 +187,30 @@ class VoucherIssuanceWorker:
                     "termsHash": terms_hash,
                     "serial": int(voucher["serial"]),
                     "status": "ERROR",
+                    "detail": str(exc),
+                }
+            results.append(result)
+        for series, voucher in self.presales.pending_stripe_terminal_executions():
+            try:
+                status = await self._resume_stripe_terminal_execution(
+                    series,
+                    voucher,
+                )
+                result = {
+                    "termsHash": str(series["termsHash"]),
+                    "serial": int(voucher["serial"]),
+                    "status": status,
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Stripe voucher exact execution retry failed for %s/%s",
+                    series["termsHash"],
+                    voucher["serial"],
+                )
+                result = {
+                    "termsHash": str(series["termsHash"]),
+                    "serial": int(voucher["serial"]),
+                    "status": "STRIPE_TERMINAL_RETRY_ERROR",
                     "detail": str(exc),
                 }
             results.append(result)
@@ -360,19 +394,23 @@ class VoucherIssuanceWorker:
                 continue
             seen_redemption_series.add(terms_hash)
             try:
+                if (
+                    voucher.get("terminalExactExecution")
+                    and not voucher.get("redemptionBundleId")
+                ):
+                    result = {
+                        "termsHash": terms_hash,
+                        "serial": int(voucher["serial"]),
+                        "status": "STRIPE_TERMINAL_RETRY_PENDING",
+                    }
+                    results.append(result)
+                    continue
                 if voucher.get("redemptionBundleId"):
                     confirmed = await self._confirm_stripe_redemption_if_ready(
                         series, voucher
                     )
                     if confirmed:
                         status = "STRIPE_DEED_DELIVERED"
-                    elif (
-                        int(time.time())
-                        >= int(series.get("deliveryDeadline") or 0)
-                        and await self._base_terminal_inputs_are_unspent(voucher)
-                    ):
-                        await self._submit_stripe_expired_refund(series, voucher)
-                        status = "STRIPE_REFUND_SUBMITTED"
                     else:
                         status = "STRIPE_REDEMPTION_CONFIRMING"
                 elif int(time.time()) >= int(
@@ -1256,6 +1294,103 @@ class VoucherIssuanceWorker:
         )
         return True
 
+    def _stripe_execution_services(
+        self,
+    ) -> tuple[ProtocolBundleSubmitter, KeyOfSolomonExactExecutor]:
+        if self.submitter is None or self.exact_executor is None:
+            raise RuntimeError(
+                "Stripe voucher settlement requires the exact KoS executor and "
+                "protocol fee funding"
+            )
+        return self.submitter, self.exact_executor
+
+    async def _resume_stripe_terminal_execution(
+        self,
+        series: dict[str, Any],
+        voucher_json: dict[str, Any],
+    ) -> str:
+        _submitter, exact_executor = self._stripe_execution_services()
+        stored = self.purchases.get(str(voucher_json["purchaseId"]))
+        purchase = purchase_artifact_v3_from_json(stored.purchase_artifact)
+        execution_json = voucher_json.get("terminalExactExecution")
+        if not isinstance(execution_json, Mapping):
+            raise RuntimeError("Stripe voucher exact execution is missing")
+        execution, observed_at = await resume_stripe_terminal(
+            exact_executor=exact_executor,
+            execution=execution_json,
+            expected_purchase_id=purchase.purchase_id,
+            expected_artifact_hash=purchase.artifact_hash,
+        )
+        self._record_stripe_terminal_submission(
+            series,
+            voucher_json,
+            execution,
+            observed_at,
+        )
+        return (
+            "STRIPE_REDEMPTION_SUBMITTED"
+            if execution["mode"] == "REDEEM"
+            else "STRIPE_REFUND_SUBMITTED"
+        )
+
+    def _record_stripe_terminal_submission(
+        self,
+        series: dict[str, Any],
+        voucher_json: dict[str, Any],
+        execution: Mapping[str, Any],
+        observed_at: int,
+    ) -> None:
+        prepared = execution.get("prepared")
+        roles = execution.get("outputRoles")
+        bindings = execution.get("bindings")
+        if not all(isinstance(value, Mapping) for value in (prepared, roles, bindings)):
+            raise RuntimeError("Stripe voucher exact execution binding is malformed")
+        mode = str(execution.get("mode", ""))
+        action = VoucherAction(int(execution["voucherAction"]))
+        bundle_id = str(prepared["spendBundleId"])
+        terms_hash = str(series["termsHash"])
+        serial = int(voucher_json["serial"])
+        if mode == "REDEEM":
+            self.presales.record_redemption_submission(
+                terms_hash,
+                serial,
+                spend_bundle_id=bundle_id,
+                treasury_output_coin_id=str(roles["coordination"]),
+                deed_output_coin_id=str(roles["deed"]),
+                terminal_voucher_coin_id=str(roles["terminalVoucher"]),
+                series_input_coin_id=str(bindings["seriesInputCoinId"]),
+                series_output_coin_id=str(roles["series"]),
+                deed_input_coin_id=str(bindings["deedInputCoinId"]),
+                external_settlement_evidence_hash=str(
+                    bindings["externalSettlementEvidenceHash"]
+                ),
+                execution_observed_at=observed_at,
+            )
+            return
+        if mode not in {"REFUND_EXPIRED", "REFUND_OWNER"}:
+            raise RuntimeError("Stripe voucher exact execution mode is invalid")
+        self.presales.record_stripe_refund_submission(
+            terms_hash,
+            serial,
+            action=action,
+            spend_bundle_id=bundle_id,
+            external_settlement_evidence_hash=str(
+                bindings["externalSettlementEvidenceHash"]
+            ),
+            terminal_voucher_coin_id=str(roles["terminalVoucher"]),
+            series_input_coin_id=str(bindings["seriesInputCoinId"]),
+            series_output_coin_id=str(roles["series"]),
+            vault_input_coin_id=(
+                str(bindings["vaultInputCoinId"])
+                if bindings.get("vaultInputCoinId")
+                else None
+            ),
+            vault_output_coin_id=(
+                str(roles["vault"]) if roles.get("vault") else None
+            ),
+            execution_observed_at=observed_at,
+        )
+
     def _stripe_payment_evidence(
         self,
         voucher_json: dict[str, Any],
@@ -1471,21 +1606,36 @@ class VoucherIssuanceWorker:
             1,
             "vault SmartDeed delivery",
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "Stripe voucher redemption")
-        self.presales.record_redemption_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            spend_bundle_id=_hex32(bundle.name()),
-            treasury_output_coin_id=_hex32(treasury_output.name()),
-            deed_output_coin_id=_hex32(deed_output.name()),
-            terminal_voucher_coin_id=_hex32(
-                terminal.terminal_voucher_coin.name()
-            ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
-            deed_input_coin_id=_hex32(context.deed_coin.name()),
-            external_settlement_evidence_hash=_hex32(evidence_hash),
+        submitter, exact_executor = self._stripe_execution_services()
+        execution, observed_at = await prepare_and_dispatch_stripe_terminal(
+            store=self.presales,
+            submitter=submitter,
+            exact_executor=exact_executor,
+            terms_hash=str(series["termsHash"]),
+            serial=int(voucher_json["serial"]),
+            mode="REDEEM",
+            voucher_action=int(VoucherAction.REDEEM),
+            purchase_id=context.purchase.purchase_id,
+            artifact_hash=context.purchase.artifact_hash,
+            claim_hash=terminal.validator_message,
+            protocol_bundle=bundle,
+            expected_outputs={
+                "coordination": treasury_output,
+                "deed": deed_output,
+                "series": terminal.next_series_coin,
+                "terminalVoucher": terminal.terminal_voucher_coin,
+            },
+            bindings={
+                "seriesInputCoinId": _hex32(series_coin.name()),
+                "deedInputCoinId": _hex32(context.deed_coin.name()),
+                "externalSettlementEvidenceHash": _hex32(evidence_hash),
+            },
+        )
+        self._record_stripe_terminal_submission(
+            series,
+            voucher_json,
+            execution,
+            observed_at,
         )
         return True
 
@@ -1838,19 +1988,33 @@ class VoucherIssuanceWorker:
             list(terminal.coin_spends),
             quorum.aggregated_signature,
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "Stripe expired voucher refund")
-        self.presales.record_stripe_refund_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            action=VoucherAction.REFUND_EXPIRED,
-            spend_bundle_id=_hex32(bundle.name()),
-            external_settlement_evidence_hash=_hex32(evidence_hash),
-            terminal_voucher_coin_id=_hex32(
-                terminal.terminal_voucher_coin.name()
-            ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
+        submitter, exact_executor = self._stripe_execution_services()
+        execution, observed_at = await prepare_and_dispatch_stripe_terminal(
+            store=self.presales,
+            submitter=submitter,
+            exact_executor=exact_executor,
+            terms_hash=str(series["termsHash"]),
+            serial=int(voucher_json["serial"]),
+            mode="REFUND_EXPIRED",
+            voucher_action=int(VoucherAction.REFUND_EXPIRED),
+            purchase_id=purchase.purchase_id,
+            artifact_hash=purchase.artifact_hash,
+            claim_hash=terminal.validator_message,
+            protocol_bundle=bundle,
+            expected_outputs={
+                "series": terminal.next_series_coin,
+                "terminalVoucher": terminal.terminal_voucher_coin,
+            },
+            bindings={
+                "seriesInputCoinId": _hex32(series_coin.name()),
+                "externalSettlementEvidenceHash": _hex32(evidence_hash),
+            },
+        )
+        self._record_stripe_terminal_submission(
+            series,
+            voucher_json,
+            execution,
+            observed_at,
         )
 
     async def _submit_base_expired_refund(

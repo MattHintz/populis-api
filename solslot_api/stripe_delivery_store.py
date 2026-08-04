@@ -383,6 +383,40 @@ class StripeDeliveryStore:
             raise StripeDeliveryNotFound("settlement authorization was not found")
         return _record(row)
 
+    def pending_exact_fee_coin_ids(self) -> set[str]:
+        """Return fee coins sealed in exact executions not yet finalized."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT receipt_funding_exact_bundle_json,
+                       delivery_exact_bundle_json
+                FROM stripe_delivery_operations
+                WHERE state != ?
+                  AND (receipt_funding_exact_bundle_json IS NOT NULL
+                       OR delivery_exact_bundle_json IS NOT NULL)
+                """,
+                (FINALIZED,),
+            ).fetchall()
+        reserved: set[str] = set()
+        for row in rows:
+            for field in (
+                "receipt_funding_exact_bundle_json",
+                "delivery_exact_bundle_json",
+            ):
+                raw = row[field]
+                if raw is None:
+                    continue
+                try:
+                    exact = json.loads(str(raw))
+                    fee_coin_id = _fee_coin_id(str(exact["feeCoinId"]))
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise StripeDeliveryConflict(
+                        "persisted exact execution has an invalid fee coin"
+                    ) from exc
+                reserved.add(fee_coin_id)
+        return reserved
+
     def list_pending_external_settlements(
         self,
         *,
@@ -1016,6 +1050,17 @@ def _external_payment_id(
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is required")
     return value.lower()
+
+
+def _fee_coin_id(value: str) -> str:
+    normalized = value.lower().removeprefix("0x")
+    try:
+        raw = bytes.fromhex(normalized)
+    except ValueError as exc:
+        raise ValueError("fee coin ID is not hex") from exc
+    if len(raw) != 32:
+        raise ValueError("fee coin ID is not bytes32")
+    return "0x" + normalized
 
 
 _stores: dict[str, StripeDeliveryStore] = {}
