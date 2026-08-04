@@ -32,6 +32,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from web3 import Web3
 
+from solslot_puzzles import load_puzzle
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
     AUTH_TYPE_SECP256K1,
@@ -54,7 +55,10 @@ from solslot_puzzles.payment_artifacts_v2 import (
 )
 from solslot_puzzles.payment_artifacts_v3 import (
     PurchaseDeliveryKind,
+    PurchaseKind,
     STRIPE_PAYMENT_PROVIDER_ID,
+    StripeFundingType,
+    StripeMethodFamily,
     build_purchase_batch_settlement_receipt_v1,
     build_stripe_settlement_receipt_v1,
     purchase_artifact_v3_from_json,
@@ -118,6 +122,16 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     curry_xch_escrow,
     external_receipt_evidence_message,
     validate_xch_voucher_offer,
+)
+from solslot_puzzles.voucher_presale_v3 import (
+    VoucherPaymentRailV3,
+    VoucherV3Error,
+    stripe_original_payer,
+    validate_stripe_voucher_purchase,
+    voucher_commitment_v3_from_json,
+)
+from solslot_puzzles.voucher_presale_v3_driver import (
+    build_stripe_voucher_issuance_spends,
 )
 
 from .config import Settings
@@ -1230,7 +1244,7 @@ def _verify_stripe_provider_evidence(
     evidence = stripe_settlement_evidence_from_json(claim.stripe_evidence)
     if (
         evidence.stripe_account_id != settings.stripe_account_id
-        or (settings.stripe_mode == "test") != (int(evidence.mode) == 1)
+        or (settings.stripe_mode == "live") != evidence.livemode
     ):
         raise ValidatorEvidenceError(
             "Stripe evidence does not match this validator's account and mode"
@@ -1298,7 +1312,7 @@ def _verify_stripe_provider_evidence(
         or not isinstance(metadata, Mapping)
         or str(metadata.get("protocol_purchase_id") or "").lower()
         != "0x" + purchase_id.hex()
-        or str(metadata.get("protocol_artifact_hash") or "").lower()
+        or str(metadata.get("purchase_artifact_hash") or "").lower()
         != "0x" + purchase_hash.hex()
     ):
         raise ValidatorEvidenceError(
@@ -1310,7 +1324,11 @@ def _verify_stripe_provider_evidence(
     if not isinstance(method_details, Mapping):
         raise ValidatorEvidenceError("Stripe payment method evidence is unavailable")
     method_type = str(method_details.get("type") or "")
-    expected_method = "card" if int(evidence.method_family) == 1 else "us_bank_account"
+    expected_method = (
+        "card"
+        if evidence.method_family == StripeMethodFamily.CARD
+        else "us_bank_account"
+    )
     card = method_details.get("card")
     observed_funding = (
         str(card.get("funding") or "unknown")
@@ -1318,12 +1336,12 @@ def _verify_stripe_provider_evidence(
         else "not_applicable"
     )
     expected_funding = {
-        0: "not_applicable",
-        1: "credit",
-        2: "debit",
-        3: "prepaid",
-        4: "unknown",
-    }[int(evidence.funding_type)]
+        StripeFundingType.CREDIT: "credit",
+        StripeFundingType.DEBIT: "debit",
+        StripeFundingType.PREPAID: "prepaid",
+        StripeFundingType.UNKNOWN: "unknown",
+        StripeFundingType.BANK_ACCOUNT: "not_applicable",
+    }[evidence.funding_type]
     if (
         method_type != expected_method
         or observed_funding != expected_funding
@@ -2108,22 +2126,75 @@ def verify_voucher_issuance_claim(
         != str(artifact.get("artifactHash") or "").lower()
     ):
         raise ValidatorEvidenceError("voucher claim does not match active genesis")
+    is_stripe = (
+        claim.voucher_commitment.get("schema")
+        == "solslot.voucher-commitment.v3"
+    )
     try:
         terms = series_terms_from_json(claim.series_terms)
-        voucher = voucher_commitment_from_json(claim.voucher_commitment)
-        purchase = purchase_artifact_from_json(claim.purchase_artifact)
-        if voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
-            payment_source = claim.payment_evidence.get("source")
-            if not isinstance(payment_source, Mapping):
-                raise ValueError("voucher payment source is missing")
-            authorization_time = int(payment_source.get("blockTimestamp") or 0)
-            if authorization_time <= 0:
-                raise ValueError("voucher payment confirmation time is missing")
-        elif voucher.payment_rail == VoucherPaymentRail.CHIA_XCH:
-            authorization_time = int(time.time())
+        if is_stripe:
+            voucher = voucher_commitment_v3_from_json(
+                claim.voucher_commitment
+            )
+            purchase = purchase_artifact_v3_from_json(
+                claim.purchase_artifact
+            )
+            evidence = stripe_settlement_evidence_from_json(
+                claim.payment_evidence
+            )
+            validator_pubkeys = tuple(
+                bytes.fromhex(value.removeprefix("0x"))
+                for value in settings.roster_pubkeys
+            )
+            receipt = build_stripe_settlement_receipt_v1(
+                artifact=purchase,
+                evidence=evidence,
+                validator_pubkeys=validator_pubkeys,  # type: ignore[arg-type]
+            )
+            if (
+                voucher.payment_rail != VoucherPaymentRailV3.STRIPE_USD
+                or purchase.rail != PaymentRail.STRIPE
+                or purchase.purchase_kind != PurchaseKind.PRESALE
+            ):
+                raise ValueError("Stripe voucher payment rail is inconsistent")
+            authorization_time = evidence.observed_at
+            validate_stripe_voucher_purchase(
+                series=terms,
+                voucher=voucher,
+                artifact=purchase,
+                receipt=receipt,
+                expected_original_payer=stripe_original_payer(purchase),
+                expected_smart_deed_inner_hash=bytes32(
+                    load_puzzle("smart_deed_inner_v2.clsp").get_tree_hash()
+                ),
+                now_seconds=authorization_time,
+            )
         else:
-            raise ValueError("voucher payment rail is unsupported")
-        purchase.assert_live(authorization_time)
+            voucher = voucher_commitment_from_json(
+                claim.voucher_commitment
+            )
+            purchase = purchase_artifact_from_json(claim.purchase_artifact)
+            if voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
+                payment_source = claim.payment_evidence.get("source")
+                if not isinstance(payment_source, Mapping):
+                    raise ValueError("voucher payment source is missing")
+                authorization_time = int(
+                    payment_source.get("blockTimestamp") or 0
+                )
+                if authorization_time <= 0:
+                    raise ValueError(
+                        "voucher payment confirmation time is missing"
+                    )
+            elif voucher.payment_rail == VoucherPaymentRail.CHIA_XCH:
+                authorization_time = int(time.time())
+            else:
+                raise ValueError("voucher payment rail is unsupported")
+            purchase.assert_live(authorization_time)
+            validate_purchase(
+                series=terms,
+                voucher=voucher,
+                now_seconds=authorization_time,
+            )
         state = VoucherSeriesStateV2(
             sold_count=claim.series_sold_count,
             redeemed_count=claim.series_redeemed_count,
@@ -2131,12 +2202,13 @@ def verify_voucher_issuance_claim(
             phase=VoucherSeriesState(claim.series_phase),
             launched_at=claim.series_launched_at,
         )
-        validate_purchase(
-            series=terms,
-            voucher=voucher,
-            now_seconds=authorization_time,
-        )
-    except (PaymentArtifactError, VoucherV2Error, TypeError, ValueError) as exc:
+    except (
+        PaymentArtifactError,
+        VoucherV2Error,
+        VoucherV3Error,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise ValidatorEvidenceError("voucher issuance commitments are invalid") from exc
     raw_pubkeys = artifact.get("validatorSet", {}).get("pubkeys")
     treasury = artifact.get("puzzleHashes", {}).get("protocolTreasuryPuzzleHash")
@@ -2181,7 +2253,30 @@ def verify_voucher_issuance_claim(
         "voucher series parent",
     )
     series_lineage = lineage_proof_for_coinsol(parent_spend)
-    if voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
+    if is_stripe:
+        purchase_record = _fetch_coin(
+            settings,
+            claim.purchase_launcher_coin_id,
+            "Stripe voucher purchase launcher",
+        )
+        purchase_coin = _coin_from_record(
+            purchase_record, "Stripe voucher purchase launcher"
+        )
+        if (
+            "0x" + bytes(purchase_coin.name()).hex()
+            != claim.purchase_launcher_coin_id
+        ):
+            raise ValidatorEvidenceError(
+                "Stripe voucher purchase launcher ID is not canonical"
+            )
+        _verify_stripe_provider_evidence(
+            settings,
+            SimpleNamespace(
+                stripe_evidence=claim.payment_evidence,
+                purchase_artifact=claim.purchase_artifact,
+            ),
+        )
+    elif voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
         if purchase.rail != PaymentRail.EVM_TEST_USD:
             raise ValidatorEvidenceError("Base voucher purchase rail is inconsistent")
         purchase_record = _fetch_coin(
@@ -2267,18 +2362,38 @@ def verify_voucher_issuance_claim(
     else:
         raise ValidatorEvidenceError("voucher payment rail is unsupported")
     try:
-        issuance = build_voucher_issuance_spends(
-            terms=terms,
-            state=state,
-            series_coin=series_coin,
-            series_lineage_proof=series_lineage,
-            voucher=voucher,
-            purchase_launcher_coin=purchase_coin,
-            payment_puzzle=payment_puzzle,
-            payment_amount=payment_amount,
-            signer_indices=(0, 1),
-        )
-    except (PaymentArtifactError, VoucherV2Error, ValueError) as exc:
+        if is_stripe:
+            issuance = build_stripe_voucher_issuance_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                artifact=purchase,
+                receipt=receipt,
+                expected_original_payer=stripe_original_payer(purchase),
+                smart_deed_inner_hash=voucher.smart_deed_inner_hash,
+                purchase_launcher_coin=purchase_coin,
+                signer_indices=(0, 1),
+            )
+        else:
+            issuance = build_voucher_issuance_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=series_lineage,
+                voucher=voucher,
+                purchase_launcher_coin=purchase_coin,
+                payment_puzzle=payment_puzzle,
+                payment_amount=payment_amount,
+                signer_indices=(0, 1),
+            )
+    except (
+        PaymentArtifactError,
+        VoucherV2Error,
+        VoucherV3Error,
+        ValueError,
+    ) as exc:
         raise ValidatorEvidenceError("voucher issuance bundle cannot be re-derived") from exc
     if "0x" + bytes(issuance.validator_message).hex() != claim.validator_message:
         raise ValidatorEvidenceError("voucher validator message changed on re-derivation")

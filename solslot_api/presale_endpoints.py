@@ -39,6 +39,13 @@ from solslot_puzzles.payment_artifacts_v2 import (
     PaymentRail,
     purchase_artifact_from_json,
 )
+from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseArtifactV3,
+    PurchaseKind,
+    StripeSettlementReceiptV1,
+    purchase_artifact_v3_to_json,
+    stripe_receipt_to_json,
+)
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.voucher_presale_v2 import (
     DELIVERY_WINDOW_SECONDS,
@@ -66,6 +73,12 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     curry_series,
     prepare_xch_voucher_offer,
     validate_xch_voucher_offer,
+)
+from solslot_puzzles.voucher_presale_v3 import (
+    build_stripe_voucher_commitment,
+    stripe_original_payer,
+    validate_stripe_voucher_purchase,
+    voucher_commitment_v3_to_json,
 )
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
@@ -470,7 +483,7 @@ class PresaleStore:
               terms_hash TEXT NOT NULL REFERENCES presale_series_v2(terms_hash),
               serial INTEGER NOT NULL,
               deed_launcher_id TEXT NOT NULL,
-              payment_rail TEXT NOT NULL CHECK (payment_rail IN ('BASE_SEPOLIA_USDC','CHIA_XCH')),
+              payment_rail TEXT NOT NULL CHECK (payment_rail IN ('BASE_SEPOLIA_USDC','CHIA_XCH','STRIPE_USD')),
               payment_principal INTEGER NOT NULL,
               base_price_minor INTEGER NOT NULL,
               technology_fee_bps INTEGER NOT NULL,
@@ -483,6 +496,9 @@ class PresaleStore:
               global_payment_id TEXT NOT NULL UNIQUE,
               commitment_hash TEXT NOT NULL UNIQUE,
               commitment_json TEXT NOT NULL,
+              purchase_artifact_json TEXT,
+              settlement_receipt_json TEXT,
+              processing_charge_minor INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL CHECK (state IN ('PENDING_ISSUANCE','ISSUANCE_SUBMITTED','ESCROWED','REFUNDING','REFUNDED','REDEEMING','REDEEMED')),
               payment_evidence_id TEXT NOT NULL,
               issuance_evidence_id TEXT,
@@ -587,6 +603,8 @@ class PresaleStore:
             ).fetchall()
         }
         voucher_text_columns = (
+            "purchase_artifact_json",
+            "settlement_receipt_json",
             "refund_bundle_id",
             "refund_output_coin_id",
             "terminal_voucher_coin_id",
@@ -609,6 +627,7 @@ class PresaleStore:
                     f"ALTER TABLE voucher_records_v2 ADD COLUMN {name} TEXT"
                 )
         for name in (
+            "processing_charge_minor",
             "refund_action",
             "refund_submitted_at",
             "refund_confirmed_height",
@@ -619,6 +638,127 @@ class PresaleStore:
                 self._conn.execute(
                     f"ALTER TABLE voucher_records_v2 ADD COLUMN {name} INTEGER"
                 )
+        self._upgrade_voucher_payment_rail_constraint()
+
+    def _upgrade_voucher_payment_rail_constraint(self) -> None:
+        """Rebuild an initialized pre-Stripe table without changing its rows."""
+
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            ("voucher_records_v2",),
+        ).fetchone()
+        if row is None or "STRIPE_USD" in str(row["sql"] or ""):
+            return
+        self._conn.execute(
+            "UPDATE voucher_records_v2 SET processing_charge_minor=0 "
+            "WHERE processing_charge_minor IS NULL"
+        )
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                """
+                CREATE TABLE voucher_records_v2_rc27 (
+                  terms_hash TEXT NOT NULL REFERENCES presale_series_v2(terms_hash),
+                  serial INTEGER NOT NULL,
+                  deed_launcher_id TEXT NOT NULL,
+                  payment_rail TEXT NOT NULL CHECK (payment_rail IN ('BASE_SEPOLIA_USDC','CHIA_XCH','STRIPE_USD')),
+                  payment_principal INTEGER NOT NULL,
+                  base_price_minor INTEGER NOT NULL,
+                  technology_fee_bps INTEGER NOT NULL,
+                  technology_fee_minor INTEGER NOT NULL,
+                  gross_price_minor INTEGER NOT NULL,
+                  original_payer TEXT NOT NULL,
+                  vault_launcher_id TEXT NOT NULL,
+                  vault_p2_puzzle_hash TEXT NOT NULL,
+                  purchase_id TEXT NOT NULL UNIQUE,
+                  global_payment_id TEXT NOT NULL UNIQUE,
+                  commitment_hash TEXT NOT NULL UNIQUE,
+                  commitment_json TEXT NOT NULL,
+                  purchase_artifact_json TEXT,
+                  settlement_receipt_json TEXT,
+                  processing_charge_minor INTEGER NOT NULL DEFAULT 0,
+                  state TEXT NOT NULL CHECK (state IN ('PENDING_ISSUANCE','ISSUANCE_SUBMITTED','ESCROWED','REFUNDING','REFUNDED','REDEEMING','REDEEMED')),
+                  payment_evidence_id TEXT NOT NULL,
+                  issuance_evidence_id TEXT,
+                  issuance_bundle_id TEXT,
+                  funding_bundle_id TEXT,
+                  purchase_launcher_coin_id TEXT,
+                  purchase_launcher_puzzle_hash TEXT,
+                  voucher_launcher_id TEXT,
+                  voucher_output_coin_id TEXT,
+                  payment_commitment_coin_id TEXT,
+                  series_input_coin_id TEXT,
+                  series_output_coin_id TEXT,
+                  issuance_confirmed_height INTEGER,
+                  refund_evidence_id TEXT,
+                  refund_action INTEGER,
+                  refund_bundle_id TEXT,
+                  refund_output_coin_id TEXT,
+                  terminal_voucher_coin_id TEXT,
+                  refund_series_input_coin_id TEXT,
+                  refund_series_output_coin_id TEXT,
+                  refund_vault_input_coin_id TEXT,
+                  refund_vault_output_coin_id TEXT,
+                  refund_submitted_at INTEGER,
+                  refund_confirmed_height INTEGER,
+                  redemption_bundle_id TEXT,
+                  redemption_treasury_output_coin_id TEXT,
+                  redemption_deed_output_coin_id TEXT,
+                  redemption_terminal_voucher_coin_id TEXT,
+                  redemption_series_input_coin_id TEXT,
+                  redemption_series_output_coin_id TEXT,
+                  redemption_deed_input_coin_id TEXT,
+                  external_settlement_evidence_hash TEXT,
+                  redemption_submitted_at INTEGER,
+                  redemption_confirmed_height INTEGER,
+                  delivery_evidence_id TEXT,
+                  delivery_output_coin_id TEXT,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (terms_hash, serial),
+                  UNIQUE (terms_hash, deed_launcher_id)
+                )
+                """
+            )
+            old_columns = {
+                str(info[1])
+                for info in self._conn.execute(
+                    "PRAGMA table_info(voucher_records_v2)"
+                ).fetchall()
+            }
+            new_columns = [
+                str(info[1])
+                for info in self._conn.execute(
+                    "PRAGMA table_info(voucher_records_v2_rc27)"
+                ).fetchall()
+            ]
+            if old_columns != set(new_columns):
+                raise RuntimeError(
+                    "pre-Stripe voucher table cannot be migrated without data loss"
+                )
+            columns_sql = ", ".join(f'"{name}"' for name in new_columns)
+            self._conn.execute(
+                f"INSERT INTO voucher_records_v2_rc27 ({columns_sql}) "
+                f"SELECT {columns_sql} FROM voucher_records_v2"
+            )
+            self._conn.execute("DROP TABLE voucher_records_v2")
+            self._conn.execute(
+                "ALTER TABLE voucher_records_v2_rc27 RENAME TO voucher_records_v2"
+            )
+            self._conn.execute(
+                "CREATE INDEX idx_presale_v2_state "
+                "ON voucher_records_v2(terms_hash, state, serial)"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("voucher payment-rail migration broke foreign keys")
 
     @contextmanager
     def txn(self) -> Iterator[sqlite3.Cursor]:
@@ -944,6 +1084,183 @@ class PresaleStore:
                 (global_payment_id,),
             ).fetchone()
         return self._render_payment_event(event)
+
+    def ingest_stripe_payment(
+        self,
+        terms_hash: str,
+        *,
+        artifact: PurchaseArtifactV3,
+        receipt: StripeSettlementReceiptV1,
+        evidence_id: str,
+        issued_purchase: StoredPaymentPurchase,
+    ) -> dict[str, Any]:
+        """Persist one final Stripe payment as an exact Voucher V3 issuance."""
+
+        series = self.get(terms_hash)
+        if series["state"] != "PRESALE":
+            raise ValueError("voucher series is not in PRESALE")
+        terms = _series_program(series["terms"])
+        if (
+            artifact.purchase_kind != PurchaseKind.PRESALE
+            or artifact.presale_terms_hash != terms.terms_hash
+            or receipt.artifact != artifact
+        ):
+            raise ValueError("Stripe receipt does not target this presale")
+        deed = next(
+            (
+                row
+                for row in series["terms"]["deeds"]
+                if str(row["deedLauncherId"]).lower()
+                == _hex32(artifact.deed_launcher_id)
+            ),
+            None,
+        )
+        if deed is None:
+            raise ValueError("Stripe purchase does not target this series")
+        expected = (
+            terms.collection_id,
+            terms.metadata_root,
+            terms.metadata_anchor_id,
+            int(deed["sharePpm"]),
+            int(deed["basePriceMinor"]),
+            int(series["terms"]["technologyFeeBps"]),
+            int(deed["technologyFeeMinor"]),
+            int(deed["grossPriceMinor"]),
+            terms.trusted_protocol_treasury,
+        )
+        observed = (
+            artifact.collection_id,
+            artifact.metadata_root,
+            artifact.metadata_anchor_id,
+            artifact.share_ppm,
+            artifact.base_amount_minor,
+            artifact.technology_fee_bps,
+            artifact.technology_fee_minor,
+            artifact.subtotal_minor,
+            artifact.protocol_treasury_puzzle_hash,
+        )
+        if observed != expected:
+            raise ValueError("Stripe purchase changes governed presale economics")
+        artifact_json = purchase_artifact_v3_to_json(artifact)
+        if (
+            issued_purchase.rail != "stripe"
+            or issued_purchase.purchase_id.lower()
+            != _hex32(artifact.purchase_id)
+            or issued_purchase.artifact_hash.lower()
+            != _hex32(artifact.artifact_hash)
+            or issued_purchase.purchase_artifact != artifact_json
+        ):
+            raise ValueError("stored Stripe purchase differs from the paid artifact")
+        original_payer = stripe_original_payer(artifact)
+        smart_deed_inner_hash = bytes32(
+            load_puzzle("smart_deed_inner_v2.clsp").get_tree_hash()
+        )
+        commitment = build_stripe_voucher_commitment(
+            series=terms,
+            allocation_root=terms.allocation_root,
+            serial=int(deed["ordinal"]),
+            original_payer=original_payer,
+            smart_deed_inner_hash=smart_deed_inner_hash,
+            artifact=artifact,
+            receipt=receipt,
+        )
+        validate_stripe_voucher_purchase(
+            series=terms,
+            voucher=commitment,
+            artifact=artifact,
+            receipt=receipt,
+            expected_original_payer=original_payer,
+            expected_smart_deed_inner_hash=smart_deed_inner_hash,
+            now_seconds=receipt.evidence.observed_at,
+        )
+        commitment_json = voucher_commitment_v3_to_json(commitment)
+        receipt_json = stripe_receipt_to_json(receipt)
+        global_payment_id = _hex32(commitment.global_payment_id)
+        order_key = (
+            f"stripe:{receipt.evidence.observed_at:020d}:"
+            f"{receipt.evidence.event_id}:{global_payment_id}"
+        )
+        now = int(time.time())
+        with self.txn() as cur:
+            existing = cur.execute(
+                "SELECT * FROM presale_payment_events_v2 WHERE global_payment_id=?",
+                (global_payment_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["evidence_id"] != evidence_id:
+                    raise ValueError("Stripe payment is bound to different evidence")
+                rendered = self._render_payment_event(existing)
+                rendered["voucherState"] = self.voucher(
+                    terms_hash, int(deed["ordinal"])
+                )["state"]
+                return rendered
+            occupied = cur.execute(
+                "SELECT 1 FROM voucher_records_v2 WHERE terms_hash=? AND serial=?",
+                (terms_hash.lower(), int(deed["ordinal"])),
+            ).fetchone()
+            if occupied:
+                raise ValueError("governed presale deed is already reserved")
+            cur.execute(
+                """
+                INSERT INTO presale_payment_events_v2(
+                  global_payment_id, terms_hash, order_key, evidence_id,
+                  outcome, serial, created_at
+                ) VALUES (?, ?, ?, ?, 'PAYMENT_CONFIRMED', ?, ?)
+                """,
+                (
+                    global_payment_id,
+                    terms_hash.lower(),
+                    order_key,
+                    evidence_id,
+                    int(deed["ordinal"]),
+                    now,
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO voucher_records_v2(
+                  terms_hash, serial, deed_launcher_id, payment_rail,
+                  payment_principal, base_price_minor, technology_fee_bps,
+                  technology_fee_minor, gross_price_minor, processing_charge_minor,
+                  original_payer, vault_launcher_id, vault_p2_puzzle_hash,
+                  purchase_id, global_payment_id, commitment_hash,
+                  commitment_json, purchase_artifact_json,
+                  settlement_receipt_json, state, payment_evidence_id,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, 'STRIPE_USD', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, 'PENDING_ISSUANCE', ?, ?, ?)
+                """,
+                (
+                    terms_hash.lower(),
+                    int(deed["ordinal"]),
+                    str(deed["deedLauncherId"]).lower(),
+                    commitment.payment_principal,
+                    commitment.base_price_minor,
+                    commitment.technology_fee_bps,
+                    commitment.technology_fee_minor,
+                    commitment.gross_price_minor,
+                    commitment.processing_charge_minor,
+                    _hex32(commitment.original_payer),
+                    _hex32(commitment.approved_vault_launcher_id),
+                    _hex32(commitment.approved_vault_p2_puzzle_hash),
+                    _hex32(artifact.purchase_id),
+                    global_payment_id,
+                    _hex32(commitment.commitment_hash),
+                    _json(commitment_json),
+                    _json(artifact_json),
+                    _json(receipt_json),
+                    evidence_id,
+                    now,
+                    now,
+                ),
+            )
+            event = cur.execute(
+                "SELECT * FROM presale_payment_events_v2 WHERE global_payment_id=?",
+                (global_payment_id,),
+            ).fetchone()
+        rendered = self._render_payment_event(event)
+        rendered["voucherState"] = "PENDING_ISSUANCE"
+        return rendered
 
     def record_native_issuance_submission(
         self,
@@ -2718,6 +3035,7 @@ class PresaleStore:
             "technologyFeeBps": row["technology_fee_bps"],
             "technologyFeeMinor": row["technology_fee_minor"],
             "grossPriceMinor": row["gross_price_minor"],
+            "processingChargeMinor": row["processing_charge_minor"] or 0,
             "originalPayer": row["original_payer"],
             "vaultLauncherId": row["vault_launcher_id"],
             "vaultP2PuzzleHash": row["vault_p2_puzzle_hash"],
@@ -2725,6 +3043,16 @@ class PresaleStore:
             "globalPaymentId": row["global_payment_id"],
             "commitmentHash": row["commitment_hash"],
             "commitment": json.loads(row["commitment_json"]),
+            "purchaseArtifact": (
+                json.loads(row["purchase_artifact_json"])
+                if row["purchase_artifact_json"]
+                else None
+            ),
+            "settlementReceipt": (
+                json.loads(row["settlement_receipt_json"])
+                if row["settlement_receipt_json"]
+                else None
+            ),
             "state": row["state"],
             "paymentEvidenceId": row["payment_evidence_id"],
             "issuanceEvidenceId": row["issuance_evidence_id"],

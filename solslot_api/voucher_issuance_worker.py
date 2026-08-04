@@ -24,6 +24,10 @@ from chia_rs.sized_ints import uint64
 
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.payment_artifacts_v2 import purchase_artifact_from_json
+from solslot_puzzles.payment_artifacts_v3 import (
+    purchase_artifact_v3_from_json,
+    stripe_receipt_from_json,
+)
 from solslot_puzzles.voucher_presale_v2 import (
     VoucherSeriesState,
     series_terms_from_json,
@@ -40,6 +44,11 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     curry_purchase_launcher,
     curry_series,
     external_receipt_evidence_message,
+)
+from solslot_puzzles.voucher_presale_v3 import voucher_commitment_v3_from_json
+from solslot_puzzles.voucher_presale_v3_driver import (
+    build_stripe_voucher_issuance_spends,
+    curry_stripe_voucher_receipt,
 )
 from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 from solslot_puzzles.primary_purchase_v2_driver import (
@@ -337,7 +346,10 @@ class VoucherIssuanceWorker:
             "termsHash": str(series["termsHash"]),
             "serial": int(voucher["serial"]),
         }
-        if voucher["paymentRail"] != "BASE_SEPOLIA_USDC":
+        if voucher["paymentRail"] not in {
+            "BASE_SEPOLIA_USDC",
+            "STRIPE_USD",
+        }:
             return {**base, "status": "WAITING_FOR_WALLET_OFFER"}
         if voucher["state"] == "ISSUANCE_SUBMITTED":
             confirmed = await self._confirm_if_ready(series, voucher)
@@ -359,8 +371,21 @@ class VoucherIssuanceWorker:
         self, series: dict[str, Any], voucher_json: dict[str, Any]
     ) -> dict[str, Any]:
         terms = series_terms_from_json(series["terms"])
-        voucher = voucher_commitment_from_json(voucher_json["commitment"])
-        payment_puzzle = curry_external_receipt(terms=terms, voucher=voucher)
+        if voucher_json["paymentRail"] == "STRIPE_USD":
+            voucher = voucher_commitment_v3_from_json(
+                voucher_json["commitment"]
+            )
+            purchase = purchase_artifact_v3_from_json(
+                voucher_json["purchaseArtifact"]
+            )
+            payment_puzzle = curry_stripe_voucher_receipt(
+                terms=terms,
+                voucher=voucher,
+                artifact=purchase,
+            )
+        else:
+            voucher = voucher_commitment_from_json(voucher_json["commitment"])
+            payment_puzzle = curry_external_receipt(terms=terms, voucher=voucher)
         launcher_puzzle = curry_purchase_launcher(
             terms=terms,
             voucher=voucher,
@@ -448,7 +473,6 @@ class VoucherIssuanceWorker:
             raise RuntimeError("current series coin record is not canonical")
 
         terms = series_terms_from_json(series["terms"])
-        voucher = voucher_commitment_from_json(voucher_json["commitment"])
         state = _series_state(series)
         lineage = LineageProof(
             _b32(chain["lineageParentName"]),
@@ -459,21 +483,55 @@ class VoucherIssuanceWorker:
             ),
             uint64(1),
         )
-        payment_puzzle = curry_external_receipt(terms=terms, voucher=voucher)
-        provisional = build_voucher_issuance_spends(
-            terms=terms,
-            state=state,
-            series_coin=series_coin,
-            series_lineage_proof=lineage,
-            voucher=voucher,
-            purchase_launcher_coin=purchase_coin,
-            payment_puzzle=payment_puzzle,
-            payment_amount=1,
-            signer_indices=tuple(range(self.settings.zkpassport_validator_threshold)),
-        )
         stored_purchase = self.purchases.get(str(voucher_json["purchaseId"]))
-        if not isinstance(stored_purchase.external_message, Mapping):
-            raise RuntimeError("voucher payment has no authenticated external evidence")
+        is_stripe = voucher_json["paymentRail"] == "STRIPE_USD"
+        if is_stripe:
+            voucher = voucher_commitment_v3_from_json(
+                voucher_json["commitment"]
+            )
+            purchase = purchase_artifact_v3_from_json(
+                voucher_json["purchaseArtifact"]
+            )
+            receipt = stripe_receipt_from_json(
+                voucher_json["settlementReceipt"]
+            )
+            provisional = build_stripe_voucher_issuance_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=lineage,
+                voucher=voucher,
+                artifact=purchase,
+                receipt=receipt,
+                expected_original_payer=voucher.original_payer,
+                smart_deed_inner_hash=voucher.smart_deed_inner_hash,
+                purchase_launcher_coin=purchase_coin,
+                signer_indices=tuple(
+                    range(self.settings.zkpassport_validator_threshold)
+                ),
+            )
+            payment_evidence = voucher_json["settlementReceipt"]["evidence"]
+        else:
+            voucher = voucher_commitment_from_json(voucher_json["commitment"])
+            payment_puzzle = curry_external_receipt(terms=terms, voucher=voucher)
+            provisional = build_voucher_issuance_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=lineage,
+                voucher=voucher,
+                purchase_launcher_coin=purchase_coin,
+                payment_puzzle=payment_puzzle,
+                payment_amount=1,
+                signer_indices=tuple(
+                    range(self.settings.zkpassport_validator_threshold)
+                ),
+            )
+            if not isinstance(stored_purchase.external_message, Mapping):
+                raise RuntimeError(
+                    "voucher payment has no authenticated external evidence"
+                )
+            payment_evidence = dict(stored_purchase.external_message)
         artifact = load_signed_public_artifact(self.settings)
         claim = VoucherIssuanceClaim(
             network=self.settings.network,
@@ -488,21 +546,36 @@ class VoucherIssuanceWorker:
             series_phase=int(state.phase),
             series_launched_at=state.launched_at,
             purchase_launcher_coin_id=_hex32(purchase_coin.name()),
-            payment_evidence=dict(stored_purchase.external_message),
+            payment_evidence=payment_evidence,
             validator_message=_hex32(provisional.validator_message),
         )
         quorum = await collect_voucher_issuance_quorum(self.settings, claim)
-        issuance = build_voucher_issuance_spends(
-            terms=terms,
-            state=state,
-            series_coin=series_coin,
-            series_lineage_proof=lineage,
-            voucher=voucher,
-            purchase_launcher_coin=purchase_coin,
-            payment_puzzle=payment_puzzle,
-            payment_amount=1,
-            signer_indices=quorum.signer_indices,
-        )
+        if is_stripe:
+            issuance = build_stripe_voucher_issuance_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=lineage,
+                voucher=voucher,
+                artifact=purchase,
+                receipt=receipt,
+                expected_original_payer=voucher.original_payer,
+                smart_deed_inner_hash=voucher.smart_deed_inner_hash,
+                purchase_launcher_coin=purchase_coin,
+                signer_indices=quorum.signer_indices,
+            )
+        else:
+            issuance = build_voucher_issuance_spends(
+                terms=terms,
+                state=state,
+                series_coin=series_coin,
+                series_lineage_proof=lineage,
+                voucher=voucher,
+                purchase_launcher_coin=purchase_coin,
+                payment_puzzle=payment_puzzle,
+                payment_amount=1,
+                signer_indices=quorum.signer_indices,
+            )
         if issuance.validator_message != provisional.validator_message:
             raise RuntimeError("voucher issuance changed after quorum selection")
         bundle = SpendBundle(
@@ -516,7 +589,13 @@ class VoucherIssuanceWorker:
             issuance_bundle_id=_hex32(bundle.name()),
             voucher_launcher_id=_hex32(issuance.voucher_launcher_id),
             voucher_output_coin_id=_hex32(issuance.voucher_coin.name()),
-            payment_commitment_coin_id=_hex32(issuance.payment_coin.name()),
+            payment_commitment_coin_id=_hex32(
+                (
+                    issuance.receipt_coin
+                    if is_stripe
+                    else issuance.payment_coin
+                ).name()
+            ),
             series_input_coin_id=_hex32(series_coin.name()),
             series_output_coin_id=_hex32(issuance.next_series_coin.name()),
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,6 +69,17 @@ from solslot_puzzles.payment_artifacts_v2 import (
     purchase_artifact_from_json,
     purchase_artifact_to_json,
 )
+from solslot_puzzles.payment_artifacts_v3 import (
+    StripeDisputeState,
+    StripeFundingType,
+    StripeMethodFamily,
+    StripePaymentStatus,
+    StripeRefundState,
+    StripeSettlementEvidenceV1,
+    build_stripe_purchase_artifact_v3,
+    build_stripe_settlement_receipt_v1,
+    purchase_artifact_v3_to_json,
+)
 from solslot_puzzles.mint_publish_driver import (
     deed_launcher_coin_for_parent,
     deed_singleton_struct,
@@ -100,6 +112,11 @@ from solslot_puzzles.voucher_presale_v2_driver import (
     curry_external_receipt,
     curry_voucher_inner,
     curry_xch_escrow,
+)
+from solslot_puzzles.voucher_presale_v3 import voucher_commitment_v3_from_json
+from solslot_puzzles.voucher_presale_v3_driver import (
+    curry_stripe_voucher_receipt,
+    curry_voucher_inner_v3,
 )
 
 
@@ -606,6 +623,100 @@ def ingest(
     )
 
 
+def test_final_stripe_presale_payment_creates_v3_voucher_once() -> None:
+    now = int(time.time())
+    current_terms = terms(now)
+    store = PresaleStore(":memory:")
+    create_series(store, current_terms)
+    vault = approved_vault()
+    deed = current_terms["deeds"][0]  # type: ignore[index]
+    artifact = build_stripe_purchase_artifact_v3(
+        network="testnet11",
+        collection_id=bytes32.from_hexstr(str(current_terms["collectionId"])),
+        deed_launcher_id=bytes32.from_hexstr(str(deed["deedLauncherId"])),
+        metadata_root=bytes32.from_hexstr(str(current_terms["metadataRoot"])),
+        metadata_anchor_id=bytes32.from_hexstr(
+            str(current_terms["metadataAnchorId"])
+        ),
+        share_ppm=int(deed["sharePpm"]),
+        base_usd_amount_minor=int(deed["basePriceMinor"]),
+        technology_fee_bps=int(current_terms["technologyFeeBps"]),
+        protocol_treasury_puzzle_hash=bytes32.from_hexstr(
+            str(current_terms["trustedProtocolTreasury"])
+        ),
+        zkpassport_root=b32(42),
+        vault_launcher_id=bytes32.from_hexstr(vault.launcher_id),
+        vault_p2_puzzle_hash=bytes32.from_hexstr(vault.p2_puzzle_hash),
+        authorization_nonce=b32(51),
+        authorization_expires_at=now + 600,
+        quote_expires_at=now + 100,
+        presale_terms_hash=bytes32.from_hexstr(
+            str(current_terms["termsHash"])
+        ),
+    )
+    evidence_value = StripeSettlementEvidenceV1(
+        stripe_account_id="acct_testnet_alpha",
+        livemode=False,
+        payment_intent_id="pi_stripe_voucher_alpha",
+        event_id="evt_stripe_voucher_alpha",
+        amount_minor=artifact.subtotal_minor,
+        currency="usd",
+        method_family=StripeMethodFamily.US_BANK_ACCOUNT,
+        funding_type=StripeFundingType.BANK_ACCOUNT,
+        processing_charge_minor=0,
+        status=StripePaymentStatus.SUCCEEDED,
+        refunded_minor=0,
+        refund_state=StripeRefundState.NONE,
+        dispute_state=StripeDisputeState.NONE,
+        observed_at=now + 2,
+    )
+    receipt = build_stripe_settlement_receipt_v1(
+        artifact=artifact,
+        evidence=evidence_value,
+        validator_pubkeys=tuple(
+            bytes.fromhex(str(value).removeprefix("0x"))
+            for value in current_terms["validatorPubkeys"]  # type: ignore[index]
+        ),
+    )
+    artifact_value = purchase_artifact_v3_to_json(artifact)
+    stored = StoredPaymentPurchase(
+        purchase_id=str(artifact_value["purchaseId"]),
+        artifact_hash=str(artifact_value["artifactHash"]),
+        purchase_intent_id="pi_stripe_presale",
+        rail="stripe",
+        quote_expires_at=artifact.quote_expires_at,
+        offer_artifact_hash=hex32(70),
+        offer_artifact={},
+        purchase_artifact=artifact_value,
+        external_message=None,
+    )
+
+    first = store.ingest_stripe_payment(
+        str(current_terms["termsHash"]),
+        artifact=artifact,
+        receipt=receipt,
+        evidence_id=evidence_value.event_id,
+        issued_purchase=stored,
+    )
+    second = store.ingest_stripe_payment(
+        str(current_terms["termsHash"]),
+        artifact=artifact,
+        receipt=receipt,
+        evidence_id=evidence_value.event_id,
+        issued_purchase=stored,
+    )
+    voucher = store.voucher(str(current_terms["termsHash"]), 0)
+
+    assert first["outcome"] == second["outcome"] == "PAYMENT_CONFIRMED"
+    assert first["voucherState"] == second["voucherState"] == "PENDING_ISSUANCE"
+    assert voucher["paymentRail"] == "STRIPE_USD"
+    assert voucher["processingChargeMinor"] == 0
+    assert voucher["purchaseArtifact"] == artifact_value
+    assert voucher["settlementReceipt"]["receiptHash"] == hex32(
+        receipt.receipt_hash
+    )
+
+
 def create_series(
     store: PresaleStore, current_terms: dict[str, object]
 ) -> dict[str, object]:
@@ -631,6 +742,66 @@ def test_presale_store_creates_parent_directory(tmp_path: Path) -> None:
     store = PresaleStore(str(database_path))
 
     assert database_path.is_file()
+
+
+def test_pre_stripe_voucher_table_migrates_without_losing_records(
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    current_terms = terms(now)
+    database_path = tmp_path / "presale.db"
+    original = PresaleStore(str(database_path))
+    create_series(original, current_terms)
+    expected = ingest(original, current_terms)
+    original._conn.close()
+
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=OFF")
+    current_schema = str(
+        connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            ("voucher_records_v2",),
+        ).fetchone()["sql"]
+    )
+    legacy_schema = current_schema.replace(
+        "CREATE TABLE voucher_records_v2",
+        "CREATE TABLE voucher_records_v2_legacy",
+        1,
+    ).replace(", 'STRIPE_USD'", "")
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(legacy_schema)
+    columns = [
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(voucher_records_v2)"
+        ).fetchall()
+    ]
+    columns_sql = ", ".join(f'"{name}"' for name in columns)
+    connection.execute(
+        f"INSERT INTO voucher_records_v2_legacy ({columns_sql}) "
+        f"SELECT {columns_sql} FROM voucher_records_v2"
+    )
+    connection.execute("DROP TABLE voucher_records_v2")
+    connection.execute(
+        "ALTER TABLE voucher_records_v2_legacy RENAME TO voucher_records_v2"
+    )
+    connection.execute("COMMIT")
+    connection.close()
+
+    upgraded = PresaleStore(str(database_path))
+    restored = upgraded.voucher(str(current_terms["termsHash"]), 0)
+    schema = str(
+        upgraded._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            ("voucher_records_v2",),
+        ).fetchone()["sql"]
+    )
+
+    assert restored["globalPaymentId"] == expected["globalPaymentId"]
+    assert restored["paymentRail"] == "BASE_SEPOLIA_USDC"
+    assert "STRIPE_USD" in schema
+    assert upgraded._conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_public_presale_redacts_vouchers_and_vault_view_is_scoped() -> None:
@@ -2008,6 +2179,7 @@ async def test_base_voucher_worker_funds_then_submits_only_after_confirmation(
     assert confirmed["issuanceConfirmedHeight"] == confirmed_height
     assert store.get(str(current_terms["termsHash"]))["chainState"]["soldCount"] == 1
 
+
     launch_anchor = int(current_terms["saleClose"])
     issuance_bundle = SpendBundle.from_json_dict(coinset.pushed[1])
     issuance_series_spend = next(
@@ -2274,6 +2446,176 @@ async def test_base_voucher_worker_funds_then_submits_only_after_confirmation(
                 confirmedAt=now + 100,
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_stripe_ach_voucher_worker_submits_exact_v3_issuance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    current_terms = terms(now)
+    store = PresaleStore(":memory:")
+    created = create_series(store, current_terms)
+    vault = approved_vault()
+    deed = current_terms["deeds"][0]  # type: ignore[index]
+    artifact = build_stripe_purchase_artifact_v3(
+        network="testnet11",
+        collection_id=bytes32.from_hexstr(str(current_terms["collectionId"])),
+        deed_launcher_id=bytes32.from_hexstr(str(deed["deedLauncherId"])),
+        metadata_root=bytes32.from_hexstr(str(current_terms["metadataRoot"])),
+        metadata_anchor_id=bytes32.from_hexstr(
+            str(current_terms["metadataAnchorId"])
+        ),
+        share_ppm=int(deed["sharePpm"]),
+        base_usd_amount_minor=int(deed["basePriceMinor"]),
+        technology_fee_bps=int(current_terms["technologyFeeBps"]),
+        protocol_treasury_puzzle_hash=bytes32.from_hexstr(
+            str(current_terms["trustedProtocolTreasury"])
+        ),
+        zkpassport_root=b32(42),
+        vault_launcher_id=bytes32.from_hexstr(vault.launcher_id),
+        vault_p2_puzzle_hash=bytes32.from_hexstr(vault.p2_puzzle_hash),
+        authorization_nonce=b32(151),
+        authorization_expires_at=now + 600,
+        quote_expires_at=now + 100,
+        presale_terms_hash=bytes32.from_hexstr(str(current_terms["termsHash"])),
+    )
+    stripe_evidence = StripeSettlementEvidenceV1(
+        stripe_account_id="acct_testnet_alpha",
+        livemode=False,
+        payment_intent_id="pi_stripe_ach_worker",
+        event_id="evt_stripe_ach_worker",
+        amount_minor=artifact.subtotal_minor,
+        currency="usd",
+        method_family=StripeMethodFamily.US_BANK_ACCOUNT,
+        funding_type=StripeFundingType.BANK_ACCOUNT,
+        processing_charge_minor=0,
+        status=StripePaymentStatus.SUCCEEDED,
+        refunded_minor=0,
+        refund_state=StripeRefundState.NONE,
+        dispute_state=StripeDisputeState.NONE,
+        observed_at=now + 2,
+    )
+    receipt = build_stripe_settlement_receipt_v1(
+        artifact=artifact,
+        evidence=stripe_evidence,
+        validator_pubkeys=tuple(
+            bytes.fromhex(str(value).removeprefix("0x"))
+            for value in current_terms["validatorPubkeys"]  # type: ignore[index]
+        ),
+    )
+    artifact_json_v3 = purchase_artifact_v3_to_json(artifact)
+    purchases = PaymentPurchaseStore(str(tmp_path / "stripe-purchases.db"))
+    stored = purchases.save(
+        purchase_intent_id="pi_stripe_ach_worker",
+        rail="stripe",
+        offer_artifact_hash=hex32(170),
+        offer_artifact={},
+        purchase_artifact=artifact_json_v3,
+        created_at=now,
+    )
+    store.ingest_stripe_payment(
+        str(current_terms["termsHash"]),
+        artifact=artifact,
+        receipt=receipt,
+        evidence_id=stripe_evidence.event_id,
+        issued_purchase=stored,
+    )
+
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    faucet_coin = Coin(b32(171), faucet.address_puzzle_hash, uint64(20))
+    coinset = FakeCoinset(faucet_coin)
+    worker = VoucherIssuanceWorker(
+        settings=Settings(runtime_environment="test", network="testnet11"),
+        faucet=faucet,
+        coinset=coinset,
+        presales=store,
+        purchases=purchases,
+        config=VoucherIssuanceWorkerConfig(enabled=True),
+    )
+
+    first = await worker.reconcile_once()
+    assert first[0]["status"] == "FUNDING_SUBMITTED"
+    pending = store.voucher(str(current_terms["termsHash"]), 0)
+    assert pending["state"] == "PENDING_ISSUANCE"
+    assert pending["paymentRail"] == "STRIPE_USD"
+    assert len(coinset.pushed) == 1
+
+    purchase_launcher = Coin(
+        bytes32(faucet_coin.name()),
+        bytes32.from_hexstr(str(pending["purchaseLauncherPuzzleHash"])),
+        uint64(2),
+    )
+    series_coin = Coin(
+        bytes32.from_hexstr(str(current_terms["seriesSingletonId"])),
+        bytes32.from_hexstr(str(created["singletonLaunch"]["fullPuzzleHash"])),
+        uint64(1),
+    )
+    coinset.records[str(pending["purchaseLauncherCoinId"])] = coin_record(
+        purchase_launcher
+    )
+    coinset.records[str(created["chainState"]["currentCoinId"])] = coin_record(
+        series_coin
+    )
+    observed_claims = []
+
+    async def fake_quorum(_settings, claim):
+        observed_claims.append(claim)
+        return ValidatorQuorumResult(
+            signer_indices=(0, 1),
+            aggregated_signature=G2Element(),
+            claim_hash=claim.canonical_hash(),
+        )
+
+    monkeypatch.setattr(
+        "solslot_api.voucher_issuance_worker.collect_voucher_issuance_quorum",
+        fake_quorum,
+    )
+    monkeypatch.setattr(
+        "solslot_api.voucher_issuance_worker.load_signed_public_artifact",
+        lambda _settings: {"artifactHash": hex32(172)},
+    )
+
+    second = await worker.reconcile_once()
+    assert second[0]["status"] == "ISSUANCE_SUBMITTED"
+    submitted = store.voucher(str(current_terms["termsHash"]), 0)
+    assert submitted["state"] == "ISSUANCE_SUBMITTED"
+    assert submitted["voucherOutputCoinId"]
+    assert submitted["paymentCommitmentCoinId"]
+    assert len(coinset.pushed) == 2
+    assert len(observed_claims) == 1
+    assert observed_claims[0].purchase_artifact == artifact_json_v3
+    assert (
+        observed_claims[0].payment_evidence["paymentIntentId"]
+        == stripe_evidence.payment_intent_id
+    )
+
+    program_terms = series_terms_from_json(current_terms)
+    commitment = voucher_commitment_v3_from_json(submitted["commitment"])
+    voucher_launcher = bytes32.from_hexstr(str(submitted["voucherLauncherId"]))
+    voucher_inner = curry_voucher_inner_v3(
+        terms=program_terms,
+        voucher=commitment,
+        voucher_launcher_id=voucher_launcher,
+    )
+    voucher_coin = Coin(
+        voucher_launcher,
+        bytes32(puzzle_for_singleton(voucher_launcher, voucher_inner).get_tree_hash()),
+        uint64(1),
+    )
+    stripe_receipt = curry_stripe_voucher_receipt(
+        terms=program_terms,
+        voucher=commitment,
+        artifact=artifact,
+    )
+    receipt_coin = Coin(
+        bytes32.from_hexstr(str(submitted["purchaseLauncherCoinId"])),
+        bytes32(stripe_receipt.get_tree_hash()),
+        uint64(1),
+    )
+    assert submitted["voucherOutputCoinId"] == hex32(voucher_coin.name())
+    assert submitted["paymentCommitmentCoinId"] == hex32(receipt_coin.name())
 
 
 @pytest.mark.asyncio
