@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from fastapi import FastAPI
@@ -13,7 +14,7 @@ from eth_utils import keccak
 import solslot_api.genesis as genesis_module
 from solslot_api.config import Settings, get_settings
 from solslot_api.genesis import get_genesis_store, router
-from solslot_api.genesis_store import GenesisStore
+from solslot_api.genesis_store import GenesisConflict, GenesisStore
 
 
 ADMIN_TOKEN = "test-ceremony-operator-token"
@@ -28,6 +29,15 @@ SOURCE_NAMES = (
     "customerWeb",
     "adminPortal",
 )
+
+
+def test_global_finalization_lock_rejects_a_concurrent_writer(tmp_path) -> None:
+    lock_path = tmp_path / "bootstrap-lock.json"
+
+    with genesis_module._exclusive_finalization_lock(lock_path):
+        with pytest.raises(GenesisConflict, match="already active"):
+            with genesis_module._exclusive_finalization_lock(lock_path):
+                pass
 
 
 def _source_shas() -> dict[str, str]:

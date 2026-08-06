@@ -51,6 +51,7 @@ class GovernanceQueueRecord:
     proposal_coin_id: str | None
     completion_bundle_id: str | None
     publication_coadmin_slot: int | None
+    publication_voting_deadline: int | None
     execution_bundle_id: str | None
     expected_output_coin_ids: tuple[str, ...]
     execution_submitted_at: int | None
@@ -213,6 +214,7 @@ class GovernanceQueueStore:
             self._ensure_column(cursor, "governance_proposal_queue", "proposal_coin_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "completion_bundle_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "publication_coadmin_slot", "INTEGER")
+            self._ensure_column(cursor, "governance_proposal_queue", "publication_voting_deadline", "INTEGER")
             self._ensure_column(cursor, "governance_proposal_queue", "execution_bundle_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "expected_output_coin_ids_json", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "execution_submitted_at", "INTEGER")
@@ -552,15 +554,19 @@ class GovernanceQueueStore:
         *,
         proposal_id: str,
         coadmin_slot: int,
+        voting_deadline: int,
         actor: str,
         now: int | None = None,
     ) -> GovernanceQueueRecord:
         if coadmin_slot not in (1, 2):
             raise GovernanceQueueConflict("publication coadministrator is invalid")
         timestamp = int(time.time()) if now is None else now
+        if voting_deadline <= timestamp:
+            raise GovernanceQueueConflict("publication voting deadline must be future")
         with self._txn() as cursor:
             row = cursor.execute(
-                "SELECT state, revision, publication_coadmin_slot "
+                "SELECT state, revision, publication_coadmin_slot, "
+                "publication_voting_deadline "
                 "FROM governance_proposal_queue WHERE id=?",
                 (proposal_id,),
             ).fetchone()
@@ -576,12 +582,14 @@ class GovernanceQueueStore:
                     raise GovernanceQueueConflict(
                         "publication coadministrator is already fixed"
                     )
-                return self.get(proposal_id)
+                if row["publication_voting_deadline"] is not None:
+                    return self.get(proposal_id)
             cursor.execute(
                 "UPDATE governance_proposal_queue SET "
-                "publication_coadmin_slot=?, updated_at=? "
+                "publication_coadmin_slot=?, publication_voting_deadline=?, "
+                "updated_at=? "
                 "WHERE id=?",
-                (coadmin_slot, timestamp, proposal_id),
+                (coadmin_slot, voting_deadline, timestamp, proposal_id),
             )
             self._audit(
                 cursor,
@@ -589,7 +597,10 @@ class GovernanceQueueStore:
                 actor,
                 "PUBLICATION_PREPARED",
                 int(row["revision"]),
-                {"coadminSlot": coadmin_slot},
+                {
+                    "coadminSlot": coadmin_slot,
+                    "votingDeadline": voting_deadline,
+                },
                 timestamp,
             )
         return self.get(proposal_id)
@@ -785,6 +796,11 @@ def _record(row: sqlite3.Row) -> GovernanceQueueRecord:
         publication_coadmin_slot=(
             int(row["publication_coadmin_slot"])
             if row["publication_coadmin_slot"] is not None
+            else None
+        ),
+        publication_voting_deadline=(
+            int(row["publication_voting_deadline"])
+            if row["publication_voting_deadline"] is not None
             else None
         ),
         execution_bundle_id=(

@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import stat
 import time
+from pathlib import Path
 from typing import Annotated, Any, Literal, Mapping, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from chia_rs.sized_bytes import bytes32
+from web3 import Web3
 
 from solslot_puzzles.payment_artifacts_v2 import (
     DeedPriceV1,
@@ -115,6 +119,45 @@ PurchaseIntentState = Literal[
 ]
 
 ALPHA_TECHNOLOGY_FEE_BPS = 100
+PAYMENT_SETTLED_TOPIC = Web3.keccak(
+    text="PaymentSettled(bytes32,address,address,uint256,bool,bool)"
+).hex()
+ESCROW_DEPOSIT_ABI = [
+    {
+        "inputs": [{"name": "globalPaymentId", "type": "bytes32"}],
+        "name": "getDeposit",
+        "outputs": [
+            {
+                "components": [
+                    {"name": "depositor", "type": "address"},
+                    {"name": "settlementToken", "type": "address"},
+                    {"name": "localPaymentId", "type": "bytes32"},
+                    {"name": "purchaseId", "type": "bytes32"},
+                    {"name": "artifactHash", "type": "bytes32"},
+                    {"name": "collectionId", "type": "bytes32"},
+                    {"name": "deedLauncherId", "type": "bytes32"},
+                    {"name": "vaultLauncherId", "type": "bytes32"},
+                    {"name": "destinationPuzzle", "type": "bytes32"},
+                    {"name": "requestMessageId", "type": "bytes32"},
+                    {"name": "resultMessageId", "type": "bytes32"},
+                    {"name": "warpNonce", "type": "bytes32"},
+                    {"name": "amount", "type": "uint256"},
+                    {"name": "quantity", "type": "uint256"},
+                    {"name": "hubChainSelector", "type": "uint64"},
+                    {"name": "hubGateway", "type": "address"},
+                    {"name": "createdAt", "type": "uint64"},
+                    {"name": "quoteExpiresAt", "type": "uint64"},
+                    {"name": "status", "type": "uint8"},
+                    {"name": "succeeded", "type": "bool"},
+                ],
+                "name": "",
+                "type": "tuple",
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
 
 
 @router.get("/artifact", response_model=dict[str, Any])
@@ -670,6 +713,15 @@ async def verify_purchase_finalization(
                     != StripeDisputeState.NONE
                 ):
                     reasons.append("stripe_payment_not_deliverable")
+                if not reasons:
+                    try:
+                        _verify_stripe_provider_evidence(
+                            settings,
+                            canonical,
+                            stripe_evidence,
+                        )
+                    except PaymentArtifactError:
+                        reasons.append("stripe_provider_unverified")
     if canonical is not None and body.rail in {"base_usdc", "evm_usdc"}:
         canonical_item = (
             canonical.artifacts[0]
@@ -1009,6 +1061,17 @@ async def verify_external_escrow(
             status_code=status.HTTP_409_CONFLICT,
             detail="external payment provenance does not match the reviewed escrow rail",
         )
+    try:
+        _verify_external_escrow_chain_evidence(
+            settings,
+            normalized=normalized,
+            deployment=deployment,
+        )
+    except PaymentArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     delivery_amount = batch.quantity if batch is not None else 1
     delivery_context = canonical.collection_id
     delivery_asset = canonical.deed_launcher_id
@@ -2437,18 +2500,267 @@ def _require_server_to_server_token(
 ) -> None:
     expected = settings.protocol_artifact_api_token
     if not expected:
-        return
+        if settings.runtime_environment == "test":
+            return
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Protocol artifact service authentication is not configured.",
+        )
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing protocol artifact bearer token.",
         )
     supplied = authorization.removeprefix("Bearer ").strip()
-    if supplied != expected:
+    if not secrets.compare_digest(supplied, expected):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid protocol artifact bearer token.",
         )
+
+
+def _stripe_restricted_key(settings: Settings) -> str:
+    path = Path(str(settings.stripe_restricted_key_file or ""))
+    if path.is_symlink() or not path.is_file():
+        raise PaymentArtifactError("Stripe restricted key file is unavailable")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise PaymentArtifactError(
+            "Stripe restricted key file must not be accessible by group/other"
+        )
+    try:
+        key = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise PaymentArtifactError("Stripe restricted key is unreadable") from exc
+    prefix = "rk_live_" if settings.stripe_mode == "live" else "rk_test_"
+    if not key.startswith(prefix) or len(key) < len(prefix) + 16:
+        raise PaymentArtifactError(
+            "Stripe restricted key does not match the configured mode"
+        )
+    return key
+
+
+def _verify_stripe_provider_evidence(
+    settings: Settings,
+    purchase: PurchaseArtifactV3 | PurchaseBatchV1,
+    evidence: StripeSettlementEvidenceV1,
+) -> None:
+    """Independently reconstruct provider facts before durable queueing."""
+
+    if (
+        not settings.stripe_settlement_enabled
+        or evidence.stripe_account_id != settings.stripe_account_id
+        or evidence.livemode != (settings.stripe_mode == "live")
+        or not settings.stripe_api_url.startswith("https://")
+    ):
+        raise PaymentArtifactError(
+            "Stripe settlement verification is not securely configured"
+        )
+    headers = {
+        "authorization": f"Bearer {_stripe_restricted_key(settings)}",
+        "stripe-version": "2024-06-20",
+    }
+    try:
+        with httpx.Client(
+            base_url=settings.stripe_api_url.rstrip("/"),
+            headers=headers,
+            timeout=20.0,
+        ) as client:
+            intent_response = client.get(
+                f"/v1/payment_intents/{evidence.payment_intent_id}",
+                params={"expand[]": "latest_charge"},
+            )
+            intent_response.raise_for_status()
+            event_response = client.get(f"/v1/events/{evidence.event_id}")
+            event_response.raise_for_status()
+            intent = intent_response.json()
+            event = event_response.json()
+            charge = intent.get("latest_charge")
+            if isinstance(charge, str):
+                charge_response = client.get(f"/v1/charges/{charge}")
+                charge_response.raise_for_status()
+                charge = charge_response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise PaymentArtifactError(
+            "Stripe could not independently verify the paid purchase"
+        ) from exc
+    if not isinstance(intent, Mapping) or not isinstance(event, Mapping):
+        raise PaymentArtifactError("Stripe returned malformed payment evidence")
+    event_data = event.get("data")
+    event_object = (
+        event_data.get("object") if isinstance(event_data, Mapping) else None
+    )
+    metadata = intent.get("metadata")
+    purchase_id = purchase.purchase_id
+    purchase_hash = (
+        purchase.batch_hash
+        if isinstance(purchase, PurchaseBatchV1)
+        else purchase.artifact_hash
+    )
+    if (
+        intent.get("id") != evidence.payment_intent_id
+        or bool(intent.get("livemode")) != evidence.livemode
+        or intent.get("status") != "succeeded"
+        or int(intent.get("created") or 0) <= 0
+        or int(intent.get("created") or 0) >= purchase.quote_expires_at
+        or intent.get("currency") != "usd"
+        or int(intent.get("amount_received") or 0) != evidence.amount_minor
+        or event.get("id") != evidence.event_id
+        or event.get("type") != "payment_intent.succeeded"
+        or bool(event.get("livemode")) != evidence.livemode
+        or not isinstance(event_object, Mapping)
+        or event_object.get("id") != evidence.payment_intent_id
+        or not isinstance(metadata, Mapping)
+        or str(metadata.get("protocol_purchase_id") or "").lower()
+        != _hex32(purchase_id)
+        or str(metadata.get("purchase_artifact_hash") or "").lower()
+        != _hex32(purchase_hash)
+    ):
+        raise PaymentArtifactError(
+            "Stripe PaymentIntent or event differs from the purchase artifact"
+        )
+    if not isinstance(charge, Mapping):
+        raise PaymentArtifactError("Stripe payment has no retrievable charge")
+    method_details = charge.get("payment_method_details")
+    if not isinstance(method_details, Mapping):
+        raise PaymentArtifactError("Stripe payment method evidence is unavailable")
+    method_type = str(method_details.get("type") or "")
+    expected_method = (
+        "card"
+        if evidence.method_family == StripeMethodFamily.CARD
+        else "us_bank_account"
+    )
+    card = method_details.get("card")
+    observed_funding = (
+        str(card.get("funding") or "unknown")
+        if isinstance(card, Mapping)
+        else "not_applicable"
+    )
+    expected_funding = {
+        StripeFundingType.CREDIT: "credit",
+        StripeFundingType.DEBIT: "debit",
+        StripeFundingType.PREPAID: "prepaid",
+        StripeFundingType.UNKNOWN: "unknown",
+        StripeFundingType.BANK_ACCOUNT: "not_applicable",
+    }[evidence.funding_type]
+    if (
+        method_type != expected_method
+        or observed_funding != expected_funding
+        or bool(charge.get("refunded"))
+        or int(charge.get("amount_refunded") or 0) != 0
+        or bool(charge.get("disputed"))
+    ):
+        raise PaymentArtifactError(
+            "Stripe funding, refund, or dispute state differs from the receipt"
+        )
+
+
+def _rpc_hex(value: object) -> str:
+    if hasattr(value, "hex"):
+        rendered = value.hex()  # type: ignore[union-attr]
+        return rendered if str(rendered).startswith("0x") else "0x" + str(rendered)
+    return str(value)
+
+
+def _verify_external_escrow_chain_evidence(
+    settings: Settings,
+    *,
+    normalized: Mapping[str, Any],
+    deployment: Any,
+) -> None:
+    """Re-read the canonical receipt, settlement log, and deposit storage."""
+
+    if not settings.payment_omnichain_rpc_url:
+        raise PaymentArtifactError("EVM escrow RPC is not configured")
+    source = normalized["source"]
+    w3 = Web3(
+        Web3.HTTPProvider(
+            settings.payment_omnichain_rpc_url,
+            request_kwargs={"timeout": 20.0},
+        )
+    )
+    try:
+        receipt = w3.eth.get_transaction_receipt(source["transactionHash"])
+        block = w3.eth.get_block(source["blockNumber"])
+        latest = int(w3.eth.block_number)
+    except Exception as exc:  # noqa: BLE001
+        raise PaymentArtifactError(
+            "EVM escrow transaction could not be independently verified"
+        ) from exc
+    block_number = int(receipt.get("blockNumber") or 0)
+    confirmations = latest - block_number + 1
+    if (
+        int(receipt.get("status") or 0) != 1
+        or str(receipt.get("to") or "").lower() != deployment.spoke_address
+        or _rpc_hex(receipt.get("transactionHash")).lower()
+        != source["transactionHash"]
+        or block_number != source["blockNumber"]
+        or _rpc_hex(receipt.get("blockHash")).lower() != source["blockHash"]
+        or _rpc_hex(block.get("hash")).lower() != source["blockHash"]
+        or int(block.get("timestamp") or 0) != source["blockTimestamp"]
+        or confirmations < deployment.confirmations
+        or confirmations < source["confirmations"]
+    ):
+        raise PaymentArtifactError("EVM escrow receipt provenance changed")
+    matching_logs = [
+        log
+        for log in receipt.get("logs", [])
+        if int(log.get("logIndex", -1)) == source["logIndex"]
+        and str(log.get("address") or "").lower() == deployment.spoke_address
+        and len(log.get("topics") or []) >= 2
+        and _rpc_hex(log["topics"][0]).lower() == PAYMENT_SETTLED_TOPIC.lower()
+        and _rpc_hex(log["topics"][1]).lower()
+        == normalized["globalPaymentId"]
+    ]
+    if len(matching_logs) != 1:
+        raise PaymentArtifactError("EVM settlement log is missing or ambiguous")
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(deployment.spoke_address),
+        abi=ESCROW_DEPOSIT_ABI,
+    )
+    try:
+        deposit = contract.functions.getDeposit(
+            normalized["globalPaymentId"]
+        ).call(block_identifier=source["blockNumber"])
+    except Exception as exc:  # noqa: BLE001
+        raise PaymentArtifactError("EVM escrow deposit storage is unavailable") from exc
+    observed = {
+        "depositor": str(deposit[0]).lower(),
+        "settlementToken": str(deposit[1]).lower(),
+        "localPaymentId": _rpc_hex(deposit[2]).lower(),
+        "purchaseId": _rpc_hex(deposit[3]).lower(),
+        "artifactHash": _rpc_hex(deposit[4]).lower(),
+        "collectionId": _rpc_hex(deposit[5]).lower(),
+        "deedLauncherId": _rpc_hex(deposit[6]).lower(),
+        "vaultLauncherId": _rpc_hex(deposit[7]).lower(),
+        "destinationPuzzle": _rpc_hex(deposit[8]).lower(),
+        "amount": int(deposit[12]),
+        "quantity": int(deposit[13]),
+        "quoteExpiresAt": int(deposit[17]),
+        "status": int(deposit[18]),
+        "succeeded": bool(deposit[19]),
+    }
+    expected = {
+        field: normalized[field]
+        for field in (
+            "depositor",
+            "settlementToken",
+            "localPaymentId",
+            "purchaseId",
+            "artifactHash",
+            "collectionId",
+            "deedLauncherId",
+            "vaultLauncherId",
+            "destinationPuzzle",
+            "amount",
+            "quantity",
+            "quoteExpiresAt",
+        )
+    }
+    expected["status"] = 3
+    expected["succeeded"] = True
+    if observed != expected:
+        raise PaymentArtifactError("EVM escrow deposit differs from callback evidence")
 
 
 def _require_omnichain_ingest_token(

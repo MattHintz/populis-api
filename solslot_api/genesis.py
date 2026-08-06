@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import secrets
 import sys
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping
+from typing import Annotated, Any, Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -380,6 +382,87 @@ def _atomic_bytes(path: Path, payload: bytes, *, mode: int = 0o444) -> None:
         os.fsync(handle.fileno())
     os.chmod(temporary, mode)
     os.replace(temporary, path)
+
+
+@contextmanager
+def _exclusive_finalization_lock(lock_path: Path) -> Iterator[None]:
+    """Serialize the one global artifact/lock publication across API workers."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    guard_path = lock_path.with_name(lock_path.name + ".finalize.lock")
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(guard_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise GenesisConflict(
+                "another genesis finalization is already active"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _commit_finalization(
+    *,
+    ceremony_id: str,
+    settings: Settings,
+    store: GenesisStore,
+    record: Mapping[str, Any],
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    public_path = Path(settings.public_artifact_path)
+    lock_path = Path(settings.bootstrap_manifest_path)
+    with _exclusive_finalization_lock(lock_path):
+        store.reserve_finalization(ceremony_id)
+        if public_path.exists() or lock_path.exists():
+            raise GenesisConflict(
+                "public artifact or bootstrap lock already exists; use fresh paths"
+            )
+        output = Path(settings.genesis_output_dir) / ceremony_id.removeprefix("0x")
+        if not output.is_dir():
+            raise GenesisConflict("private ceremony evidence directory is missing")
+        _atomic_json(output / "public_artifact.json", artifact)
+        _atomic_json(public_path, artifact)
+        evidence_files = sorted(path for path in output.iterdir() if path.is_file())
+        sums = "".join(
+            hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.name + "\n"
+            for path in evidence_files
+        )
+        sums_path = output / "sha256sums.txt"
+        sums_path.write_text(sums, encoding="ascii")
+        with sums_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+
+        lock = {
+            "schemaVersion": 4,
+            "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
+            "protocolVersion": "solslot-v2-rc23",
+            "reviewClass": artifact["reviewClass"],
+            "testOnly": artifact["testOnly"],
+            "auditStatus": artifact["auditStatus"],
+            "ceremonyId": ceremony_id,
+            "planHash": record["plan_hash"],
+            "artifactHash": artifact["artifactHash"],
+            "spendBundleId": record["spend_bundle_id"],
+            "confirmedBlockIndex": record["confirmed_block_index"],
+            "lockedAt": int(time.time()),
+        }
+        _atomic_json(lock_path, lock, mode=0o444)
+        locked = store.mark_locked(ceremony_id)
+    return {
+        "locked": True,
+        "artifactHash": artifact["artifactHash"],
+        "publicArtifactPath": str(public_path),
+        "bootstrapLockPath": str(lock_path),
+        "ceremony": _safe_state(locked),
+    }
 
 
 @router.post("/drafts", dependencies=[Depends(require_admin_token)])
@@ -1205,51 +1288,13 @@ async def finalize(
         ]
 
         await _run_worker({"operation": "verifyArtifact", "artifact": artifact})
-        public_path = Path(settings.public_artifact_path)
-        lock_path = Path(settings.bootstrap_manifest_path)
-        if public_path.exists() or lock_path.exists():
-            raise GenesisConflict(
-                "public artifact or bootstrap lock already exists; use fresh paths"
-            )
-        output = Path(settings.genesis_output_dir) / ceremony_id.lower().removeprefix("0x")
-        if not output.is_dir():
-            raise GenesisConflict("private ceremony evidence directory is missing")
-        _atomic_json(output / "public_artifact.json", artifact)
-        _atomic_json(public_path, artifact)
-        evidence_files = sorted(path for path in output.iterdir() if path.is_file())
-        sums = "".join(
-            hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.name + "\n"
-            for path in evidence_files
+        return _commit_finalization(
+            ceremony_id=ceremony_id.lower(),
+            settings=settings,
+            store=store,
+            record=record,
+            artifact=artifact,
         )
-        sums_path = output / "sha256sums.txt"
-        sums_path.write_text(sums, encoding="ascii")
-        with sums_path.open("rb") as handle:
-            os.fsync(handle.fileno())
-
-        # The lock manifest is intentionally the final public file written.
-        lock = {
-            "schemaVersion": 4,
-            "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
-            "protocolVersion": "solslot-v2-rc23",
-            "reviewClass": artifact["reviewClass"],
-            "testOnly": artifact["testOnly"],
-            "auditStatus": artifact["auditStatus"],
-            "ceremonyId": ceremony_id.lower(),
-            "planHash": record["plan_hash"],
-            "artifactHash": artifact["artifactHash"],
-            "spendBundleId": record["spend_bundle_id"],
-            "confirmedBlockIndex": record["confirmed_block_index"],
-            "lockedAt": int(time.time()),
-        }
-        _atomic_json(lock_path, lock, mode=0o444)
-        locked = store.mark_locked(ceremony_id.lower())
-        return {
-            "locked": True,
-            "artifactHash": artifact["artifactHash"],
-            "publicArtifactPath": str(public_path),
-            "bootstrapLockPath": str(lock_path),
-            "ceremony": _safe_state(locked),
-        }
     except GenesisStoreError as exc:
         _raise_store_error(exc)
 

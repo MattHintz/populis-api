@@ -32,6 +32,12 @@ def test_production_installs_locked_stripe_state_and_guided_gate() -> None:
     assert "Environment=SOLSLOT_LAUNCH_CONTROL_ENABLED=true" in text
     assert "Environment=SOLSLOT_PAYMENT_PURCHASE_DB_PATH=$state_dir/" in text
     assert "zz-stripe-test-rehearsal.conf" in text
+    manager = Path("scripts/manage_stripe_test_rehearsal_ceiling.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '"SOLSLOT_STRIPE_RESTRICTED_KEY_FILE"' in manager
+    assert 'restricted_key.startswith("rk_test_")' in manager
+    assert "st_mode & 0o077" in manager
 
 
 def test_stripe_rehearsal_workflow_never_opens_signed_windows() -> None:

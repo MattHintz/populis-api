@@ -21,7 +21,6 @@ from chia.types.coin_spend import make_spend
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
-    SINGLETON_LAUNCHER_HASH,
     SINGLETON_MOD,
     lineage_proof_for_coinsol,
 )
@@ -2444,6 +2443,7 @@ def _verify_governed_deed_launchers(
     settings: ValidatorSettings,
     claim: VoucherSeriesPhaseClaim,
     terms: Any,
+    artifact: Mapping[str, Any],
 ) -> None:
     raw_deeds = claim.series_terms.get("deeds")
     if not isinstance(raw_deeds, list) or len(raw_deeds) != terms.inventory_cap:
@@ -2481,6 +2481,22 @@ def _verify_governed_deed_launchers(
     ]
     if claim.deed_launcher_ids != expected_launchers:
         raise ValidatorEvidenceError("governed deed launcher order changed")
+    if len(claim.governed_deed_puzzle_hashes) != len(expected_launchers):
+        raise ValidatorEvidenceError("governed deed puzzle evidence is incomplete")
+    try:
+        launchers = artifact.get("launcherIds")
+        if not isinstance(launchers, Mapping):
+            raise ValueError("launcher coordinates are unavailable")
+        did_struct = singleton_struct(
+            bytes32.fromhex(str(launchers["did"]).removeprefix("0x"))
+        )
+        expected_launcher_puzzle_hash = deed_launcher_puzzle_hash(
+            protocol_did_singleton_struct=did_struct
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(
+            "signed artifact lacks the governed deed launcher coordinates"
+        ) from exc
 
     for ordinal, launcher_id in enumerate(claim.deed_launcher_ids):
         record = _fetch_coin(
@@ -2493,12 +2509,12 @@ def _verify_governed_deed_launchers(
         spent_height = int(record.get("spent_block_index") or 0)
         if (
             "0x" + bytes(launcher.name()).hex() != launcher_id
-            or launcher.puzzle_hash != SINGLETON_LAUNCHER_HASH
+            or launcher.puzzle_hash != expected_launcher_puzzle_hash
             or int(launcher.amount) != 1
             or spent_height <= 0
         ):
             raise ValidatorEvidenceError(
-                f"governed deed launcher {ordinal} is not an executed singleton launch"
+                f"governed deed launcher {ordinal} is not the DID-bound deployment launcher"
             )
         spend = _fetch_coin_spend(
             settings,
@@ -2511,9 +2527,11 @@ def _verify_governed_deed_launchers(
             len(additions) != 1
             or additions[0].parent_coin_info != launcher.name()
             or int(additions[0].amount) != 1
+            or "0x" + bytes(additions[0].puzzle_hash).hex()
+            != claim.governed_deed_puzzle_hashes[ordinal]
         ):
             raise ValidatorEvidenceError(
-                f"governed deed launcher {ordinal} did not create one SmartDeed singleton"
+                f"governed deed launcher {ordinal} did not create the executed proposal child"
             )
 
 
@@ -2560,8 +2578,8 @@ def verify_voucher_series_phase_claim(
     if transition == SeriesTransition.LAUNCH:
         if abs(int(time.time()) - claim.launch_anchor) > 90:
             raise ValidatorEvidenceError("series launch anchor is stale")
-        _verify_governed_deed_launchers(settings, claim, terms)
-    elif claim.deed_launcher_ids or claim.governance_execution_ids:
+        _verify_governed_deed_launchers(settings, claim, terms, artifact)
+    elif claim.deed_launcher_ids or claim.governed_deed_puzzle_hashes:
         raise ValidatorEvidenceError("series cancellation carried launch evidence")
 
     series_coin, lineage = _confirmed_coin_and_lineage(

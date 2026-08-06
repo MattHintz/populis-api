@@ -14,6 +14,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends
 
+from .admin_auth import AdminClaims, require_admin_jwt
 from .config import Settings, get_settings
 
 router = APIRouter(prefix="/alpha", tags=["alpha-ops"])
@@ -69,6 +70,7 @@ def _telemetry_metrics() -> dict:
 @router.get("/metrics")
 def alpha_metrics(
     settings: Annotated[Settings, Depends(get_settings)],
+    _admin: Annotated[AdminClaims, Depends(require_admin_jwt)],
 ) -> dict:
     """Return an aggregate operational metrics snapshot.
 

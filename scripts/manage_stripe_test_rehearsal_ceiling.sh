@@ -206,6 +206,7 @@ for name in (
 
 required_api = (
     "SOLSLOT_STRIPE_ACCOUNT_ID",
+    "SOLSLOT_STRIPE_RESTRICTED_KEY_FILE",
     "SOLSLOT_PAYMENT_KOS_EXECUTOR_URL",
     "SOLSLOT_PAYMENT_KOS_EXECUTOR_PRIVATE_KEY_FILE",
     "SOLSLOT_PAYMENT_KOS_EXECUTOR_PUBLIC_KEY",
@@ -220,6 +221,19 @@ if api.get("SOLSLOT_STRIPE_MODE", "test").lower() != "test":
     raise SystemExit("RC27 rehearsal cannot use Stripe live mode")
 if len(api["SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN"]) < 32:
     raise SystemExit("protocol artifact service token is too short")
+restricted_key_path = pathlib.Path(api["SOLSLOT_STRIPE_RESTRICTED_KEY_FILE"])
+if not restricted_key_path.is_absolute():
+    raise SystemExit("Stripe restricted key path must be absolute")
+if restricted_key_path.is_symlink() or not restricted_key_path.is_file():
+    raise SystemExit("Stripe restricted key must be a regular, non-symlink file")
+if restricted_key_path.stat().st_mode & 0o077:
+    raise SystemExit("Stripe restricted key must not be accessible by group/other")
+try:
+    restricted_key = restricted_key_path.read_text(encoding="ascii").strip()
+except (OSError, UnicodeError) as exc:
+    raise SystemExit("Stripe restricted key is unreadable") from exc
+if not restricted_key.startswith("rk_test_") or len(restricted_key) < 24:
+    raise SystemExit("RC27 rehearsal requires a Stripe test-mode restricted key")
 PY
 fi
 

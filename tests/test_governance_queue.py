@@ -35,7 +35,7 @@ from solslot_api.governance_execution import (
     trace_allocation_proposal,
 )
 from solslot_api.governance_sale_offer import reconstruct_governed_sale_offer
-from solslot_api.governance_publisher import _action
+from solslot_api.governance_publisher import _action, _publication_delegated_puzzle
 from solslot_api.governance_queue import (
     GovernanceQueueConflict,
     GovernanceQueueStore,
@@ -868,15 +868,19 @@ def test_publication_approver_and_exact_signatures_are_immutable(tmp_path) -> No
     prepared = store.bind_publication_coadmin(
         proposal_id=value.id,
         coadmin_slot=2,
+        voting_deadline=1_800_086_500,
         actor="0xowner",
         now=1_800_000_100,
     )
     assert prepared.publication_coadmin_slot == 2
+    assert prepared.publication_voting_deadline == 1_800_086_500
     with pytest.raises(GovernanceQueueConflict, match="already fixed"):
         store.bind_publication_coadmin(
             proposal_id=value.id,
             coadmin_slot=1,
+            voting_deadline=1_800_086_500,
             actor="0xowner",
+            now=1_800_000_101,
         )
 
     signature = store.add_signature(
@@ -921,6 +925,7 @@ def test_publication_action_binds_coin_delegated_puzzle_and_proposal() -> None:
         coin_id=bytes32(b"\x41" * 32),
         delegated_puzzle_hash=bytes32(b"\x42" * 32),
         proposal_hash=bytes32(b"\x43" * 32),
+        voting_deadline=1_900_000_000,
     )
     signature = private_key.sign_msg_hash(
         bytes.fromhex(action.message_hash[2:])
@@ -936,9 +941,18 @@ def test_publication_action_binds_coin_delegated_puzzle_and_proposal() -> None:
         coin_id=bytes32(b"\x41" * 32),
         delegated_puzzle_hash=bytes32(b"\x44" * 32),
         proposal_hash=bytes32(b"\x45" * 32),
+        voting_deadline=1_900_000_001,
     )
     assert altered.action_id != action.action_id
     assert altered.message_hash != action.message_hash
+
+
+def test_publication_deadline_changes_signed_delegated_puzzle() -> None:
+    proposal_hash = bytes32(b"\x46" * 32)
+    first = _publication_delegated_puzzle(proposal_hash, 1_900_000_000)
+    second = _publication_delegated_puzzle(proposal_hash, 1_900_000_001)
+
+    assert first.get_tree_hash() != second.get_tree_hash()
 
 
 def _coin_record(coin: Coin, *, confirmed: int, spent: int) -> dict:

@@ -12,6 +12,19 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
+try:
+    from scripts.bounded_archive import (
+        ArchiveLimitError,
+        iter_bounded_archive,
+        read_bounded_file,
+    )
+except ModuleNotFoundError:  # Direct ``python scripts/check_namespace.py`` use.
+    from bounded_archive import (  # type: ignore[no-redef]
+        ArchiveLimitError,
+        iter_bounded_archive,
+        read_bounded_file,
+    )
+
 
 FORBIDDEN_DIGEST = "4b61ef4fda96729ef3703e602087708f3fa1ebfc2d809e0be3398086f8ec6706"
 FORBIDDEN_LENGTH = 7
@@ -93,23 +106,11 @@ def iter_paths(paths: Iterable[Path]) -> Iterable[Path]:
 
 def archive_violations(path: Path) -> list[str]:
     violations: list[str] = []
-    lower_name = path.name.lower()
-    if lower_name.endswith((".tar", ".tgz", ".tar.gz")):
-        with tarfile.open(path, "r:*") as archive:
-            for member in archive.getmembers():
-                if contains_forbidden(member.name.encode()):
-                    violations.append(f"{path}:{member.name} (path)")
-                if member.isfile():
-                    stream = archive.extractfile(member)
-                    if stream is not None and contains_forbidden(stream.read()):
-                        violations.append(f"{path}:{member.name} (content)")
-    elif lower_name.endswith(".zip"):
-        with zipfile.ZipFile(path) as archive:
-            for name in archive.namelist():
-                if contains_forbidden(name.encode()):
-                    violations.append(f"{path}:{name} (path)")
-                if not name.endswith("/") and contains_forbidden(archive.read(name)):
-                    violations.append(f"{path}:{name} (content)")
+    for member in iter_bounded_archive(path):
+        if contains_forbidden(member.name.encode()):
+            violations.append(f"{path}:{member.name} (path)")
+        if member.data is not None and contains_forbidden(member.data):
+            violations.append(f"{path}:{member.name} (content)")
     return violations
 
 
@@ -118,8 +119,8 @@ def scan_file(path: Path) -> list[str]:
     if contains_forbidden(str(path).encode()):
         violations.append(f"{path} (path)")
     try:
-        data = path.read_bytes()
-    except OSError as error:
+        data = read_bounded_file(path)
+    except (OSError, ArchiveLimitError) as error:
         return [f"{path} (unreadable: {error})"]
     if contains_forbidden(data):
         violations.append(f"{path} (content)")
@@ -134,8 +135,8 @@ def scan_file(path: Path) -> list[str]:
     if path.name.lower().endswith(ARCHIVE_SUFFIXES):
         try:
             violations.extend(archive_violations(path))
-        except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:
-            violations.append(f"{path} (invalid archive: {error})")
+        except (OSError, ArchiveLimitError, tarfile.TarError, zipfile.BadZipFile) as error:
+            violations.append(f"{path} (unsafe archive: {error})")
     return violations
 
 

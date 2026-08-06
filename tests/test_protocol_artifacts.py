@@ -22,6 +22,7 @@ from solslot_api.protocol_artifacts import (
     VerifyPurchaseFinalizationRequest,
     VerifyExternalEscrowWebhookRequest,
     _build_canonical_payment_artifact,
+    _require_server_to_server_token,
     verify_external_escrow,
     verify_purchase_finalization,
 )
@@ -113,6 +114,10 @@ def isolate_protocol_artifact_env(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "solslot_api.protocol_artifacts.get_collection_store",
         lambda _settings: Store(),
+    )
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._verify_external_escrow_chain_evidence",
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         "solslot_api.protocol_artifacts._active_presale_terms_for_deed",
@@ -1435,6 +1440,10 @@ async def test_stripe_presale_finalization_dispatches_only_to_voucher_v3(
         lambda *_args, **_kwargs: [],
     )
     monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._verify_stripe_provider_evidence",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
         "solslot_api.protocol_artifacts.get_payment_purchase_store",
         lambda *_args: Purchases(),
     )
@@ -1914,6 +1923,10 @@ def test_finalization_accepts_exact_deliverable_stripe_settlement_evidence(
 ):
     monkeypatch.setenv("SOLSLOT_DEPLOYMENT_MANIFEST_PATH", str(tmp_path / "missing.json"))
     _configure_external_quote(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "solslot_api.protocol_artifacts._verify_stripe_provider_evidence",
+        lambda *_args, **_kwargs: None,
+    )
     now = int(time.time())
     with TestClient(app) as client:
         built = client.post(
@@ -2020,6 +2033,21 @@ def test_build_and_finalization_can_require_server_token(monkeypatch, tmp_path):
         assert built.status_code == 200, built.text
     monkeypatch.delenv("SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN", raising=False)
     get_settings.cache_clear()
+
+
+def test_production_protocol_service_fails_closed_without_token() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _require_server_to_server_token(
+            get_settings().model_copy(
+                update={
+                    "runtime_environment": "production",
+                    "protocol_artifact_api_token": None,
+                }
+            ),
+            None,
+        )
+
+    assert exc_info.value.status_code == 503
 
 
 def test_rejects_credential_markers_in_artifact_metadata(monkeypatch, tmp_path):

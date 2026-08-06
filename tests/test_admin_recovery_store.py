@@ -481,5 +481,5 @@ def test_schema_eight_adds_resumable_evm_submissions_on_restart(
             "WHERE type='table' AND name='admin_recovery_evm_submissions'"
         ).fetchone()
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 10
     assert table is not None

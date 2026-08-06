@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -64,9 +66,27 @@ def _strip0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
 
 
-def _load_deployment_manifest(path: str) -> dict:
-    with open(path, "r") as f:
-        return json.load(f)
+def _load_deployment_manifest(
+    path: str,
+    *,
+    expected_sha256: str | None,
+    require_pin: bool,
+) -> tuple[dict, str]:
+    if require_pin and not expected_sha256:
+        raise ValueError("--manifest-sha256 is required for broadcast")
+    expected = expected_sha256.lower() if expected_sha256 else None
+    if expected is not None and (
+        len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected)
+    ):
+        raise ValueError("--manifest-sha256 must be exactly 64 hexadecimal characters")
+    payload = Path(path).read_bytes()
+    actual = hashlib.sha256(payload).hexdigest()
+    if expected is not None and not secrets.compare_digest(actual, expected):
+        raise ValueError("deployment manifest SHA-256 does not match the approved digest")
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise ValueError("deployment manifest must be a JSON object")
+    return parsed, actual
 
 
 def _load_env(path: Path) -> dict:
@@ -102,12 +122,18 @@ async def main() -> int:
         help="Path to the deployment manifest JSON.",
     )
     parser.add_argument(
+        "--manifest-sha256",
+        help="Approved SHA-256 of the exact deployment manifest (required to broadcast).",
+    )
+    parser.add_argument(
         "--fee",
         type=int,
         default=0,
         help="Network fee in mojos (default 0).",
     )
     args = parser.parse_args()
+    if not args.dry_run and not args.manifest_sha256:
+        parser.error("--manifest-sha256 is required when broadcasting")
 
     # Load settings and manifest.
     env = _load_env(Path(args.env_file))
@@ -121,7 +147,15 @@ async def main() -> int:
         print("ERROR: no faucet master key available")
         return 1
 
-    manifest = _load_deployment_manifest(args.manifest)
+    try:
+        manifest, manifest_sha256 = _load_deployment_manifest(
+            args.manifest,
+            expected_sha256=args.manifest_sha256,
+            require_pin=not args.dry_run,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR: deployment manifest provenance check failed: {exc}")
+        return 1
     pool_launcher_id = bytes32.fromhex(_strip0x(manifest["pool_launcher_id"]))
     tracker_launcher_id = bytes32.fromhex(_strip0x(manifest["tracker_launcher_id"]))
     admin_authority_launcher_id = bytes32.fromhex(
@@ -139,6 +173,7 @@ async def main() -> int:
     vault_version = settings.vault_version_registry_version or 1
 
     print(f"Network               : {NETWORK}")
+    print(f"Manifest SHA-256      : {manifest_sha256}")
     print(f"Pool launcher id      : 0x{pool_launcher_id.hex()}")
     print(f"Gov tracker launcher  : 0x{tracker_launcher_id.hex()}")
     print(f"Admin authority v2 id : 0x{admin_authority_launcher_id.hex()}")

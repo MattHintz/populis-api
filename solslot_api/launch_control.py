@@ -1503,27 +1503,22 @@ async def claim_owner_link(
     ):
         raise HTTPException(status_code=403, detail="Owner launch link is invalid.")
     try:
-        if store.owner_claim_used(_token_hash(body.token)):
-            raise GenesisConflict("owner launch link was already consumed")
-        active = store.active()
-        if active is None:
-            release = _load_release_evidence(settings)
-            ceremony_id = "0x" + secrets.token_hex(32)
-            active = store.create_draft(
-                ceremony_id,
-                {
-                    "schemaVersion": 2,
-                    "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
-                    "network": "testnet11",
-                    "evmChainId": 11155111,
-                    "reviewClass": INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
-                    "releaseTag": release["releaseTag"],
-                    "releaseEvidenceHash": release["fileSha256"],
-                    "sourceShas": release["sourceShas"],
-                },
-            )
+        release = _load_release_evidence(settings)
+        active = store.claim_or_create_draft(
+            token_hash=_token_hash(body.token),
+            ceremony_id="0x" + secrets.token_hex(32),
+            draft={
+                "schemaVersion": 2,
+                "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
+                "network": "testnet11",
+                "evmChainId": 11155111,
+                "reviewClass": INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
+                "releaseTag": release["releaseTag"],
+                "releaseEvidenceHash": release["fileSha256"],
+                "sourceShas": release["sourceShas"],
+            },
+        )
         ceremony_id = str(active["ceremony_id"])
-        store.consume_owner_claim(ceremony_id, token_hash=_token_hash(body.token))
         token = secrets.token_urlsafe(32)
         expires_at = int(time.time()) + settings.genesis_invitation_ttl_seconds
         store.issue_invitation(
@@ -2159,6 +2154,7 @@ async def approve_launch_action(
             slot=session.slot,
             signer_address=session.wallet or "",
             signature=body.signature,
+            expires_at=body.expires_at,
         )
     except (GenesisStoreError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

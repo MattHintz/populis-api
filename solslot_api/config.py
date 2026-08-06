@@ -91,6 +91,52 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    hosted = settings.runtime_environment in {"staging", "production"}
+    if hosted and len(settings.protocol_artifact_api_token or "") < 32:
+        raise RuntimeError(
+            "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN must contain at least 32 "
+            "characters in staging/production."
+        )
+    if settings.stripe_settlement_enabled:
+        if not (settings.stripe_account_id or "").startswith("acct_"):
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_SETTLEMENT_ENABLED requires a configured "
+                "SOLSLOT_STRIPE_ACCOUNT_ID."
+            )
+        if not settings.stripe_api_url.startswith("https://"):
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_SETTLEMENT_ENABLED requires an HTTPS "
+                "SOLSLOT_STRIPE_API_URL."
+            )
+        key_path = Path(str(settings.stripe_restricted_key_file or ""))
+        try:
+            if key_path.is_symlink() or not key_path.is_file():
+                raise RuntimeError(
+                    "SOLSLOT_STRIPE_SETTLEMENT_ENABLED requires a regular, "
+                    "non-symlink SOLSLOT_STRIPE_RESTRICTED_KEY_FILE."
+                )
+            key_mode = stat.S_IMODE(key_path.stat().st_mode)
+            if key_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise RuntimeError(
+                    "SOLSLOT_STRIPE_RESTRICTED_KEY_FILE must not be accessible "
+                    "by group/other."
+                )
+            restricted_key = key_path.read_text(encoding="ascii").strip()
+        except RuntimeError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_RESTRICTED_KEY_FILE is unavailable or unreadable."
+            ) from exc
+        key_prefix = "rk_live_" if settings.stripe_mode == "live" else "rk_test_"
+        if not restricted_key.startswith(key_prefix) or len(restricted_key) < len(
+            key_prefix
+        ) + 16:
+            raise RuntimeError(
+                "SOLSLOT_STRIPE_RESTRICTED_KEY_FILE does not contain a "
+                "restricted key for the configured Stripe mode."
+            )
+
     if settings.chia_primary_required and not settings.chia_primary_url:
         raise RuntimeError(
             "SOLSLOT_CHIA_PRIMARY_REQUIRED requires SOLSLOT_CHIA_PRIMARY_URL."
@@ -449,7 +495,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 f"ownership, and activation evidence: {exc}"
             ) from exc
 
-    if settings.runtime_environment not in {"staging", "production"}:
+    if not hosted:
         return
     if settings.chia_primary_url:
         if not settings.chia_primary_url.startswith("https://"):
@@ -698,6 +744,7 @@ class Settings(BaseSettings):
         "payment_kos_executor_mtls_key_path",
         "payment_omnichain_ingest_token",
         "payment_omnichain_rpc_url",
+        "stripe_restricted_key_file",
         "payment_omnichain_ownership_safe_operation_path",
         "payment_omnichain_ownership_safe_operation_hash",
         "payment_omnichain_ownership_execute_operation_path",
@@ -1074,11 +1121,14 @@ class Settings(BaseSettings):
     # 0x-prefixed 20-byte token addresses as values.
     payment_purchase_db_path: str = "./state/payment_purchases_v2.db"
     payment_evm_usdc_tokens: dict[str, str] = Field(default_factory=dict)
-    # Stripe fulfillment is a post-mint direct rail. The API stores no Stripe
-    # secret; each isolated validator uses its own restricted read-only key.
+    # Stripe fulfillment is a post-mint direct rail. The API and each isolated
+    # validator use distinct restricted read-only keys so provider evidence is
+    # verified before durable queueing and again before validator signing.
     stripe_settlement_enabled: bool = False
     stripe_account_id: Optional[str] = None
     stripe_mode: Literal["test", "live"] = "test"
+    stripe_restricted_key_file: Optional[str] = None
+    stripe_api_url: str = "https://api.stripe.com"
     stripe_delivery_db_path: str = "./state/stripe_deliveries_v1.db"
     stripe_delivery_worker_enabled: bool = False
     stripe_delivery_interval_seconds: float = Field(15.0, ge=5.0, le=300.0)
