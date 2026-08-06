@@ -21,6 +21,7 @@ from solslot_api.admin_operations import (
     get_operation_store,
     request_binding_hash,
     require_admin_operation,
+    resolve_admin_roster,
     router,
 )
 from solslot_api.config import Settings, get_settings
@@ -28,6 +29,28 @@ from solslot_api.config import Settings, get_settings
 
 OWNER = "0x" + "11" * 20
 COADMIN = "0x" + "22" * 20
+
+
+def test_production_roster_uses_completed_signed_rotations(monkeypatch) -> None:
+    replacements = [
+        ("0x" + f"{index + 1:02x}" * 20, "0x02" + f"{index + 4:02x}" * 32)
+        for index in range(3)
+    ]
+    monkeypatch.setattr(
+        "solslot_api.admin_operations.load_signed_public_artifact",
+        lambda _settings: {"launcherIds": {"adminAuthority": "0x" + "ab" * 32}},
+    )
+    monkeypatch.setattr(
+        "solslot_api.admin_operations.current_signed_admins",
+        lambda _settings: replacements,
+    )
+
+    roster = resolve_admin_roster(Settings(runtime_environment="production"))
+
+    assert roster.launcher_id == bytes32(b"\xab" * 32)
+    assert roster.compressed_pubkeys == tuple(
+        bytes.fromhex(item[1][2:]) for item in replacements
+    )
 
 
 def claims(subject: str = OWNER) -> AdminClaims:

@@ -183,6 +183,7 @@ def _action(
     coin_id: bytes32,
     delegated_puzzle_hash: bytes32,
     proposal_hash: bytes32,
+    voting_deadline: int,
 ) -> GovernanceSigningAction:
     prefix = eip712_prefix_and_domain_separator(
         genesis_challenge_for_network("testnet11")
@@ -192,6 +193,7 @@ def _action(
         "schemaVersion": 1,
         "purpose": "SGT_ALLOCATION_PROPOSAL",
         "proposalHash": _hex32(proposal_hash),
+        "votingDeadline": voting_deadline,
         "signerSlot": slot,
         "coinId": _hex32(coin_id),
         "delegatedPuzzleHash": _hex32(delegated_puzzle_hash),
@@ -212,6 +214,31 @@ def _action(
             coin_id=coin_id,
             delegated_puzzle_hash=delegated_puzzle_hash,
         ),
+    )
+
+
+def _publication_delegated_puzzle(
+    proposal_hash: bytes32,
+    voting_deadline: int,
+) -> Program:
+    if voting_deadline <= 0:
+        raise ValueError("governance voting deadline must be positive")
+    deadline_message = hashlib.sha256(
+        b"SOLSLOT_GOVERNANCE_DEADLINE_V1"
+        + bytes(proposal_hash)
+        + voting_deadline.to_bytes(8, "big")
+    ).digest()
+    return Program.to(
+        (
+            1,
+            [
+                [
+                    CREATE_PUZZLE_ANNOUNCEMENT,
+                    admin_governance_proposal_message(proposal_hash),
+                ],
+                [CREATE_PUZZLE_ANNOUNCEMENT, deadline_message],
+            ],
+        )
     )
 
 
@@ -418,16 +445,25 @@ async def build_governance_publication(
     if _hex32(proposal_hash) != record.proposal_hash.lower():
         raise ValueError("queued proposal hash does not match its canonical bill")
     timestamp = int(time.time()) if now is None else now
-    if record.publication_coadmin_slot is None:
+    proposed_deadline = timestamp + int(parameters.get("votingWindowSeconds"))
+    if (
+        record.publication_coadmin_slot is None
+        or record.publication_voting_deadline is None
+    ):
         record = queue_store.bind_publication_coadmin(
             proposal_id=record.id,
             coadmin_slot=coadmin_slot,
+            voting_deadline=proposed_deadline,
             actor=actor,
             now=timestamp,
         )
     elif record.publication_coadmin_slot != coadmin_slot:
         raise ValueError("a different coadministrator is already assigned")
-    deadline = timestamp + int(parameters.get("votingWindowSeconds"))
+    if record.publication_voting_deadline is None:
+        raise ValueError("governance publication deadline is unavailable")
+    deadline = record.publication_voting_deadline
+    if timestamp >= deadline:
+        raise ValueError("governance publication deadline has expired")
     requested_sgt = (
         int(parameters.get("minProposalStake"))
         if record.kind == "FUNDED_REDEMPTION"
@@ -437,11 +473,9 @@ async def build_governance_publication(
         raise ValueError("SGT allocation exceeds the confirmed company reserve")
     if record.kind == "SGT_SALE" and int(record.bill.get("expiresAt") or 0) <= deadline:
         raise ValueError("SGT sale must remain available beyond the committee vote")
-    delegated_puzzle = Program.to(
-        (
-            1,
-            [[CREATE_PUZZLE_ANNOUNCEMENT, admin_governance_proposal_message(proposal_hash)]],
-        )
+    delegated_puzzle = _publication_delegated_puzzle(
+        proposal_hash,
+        deadline,
     )
     mips = build_authority_operational_mips_spend(
         authority=authority,
@@ -466,6 +500,7 @@ async def build_governance_publication(
                 ).get_tree_hash()
             ),
             proposal_hash=proposal_hash,
+            voting_deadline=deadline,
         )
         for slot in mips.selected_slots
     )

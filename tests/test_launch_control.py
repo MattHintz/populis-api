@@ -557,6 +557,7 @@ def test_purchase_gate_stays_locked_until_delivery_and_refund_are_proven(
             slot=slot,
             signer_address=account.address,
             signature="0x" + f"{slot:02x}" * 65,
+            expires_at=now + 600,
             now=now - 100 + slot,
         )
     _login(client, owner)

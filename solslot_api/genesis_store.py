@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
 OWNER_SLOT = 1
@@ -699,6 +699,46 @@ class GenesisStore:
                     COMMIT;
                     """
                 )
+                version = 9
+            if version < 10:
+                approval_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(launch_action_approvals)"
+                    ).fetchall()
+                }
+                if "expires_at" not in approval_columns:
+                    connection.execute(
+                        "ALTER TABLE launch_action_approvals "
+                        "ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"
+                    )
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE INDEX IF NOT EXISTS launch_action_approvals_expiry_idx
+                        ON launch_action_approvals(
+                            ceremony_id, action_id, expires_at
+                        );
+                    CREATE TABLE IF NOT EXISTS genesis_finalization_reservation (
+                        singleton_slot INTEGER PRIMARY KEY,
+                        ceremony_id TEXT NOT NULL UNIQUE,
+                        reserved_at INTEGER NOT NULL,
+                        FOREIGN KEY (ceremony_id) REFERENCES ceremonies(ceremony_id),
+                        CHECK (singleton_slot = 1)
+                    );
+                    INSERT OR IGNORE INTO genesis_finalization_reservation(
+                        singleton_slot, ceremony_id, reserved_at
+                    )
+                    SELECT 1, ceremony_id, updated_at
+                    FROM ceremonies
+                    WHERE state='locked'
+                    ORDER BY updated_at
+                    LIMIT 1;
+
+                    PRAGMA user_version = 10;
+                    COMMIT;
+                    """
+                )
 
     def _event(
         self,
@@ -752,6 +792,62 @@ class GenesisStore:
                 raise GenesisConflict("ceremony id already exists") from exc
             self._event(connection, ceremony_id, "draft_created", draft, timestamp)
         return self.get(ceremony_id)
+
+    def claim_or_create_draft(
+        self,
+        *,
+        token_hash: str,
+        ceremony_id: str,
+        draft: dict[str, Any],
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically consume an owner link and select the one active ceremony."""
+        timestamp = int(time.time()) if now is None else now
+        encoded = canonical_json(draft)
+        selected_id: str
+        with self._transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM launch_claims WHERE token_hash=?", (token_hash,)
+            ).fetchone():
+                raise GenesisConflict("owner launch link was already consumed")
+            active = connection.execute(
+                "SELECT ceremony_id FROM ceremonies "
+                "WHERE state NOT IN ('locked', 'abandoned') ORDER BY created_at DESC"
+            ).fetchall()
+            if len(active) > 1:
+                raise GenesisConflict(
+                    "more than one active ceremony exists; archive the stale launch first"
+                )
+            if active:
+                selected_id = str(active[0]["ceremony_id"])
+            else:
+                selected_id = ceremony_id
+                try:
+                    connection.execute(
+                        "INSERT INTO ceremonies("
+                        "ceremony_id,network,state,draft_json,created_at,updated_at"
+                        ") VALUES(?, 'testnet11', 'draft', ?, ?, ?)",
+                        (selected_id, encoded, timestamp, timestamp),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise GenesisConflict("ceremony id already exists") from exc
+                self._event(
+                    connection, selected_id, "draft_created", draft, timestamp
+                )
+            connection.execute(
+                "INSERT INTO launch_claims("
+                "ceremony_id,token_hash,consumed_at,created_at"
+                ") VALUES(?,?,?,?)",
+                (selected_id, token_hash, timestamp, timestamp),
+            )
+            self._event(
+                connection,
+                selected_id,
+                "owner_link_consumed",
+                {"slot": OWNER_SLOT},
+                timestamp,
+            )
+        return self.get(selected_id)
 
     def issue_invitation(
         self,
@@ -1154,12 +1250,64 @@ class GenesisStore:
         with self._transaction() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
             self._require_state(ceremony, "artifact_signed")
+            reservation = connection.execute(
+                "SELECT ceremony_id FROM genesis_finalization_reservation "
+                "WHERE singleton_slot=1"
+            ).fetchone()
+            if reservation is None:
+                connection.execute(
+                    "INSERT INTO genesis_finalization_reservation("
+                    "singleton_slot,ceremony_id,reserved_at) VALUES(1,?,?)",
+                    (ceremony_id, timestamp),
+                )
+            elif str(reservation["ceremony_id"]) != ceremony_id:
+                raise GenesisConflict(
+                    "a different genesis ceremony owns finalization"
+                )
+            existing = connection.execute(
+                "SELECT ceremony_id FROM ceremonies "
+                "WHERE state='locked' AND ceremony_id<>? LIMIT 1",
+                (ceremony_id,),
+            ).fetchone()
+            if existing is not None:
+                raise GenesisConflict("a different genesis ceremony is already locked")
             connection.execute(
                 "UPDATE ceremonies SET state='locked',updated_at=? WHERE ceremony_id=?",
                 (timestamp, ceremony_id),
             )
             self._event(connection, ceremony_id, "bootstrap_locked", {}, timestamp)
         return self.get(ceremony_id)
+
+    def reserve_finalization(
+        self, ceremony_id: str, *, now: int | None = None
+    ) -> None:
+        """Reserve the one canonical finalization slot before publishing files."""
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            ceremony = self._require_ceremony(connection, ceremony_id)
+            self._require_state(ceremony, "artifact_signed")
+            reservation = connection.execute(
+                "SELECT ceremony_id FROM genesis_finalization_reservation "
+                "WHERE singleton_slot=1"
+            ).fetchone()
+            if reservation is not None:
+                if str(reservation["ceremony_id"]) != ceremony_id:
+                    raise GenesisConflict(
+                        "a different genesis ceremony owns finalization"
+                    )
+                return
+            connection.execute(
+                "INSERT INTO genesis_finalization_reservation("
+                "singleton_slot,ceremony_id,reserved_at) VALUES(1,?,?)",
+                (ceremony_id, timestamp),
+            )
+            self._event(
+                connection,
+                ceremony_id,
+                "finalization_reserved",
+                {},
+                timestamp,
+            )
 
     def abandon(
         self, ceremony_id: str, reason: str, *, now: int | None = None
@@ -1431,9 +1579,12 @@ class GenesisStore:
         slot: int,
         signer_address: str,
         signature: str,
+        expires_at: int,
         now: int | None = None,
     ) -> dict[str, Any]:
         timestamp = int(time.time()) if now is None else now
+        if expires_at < timestamp:
+            raise GenesisExpired("launch action signature expired")
         with self._transaction() as connection:
             self._require_ceremony(connection, ceremony_id)
             member = connection.execute(
@@ -1444,21 +1595,31 @@ class GenesisStore:
             if member is None or str(member["wallet_address"]).lower() != signer_address.lower():
                 raise GenesisConflict("action signer is not the enrolled administrator")
             existing = connection.execute(
-                "SELECT payload_hash,signature FROM launch_action_approvals "
+                "SELECT payload_hash,signature,expires_at FROM launch_action_approvals "
                 "WHERE ceremony_id=? AND action_id=? AND slot=?",
                 (ceremony_id, action_id, slot),
             ).fetchone()
+            if existing and int(existing["expires_at"]) < timestamp:
+                connection.execute(
+                    "DELETE FROM launch_action_approvals "
+                    "WHERE ceremony_id=? AND action_id=? AND slot=?",
+                    (ceremony_id, action_id, slot),
+                )
+                existing = None
             if existing:
                 if (
                     str(existing["payload_hash"]).lower() == payload_hash.lower()
                     and str(existing["signature"]).lower() == signature.lower()
+                    and int(existing["expires_at"]) == expires_at
                 ):
-                    return self.action_approvals(ceremony_id, action_id)
+                    return self.action_approvals(
+                        ceremony_id, action_id, now=timestamp
+                    )
                 raise GenesisConflict("administrator slot already approved this action")
             connection.execute(
                 "INSERT INTO launch_action_approvals("
                 "ceremony_id,action_id,action_type,payload_hash,slot,signer_address,"
-                "signature,submitted_at) VALUES(?,?,?,?,?,?,?,?)",
+                "signature,submitted_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     ceremony_id,
                     action_id,
@@ -1468,6 +1629,7 @@ class GenesisStore:
                     signer_address.lower(),
                     signature.lower(),
                     timestamp,
+                    expires_at,
                 ),
             )
             self._event(
@@ -1479,21 +1641,24 @@ class GenesisStore:
                     "actionType": action_type,
                     "payloadHash": payload_hash.lower(),
                     "slot": slot,
+                    "expiresAt": expires_at,
                 },
                 timestamp,
             )
-        return self.action_approvals(ceremony_id, action_id)
+        return self.action_approvals(ceremony_id, action_id, now=timestamp)
 
     def action_approvals(
-        self, ceremony_id: str, action_id: str
+        self, ceremony_id: str, action_id: str, *, now: int | None = None
     ) -> dict[str, Any]:
+        timestamp = int(time.time()) if now is None else now
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM launch_action_approvals "
                 "WHERE ceremony_id=? AND action_id=? ORDER BY slot",
                 (ceremony_id, action_id),
             ).fetchall()
-        slots = {int(row["slot"]) for row in rows}
+        active_rows = [row for row in rows if int(row["expires_at"]) >= timestamp]
+        slots = {int(row["slot"]) for row in active_rows}
         return {
             "actionId": action_id,
             "approved": owner_plus_one_approved(slots),
@@ -1503,6 +1668,8 @@ class GenesisStore:
                     "slot": int(row["slot"]),
                     "signer": str(row["signer_address"]),
                     "submittedAt": int(row["submitted_at"]),
+                    "expiresAt": int(row["expires_at"]),
+                    "expired": int(row["expires_at"]) < timestamp,
                 }
                 for row in rows
             ],

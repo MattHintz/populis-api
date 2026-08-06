@@ -123,6 +123,7 @@ SOLSLOT_TRUSTED_PROXY_CIDRS=<reviewed Cloudflare IPv4 and IPv6 ranges>
 SOLSLOT_CORS_ORIGINS=https://staging.solslot.com
 SOLSLOT_MAX_REQUEST_BODY_BYTES=4194304
 SOLSLOT_REQUEST_TIMEOUT_SECONDS=30
+SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN=<at-least-32-character-server-only-token>
 SOLSLOT_CHALLENGE_STORE_PATH=/opt/solslot/api-staging/shared/state/challenges_v2.db
 SOLSLOT_CHIA_PRIMARY_URL=https://127.0.0.1:18555
 SOLSLOT_CHIA_FALLBACK_URL=https://testnet11.api.coinset.org
@@ -137,6 +138,20 @@ SOLSLOT_PROTOCOL_MAXIMUM_FEE_MOJOS=10000000
 SOLSLOT_PROTOCOL_MEMPOOL_TIMEOUT_SECONDS=20
 SOLSLOT_PROTOCOL_MEMPOOL_POLL_SECONDS=0.5
 ```
+
+The artifact token is required even while purchase gates are closed so a
+release cannot become healthy with silently unusable internal routes. Keep it
+only in the mode-`0600` shared environment file and use the same value only in
+the authorized server-to-server caller; it must never enter either browser
+build.
+
+Before the Stripe test-mode rehearsal ceiling can be armed, install a distinct
+coordinator restricted read key with Account, Event, and PaymentIntent read
+permissions. Set `SOLSLOT_STRIPE_RESTRICTED_KEY_FILE` in the shared environment
+to its absolute path. The file must be a regular non-symlink, inaccessible to
+group and other users, and contain an `rk_test_` key. This does not enable
+Stripe or open a signed purchase window; the guided rehearsal workflow checks
+the file again before it changes the infrastructure ceiling.
 
 The challenge database is SQLite-WAL state shared by vault registration and
 admin-login namespaces. It makes issuance quotas and nonce consumption atomic

@@ -4,6 +4,10 @@ import io
 import tarfile
 from pathlib import Path
 
+import pytest
+
+from scripts.bounded_archive import ArchiveLimitError
+from scripts.check_namespace import archive_violations
 from scripts.check_secrets import violations_for_path
 
 
@@ -34,3 +38,16 @@ def test_packaged_release_is_scanned(tmp_path: Path) -> None:
     assert violations_for_path(archive_path) == [
         f"{archive_path}!release/.env"
     ]
+
+
+def test_security_scanners_reject_high_ratio_archive(tmp_path: Path) -> None:
+    archive_path = tmp_path / "bomb.tgz"
+    content = b"\x00" * (1024 * 1024)
+    with tarfile.open(archive_path, "w:gz") as archive:
+        info = tarfile.TarInfo("large-zero-file")
+        info.size = len(content)
+        archive.addfile(info, io.BytesIO(content))
+
+    with pytest.raises(ArchiveLimitError, match="compression ratio"):
+        archive_violations(archive_path)
+    assert "unsafe or unreadable" in violations_for_path(archive_path)[0]

@@ -13,7 +13,7 @@ for name in signatures_v2.db; do
     sqlite3 "$source_dir/$name" ".backup '$target/$name'"
   fi
 done
-for name in public_artifact_v2.json; do
+for name in public_artifact_v4.json; do
   [ ! -f "$source_dir/$name" ] || cp --preserve=mode,timestamps "$source_dir/$name" "$target/$name"
 done
 sha256sum "$target"/* > "$target/SHA256SUMS"

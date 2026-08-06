@@ -170,6 +170,7 @@ def test_admin_reconcile_advances_only_the_normalized_stored_purchase(
 def test_purchase_operations_configuration_must_be_complete_and_internal() -> None:
     incomplete = Settings(
         runtime_environment="production",
+        protocol_artifact_api_token="a" * 32,
         purchase_operations_service_url="http://127.0.0.1:5000",
     )
     try:
@@ -181,6 +182,7 @@ def test_purchase_operations_configuration_must_be_complete_and_internal() -> No
 
     external_cleartext = Settings(
         runtime_environment="production",
+        protocol_artifact_api_token="a" * 32,
         purchase_operations_service_url="http://backend.example.test",
         purchase_operations_token="t" * 32,
     )

@@ -64,6 +64,7 @@ def _staging(**overrides: object) -> Settings:
         "alpha_writes_enabled": False,
         "admin_operation_approvals_enabled": True,
         "vault_session_jwt_secret": "v" * 32,
+        "protocol_artifact_api_token": "a" * 32,
         "minting_enabled": False,
         "zkpassport_validator_urls": [
             "https://10.77.0.10:9443",
@@ -85,6 +86,67 @@ def _staging(**overrides: object) -> Settings:
 
 def test_staging_posture_passes_with_exact_https_origin() -> None:
     validate_server_hardening_at_startup(_staging())
+
+
+@pytest.mark.parametrize("token", [None, "", "too-short"])
+def test_staging_requires_protocol_artifact_service_token(
+    token: str | None,
+) -> None:
+    with pytest.raises(RuntimeError, match="PROTOCOL_ARTIFACT_API_TOKEN"):
+        validate_server_hardening_at_startup(
+            _staging(protocol_artifact_api_token=token)
+        )
+
+
+def test_stripe_settlement_requires_restricted_provider_key(
+    tmp_path,
+) -> None:
+    missing = tmp_path / "missing-key"
+    with pytest.raises(RuntimeError, match="STRIPE_RESTRICTED_KEY_FILE"):
+        validate_server_hardening_at_startup(
+            _staging(
+                stripe_settlement_enabled=True,
+                stripe_account_id="acct_testnet",
+                stripe_restricted_key_file=str(missing),
+            )
+        )
+
+    key_path = tmp_path / "coordinator-stripe-read-key"
+    key_path.write_text("rk_test_" + "a" * 24, encoding="ascii")
+    key_path.chmod(0o600)
+    validate_server_hardening_at_startup(
+        _staging(
+            stripe_settlement_enabled=True,
+            stripe_account_id="acct_testnet",
+            stripe_restricted_key_file=str(key_path),
+        )
+    )
+
+
+def test_stripe_settlement_rejects_exposed_or_wrong_mode_key(
+    tmp_path,
+) -> None:
+    key_path = tmp_path / "coordinator-stripe-read-key"
+    key_path.write_text("rk_live_" + "a" * 24, encoding="ascii")
+    key_path.chmod(0o644)
+    with pytest.raises(RuntimeError, match="group/other"):
+        validate_server_hardening_at_startup(
+            _staging(
+                stripe_settlement_enabled=True,
+                stripe_account_id="acct_testnet",
+                stripe_restricted_key_file=str(key_path),
+            )
+        )
+
+    key_path.chmod(0o600)
+    with pytest.raises(RuntimeError, match="configured Stripe mode"):
+        validate_server_hardening_at_startup(
+            _staging(
+                stripe_settlement_enabled=True,
+                stripe_account_id="acct_testnet",
+                stripe_restricted_key_file=str(key_path),
+            )
+        )
 
 
 def test_sgt_allocations_require_release_bound_company_treasury() -> None:

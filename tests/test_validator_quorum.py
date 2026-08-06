@@ -159,7 +159,7 @@ def _voucher_series_phase_claim() -> VoucherSeriesPhaseClaim:
         transition=2,
         launch_anchor=1_800_000_000,
         deed_launcher_ids=["0x" + "44" * 32, "0x" + "45" * 32],
-        governance_execution_ids=["0x" + "46" * 32, "0x" + "47" * 32],
+        governed_deed_puzzle_hashes=["0x" + "46" * 32, "0x" + "47" * 32],
         validator_message="0x" + "48" * 32,
     )
 

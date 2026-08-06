@@ -11,6 +11,19 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
+try:
+    from scripts.bounded_archive import (
+        ArchiveLimitError,
+        iter_bounded_archive,
+        read_bounded_file,
+    )
+except ModuleNotFoundError:  # Direct ``python scripts/check_secrets.py`` use.
+    from bounded_archive import (  # type: ignore[no-redef]
+        ArchiveLimitError,
+        iter_bounded_archive,
+        read_bounded_file,
+    )
+
 
 EXCLUDED_PARTS = frozenset(
     {".git", ".mypy_cache", ".pytest_cache", ".venv", "__pycache__", "node_modules"}
@@ -73,25 +86,20 @@ def _contains_credential(data: bytes) -> bool:
 def violations_for_path(path: Path) -> list[str]:
     violations: list[str] = []
     try:
-        if tarfile.is_tarfile(path):
-            with tarfile.open(path, "r:*") as archive:
-                for member in archive.getmembers():
-                    if not member.isfile():
-                        continue
-                    handle = archive.extractfile(member)
-                    if handle is not None and _contains_credential(handle.read()):
-                        violations.append(f"{path}!{member.name}")
+        lower_name = path.name.lower()
+        if (
+            lower_name.endswith((".tar", ".tgz", ".tar.gz", ".zip"))
+            or tarfile.is_tarfile(path)
+            or zipfile.is_zipfile(path)
+        ):
+            for member in iter_bounded_archive(path):
+                if member.data is not None and _contains_credential(member.data):
+                    violations.append(f"{path}!{member.name}")
             return violations
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path) as archive:
-                for name in archive.namelist():
-                    if not name.endswith("/") and _contains_credential(archive.read(name)):
-                        violations.append(f"{path}!{name}")
-            return violations
-        if _contains_credential(path.read_bytes()):
+        if _contains_credential(read_bounded_file(path)):
             violations.append(str(path))
-    except (OSError, tarfile.TarError, zipfile.BadZipFile):
-        violations.append(f"{path} (unreadable)")
+    except (OSError, ArchiveLimitError, tarfile.TarError, zipfile.BadZipFile) as error:
+        violations.append(f"{path} (unsafe or unreadable: {error})")
     return violations
 
 

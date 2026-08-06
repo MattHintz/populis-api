@@ -4224,6 +4224,7 @@ async def _submit_series_phase_transition(
     launch_anchor = int(time.time()) if transition == SeriesTransition.LAUNCH else 0
     deed_launcher_ids: list[str] = []
     governance_execution_ids: list[str] = []
+    governed_deed_puzzle_hashes: list[str] = []
     if transition == SeriesTransition.LAUNCH:
         if collection is None:
             raise ValueError("series launch requires collection execution evidence")
@@ -4242,6 +4243,28 @@ async def _submit_series_phase_transition(
             deed_launcher_ids.append(str(deed["deedLauncherId"]).lower())
             governance_execution_ids.append(
                 _hex32(_b32(stored["executeBundleId"], nonzero=True))
+            )
+            from .mint_endpoints import get_mint_proposal_store
+
+            proposal = get_mint_proposal_store(settings).get(
+                str(stored.get("proposalId") or "")
+            )
+            if (
+                proposal is None
+                or proposal.state != "EXECUTED"
+                or proposal.deed_launcher_id is None
+                or proposal.deed_full_puzhash is None
+                or proposal.executed_bundle_id is None
+                or _hex32(bytes32(proposal.deed_launcher_id))
+                != str(deed["deedLauncherId"]).lower()
+                or proposal.executed_bundle_id.lower()
+                != str(stored["executeBundleId"]).lower()
+            ):
+                raise ValueError(
+                    "collection execution differs from its canonical mint proposal"
+                )
+            governed_deed_puzzle_hashes.append(
+                _hex32(bytes32(proposal.deed_full_puzhash))
             )
     provisional = build_voucher_series_phase_spend(
         terms=terms,
@@ -4266,7 +4289,7 @@ async def _submit_series_phase_transition(
         transition=int(transition),
         launch_anchor=launch_anchor,
         deed_launcher_ids=deed_launcher_ids,
-        governance_execution_ids=governance_execution_ids,
+        governed_deed_puzzle_hashes=governed_deed_puzzle_hashes,
         validator_message=_hex32(provisional.validator_message),
     )
     quorum = await collect_voucher_series_phase_quorum(settings, claim)

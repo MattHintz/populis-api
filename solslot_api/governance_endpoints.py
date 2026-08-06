@@ -479,6 +479,7 @@ def _public(
         "proposalCoinId": value.proposal_coin_id,
         "completionBundleId": value.completion_bundle_id,
         "publicationCoadminSlot": value.publication_coadmin_slot,
+        "publicationVotingDeadline": value.publication_voting_deadline,
         "executionBundleId": value.execution_bundle_id,
         "expectedOutputCoinIds": list(value.expected_output_coin_ids),
         "executionSubmittedAt": value.execution_submitted_at,

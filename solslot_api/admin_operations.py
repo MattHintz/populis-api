@@ -20,6 +20,7 @@ from solslot_puzzles.admin_operation_v1 import AdminOperationCoreV1, canonical_j
 
 from .admin_auth import AdminClaims, require_admin_jwt
 from .admin_records import get_admin_records_for_settings
+from .admin_roster import current_signed_admins
 from .config import Settings, get_settings
 from .evm_auth import recover_evm_signer
 from .public_artifact import load_signed_public_artifact
@@ -115,12 +116,12 @@ def resolve_admin_roster(settings: Settings) -> AdminRoster:
         str(artifact["launcherIds"]["adminAuthority"]),
         "admin authority launcher",
     )
-    values = artifact["adminAuthority"]["compressedPubkeys"]
-    if not isinstance(values, list) or len(values) != 3:
-        raise ValueError("signed artifact must contain exactly three admin keys")
-    keys = tuple(bytes.fromhex(str(value).removeprefix("0x")) for value in values)
+    values = current_signed_admins(settings)
+    if len(values) != 3:
+        raise ValueError("current signed roster must contain exactly three admin keys")
+    keys = tuple(bytes.fromhex(value[1].removeprefix("0x")) for value in values)
     if any(len(value) != 33 for value in keys):
-        raise ValueError("signed artifact contains malformed admin key")
+        raise ValueError("current signed roster contains malformed admin key")
     return AdminRoster(launcher, keys)  # type: ignore[arg-type]
 
 

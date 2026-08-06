@@ -763,7 +763,7 @@ class VoucherSeriesPhaseClaim(BaseModel):
     transition: int = Field(..., ge=2, le=3)
     launch_anchor: int = Field(..., ge=0)
     deed_launcher_ids: list[str] = Field(default_factory=list, max_length=100_000)
-    governance_execution_ids: list[str] = Field(
+    governed_deed_puzzle_hashes: list[str] = Field(
         default_factory=list,
         max_length=100_000,
     )
@@ -778,7 +778,7 @@ class VoucherSeriesPhaseClaim(BaseModel):
     def _phase_hex32(cls, value: str, info) -> str:
         return _hex(value, 32, info.field_name)
 
-    @field_validator("deed_launcher_ids", "governance_execution_ids")
+    @field_validator("deed_launcher_ids", "governed_deed_puzzle_hashes")
     @classmethod
     def _phase_hex32_list(cls, value: list[str], info) -> list[str]:
         return [_hex(item, 32, info.field_name) for item in value]
@@ -792,20 +792,22 @@ class VoucherSeriesPhaseClaim(BaseModel):
                 raise ValueError("series launch requires a positive launch anchor")
             if not self.deed_launcher_ids:
                 raise ValueError("series launch requires governed deed evidence")
-            if len(self.deed_launcher_ids) != len(self.governance_execution_ids):
-                raise ValueError("series launch governance evidence is incomplete")
+            if len(self.deed_launcher_ids) != len(
+                self.governed_deed_puzzle_hashes
+            ):
+                raise ValueError("series launch governed deed evidence is incomplete")
         elif (
             self.launch_anchor != 0
             or self.deed_launcher_ids
-            or self.governance_execution_ids
+            or self.governed_deed_puzzle_hashes
         ):
             raise ValueError("series cancellation cannot carry launch evidence")
         if len(set(self.deed_launcher_ids)) != len(self.deed_launcher_ids):
             raise ValueError("series launch deed evidence contains duplicates")
-        if len(set(self.governance_execution_ids)) != len(
-            self.governance_execution_ids
+        if len(set(self.governed_deed_puzzle_hashes)) != len(
+            self.governed_deed_puzzle_hashes
         ):
-            raise ValueError("series launch execution evidence contains duplicates")
+            raise ValueError("series launch governed deed evidence contains duplicates")
         return self
 
     def canonical_hash(self) -> str:

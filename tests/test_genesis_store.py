@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
 import pytest
 
 from solslot_api.genesis_store import (
@@ -14,6 +17,49 @@ CEREMONY = "0x" + "11" * 32
 ROSTER = "0x" + "22" * 32
 PLAN = "0x" + "33" * 32
 ARTIFACT = "0x" + "44" * 32
+
+
+def test_owner_claim_consumption_and_draft_creation_are_atomic(tmp_path) -> None:
+    store = GenesisStore(tmp_path / "owner-claim.db")
+    barrier = threading.Barrier(2)
+
+    def claim(index: int) -> str:
+        barrier.wait()
+        try:
+            record = store.claim_or_create_draft(
+                token_hash="one-use-owner-link",
+                ceremony_id="0x" + f"{index + 1:02x}" * 32,
+                draft={"sourceShas": {}},
+                now=100 + index,
+            )
+            return str(record["ceremony_id"])
+        except GenesisConflict:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, range(2)))
+
+    assert results.count("conflict") == 1
+    assert len(store.list_ceremonies()) == 1
+
+
+def test_only_one_ceremony_can_reserve_global_finalization(tmp_path) -> None:
+    store = GenesisStore(tmp_path / "finalization.db")
+    first = "0x" + "a1" * 32
+    second = "0x" + "a2" * 32
+    store.create_draft(first, {}, now=100)
+    store.create_draft(second, {}, now=101)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE ceremonies SET state='artifact_signed' "
+            "WHERE ceremony_id IN (?,?)",
+            (first, second),
+        )
+
+    store.reserve_finalization(first, now=110)
+
+    with pytest.raises(GenesisConflict, match="owns finalization"):
+        store.reserve_finalization(second, now=111)
 
 
 def _enroll(store: GenesisStore, slot: int, now: int = 100) -> None:
@@ -319,6 +365,7 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
         slot=1,
         signer_address="0x" + "01" * 20,
         signature="0x" + "01" * 65,
+        expires_at=200,
         now=130,
     )
     assert one["approved"] is False
@@ -331,6 +378,7 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
         slot=3,
         signer_address="0x" + "03" * 20,
         signature="0x" + "03" * 65,
+        expires_at=200,
         now=131,
     )
     assert two["approved"] is True
@@ -343,8 +391,27 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
             slot=1,
             signer_address="0x" + "01" * 20,
             signature="0x" + "04" * 65,
+            expires_at=200,
             now=132,
         )
+
+    assert store.action_approvals(CEREMONY, action_id, now=200)["approved"] is True
+    expired = store.action_approvals(CEREMONY, action_id, now=201)
+    assert expired["approved"] is False
+    assert expired["slots"] == []
+    for slot in (1, 3):
+        renewed = store.add_action_approval(
+            CEREMONY,
+            action_id=action_id,
+            action_type="funding",
+            payload_hash=payload_hash,
+            slot=slot,
+            signer_address="0x" + f"{slot:02x}" * 20,
+            signature="0x" + f"{slot + 10:02x}" * 65,
+            expires_at=300,
+            now=210 + slot,
+        )
+    assert renewed["approved"] is True
 
 
 def test_guided_gate_expires_fail_closed_and_funding_plan_is_immutable(tmp_path) -> None:
