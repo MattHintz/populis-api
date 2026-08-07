@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a non-approving Authority V3 review request from exact Git heads."""
+"""Build a non-approving review request from an exact release manifest."""
 
 from __future__ import annotations
 
@@ -11,14 +11,17 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
-from urllib.parse import urlsplit
+
+from solslot_puzzles.admin_authority_v3_driver import (
+    admin_authority_v3_inner_mod_hash,
+)
 
 from solslot_api.authority_v3_review_packet import (
-    CHANGED_SOURCE_PULL_REQUESTS,
     SOURCE_REPOSITORIES,
     AuthorityV3ReviewPacketError,
     build_review_request,
     normalize_repository,
+    validate_source_manifest,
 )
 
 
@@ -33,14 +36,6 @@ ARGUMENT_NAMES = {
     "customerWeb": "customer-web-repo",
     "adminPortal": "admin-portal-repo",
 }
-PR_ARGUMENT_NAMES = {
-    "protocol": "protocol-pr",
-    "omnichain": "omnichain-pr",
-    "api": "api-pr",
-    "adminPortal": "admin-portal-pr",
-}
-
-
 def _git(path: Path, *args: str) -> str:
     try:
         result = subprocess.run(
@@ -76,39 +71,59 @@ def _inspect_source(name: str, path: Path) -> dict[str, str]:
     }
 
 
-def _verify_pull_request(
-    source: str,
-    repository_path: Path,
-    url: str,
-    expected_head: str,
-) -> dict[str, str]:
-    path_parts = [item for item in urlsplit(url).path.split("/") if item]
-    if (
-        len(path_parts) != 4
-        or path_parts[2] != "pull"
-        or not path_parts[3].isdigit()
-    ):
-        raise AuthorityV3ReviewPacketError(
-            f"{source} pull request URL is invalid"
-        )
-    remote_ref = f"refs/pull/{int(path_parts[3])}/head"
+def _remote_ref(repository_path: Path, ref: str) -> str:
     output = _git(
         repository_path.resolve(),
         "ls-remote",
         "origin",
-        remote_ref,
+        ref,
+        ref + "^{}",
     )
-    fields = output.split()
-    if len(fields) != 2 or fields[1] != remote_ref:
+    resolved = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            resolved[fields[1]] = fields[0].lower()
+    commit = resolved.get(ref + "^{}") or resolved.get(ref)
+    if commit is None:
         raise AuthorityV3ReviewPacketError(
-            f"{source} pull request head is unavailable"
+            f"release ref {ref} is unavailable"
         )
-    remote_head = fields[0].lower()
-    if remote_head != expected_head:
+    return commit
+
+
+def _verify_release_refs(
+    source: str,
+    repository_path: Path,
+    *,
+    release_id: str,
+    release_branch: str,
+    expected_commit: str,
+) -> None:
+    refs = (
+        "refs/heads/main",
+        f"refs/heads/{release_branch}",
+        f"refs/tags/{release_id}",
+    )
+    for ref in refs:
+        if _remote_ref(repository_path, ref) != expected_commit:
+            label = ref.removeprefix("refs/")
+            raise AuthorityV3ReviewPacketError(
+                f"{source} remote {label} differs from the release manifest"
+            )
+
+
+def _read_json(path: Path, label: str) -> tuple[dict, bytes]:
+    try:
+        raw = path.resolve().read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AuthorityV3ReviewPacketError(
-            f"{source} pull request head differs from the clean worktree"
-        )
-    return {"url": url, "headSha": remote_head}
+            f"{label} is unreadable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise AuthorityV3ReviewPacketError(f"{label} must be an object")
+    return value, raw
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -120,12 +135,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             type=Path,
             required=True,
         )
-    for name, argument in PR_ARGUMENT_NAMES.items():
-        parser.add_argument(
-            f"--{argument}",
-            dest=f"{name}_pr",
-            required=True,
-        )
+    parser.add_argument("--source-manifest", type=Path, required=True)
+    parser.add_argument("--puzzle-inventory", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--generated-at")
     return parser.parse_args(argv)
@@ -138,30 +149,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise AuthorityV3ReviewPacketError(
             "review packet output directory must be empty"
         )
+    source_manifest, manifest_bytes = _read_json(
+        args.source_manifest,
+        "release source manifest",
+    )
+    manifest = validate_source_manifest(source_manifest)
     states = {
         name: _inspect_source(name, getattr(args, name))
         for name in SOURCE_REPOSITORIES
     }
-    pull_requests = {}
-    for source in sorted(CHANGED_SOURCE_PULL_REQUESTS):
-        pull_requests[source] = _verify_pull_request(
+    for source in SOURCE_REPOSITORIES:
+        _verify_release_refs(
             source,
             getattr(args, source),
-            str(getattr(args, source + "_pr")),
-            states[source]["commit"],
+            release_id=manifest["releaseId"],
+            release_branch=manifest["releaseBranch"],
+            expected_commit=manifest["sourceShas"][source],
         )
-    inventory_path = (
+    release_line = (
+        manifest["releaseId"]
+        .removeprefix("solslot-v2-alpha-")
+        .split("-", 1)[0]
+        .split(".", 1)[0]
+    )
+    inventory_path = args.puzzle_inventory or (
         args.protocol.resolve()
         / "release-manifests"
-        / "rc23-puzzle-hashes.json"
+        / f"{release_line}-puzzle-hashes.json"
     )
-    try:
-        inventory_bytes = inventory_path.read_bytes()
-        puzzle_inventory = json.loads(inventory_bytes)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AuthorityV3ReviewPacketError(
-            "RC23 puzzle inventory is unreadable"
-        ) from exc
+    puzzle_inventory, inventory_bytes = _read_json(
+        inventory_path,
+        "current puzzle inventory",
+    )
     generated_at = args.generated_at or (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
@@ -170,12 +189,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     request = build_review_request(
         source_states=states,
-        pull_requests=pull_requests,
+        source_manifest=source_manifest,
+        source_manifest_file_sha256=hashlib.sha256(
+            manifest_bytes
+        ).hexdigest(),
         puzzle_inventory=puzzle_inventory,
         puzzle_inventory_file_sha256=hashlib.sha256(
             inventory_bytes
         ).hexdigest(),
+        authority_inner_mod_hash=(
+            "0x" + admin_authority_v3_inner_mod_hash().hex()
+        ),
         generated_at=generated_at,
+        release_refs_verified=True,
     )
     request_bytes = (
         json.dumps(request, sort_keys=True, indent=2) + "\n"

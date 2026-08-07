@@ -46,17 +46,37 @@ def _canonical_hash(payload: dict) -> str:
 
 
 def _payload() -> dict:
+    source_shas = {
+        name: f"{index:x}" * 40
+        for index, name in enumerate(SOURCE_NAMES, start=1)
+    }
+    authority_source_commitment = _canonical_hash(
+        {
+            "version": 4,
+            "sources": source_shas,
+            "dependencies": {
+                "administratorRecovery": (
+                    "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
+                )
+            },
+        }
+    )
     payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "solslot-authority-v3-independent-review",
         "network": "testnet11",
-        "protocolVersion": "solslot-v2-rc23",
+        "protocolVersion": "solslot-v2",
         "outcome": "approved",
         "reviewRequestHash": "0x" + "40" * 32,
-        "sourceShas": {
-            name: f"{index:x}" * 40
-            for index, name in enumerate(SOURCE_NAMES, start=1)
+        "release": {
+            "releaseId": "solslot-v2-alpha-rc27.4-20260807",
+            "releaseBranch": "release/testnet-alpha-rc27.4-20260807",
+            "sourceManifestHash": "0x" + "43" * 32,
+            "sourceManifestFileSha256": "0x" + "44" * 32,
+            "authoritySourceCommitment": authority_source_commitment,
+            "releaseRefsVerified": True,
         },
+        "sourceShas": source_shas,
         "chiaAuthority": {
             "innerModHash": "0x" + "41" * 32,
         },
@@ -240,6 +260,24 @@ def test_rejects_unbound_request_or_reused_evidence_file(tmp_path) -> None:
             governance_evidence_hash="0x" + "42" * 32,
         )
 
+
+def test_rejects_stale_release_source_commitment(tmp_path) -> None:
+    payload = _payload()
+    payload["release"]["authoritySourceCommitment"] = "0x" + "aa" * 32
+    payload["artifactHash"] = _canonical_hash(payload)
+    with pytest.raises(
+        AuthorityV3ReviewError,
+        match="source commitment is stale",
+    ):
+        load_authority_v3_review(
+            _write(tmp_path, payload),
+            source_shas=payload["sourceShas"],
+            authority_inner_mod_hash="0x" + "41" * 32,
+            governance_evidence_hash="0x" + "42" * 32,
+        )
+
+
+def test_rejects_reused_evidence_file(tmp_path) -> None:
     payload = _payload()
     payload["reviews"][1]["evidenceFile"] = payload["reviews"][0][
         "evidenceFile"

@@ -22,6 +22,9 @@ from .config import Settings
 
 MAX_REVIEW_BYTES = 128 * 1024
 REVIEW_KIND = "solslot-authority-v3-independent-review"
+REVIEW_SCHEMA_VERSION = 2
+SOURCE_MANIFEST_VERSION = 4
+PROTOCOL_VERSION = "solslot-v2"
 REQUIRED_SCOPES = frozenset(
     {
         "chialisp-wrapper",
@@ -31,10 +34,24 @@ REQUIRED_SCOPES = frozenset(
     }
 )
 _EVIDENCE_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RELEASE_ID = re.compile(
+    r"^solslot-v2-alpha-rc[0-9]+(?:\.[0-9]+)?-[0-9]{8}$"
+)
 
 
 class AuthorityV3ReviewError(ValueError):
     """Authority V3 review evidence is absent, stale, or malformed."""
+
+
+def _exact_keys(
+    value: Mapping[str, Any],
+    expected: set[str],
+    label: str,
+) -> None:
+    if set(value) != expected:
+        raise AuthorityV3ReviewError(
+            f"{label} contains unsupported or missing fields"
+        )
 
 
 def read_authority_v3_review_receipt(
@@ -132,6 +149,22 @@ def _full_sha(value: object, label: str) -> str:
     return normalized
 
 
+def _authority_source_commitment(
+    source_shas: Mapping[str, str],
+) -> str:
+    return _canonical_hash(
+        {
+            "version": SOURCE_MANIFEST_VERSION,
+            "sources": dict(source_shas),
+            "dependencies": {
+                "administratorRecovery": (
+                    "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
+                )
+            },
+        }
+    )
+
+
 def load_authority_v3_review(
     settings: Settings,
     *,
@@ -178,10 +211,10 @@ def load_authority_v3_review(
         ) from exc
     if (
         not isinstance(payload, dict)
-        or payload.get("schemaVersion") != 1
+        or payload.get("schemaVersion") != REVIEW_SCHEMA_VERSION
         or payload.get("kind") != REVIEW_KIND
         or payload.get("network") != "testnet11"
-        or payload.get("protocolVersion") != "solslot-v2-rc23"
+        or payload.get("protocolVersion") != PROTOCOL_VERSION
         or payload.get("outcome") != "approved"
         or payload.get("artifactHash") != _canonical_hash(payload)
     ):
@@ -193,13 +226,34 @@ def load_authority_v3_review(
         length=32,
         label="Authority V3 review request hash",
     )
+    _exact_keys(
+        payload,
+        {
+            "schemaVersion",
+            "kind",
+            "network",
+            "protocolVersion",
+            "outcome",
+            "reviewRequestHash",
+            "release",
+            "sourceShas",
+            "chiaAuthority",
+            "evmAuthority",
+            "upstream",
+            "reviews",
+            "artifactHash",
+        },
+        "Authority V3 review receipt",
+    )
     reviewed_sources = payload.get("sourceShas")
+    release = payload.get("release")
     if not isinstance(reviewed_sources, Mapping) or set(
         reviewed_sources
     ) != set(source_shas):
         raise AuthorityV3ReviewError(
             "Authority V3 review source manifest is incomplete"
         )
+    normalized_sources: dict[str, str] = {}
     for key, expected in source_shas.items():
         reviewed = _full_sha(
             reviewed_sources.get(key),
@@ -209,6 +263,53 @@ def load_authority_v3_review(
             raise AuthorityV3ReviewError(
                 f"Authority V3 review sourceShas.{key} is stale"
             )
+        normalized_sources[key] = reviewed
+    if (
+        not isinstance(release, Mapping)
+        or _RELEASE_ID.fullmatch(
+            str(release.get("releaseId") or "")
+        )
+        is None
+        or release.get("releaseBranch")
+        != "release/testnet-alpha-"
+        + str(release.get("releaseId")).removeprefix(
+            "solslot-v2-alpha-"
+        )
+        or release.get("releaseRefsVerified") is not True
+    ):
+        raise AuthorityV3ReviewError(
+            "Authority V3 review release binding is incomplete"
+        )
+    _exact_keys(
+        release,
+        {
+            "releaseId",
+            "releaseBranch",
+            "sourceManifestHash",
+            "sourceManifestFileSha256",
+            "authoritySourceCommitment",
+            "releaseRefsVerified",
+        },
+        "Authority V3 review release binding",
+    )
+    _hex(
+        release.get("sourceManifestHash"),
+        length=32,
+        label="Authority V3 source manifest hash",
+    )
+    _hex(
+        release.get("sourceManifestFileSha256"),
+        length=32,
+        label="Authority V3 source manifest file SHA-256",
+    )
+    if _hex(
+        release.get("authoritySourceCommitment"),
+        length=32,
+        label="Authority V3 source commitment",
+    ) != _authority_source_commitment(normalized_sources):
+        raise AuthorityV3ReviewError(
+            "Authority V3 review source commitment is stale"
+        )
     authority = payload.get("chiaAuthority")
     evm = payload.get("evmAuthority")
     upstream = payload.get("upstream")
@@ -219,6 +320,21 @@ def load_authority_v3_review(
         raise AuthorityV3ReviewError(
             "Authority V3 review bindings are incomplete"
         )
+    _exact_keys(
+        authority,
+        {"innerModHash"},
+        "Authority V3 Chia binding",
+    )
+    _exact_keys(
+        evm,
+        {"governanceEvidenceHash"},
+        "Authority V3 EVM binding",
+    )
+    _exact_keys(
+        upstream,
+        {"repository", "commit", "license", "manifestHash"},
+        "Authority V3 upstream binding",
+    )
     if (
         _hex(
             authority.get("innerModHash"),
@@ -271,6 +387,18 @@ def load_authority_v3_review(
             raise AuthorityV3ReviewError(
                 "Authority V3 review approval is incomplete"
             )
+        _exact_keys(
+            review,
+            {
+                "scope",
+                "approved",
+                "reviewer",
+                "evidenceFile",
+                "evidenceHash",
+                "completedAt",
+            },
+            "Authority V3 review approval",
+        )
         evidence_file = str(review.get("evidenceFile") or "")
         if (
             review.get("approved") is not True

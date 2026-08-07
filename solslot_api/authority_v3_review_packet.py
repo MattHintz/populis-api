@@ -22,7 +22,10 @@ from .authority_v3_review import REQUIRED_SCOPES, REVIEW_KIND
 
 REQUEST_KIND = "solslot-authority-v3-review-request"
 REQUEST_STATUS = "review-required"
-PROTOCOL_VERSION = "solslot-v2-rc23"
+PROTOCOL_VERSION = "solslot-v2"
+REQUEST_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 2
+SOURCE_MANIFEST_VERSION = 4
 MAX_SCOPE_EVIDENCE_BYTES = 2 * 1024 * 1024
 SOURCE_REPOSITORIES = {
     "protocol": "https://github.com/MattHintz/solslot-protocol",
@@ -35,9 +38,6 @@ SOURCE_REPOSITORIES = {
     "customerWeb": "https://github.com/solslot/solslot",
     "adminPortal": "https://github.com/MattHintz/solslot-portal",
 }
-CHANGED_SOURCE_PULL_REQUESTS = frozenset(
-    {"protocol", "omnichain", "api", "adminPortal"}
-)
 TRUST_BOUNDARIES = {
     "chialisp-wrapper": {
         "repositories": ["protocol", "api"],
@@ -146,10 +146,31 @@ TRUST_BOUNDARIES = {
 }
 
 _EVIDENCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RELEASE_ID = re.compile(
+    r"^solslot-v2-alpha-(rc[0-9]+(?:\.[0-9]+)?)-([0-9]{8})$"
+)
+FINAL_APPROVAL_REQUIREMENTS = [
+    "all nine source SHAs must match the exact release source manifest",
+    "the live Base Sepolia governance deployment evidence must pass "
+    "the API evidence loader",
+    "all four trust boundaries need independent evidence",
+    "the final receipt must be checksum-pinned before ceremony use",
+]
 
 
 class AuthorityV3ReviewPacketError(ValueError):
     """Review request or reviewer evidence is malformed or stale."""
+
+
+def _exact_keys(
+    value: Mapping[str, Any],
+    expected: set[str],
+    label: str,
+) -> None:
+    if set(value) != expected:
+        raise AuthorityV3ReviewPacketError(
+            f"{label} contains unsupported or missing fields"
+        )
 
 
 def canonical_hash(payload: Mapping[str, Any]) -> str:
@@ -259,53 +280,191 @@ def _timestamp(value: object, label: str) -> str:
     return candidate
 
 
-def _pull_request_url(
-    value: object,
-    *,
-    source: str,
+def _release(value: object) -> tuple[str, str, str]:
+    release_id = str(value or "").strip()
+    match = _RELEASE_ID.fullmatch(release_id)
+    if match is None:
+        raise AuthorityV3ReviewPacketError(
+            "releaseId must identify a coordinated testnet alpha release"
+        )
+    release_branch = "release/testnet-alpha-" + release_id.removeprefix(
+        "solslot-v2-alpha-"
+    )
+    inventory_release = match.group(1).split(".", 1)[0].upper()
+    return release_id, release_branch, inventory_release
+
+
+def _source_manifest_hash(payload: Mapping[str, Any]) -> str:
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key != "manifestHash"
+    }
+    encoded = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return "0x" + hashlib.sha256(encoded).hexdigest()
+
+
+def _authority_source_commitment(
+    source_shas: Mapping[str, str],
 ) -> str:
-    candidate = str(value or "").strip()
-    parts = urlsplit(candidate)
-    expected_repository = normalize_repository(SOURCE_REPOSITORIES[source])
-    expected_parts = urlsplit(expected_repository)
-    path_parts = [item for item in parts.path.split("/") if item]
+    return canonical_hash(
+        {
+            "version": SOURCE_MANIFEST_VERSION,
+            "sources": dict(source_shas),
+            "dependencies": {
+                "administratorRecovery": (
+                    "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
+                )
+            },
+        }
+    )
+
+
+def validate_source_manifest(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    _exact_keys(
+        payload,
+        {
+            "schemaVersion",
+            "kind",
+            "releaseId",
+            "network",
+            "testOnly",
+            "sourceShas",
+            "dependencies",
+            "authoritySourceCommitment",
+            "sources",
+            "manifestHash",
+        },
+        "release source manifest",
+    )
+    release_id, release_branch, _ = _release(payload.get("releaseId"))
     if (
-        parts.scheme != "https"
-        or parts.hostname != "github.com"
-        or parts.username
-        or parts.password
-        or parts.query
-        or parts.fragment
-        or path_parts[:2]
-        != [item for item in expected_parts.path.split("/") if item]
-        or len(path_parts) != 4
-        or path_parts[2] != "pull"
-        or not path_parts[3].isdigit()
-        or int(path_parts[3]) <= 0
+        payload.get("schemaVersion") != SOURCE_MANIFEST_VERSION
+        or payload.get("kind") != "solslot-release-source-manifest"
+        or payload.get("network") != "testnet11"
+        or payload.get("testOnly") is not True
     ):
         raise AuthorityV3ReviewPacketError(
-            f"{source} pull request URL is invalid"
+            "release source manifest is unsupported"
         )
-    return urlunsplit(
-        ("https", "github.com", "/" + "/".join(path_parts), "", "")
+    source_shas = payload.get("sourceShas")
+    sources = payload.get("sources")
+    dependencies = payload.get("dependencies")
+    recovery = (
+        dependencies.get("administratorRecovery")
+        if isinstance(dependencies, Mapping)
+        else None
     )
+    if isinstance(dependencies, Mapping):
+        _exact_keys(
+            dependencies,
+            {"administratorRecovery"},
+            "release source dependencies",
+        )
+    if isinstance(recovery, Mapping):
+        _exact_keys(
+            recovery,
+            {"repository", "commit", "license", "manifestHash"},
+            "administrator recovery dependency",
+        )
+    if (
+        not isinstance(source_shas, Mapping)
+        or not isinstance(sources, Mapping)
+        or set(source_shas) != set(SOURCE_REPOSITORIES)
+        or set(sources) != set(SOURCE_REPOSITORIES)
+    ):
+        raise AuthorityV3ReviewPacketError(
+            "release source manifest must bind all nine repositories"
+        )
+    normalized_shas: dict[str, str] = {}
+    normalized_sources: dict[str, dict[str, str]] = {}
+    for name, expected_repository in SOURCE_REPOSITORIES.items():
+        source = sources.get(name)
+        if not isinstance(source, Mapping):
+            raise AuthorityV3ReviewPacketError(
+                f"release source manifest {name} record is invalid"
+            )
+        _exact_keys(
+            source,
+            {"repository", "branch", "commit"},
+            f"release source manifest {name} record",
+        )
+        commit = _full_sha(source_shas.get(name), f"sourceShas.{name}")
+        if _full_sha(source.get("commit"), f"{name} commit") != commit:
+            raise AuthorityV3ReviewPacketError(
+                f"release source manifest {name} commit is inconsistent"
+            )
+        repository = normalize_repository(source.get("repository"))
+        if repository != normalize_repository(expected_repository):
+            raise AuthorityV3ReviewPacketError(
+                f"release source manifest {name} repository is not canonical"
+            )
+        if source.get("branch") != release_branch:
+            raise AuthorityV3ReviewPacketError(
+                f"release source manifest {name} branch is not release-bound"
+            )
+        normalized_shas[name] = commit
+        normalized_sources[name] = {
+            "repository": repository,
+            "branch": release_branch,
+            "commit": commit,
+        }
+    if (
+        not isinstance(recovery, Mapping)
+        or recovery.get("repository") != PINNED_CNI_WALLET_SDK_REPOSITORY
+        or recovery.get("commit") != PINNED_CNI_WALLET_SDK_COMMIT
+        or recovery.get("license") != PINNED_CNI_WALLET_SDK_LICENSE
+        or recovery.get("manifestHash")
+        != "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
+    ):
+        raise AuthorityV3ReviewPacketError(
+            "release source manifest does not bind the pinned Chia SDK"
+        )
+    authority_commitment = _authority_source_commitment(normalized_shas)
+    if payload.get("authoritySourceCommitment") != authority_commitment:
+        raise AuthorityV3ReviewPacketError(
+            "release Authority V3 source commitment is invalid"
+        )
+    if payload.get("manifestHash") != _source_manifest_hash(payload):
+        raise AuthorityV3ReviewPacketError(
+            "release source manifest hash is invalid"
+        )
+    return {
+        "releaseId": release_id,
+        "releaseBranch": release_branch,
+        "sourceShas": normalized_shas,
+        "sources": normalized_sources,
+        "manifestHash": payload["manifestHash"],
+        "authoritySourceCommitment": authority_commitment,
+    }
 
 
 def build_review_request(
     *,
     source_states: Mapping[str, Mapping[str, object]],
-    pull_requests: Mapping[str, Mapping[str, object]],
+    source_manifest: Mapping[str, Any],
+    source_manifest_file_sha256: str,
     puzzle_inventory: Mapping[str, Any],
     puzzle_inventory_file_sha256: str,
+    authority_inner_mod_hash: str,
     generated_at: str,
+    release_refs_verified: bool,
 ) -> dict[str, Any]:
+    manifest = validate_source_manifest(source_manifest)
     if set(source_states) != set(SOURCE_REPOSITORIES):
         raise AuthorityV3ReviewPacketError(
             "review request must bind all nine source repositories"
         )
-    if set(pull_requests) != CHANGED_SOURCE_PULL_REQUESTS:
+    if release_refs_verified is not True:
         raise AuthorityV3ReviewPacketError(
-            "review request must bind the four Authority V3 pull requests"
+            "review request requires exact branch, tag, and main verification"
         )
     sources: dict[str, dict[str, str]] = {}
     for name, expected_repository in SOURCE_REPOSITORIES.items():
@@ -316,46 +475,28 @@ def build_review_request(
                 f"{name} does not use the canonical repository"
             )
         branch = str(state.get("branch") or "").strip()
-        if not branch:
-            raise AuthorityV3ReviewPacketError(
-                f"{name} branch is unavailable"
-            )
+        commit = _full_sha(state.get("commit"), f"{name} commit")
         sources[name] = {
             "repository": repository,
             "branch": branch,
-            "commit": _full_sha(state.get("commit"), f"{name} commit"),
+            "commit": commit,
         }
-    normalized_prs: dict[str, dict[str, str]] = {}
-    for source in sorted(CHANGED_SOURCE_PULL_REQUESTS):
-        item = pull_requests[source]
-        head_sha = _full_sha(
-            item.get("headSha"),
-            f"{source} pull request head",
-        )
-        if head_sha != sources[source]["commit"]:
+        if sources[name] != manifest["sources"][name]:
             raise AuthorityV3ReviewPacketError(
-                f"{source} pull request does not match the reviewed source"
+                f"{name} worktree differs from the release source manifest"
             )
-        normalized_prs[source] = {
-            "url": _pull_request_url(item.get("url"), source=source),
-            "headSha": head_sha,
-        }
+    _, _, expected_inventory_release = _release(manifest["releaseId"])
     if (
         puzzle_inventory.get("schema") != "solslot.puzzle-hashes.v1"
-        or puzzle_inventory.get("release") != "RC23"
+        or puzzle_inventory.get("release") != expected_inventory_release
         or not isinstance(puzzle_inventory.get("newPuzzleHashes"), Mapping)
+        or not isinstance(puzzle_inventory.get("changedPuzzleHashes"), Mapping)
     ):
         raise AuthorityV3ReviewPacketError(
-            "RC23 puzzle inventory is missing or unsupported"
+            "current puzzle inventory is missing or unsupported"
         )
     inner_hash = _bytes32(
-        "0x"
-        + str(
-            puzzle_inventory["newPuzzleHashes"].get(
-                "admin_authority_v3_inner.clsp"
-            )
-            or ""
-        ).removeprefix("0x"),
+        authority_inner_mod_hash,
         "Authority V3 inner module hash",
     )
     inventory_hash = _bytes32(
@@ -363,21 +504,33 @@ def build_review_request(
         "puzzle inventory file SHA-256",
     )
     generated = _timestamp(generated_at, "generatedAt")
-    source_shas = {
-        name: sources[name]["commit"] for name in SOURCE_REPOSITORIES
-    }
+    manifest_file_hash = _bytes32(
+        "0x" + source_manifest_file_sha256.removeprefix("0x"),
+        "source manifest file SHA-256",
+    )
+    source_shas = manifest["sourceShas"]
     payload: dict[str, Any] = {
-        "schemaVersion": 1,
+        "schemaVersion": REQUEST_SCHEMA_VERSION,
         "kind": REQUEST_KIND,
         "status": REQUEST_STATUS,
         "network": "testnet11",
         "protocolVersion": PROTOCOL_VERSION,
         "generatedAt": generated,
+        "release": {
+            "releaseId": manifest["releaseId"],
+            "releaseBranch": manifest["releaseBranch"],
+            "sourceManifestHash": manifest["manifestHash"],
+            "sourceManifestFileSha256": manifest_file_hash,
+            "authoritySourceCommitment": manifest[
+                "authoritySourceCommitment"
+            ],
+            "releaseRefsVerified": True,
+        },
         "sourceShas": source_shas,
         "sources": sources,
-        "pullRequests": normalized_prs,
         "chiaAuthority": {
             "innerModHash": inner_hash,
+            "puzzleInventoryRelease": expected_inventory_release,
             "puzzleInventoryFileSha256": inventory_hash,
             "canonicalPuzzleChecksum": _bytes32(
                 "0x"
@@ -402,13 +555,7 @@ def build_review_request(
             {"scope": scope, **TRUST_BOUNDARIES[scope]}
             for scope in sorted(REQUIRED_SCOPES)
         ],
-        "finalApprovalRequirements": [
-            "all nine source SHAs must match the final RC23 source manifest",
-            "the live Base Sepolia governance deployment evidence must pass "
-            "the API evidence loader",
-            "all four trust boundaries need independent evidence",
-            "the final receipt must be checksum-pinned before ceremony use",
-        ],
+        "finalApprovalRequirements": FINAL_APPROVAL_REQUIREMENTS,
     }
     payload["artifactHash"] = canonical_hash(payload)
     return payload
@@ -416,7 +563,7 @@ def build_review_request(
 
 def validate_review_request(payload: Mapping[str, Any]) -> dict[str, Any]:
     if (
-        payload.get("schemaVersion") != 1
+        payload.get("schemaVersion") != REQUEST_SCHEMA_VERSION
         or payload.get("kind") != REQUEST_KIND
         or payload.get("status") != REQUEST_STATUS
         or payload.get("network") != "testnet11"
@@ -428,9 +575,30 @@ def validate_review_request(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise AuthorityV3ReviewPacketError(
             "Authority V3 review request is unsupported or approving"
         )
+    _exact_keys(
+        payload,
+        {
+            "schemaVersion",
+            "kind",
+            "status",
+            "network",
+            "protocolVersion",
+            "generatedAt",
+            "release",
+            "sourceShas",
+            "sources",
+            "chiaAuthority",
+            "evmAuthority",
+            "upstream",
+            "trustBoundaries",
+            "finalApprovalRequirements",
+            "artifactHash",
+        },
+        "Authority V3 review request",
+    )
     source_shas = payload.get("sourceShas")
     sources = payload.get("sources")
-    pull_requests = payload.get("pullRequests")
+    release = payload.get("release")
     chia = payload.get("chiaAuthority")
     evm = payload.get("evmAuthority")
     upstream = payload.get("upstream")
@@ -440,7 +608,7 @@ def validate_review_request(payload: Mapping[str, Any]) -> dict[str, Any]:
         for value in (
             source_shas,
             sources,
-            pull_requests,
+            release,
             chia,
             evm,
             upstream,
@@ -455,44 +623,122 @@ def validate_review_request(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise AuthorityV3ReviewPacketError(
             "Authority V3 review request source set is incomplete"
         )
+    release_id, release_branch, inventory_release = _release(
+        release.get("releaseId")
+    )
+    _exact_keys(
+        release,
+        {
+            "releaseId",
+            "releaseBranch",
+            "sourceManifestHash",
+            "sourceManifestFileSha256",
+            "authoritySourceCommitment",
+            "releaseRefsVerified",
+        },
+        "Authority V3 review request release",
+    )
+    if (
+        release.get("releaseBranch") != release_branch
+        or release.get("releaseRefsVerified") is not True
+    ):
+        raise AuthorityV3ReviewPacketError(
+            "Authority V3 review request release refs are invalid"
+        )
+    _bytes32(
+        release.get("sourceManifestFileSha256"),
+        "source manifest file SHA-256",
+    )
+    normalized_shas: dict[str, str] = {}
+    normalized_sources: dict[str, dict[str, str]] = {}
     for name, repository in SOURCE_REPOSITORIES.items():
         state = sources[name]
+        commit = _full_sha(source_shas.get(name), f"sourceShas.{name}")
+        if isinstance(state, Mapping):
+            _exact_keys(
+                state,
+                {"repository", "branch", "commit"},
+                f"Authority V3 review request {name} source",
+            )
         if (
             not isinstance(state, Mapping)
             or normalize_repository(state.get("repository"))
             != normalize_repository(repository)
             or _full_sha(state.get("commit"), f"{name} commit")
-            != _full_sha(source_shas.get(name), f"sourceShas.{name}")
-            or not str(state.get("branch") or "").strip()
+            != commit
+            or state.get("branch") != release_branch
         ):
             raise AuthorityV3ReviewPacketError(
                 f"Authority V3 review request {name} source is invalid"
             )
-    if set(pull_requests) != CHANGED_SOURCE_PULL_REQUESTS:
+        normalized_shas[name] = commit
+        normalized_sources[name] = dict(state)
+    authority_commitment = _authority_source_commitment(normalized_shas)
+    if release.get("authoritySourceCommitment") != authority_commitment:
         raise AuthorityV3ReviewPacketError(
-            "Authority V3 review request pull request set is incomplete"
+            "Authority V3 review request source commitment is invalid"
         )
-    for source in CHANGED_SOURCE_PULL_REQUESTS:
-        item = pull_requests[source]
-        if (
-            not isinstance(item, Mapping)
-            or _pull_request_url(item.get("url"), source=source)
-            != item.get("url")
-            or _full_sha(item.get("headSha"), f"{source} pull request head")
-            != source_shas[source]
-        ):
-            raise AuthorityV3ReviewPacketError(
-                f"Authority V3 {source} pull request is stale"
-            )
+    reconstructed_manifest: dict[str, Any] = {
+        "schemaVersion": SOURCE_MANIFEST_VERSION,
+        "kind": "solslot-release-source-manifest",
+        "releaseId": release_id,
+        "network": "testnet11",
+        "testOnly": True,
+        "sourceShas": normalized_shas,
+        "dependencies": {
+            "administratorRecovery": {
+                "repository": PINNED_CNI_WALLET_SDK_REPOSITORY,
+                "commit": PINNED_CNI_WALLET_SDK_COMMIT,
+                "license": PINNED_CNI_WALLET_SDK_LICENSE,
+                "manifestHash": "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH,
+            }
+        },
+        "authoritySourceCommitment": authority_commitment,
+        "sources": normalized_sources,
+    }
+    if release.get("sourceManifestHash") != _source_manifest_hash(
+        reconstructed_manifest
+    ):
+        raise AuthorityV3ReviewPacketError(
+            "Authority V3 review request source manifest hash is invalid"
+        )
     _timestamp(payload.get("generatedAt"), "generatedAt")
+    _exact_keys(
+        chia,
+        {
+            "innerModHash",
+            "puzzleInventoryRelease",
+            "puzzleInventoryFileSha256",
+            "canonicalPuzzleChecksum",
+        },
+        "Authority V3 Chia binding",
+    )
     _bytes32(chia.get("innerModHash"), "Authority V3 inner module hash")
+    if chia.get("puzzleInventoryRelease") != inventory_release:
+        raise AuthorityV3ReviewPacketError(
+            "Authority V3 review request puzzle inventory is stale"
+        )
     _bytes32(
         chia.get("puzzleInventoryFileSha256"),
         "puzzle inventory file SHA-256",
     )
+    _exact_keys(
+        evm,
+        {
+            "sourceSha",
+            "governanceEvidenceRequired",
+            "governanceEvidenceHash",
+        },
+        "Authority V3 EVM binding",
+    )
     _bytes32(
         chia.get("canonicalPuzzleChecksum"),
         "canonical puzzle checksum",
+    )
+    _exact_keys(
+        upstream,
+        {"repository", "commit", "license", "manifestHash"},
+        "Authority V3 upstream binding",
     )
     if (
         _full_sha(evm.get("sourceSha"), "EVM source SHA")
@@ -520,6 +766,10 @@ def validate_review_request(payload: Mapping[str, Any]) -> dict[str, Any]:
     if boundaries != expected_boundaries:
         raise AuthorityV3ReviewPacketError(
             "review request must cover all four trust boundaries"
+        )
+    if payload.get("finalApprovalRequirements") != FINAL_APPROVAL_REQUIREMENTS:
+        raise AuthorityV3ReviewPacketError(
+            "review request final approval requirements are invalid"
         )
     return dict(payload)
 
@@ -591,12 +841,13 @@ def build_review_receipt(
             }
         )
     payload: dict[str, Any] = {
-        "schemaVersion": 1,
+        "schemaVersion": RECEIPT_SCHEMA_VERSION,
         "kind": REVIEW_KIND,
         "network": "testnet11",
         "protocolVersion": PROTOCOL_VERSION,
         "outcome": "approved",
         "reviewRequestHash": validated["artifactHash"],
+        "release": validated["release"],
         "sourceShas": validated["sourceShas"],
         "chiaAuthority": {
             "innerModHash": validated["chiaAuthority"]["innerModHash"],
@@ -620,7 +871,6 @@ def review_request_file_sha256(payload: Mapping[str, Any]) -> str:
 
 __all__ = [
     "AuthorityV3ReviewPacketError",
-    "CHANGED_SOURCE_PULL_REQUESTS",
     "MAX_SCOPE_EVIDENCE_BYTES",
     "REQUEST_KIND",
     "REQUEST_STATUS",
@@ -633,4 +883,5 @@ __all__ = [
     "normalize_repository",
     "review_request_file_sha256",
     "validate_review_request",
+    "validate_source_manifest",
 ]

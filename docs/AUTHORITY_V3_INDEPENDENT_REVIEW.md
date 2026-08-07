@@ -33,8 +33,9 @@ commands for each scope.
 
 ## Build The Request
 
-Run this only after the four Authority V3 branches are pushed and all nine
-worktrees are clean:
+Run this only after the coordinated release branch and tag are pushed to all
+nine repositories, each release commit is on `main`, and all nine worktrees
+are clean:
 
 ```bash
 python scripts/build_authority_v3_review_packet.py \
@@ -47,16 +48,19 @@ python scripts/build_authority_v3_review_packet.py \
   --samuel-repo ../samuel-rc22-reconcile \
   --customer-web-repo ../solslot \
   --admin-portal-repo ../solslot-portal \
-  --protocol-pr https://github.com/MattHintz/solslot-protocol/pull/7 \
-  --omnichain-pr https://github.com/solslot/omnichain/pull/4 \
-  --api-pr https://github.com/MattHintz/solslot-api/pull/16 \
-  --admin-portal-pr https://github.com/MattHintz/solslot-portal/pull/13 \
-  --output-dir /home/hiram/secure/solslot-v2-rc23/review-request
+  --source-manifest ../release-evidence/source-manifest.json \
+  --puzzle-inventory ../solslot-protocol/release-manifests/rc27-puzzle-hashes.json \
+  --output-dir /home/hiram/secure/solslot-v2/review-request
 ```
 
-The builder verifies the four remote PR heads, canonical remotes, clean
-worktrees, the RC23 puzzle inventory, all nine commits, and the pinned upstream
-dependency. Give the reviewer both generated files and retain their SHA-256.
+The builder verifies each canonical remote, clean release worktree, exact
+remote `main`, release-branch, and tag ref, source-manifest hash, Authority V3
+source commitment, current puzzle inventory and compiled inner-module hash,
+all nine commits, and the pinned upstream dependency. Pull-request heads are
+not release provenance: a normal merge changes the final commit, so the packet
+binds only the final coordinated release refs and manifest.
+
+Give the reviewer both generated files and retain their SHA-256.
 
 If any source SHA changes after review, rebuild the request and repeat the
 affected review. A receipt for the old request must remain invalid.
@@ -110,7 +114,7 @@ and four evidence files together in the private release archive.
 ## Final Freeze Rule
 
 The final ceremony source manifest requires every source commit to be the exact
-commit on `origin/main` and the RC23 tag. If merging changes a commit, the
-independent reviewer must receive a regenerated packet before the ceremony gate
-can become healthy. The tool never converts a candidate review into approval
-automatically.
+commit on remote `main`, the coordinated release branch, and the release tag.
+If any ref or manifest field changes, the independent reviewer must receive a
+regenerated packet before the ceremony gate can become healthy. The tool never
+converts a candidate review into approval automatically.
