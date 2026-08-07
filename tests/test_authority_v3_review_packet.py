@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -13,18 +14,68 @@ from solslot_api.authority_v3_review_packet import (
     canonical_hash,
     validate_review_request,
 )
+from solslot_puzzles.recovery_dependencies import (
+    PINNED_CNI_WALLET_SDK_COMMIT,
+    PINNED_CNI_WALLET_SDK_LICENSE,
+    PINNED_CNI_WALLET_SDK_REPOSITORY,
+    RECOVERY_DEPENDENCY_MANIFEST_HASH,
+)
+
+
+RELEASE_ID = "solslot-v2-alpha-rc27.4-20260807"
+RELEASE_BRANCH = "release/testnet-alpha-rc27.4-20260807"
+
+
+def _source_manifest(source_states: dict) -> dict:
+    source_shas = {
+        name: state["commit"] for name, state in source_states.items()
+    }
+    commitment = canonical_hash(
+        {
+            "version": 4,
+            "sources": source_shas,
+            "dependencies": {
+                "administratorRecovery": (
+                    "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
+                )
+            },
+        }
+    )
+    payload = {
+        "schemaVersion": 4,
+        "kind": "solslot-release-source-manifest",
+        "releaseId": RELEASE_ID,
+        "network": "testnet11",
+        "testOnly": True,
+        "sourceShas": source_shas,
+        "dependencies": {
+            "administratorRecovery": {
+                "repository": PINNED_CNI_WALLET_SDK_REPOSITORY,
+                "commit": PINNED_CNI_WALLET_SDK_COMMIT,
+                "license": PINNED_CNI_WALLET_SDK_LICENSE,
+                "manifestHash": (
+                    "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
+                ),
+            }
+        },
+        "authoritySourceCommitment": commitment,
+        "sources": source_states,
+    }
+    unsigned = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    payload["manifestHash"] = "0x" + hashlib.sha256(unsigned).hexdigest()
+    return payload
 
 
 def _request() -> dict:
     source_states = {
         name: {
             "repository": repository,
-            "branch": (
-                "feature/authority-v3-recovery"
-                if name
-                in {"protocol", "omnichain", "api", "adminPortal"}
-                else "release/testnet-alpha-rc22.2-20260729"
-            ),
+            "branch": RELEASE_BRANCH,
             "commit": f"{index:040x}",
         }
         for index, (name, repository) in enumerate(
@@ -32,30 +83,22 @@ def _request() -> dict:
             start=1,
         )
     }
-    pull_requests = {
-        name: {
-            "url": f"{SOURCE_REPOSITORIES[name]}/pull/{index}",
-            "headSha": source_states[name]["commit"],
-        }
-        for index, name in enumerate(
-            ("protocol", "omnichain", "api", "adminPortal"),
-            start=1,
-        )
-    }
     puzzle_inventory = {
         "schema": "solslot.puzzle-hashes.v1",
-        "release": "RC23",
+        "release": "RC27",
         "canonicalChecksum": "11" * 32,
-        "newPuzzleHashes": {
-            "admin_authority_v3_inner.clsp": "22" * 32,
-        },
+        "newPuzzleHashes": {},
+        "changedPuzzleHashes": {},
     }
     return build_review_request(
         source_states=source_states,
-        pull_requests=pull_requests,
+        source_manifest=_source_manifest(source_states),
+        source_manifest_file_sha256="44" * 32,
         puzzle_inventory=puzzle_inventory,
         puzzle_inventory_file_sha256="33" * 32,
+        authority_inner_mod_hash="0x" + "22" * 32,
         generated_at="2026-07-29T18:00:00Z",
+        release_refs_verified=True,
     )
 
 
@@ -78,6 +121,10 @@ def test_review_request_is_complete_and_cannot_approve() -> None:
     assert "outcome" not in validated
     assert "reviews" not in validated
     assert set(validated["sourceShas"]) == set(SOURCE_REPOSITORIES)
+    assert validated["schemaVersion"] == 2
+    assert validated["release"]["releaseId"] == RELEASE_ID
+    assert validated["release"]["releaseRefsVerified"] is True
+    assert "pullRequests" not in validated
     assert {
         item["scope"] for item in validated["trustBoundaries"]
     } == REQUIRED_SCOPES
@@ -87,13 +134,13 @@ def test_review_request_is_complete_and_cannot_approve() -> None:
     )
 
 
-def test_review_request_rejects_stale_pull_request_or_approval() -> None:
+def test_review_request_rejects_stale_manifest_or_approval() -> None:
     request = _request()
-    request["pullRequests"]["api"]["headSha"] = "f" * 40
+    request["release"]["sourceManifestHash"] = "0x" + "f" * 64
     request["artifactHash"] = canonical_hash(request)
     with pytest.raises(
         AuthorityV3ReviewPacketError,
-        match="api pull request is stale",
+        match="source manifest hash is invalid",
     ):
         validate_review_request(request)
 
@@ -105,6 +152,86 @@ def test_review_request_rejects_stale_pull_request_or_approval() -> None:
         match="unsupported or approving",
     ):
         validate_review_request(request)
+
+
+def test_review_request_rejects_stale_authority_commitment() -> None:
+    request = _request()
+    request["release"]["authoritySourceCommitment"] = "0x" + "f" * 64
+    request["artifactHash"] = canonical_hash(request)
+    with pytest.raises(
+        AuthorityV3ReviewPacketError,
+        match="source commitment is invalid",
+    ):
+        validate_review_request(request)
+
+
+def test_review_request_rejects_ambiguous_approval_fields() -> None:
+    request = _request()
+    request["approved"] = True
+    request["artifactHash"] = canonical_hash(request)
+    with pytest.raises(
+        AuthorityV3ReviewPacketError,
+        match="unsupported or missing fields",
+    ):
+        validate_review_request(request)
+
+
+def test_release_manifest_rejects_noncanonical_source_metadata() -> None:
+    source_states = {
+        name: {
+            "repository": repository,
+            "branch": RELEASE_BRANCH,
+            "commit": f"{index:040x}",
+        }
+        for index, (name, repository) in enumerate(
+            SOURCE_REPOSITORIES.items(),
+            start=1,
+        )
+    }
+    manifest = _source_manifest(source_states)
+    manifest["sources"]["api"]["repository"] = (
+        "https://github.com/attacker/solslot-api"
+    )
+    unsigned = {
+        key: value for key, value in manifest.items() if key != "manifestHash"
+    }
+    manifest["manifestHash"] = "0x" + hashlib.sha256(
+        json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    with pytest.raises(
+        AuthorityV3ReviewPacketError,
+        match="api repository is not canonical",
+    ):
+        build_review_request(
+            source_states=source_states,
+            source_manifest=manifest,
+            source_manifest_file_sha256="44" * 32,
+            puzzle_inventory={
+                "schema": "solslot.puzzle-hashes.v1",
+                "release": "RC27",
+                "canonicalChecksum": "11" * 32,
+                "newPuzzleHashes": {},
+                "changedPuzzleHashes": {},
+            },
+            puzzle_inventory_file_sha256="33" * 32,
+            authority_inner_mod_hash="0x" + "22" * 32,
+            generated_at="2026-08-07T18:00:00Z",
+            release_refs_verified=True,
+        )
+
+
+def test_builder_accepts_final_merge_commits_without_pr_heads() -> None:
+    request = _request()
+    assert request["sourceShas"]["api"] == request["sources"]["api"][
+        "commit"
+    ]
+    assert request["status"] == "review-required"
+    assert "pullRequests" not in request
 
 
 def test_builds_receipt_from_four_real_evidence_files(tmp_path) -> None:
