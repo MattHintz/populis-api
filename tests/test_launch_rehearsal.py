@@ -5,8 +5,10 @@ import hmac
 import json
 from copy import deepcopy
 
+import httpx
 import pytest
 
+from solslot_api import launch_rehearsal as launch_rehearsal_module
 from solslot_api.config import Settings
 from solslot_api.genesis_store import GenesisConflict, GenesisStore
 from solslot_api.launch_rehearsal import (
@@ -14,9 +16,13 @@ from solslot_api.launch_rehearsal import (
     canonical_json,
     persist_evidence,
     require_completed_rehearsal,
+    start_rehearsal,
     validate_status,
 )
-from solslot_api.service_urls import valid_internal_service_url
+from solslot_api.service_urls import (
+    valid_internal_service_url,
+    valid_launch_rehearsal_service_url,
+)
 
 
 CONFIG_HASH = "0x" + "ab" * 32
@@ -43,6 +49,76 @@ def test_rehearsal_service_url_allows_only_tls_or_loopback() -> None:
     assert not valid_internal_service_url("http://rehearsal.example")
     assert not valid_internal_service_url("http://localhost:8793")
     assert not valid_internal_service_url("https://user:secret@rehearsal.example")
+    assert valid_launch_rehearsal_service_url("http://127.0.0.1:8794")
+    assert valid_launch_rehearsal_service_url("http://[::1]:8794")
+    assert not valid_launch_rehearsal_service_url("http://127.0.0.1:8793")
+    assert not valid_launch_rehearsal_service_url("http://[::1]:8793")
+    assert not valid_launch_rehearsal_service_url("https://rehearsal.example:8793")
+
+
+@pytest.mark.asyncio
+async def test_start_rehearsal_sends_the_exact_coordinator_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    captured: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(
+            method=request.method,
+            url=str(request.url),
+            authorization=request.headers.get("authorization"),
+            payload=json.loads(request.content),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "jobId": "rehearsal_" + "cd" * 32,
+                "state": "VALIDATING",
+                "configHash": CONFIG_HASH,
+                "phase": "WAITING_DELIVERY_PURCHASE",
+                "completedSteps": 0,
+                "step": "Complete one test purchase",
+                "message": "Use the normal customer checkout.",
+                "walletTransaction": None,
+                "review": None,
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        launch_rehearsal_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: client,
+    )
+    release_hash = "0x" + "ef" * 32
+    wallet = "0x" + "12" * 20
+    status = await start_rehearsal(
+        _settings(tmp_path),
+        ceremony_id="ceremony_rc27_alpha",
+        release_evidence_hash=release_hash,
+        wallet_address=wallet,
+    )
+
+    assert status["phase"] == "WAITING_DELIVERY_PURCHASE"
+    assert captured == {
+        "method": "POST",
+        "url": "https://rehearsal.example/v1/rehearsals",
+        "authorization": "Bearer service-token-that-is-long-enough",
+        "payload": {
+            "ceremonyId": "ceremony_rc27_alpha",
+            "releaseTag": "solslot-v2-alpha-rc27-20260804",
+            "releaseEvidenceHash": release_hash,
+            "configHash": CONFIG_HASH,
+            "network": "testnet11",
+            "rehearsalKind": "solslot-rc27-stripe-voucher-rehearsal",
+            "requiredLanes": [
+                "stripe-voucher-delivery",
+                "stripe-voucher-refund",
+            ],
+            "walletAddress": wallet,
+        },
+    }
 
 
 def _lane(seed: int, *, lane: str) -> dict:
