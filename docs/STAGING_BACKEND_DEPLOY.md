@@ -145,6 +145,23 @@ only in the mode-`0600` shared environment file and use the same value only in
 the authorized server-to-server caller; it must never enter either browser
 build.
 
+After genesis produces the real rehearsal config and omnichain activation
+evidence, add the coordinator client values to the same private API environment:
+
+```text
+SOLSLOT_LAUNCH_REHEARSAL_SERVICE_URL=http://127.0.0.1:8794
+SOLSLOT_LAUNCH_REHEARSAL_SERVICE_TOKEN=<same value as the coordinator service-token file>
+SOLSLOT_LAUNCH_REHEARSAL_CONFIG_HASH=<hash printed when the sealed config is created>
+SOLSLOT_LAUNCH_REHEARSAL_EVIDENCE_HMAC_SECRET=<same value as the coordinator HMAC file>
+```
+
+The coordinator's candidates-token file must contain the existing
+`SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN`. The candidates route is
+`GET /protocol-api/presales/stripe-rehearsal/candidates`; it accepts only that
+bearer token. Port `8793` belongs to Key of Solomon and is rejected as a launch
+rehearsal service URL. Keep all four rehearsal values unset until their genuine
+post-genesis counterparts exist.
+
 Before the Stripe test-mode rehearsal ceiling can be armed, install a distinct
 coordinator restricted read key with Account, Event, and PaymentIntent read
 permissions. Set `SOLSLOT_STRIPE_RESTRICTED_KEY_FILE` in the shared environment

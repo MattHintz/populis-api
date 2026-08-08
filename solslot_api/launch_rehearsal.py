@@ -14,7 +14,7 @@ import httpx
 
 from .config import Settings
 from .genesis_store import GenesisConflict, GenesisStore
-from .service_urls import valid_internal_service_url
+from .service_urls import valid_launch_rehearsal_service_url
 
 
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -56,7 +56,7 @@ def _configuration(settings: Settings) -> tuple[str, str, str, str]:
     config_hash = str(settings.launch_rehearsal_config_hash or "").lower()
     evidence_secret = str(settings.launch_rehearsal_evidence_hmac_secret or "")
     if (
-        not valid_internal_service_url(url)
+        not valid_launch_rehearsal_service_url(url)
         or len(token) < 32
         or not HEX32_RE.fullmatch(config_hash)
         or len(evidence_secret) < 32

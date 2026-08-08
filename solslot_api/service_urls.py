@@ -27,4 +27,13 @@ def valid_internal_service_url(value: str) -> bool:
     return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1"}
 
 
-__all__ = ["valid_internal_service_url"]
+def valid_launch_rehearsal_service_url(value: str) -> bool:
+    """Keep the rehearsal client away from the Key of Solomon listener."""
+
+    if not valid_internal_service_url(value):
+        return False
+    parsed = urlsplit(value)
+    return parsed.port != 8793
+
+
+__all__ = ["valid_internal_service_url", "valid_launch_rehearsal_service_url"]
