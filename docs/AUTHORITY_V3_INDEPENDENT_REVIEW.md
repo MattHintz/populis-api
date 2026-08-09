@@ -65,6 +65,31 @@ Give the reviewer both generated files and retain their SHA-256.
 If any source SHA changes after review, rebuild the request and repeat the
 affected review. A receipt for the old request must remain invalid.
 
+## Export The Deployment Roster
+
+After all three administrators enroll with distinct daily wallets, complete
+their separate recovery-kit drills, freeze the roster, and build the
+deterministic Testnet11 plan, export the public Authority V3 deployment input:
+
+```bash
+python scripts/export_authority_v3_roster.py \
+  --database /opt/solslot/api-staging/shared/state/genesis_ceremony_v2.db \
+  --ceremony-id 0x... \
+  --output /home/hiram/secure/solslot-v2/authority-v3-roster.json
+```
+
+The exporter opens the ceremony ledger read-only, refuses symlinks and
+overwrites, and writes the result with mode `0600`. It verifies the frozen
+roster hash; daily wallet/public-key bindings; three completed, separate
+recovery drills; the source-manifest commitment; and all four deterministic
+authority/identity launcher IDs. An unplanned or expired ceremony is rejected.
+
+Do not use `export_safe_owner_roster.py` for Authority V3. That command emits
+the legacy schema-v1 Safe roster and intentionally lacks the recovery and Chia
+launcher bindings required by the current deployer. Supply the schema-v2 file
+to the exact Omnichain release as `SOLSLOT_AUTHORITY_V3_ROSTER_PATH`. Exporting
+the roster neither deploys contracts nor authorizes a chain transaction.
+
 ## Reviewer Evidence
 
 The reviewer should produce one nonempty evidence file for each required scope.
