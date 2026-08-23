@@ -17,6 +17,18 @@ CEREMONY = "0x" + "11" * 32
 ROSTER = "0x" + "22" * 32
 PLAN = "0x" + "33" * 32
 ARTIFACT = "0x" + "44" * 32
+BUNDLE_ID = "0x" + "55" * 32
+FEE_COIN_ID = "0x" + "66" * 32
+FEE_MOJOS = 7
+SPEND_BUNDLE = {
+    "aggregated_signature": "0x" + "00" * 96,
+    "coin_spends": [],
+}
+CEREMONY_EVIDENCE = {
+    "auditApproval": {"approved": True},
+    "authorityV3ReviewBase64": "e30K",
+    "validatorHealth": {"checkedAt": 100, "signers": []},
+}
 
 
 def test_owner_claim_consumption_and_draft_creation_are_atomic(tmp_path) -> None:
@@ -98,6 +110,122 @@ def _planned_store(tmp_path) -> GenesisStore:
     return store
 
 
+def _approve_plan(store: GenesisStore) -> None:
+    for slot in (1, 2):
+        store.add_plan_signature(
+            CEREMONY,
+            slot=slot,
+            plan_hash=PLAN,
+            compressed_pubkey="0x" + f"{slot:02x}" * 33,
+            signature="0x" + f"{slot:02x}" * 65,
+            now=130 + slot,
+        )
+
+
+def _reserve_bundle(
+    store: GenesisStore,
+    *,
+    now: int = 140,
+    expected_plan_hash: str = PLAN,
+    gate_authorization: dict | None = None,
+) -> dict:
+    return store.reserve_broadcast(
+        CEREMONY,
+        expected_plan_hash=expected_plan_hash,
+        spend_bundle_id=BUNDLE_ID,
+        spend_bundle=SPEND_BUNDLE,
+        fee_coin_id=FEE_COIN_ID,
+        fee_mojos=FEE_MOJOS,
+        ceremony_evidence=CEREMONY_EVIDENCE,
+        gate_authorization=gate_authorization,
+        now=now,
+    )
+
+
+def _broadcast_response() -> dict:
+    return {
+        "success": True,
+        "status": "MEMPOOL",
+        "spendBundleId": BUNDLE_ID,
+        "spendBundle": SPEND_BUNDLE,
+        "feeCoinId": FEE_COIN_ID,
+        "feeMojos": str(FEE_MOJOS),
+    }
+
+
+def _confirmation_evidence(height: int) -> dict:
+    return {
+        "schemaVersion": 1,
+        "spendBundleId": BUNDLE_ID,
+        "exactReservedCoinSpends": True,
+        "inputCoinIds": ["0x" + "77" * 32],
+        "confirmedBlockIndex": height,
+    }
+
+
+def _reserve_and_finalize(store: GenesisStore, *, now: int = 140) -> dict:
+    _reserve_bundle(store, now=now)
+    return store.mark_broadcast(
+        CEREMONY,
+        spend_bundle_id=BUNDLE_ID,
+        response=_broadcast_response(),
+        now=now + 1,
+    )
+
+
+def test_chain_reconciliation_finalizes_and_confirms_in_one_transaction(
+    tmp_path,
+) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+    _reserve_bundle(store, now=140)
+    response = {
+        **_broadcast_response(),
+        "status": "CHAIN_RECONCILED",
+        "submissionProvider": "exact-chain-reconciliation",
+    }
+
+    confirmed = store.mark_chain_reconciled_confirmed(
+        CEREMONY,
+        spend_bundle_id=BUNDLE_ID,
+        response=response,
+        confirmed_block_index=500,
+        confirmation_evidence=_confirmation_evidence(500),
+        now=150,
+    )
+
+    assert confirmed["state"] == "confirmed"
+    assert confirmed["confirmed_block_index"] == 500
+    assert confirmed["broadcast"]["reservationState"] == "FINALIZED"
+    assert confirmed["broadcast"]["status"] == "CHAIN_RECONCILED"
+    assert confirmed["broadcast"]["chainConfirmation"] == (
+        _confirmation_evidence(500)
+    )
+    assert store.pending_exact_fee_coin_ids() == set()
+
+
+def test_failed_chain_reconciliation_leaves_exact_reservation_unchanged(
+    tmp_path,
+) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+    before = _reserve_bundle(store, now=140)
+
+    with pytest.raises(GenesisConflict, match="changed the reserved fee coin"):
+        store.mark_chain_reconciled_confirmed(
+            CEREMONY,
+            spend_bundle_id=BUNDLE_ID,
+            response={**_broadcast_response(), "feeCoinId": "0x" + "99" * 32},
+            confirmed_block_index=500,
+            confirmation_evidence=_confirmation_evidence(500),
+            now=150,
+        )
+
+    after = store.get(CEREMONY)
+    assert after["state"] == "broadcast"
+    assert after["broadcast"] == before["broadcast"]
+
+
 def test_three_single_use_invitations_freeze_roster(tmp_path) -> None:
     store = GenesisStore(tmp_path / "genesis.db")
     store.create_draft(CEREMONY, {"sourceShas": {}}, now=100)
@@ -169,13 +297,16 @@ def test_owner_plus_one_plan_signatures_unlock_broadcast(tmp_path) -> None:
         now=132,
     )
     assert two["state"] == "plan_approved"
+    reserved = _reserve_bundle(store, now=133)
+    assert reserved["broadcast"]["reservationState"] == "RESERVED"
     broadcast = store.mark_broadcast(
         CEREMONY,
-        spend_bundle_id="0x" + "55" * 32,
-        response={"success": True},
-        now=133,
+        spend_bundle_id=BUNDLE_ID,
+        response=_broadcast_response(),
+        now=134,
     )
     assert broadcast["state"] == "broadcast"
+    assert broadcast["broadcast"]["reservationState"] == "FINALIZED"
 
 
 def test_two_coadmins_cannot_approve_plan_without_owner(tmp_path) -> None:
@@ -191,12 +322,7 @@ def test_two_coadmins_cannot_approve_plan_without_owner(tmp_path) -> None:
         )
     assert result["state"] == "planned"
     with pytest.raises(GenesisConflict, match="expected plan_approved"):
-        store.mark_broadcast(
-            CEREMONY,
-            spend_bundle_id="0x" + "55" * 32,
-            response={"success": True},
-            now=140,
-        )
+        _reserve_bundle(store, now=140)
 
 
 def test_expired_plan_and_mutated_hash_fail_closed(tmp_path) -> None:
@@ -221,6 +347,319 @@ def test_expired_plan_and_mutated_hash_fail_closed(tmp_path) -> None:
         )
 
 
+def test_broadcast_reservation_requires_exact_live_plan(tmp_path) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+
+    with pytest.raises(GenesisConflict, match="plan changed"):
+        _reserve_bundle(
+            store,
+            expected_plan_hash="0x" + "99" * 32,
+            now=999,
+        )
+    with pytest.raises(GenesisExpired, match="expired"):
+        _reserve_bundle(store, now=1000)
+
+    reserved = _reserve_bundle(store, now=999)
+    assert reserved["state"] == "broadcast"
+    assert reserved["spend_bundle_id"] == BUNDLE_ID
+    assert reserved["broadcast"] == {
+        "reservationSchemaVersion": 1,
+        "reservationState": "RESERVED",
+        "planHash": PLAN,
+        "spendBundleId": BUNDLE_ID,
+        "spendBundle": SPEND_BUNDLE,
+        "feeCoinId": FEE_COIN_ID,
+        "feeMojos": str(FEE_MOJOS),
+        "reservedAt": 999,
+        "ceremonyEvidence": CEREMONY_EVIDENCE,
+    }
+    reservation_event = store.audit_events(CEREMONY)[-1]
+    assert reservation_event["type"] == "bundle_broadcast_reserved"
+    assert reservation_event["details"]["spendBundleId"] == BUNDLE_ID
+    assert reservation_event["createdAt"] == 999
+
+
+def test_broadcast_reservation_requires_exact_open_gate_binding(tmp_path) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+    payload_hash = "0x" + "81" * 32
+    store.upsert_gate(
+        CEREMONY,
+        gate_name="ceremonyBroadcast",
+        opens_at=200,
+        closes_at=300,
+        payload_hash=payload_hash,
+        state="open",
+        now=150,
+    )
+    authorization = {
+        "gate": "ceremonyBroadcast",
+        "payloadHash": payload_hash,
+        "opensAt": 200,
+        "closesAt": 300,
+        "configuredState": "open",
+        "state": "open",
+        "approved": True,
+    }
+
+    with pytest.raises(GenesisConflict, match="authorization changed"):
+        _reserve_bundle(
+            store,
+            gate_authorization={
+                **authorization,
+                "payloadHash": "0x" + "82" * 32,
+            },
+            now=250,
+        )
+    with pytest.raises(GenesisConflict, match="gate is closed"):
+        _reserve_bundle(store, gate_authorization=authorization, now=300)
+
+    reserved = _reserve_bundle(
+        store,
+        gate_authorization=authorization,
+        now=250,
+    )
+    assert reserved["broadcast"]["gateAuthorization"] == authorization
+
+
+def test_plan_renewal_and_broadcast_reservation_are_atomic(tmp_path) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+    barrier = threading.Barrier(2)
+    renewed_hash = "0x" + "77" * 32
+    renewed_plan = {
+        "planHash": renewed_hash,
+        "expiresAt": 2000,
+    }
+
+    def reserve() -> str:
+        barrier.wait()
+        try:
+            _reserve_bundle(store, now=999)
+            return "reserved"
+        except GenesisConflict:
+            return "conflict"
+
+    def renew() -> str:
+        barrier.wait()
+        try:
+            store.renew_expired_plan(
+                CEREMONY,
+                expected_plan_hash=PLAN,
+                plan=renewed_plan,
+                plan_hash=renewed_hash,
+                expires_at=2000,
+                now=1000,
+            )
+            return "renewed"
+        except GenesisConflict:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [pool.submit(reserve), pool.submit(renew)]
+        outcomes = [result.result() for result in results]
+
+    assert outcomes.count("conflict") == 1
+    assert set(outcomes) in ({"conflict", "reserved"}, {"conflict", "renewed"})
+    assert store.get(CEREMONY)["state"] in {"broadcast", "planned"}
+
+
+def test_broadcast_finalize_requires_and_preserves_exact_reservation(tmp_path) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+    _reserve_bundle(store, now=999)
+
+    with pytest.raises(GenesisConflict, match="expected plan_approved"):
+        _reserve_bundle(store, now=999)
+    with pytest.raises(GenesisConflict, match="bundle id"):
+        store.mark_broadcast(
+            CEREMONY,
+            spend_bundle_id="0x" + "88" * 32,
+            response=_broadcast_response(),
+            now=1000,
+        )
+    with pytest.raises(GenesisConflict, match="spend bundle"):
+        store.mark_broadcast(
+            CEREMONY,
+            spend_bundle_id=BUNDLE_ID,
+            response={
+                **_broadcast_response(),
+                "spendBundle": {"coin_spends": []},
+            },
+            now=1000,
+        )
+
+    finalized = store.mark_broadcast(
+        CEREMONY,
+        spend_bundle_id=BUNDLE_ID,
+        response=_broadcast_response(),
+        now=1001,
+    )
+    assert finalized["broadcast"]["reservationState"] == "FINALIZED"
+    assert finalized["broadcast"]["reservedAt"] == 999
+    assert finalized["broadcast"]["finalizedAt"] == 1001
+    duplicate = store.mark_broadcast(
+        CEREMONY,
+        spend_bundle_id=BUNDLE_ID,
+        response=_broadcast_response(),
+        now=1100,
+    )
+    assert duplicate["broadcast"]["finalizedAt"] == 1001
+
+
+def test_pending_broadcast_fee_coin_survives_restart_and_cannot_be_abandoned(
+    tmp_path,
+) -> None:
+    store = _planned_store(tmp_path)
+    _approve_plan(store)
+    _reserve_bundle(store, now=140)
+
+    reopened = GenesisStore(tmp_path / "genesis.db")
+    assert reopened.pending_exact_fee_coin_ids() == {FEE_COIN_ID}
+    with pytest.raises(GenesisConflict, match="cannot be abandoned"):
+        reopened.abandon(CEREMONY, "ambiguous submission", now=141)
+    assert reopened.pending_exact_fee_coin_ids() == {FEE_COIN_ID}
+
+    with reopened._transaction() as connection:
+        connection.execute(
+            "UPDATE ceremonies SET broadcast_json='{}' WHERE ceremony_id=?",
+            (CEREMONY,),
+        )
+    with pytest.raises(GenesisConflict, match="reservation is invalid"):
+        reopened.pending_exact_fee_coin_ids()
+
+
+def test_schema_11_preserves_locked_legacy_evidence_but_rejects_active_legacy(
+    tmp_path,
+) -> None:
+    locked_path = tmp_path / "locked-legacy.db"
+    locked = GenesisStore(locked_path)
+    locked.create_draft(CEREMONY, {"sourceShas": {}}, now=100)
+    with locked._transaction() as connection:
+        connection.execute(
+            "UPDATE ceremonies SET state='locked',spend_bundle_id=?,"
+            "broadcast_json=? WHERE ceremony_id=?",
+            (BUNDLE_ID, '{"status":"legacy-complete"}', CEREMONY),
+        )
+        connection.execute("PRAGMA user_version = 10")
+
+    reopened = GenesisStore(locked_path)
+    assert reopened.get(CEREMONY)["broadcast"] == {
+        "status": "legacy-complete"
+    }
+
+    active_path = tmp_path / "active-legacy.db"
+    active = GenesisStore(active_path)
+    active.create_draft(CEREMONY, {"sourceShas": {}}, now=100)
+    with active._transaction() as connection:
+        connection.execute(
+            "UPDATE ceremonies SET state='broadcast',spend_bundle_id=?,"
+            "broadcast_json=? WHERE ceremony_id=?",
+            (BUNDLE_ID, '{"status":"legacy-unknown"}', CEREMONY),
+        )
+        connection.execute("PRAGMA user_version = 10")
+
+    with pytest.raises(RuntimeError, match="unreconciled legacy"):
+        GenesisStore(active_path)
+
+
+def test_expired_plan_renewal_is_atomic_and_requires_fresh_signatures(
+    tmp_path,
+) -> None:
+    store = _planned_store(tmp_path)
+    for slot in (1, 2):
+        store.add_plan_signature(
+            CEREMONY,
+            slot=slot,
+            plan_hash=PLAN,
+            compressed_pubkey="0x" + f"{slot:02x}" * 33,
+            signature="0x" + f"{slot:02x}" * 65,
+            now=130 + slot,
+        )
+    before = store.get(CEREMONY)
+    renewed_hash = "0x" + "55" * 32
+    renewed_plan = {
+        **before["plan"],
+        "expiresAt": 2000,
+        "planHash": renewed_hash,
+    }
+
+    renewed = store.renew_expired_plan(
+        CEREMONY,
+        expected_plan_hash=PLAN,
+        plan=renewed_plan,
+        plan_hash=renewed_hash,
+        expires_at=2000,
+        now=1001,
+    )
+
+    assert renewed["state"] == "planned"
+    assert renewed["plan_signatures"] == []
+    assert renewed["plan_input"] == before["plan_input"]
+    assert renewed["roster_hash"] == before["roster_hash"]
+    one = store.add_plan_signature(
+        CEREMONY,
+        slot=1,
+        plan_hash=renewed_hash,
+        compressed_pubkey="0x" + "01" * 33,
+        signature="0x" + "01" * 65,
+        now=1100,
+    )
+    assert one["state"] == "planned"
+    two = store.add_plan_signature(
+        CEREMONY,
+        slot=2,
+        plan_hash=renewed_hash,
+        compressed_pubkey="0x" + "02" * 33,
+        signature="0x" + "02" * 65,
+        now=1101,
+    )
+    assert two["state"] == "plan_approved"
+
+
+def test_plan_renewal_rejects_live_plan_cas_drift_and_binding_changes(
+    tmp_path,
+) -> None:
+    store = _planned_store(tmp_path)
+    renewed_hash = "0x" + "55" * 32
+    renewed_plan = {
+        "planHash": renewed_hash,
+        "expiresAt": 2000,
+    }
+    with pytest.raises(GenesisConflict, match="has not expired"):
+        store.renew_expired_plan(
+            CEREMONY,
+            expected_plan_hash=PLAN,
+            plan=renewed_plan,
+            plan_hash=renewed_hash,
+            expires_at=2000,
+            now=999,
+        )
+    with pytest.raises(GenesisConflict, match="changed before renewal"):
+        store.renew_expired_plan(
+            CEREMONY,
+            expected_plan_hash="0x" + "66" * 32,
+            plan=renewed_plan,
+            plan_hash=renewed_hash,
+            expires_at=2000,
+            now=1001,
+        )
+    changed_plan = {
+        **renewed_plan,
+        "fundingCoinIds": {"sgt": "0x" + "77" * 32},
+    }
+    with pytest.raises(GenesisConflict, match="immutable ceremony bindings"):
+        store.renew_expired_plan(
+            CEREMONY,
+            expected_plan_hash=PLAN,
+            plan=changed_plan,
+            plan_hash=renewed_hash,
+            expires_at=2000,
+            now=1001,
+        )
+
+
 def test_artifact_requires_two_roster_signatures_before_lock(tmp_path) -> None:
     store = _planned_store(tmp_path)
     for slot in (1, 2):
@@ -232,13 +671,13 @@ def test_artifact_requires_two_roster_signatures_before_lock(tmp_path) -> None:
             signature="0x" + f"{slot:02x}" * 65,
             now=130 + slot,
         )
-    store.mark_broadcast(
+    _reserve_and_finalize(store, now=140)
+    store.mark_confirmed(
         CEREMONY,
-        spend_bundle_id="0x" + "55" * 32,
-        response={"success": True},
-        now=140,
+        confirmed_block_index=500,
+        confirmation_evidence=_confirmation_evidence(500),
+        now=150,
     )
-    store.mark_confirmed(CEREMONY, confirmed_block_index=500, now=150)
     store.set_artifact(
         CEREMONY,
         artifact={"artifactHash": ARTIFACT},
@@ -263,6 +702,26 @@ def test_artifact_requires_two_roster_signatures_before_lock(tmp_path) -> None:
         compressed_pubkey="0x" + "03" * 33,
         signature="0x" + "03" * 65,
         now=172,
+    )
+    record = store.get(CEREMONY)
+    store.reserve_finalization(
+        CEREMONY,
+        publication={
+            "schemaVersion": 1,
+            "artifact": {
+                **record["artifact"],
+                "signatures": [
+                    {
+                        "adminIndex": int(entry["slot"]) - 1,
+                        "compressedPubkey": entry["compressed_pubkey"],
+                        "signature": entry["signature"],
+                    }
+                    for entry in record["artifact_signatures"]
+                ],
+            },
+            "bootstrapLock": {"lockedAt": 173},
+        },
+        now=173,
     )
     assert store.mark_locked(CEREMONY, now=173)["state"] == "locked"
 
@@ -424,9 +883,26 @@ def test_guided_gate_expires_fail_closed_and_funding_plan_is_immutable(tmp_path)
         opens_at=200,
         closes_at=300,
         payload_hash=payload_hash,
-        state="open",
+        state="pending",
         now=150,
     )
+    pending = store.gates(CEREMONY, now=250)["ceremonyBroadcast"]
+    assert pending["configuredState"] == "pending"
+    assert pending["state"] == "pending"
+    assert store.gates(CEREMONY, now=301)["ceremonyBroadcast"]["state"] == "pending"
+
+    store.upsert_gate(
+        CEREMONY,
+        gate_name="ceremonyBroadcast",
+        opens_at=200,
+        closes_at=300,
+        payload_hash=payload_hash,
+        state="open",
+        now=151,
+    )
+    before_open = store.gates(CEREMONY, now=199)["ceremonyBroadcast"]
+    assert before_open["configuredState"] == "open"
+    assert before_open["state"] == "pending"
     assert store.gates(CEREMONY, now=250)["ceremonyBroadcast"]["state"] == "open"
     assert store.gates(CEREMONY, now=300)["ceremonyBroadcast"]["state"] == "closed"
 
@@ -457,13 +933,13 @@ def test_two_coadmins_cannot_sign_artifact_without_owner(tmp_path) -> None:
             signature="0x" + f"{slot:02x}" * 65,
             now=130 + slot,
         )
-    store.mark_broadcast(
+    _reserve_and_finalize(store, now=140)
+    store.mark_confirmed(
         CEREMONY,
-        spend_bundle_id="0x" + "55" * 32,
-        response={"success": True},
-        now=140,
+        confirmed_block_index=500,
+        confirmation_evidence=_confirmation_evidence(500),
+        now=150,
     )
-    store.mark_confirmed(CEREMONY, confirmed_block_index=500, now=150)
     store.set_artifact(
         CEREMONY,
         artifact={"artifactHash": ARTIFACT},

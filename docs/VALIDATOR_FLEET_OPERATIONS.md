@@ -91,11 +91,12 @@ the environment: signer index, roster public keys, network, bridge policy,
 signed artifact path, EVM addresses, Stripe test account ID/API version, and
 RPC endpoints. The seed, Stripe restricted read key, and TLS private key are
 systemd credentials, never environment variables. Generate a different Stripe
-restricted key for each validator and permit only Account, Event, and
-PaymentIntent reads. The Sepolia RPC URL contains the replacement provider
-credential: install it directly in the root-managed host configuration, redact
-it from diagnostics, and never place the completed file in a release archive
-or ceremony evidence.
+restricted key for each validator and permit only Account, Event,
+PaymentIntent, and Charges reads. Charges read access is required because the
+service may request `GET /v1/charges/{id}` while verifying evidence. The
+Sepolia RPC URL contains the replacement provider credential: install it
+directly in the root-managed host configuration, redact it from diagnostics,
+and never place the completed file in a release archive or ceremony evidence.
 
 Signer state is local SQLite-WAL storage. Unique constraints cover claim hash,
 scoped nullifier, bridge coin, vault action, and EVM transaction. A signer

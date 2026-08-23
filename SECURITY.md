@@ -14,8 +14,9 @@ created until every gate in this document is green.
   compiled assets pass `scripts/check_namespace.py`.
 - Every API release records exact API and protocol commits in `release.json`.
 - The protocol dependency is an exact 40-character commit, never a branch.
-- The Chia ceremony deployment accepts only `schemaVersion: 2` and
-  `protocolVersion: "solslot-v2"` artifacts. The independently versioned RC19
+- The Chia ceremony draft envelope uses `schemaVersion: 2`. The signed launch
+  artifact and bootstrap lock use source/artifact schema v4 and
+  `protocolVersion: "solslot-v2-rc23"`. The independently versioned RC19
   Omnichain evidence uses governance v2, preflight/deployment/activation v3,
   and ownership-intent v2.
 
@@ -83,6 +84,13 @@ created until every gate in this document is green.
 - Global gas budgets and the relay circuit breaker fail closed.
 - Public enrollment requests cannot spend the faucet or create bridge coins.
 - Bridge-pool replenishment requires current chain-bound admin authority.
+- The exact fee-funded genesis bundle, bundle ID, and fee coin are persisted
+  atomically before provider submission. A partial or ambiguous push preserves
+  that reservation for reconciliation; it does not authorize constructing a
+  replacement.
+- Genesis replay requires a fresh owner-plus-one signed
+  `ceremonyBroadcast` gate and may submit only the exact preserved bundle. Its
+  reserved fee coin remains unavailable to every other protocol action.
 
 ### Server and proxy boundary
 
@@ -115,6 +123,6 @@ admin-portal test reports; namespace scans of release archives; exploit
 regressions; reproducible puzzle and contract hashes; secret-rotation evidence;
 the signed ceremony bundle; and EVM plus BLS zkPassport-to-Chia smoke receipts.
 
-No Critical, High, Medium, or Low security finding is accepted for Alpha. A
-failed ceremony is abandoned with all coordinates and secrets rotated before a
-new attempt.
+No Critical, High, Medium, or Low security finding is accepted for Alpha.
+Partial or ambiguous genesis submission is reconciled from the durable exact
+bundle; a replacement bundle must never be built or submitted.

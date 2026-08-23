@@ -100,6 +100,7 @@ from solslot_puzzles.sgt_reserve_driver import (
 )
 from solslot_puzzles.protocol_deployment import singleton_struct
 from solslot_puzzles.voucher_presale_v2 import (
+    DELIVERY_WINDOW_SECONDS,
     DeedAllocationCommitmentV2,
     VoucherPaymentRail,
     VoucherSeriesState,
@@ -169,10 +170,24 @@ class ValidatorEvidenceError(RuntimeError):
     """The coordinator claim is not independently provable."""
 
 
-def _is_protected_systemd_credential(path: Path, mode: int) -> bool:
+_PROTECTED_SYSTEMD_CREDENTIAL_NAMES = frozenset(
+    {"stripe-read-key", "validator-seed"}
+)
+
+
+def _is_protected_systemd_credential(
+    path: Path,
+    mode: int,
+    *,
+    expected_name: str,
+) -> bool:
     """Recognize systemd's read-only credential mount across supported hosts."""
     credentials_directory = os.environ.get("CREDENTIALS_DIRECTORY")
-    if not credentials_directory or path.name != "validator-seed":
+    if (
+        not credentials_directory
+        or expected_name not in _PROTECTED_SYSTEMD_CREDENTIAL_NAMES
+        or path.name != expected_name
+    ):
         return False
     try:
         directory = Path(credentials_directory)
@@ -215,7 +230,9 @@ def load_validator_private_key(settings: ValidatorSettings) -> PrivateKey:
         raise ValidatorEvidenceError("validator seed file is missing or is a symlink")
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & (stat.S_IRWXG | stat.S_IRWXO) and not _is_protected_systemd_credential(
-        path, mode
+        path,
+        mode,
+        expected_name="validator-seed",
     ):
         raise ValidatorEvidenceError("validator seed file must not be accessible by group/other")
     try:
@@ -1217,14 +1234,18 @@ def canonical_stripe_settlement_claim_json(
     )
 
 
-def _stripe_restricted_key(settings: ValidatorSettings) -> str:
+def load_stripe_restricted_key(settings: ValidatorSettings) -> str:
     if not settings.stripe_settlement_enabled:
         raise ValidatorEvidenceError("Stripe settlement signing is disabled")
     path = Path(settings.stripe_restricted_key_file)
     if path.is_symlink() or not path.is_file():
         raise ValidatorEvidenceError("Stripe restricted key file is missing")
     mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+    if mode & (stat.S_IRWXG | stat.S_IRWXO) and not _is_protected_systemd_credential(
+        path,
+        mode,
+        expected_name="stripe-read-key",
+    ):
         raise ValidatorEvidenceError(
             "Stripe restricted key file must not be accessible by group/other"
         )
@@ -1253,7 +1274,7 @@ def _verify_stripe_provider_evidence(
             "Stripe evidence does not match this validator's account and mode"
         )
     headers = {
-        "authorization": f"Bearer {_stripe_restricted_key(settings)}",
+        "authorization": f"Bearer {load_stripe_restricted_key(settings)}",
         "stripe-version": "2024-06-20",
     }
     try:
@@ -3364,6 +3385,7 @@ __all__ = [
     "canonical_voucher_transition_claim_json",
     "load_validator_artifact",
     "load_validator_private_key",
+    "load_stripe_restricted_key",
     "sign_validator_claim",
     "sign_primary_purchase_claim",
     "sign_stripe_settlement_claim",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 from eth_account import Account
@@ -12,7 +13,7 @@ from chia_rs import AugSchemeMPL
 import solslot_api.launch_control as launch_control_module
 from solslot_api.config import Settings, get_settings
 from solslot_api.genesis import get_genesis_store
-from solslot_api.genesis_store import GenesisStore
+from solslot_api.genesis_store import GenesisExpired, GenesisStore
 from solslot_api.launch_control import router
 
 
@@ -572,6 +573,73 @@ def test_purchase_gate_stays_locked_until_delivery_and_refund_are_proven(
     )
 
 
+@pytest.mark.asyncio
+async def test_approved_future_gate_is_configured_open_but_not_yet_effective(
+    tmp_path,
+) -> None:
+    ceremony_id = "0x" + "ac" * 32
+    now = int(time.time())
+    payload_hash = "0x" + "bc" * 32
+    gate = {
+        "name": "ceremonyBroadcast",
+        "network": "testnet11",
+        "opensAt": now + 300,
+        "closesAt": now + 900,
+        "payloadHash": payload_hash,
+        "configuredState": "pending",
+        "state": "pending",
+        "updatedAt": now,
+    }
+    captured: dict[str, object] = {}
+
+    class GateStore:
+        def get(self, actual_ceremony_id):
+            assert actual_ceremony_id == ceremony_id
+            return {"state": "plan_approved"}
+
+        def gates(self, actual_ceremony_id):
+            assert actual_ceremony_id == ceremony_id
+            return {"ceremonyBroadcast": gate}
+
+        def action_approvals(self, actual_ceremony_id, action_id):
+            assert actual_ceremony_id == ceremony_id
+            assert action_id.startswith("0x")
+            return {"approved": True}
+
+        def upsert_gate(self, actual_ceremony_id, **kwargs):
+            assert actual_ceremony_id == ceremony_id
+            captured.update(kwargs)
+            return {
+                **gate,
+                "configuredState": kwargs["state"],
+                "state": "pending",
+            }
+
+    settings = Settings(
+        runtime_environment="test",
+        network="testnet11",
+        genesis_db_path=str(tmp_path / "unused-genesis.db"),
+        genesis_output_dir=str(tmp_path / "unused-ceremonies"),
+    )
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=1,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=now + 3600,
+    )
+    activated = await launch_control_module.activate_gate(
+        "ceremonyBroadcast",
+        settings,
+        GateStore(),  # type: ignore[arg-type]
+        session,
+    )
+
+    assert captured["state"] == "open"
+    assert activated["configuredState"] == "open"
+    assert activated["state"] == "pending"
+
+
 def test_settlement_rehearsal_rejects_legacy_admin_wallet_transactions(tmp_path) -> None:
     client, store, _ = _client(tmp_path)
     _, ceremony_id = _claim_and_enroll_owner(client)
@@ -616,3 +684,280 @@ def test_post_genesis_settlement_does_not_block_ceremony_task_selection() -> Non
         readiness,
     )
     assert after_genesis["title"] == "Customer payment test follows launch"
+
+
+def test_expired_approved_plan_routes_owner_to_exact_renewal() -> None:
+    task = launch_control_module._task_for(
+        {
+            "state": "plan_approved",
+            "plan_expires_at": 1,
+            "invitations": [{"consumed_at": 1}] * 3,
+        },
+        [],
+    )
+
+    assert task["action"] == "renewPlan"
+    assert task["assignedRole"] == "owner"
+
+
+def test_gate_open_returns_exact_signed_broadcast_authorization(tmp_path) -> None:
+    ceremony_id = "0x" + "ad" * 32
+    gate = {
+        "name": "ceremonyBroadcast",
+        "network": "testnet11",
+        "opensAt": 1_999_999_000,
+        "closesAt": 2_000_001_000,
+        "payloadHash": "0x" + "35" * 32,
+        "configuredState": "open",
+        "state": "open",
+        "updatedAt": 1_999_999_000,
+    }
+
+    class GateStore:
+        def gates(self, actual_ceremony_id):
+            assert actual_ceremony_id == ceremony_id
+            return {"ceremonyBroadcast": gate}
+
+    settings = Settings(
+        runtime_environment="test",
+        network="testnet11",
+        alpha_writes_enabled=True,
+        ceremony_mode_enabled=True,
+        genesis_db_path=str(tmp_path / "unused-genesis.db"),
+        genesis_output_dir=str(tmp_path / "unused-ceremonies"),
+    )
+
+    authorization = launch_control_module._gate_open(
+        settings,
+        GateStore(),  # type: ignore[arg-type]
+        ceremony_id,
+        "ceremonyBroadcast",
+    )
+
+    assert authorization == {
+        "gate": "ceremonyBroadcast",
+        "payloadHash": gate["payloadHash"],
+        "opensAt": gate["opensAt"],
+        "closesAt": gate["closesAt"],
+        "configuredState": "open",
+        "state": "open",
+        "approved": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_guided_broadcast_forwards_the_application_request(
+    tmp_path, monkeypatch
+) -> None:
+    _, store, settings = _client(tmp_path)
+    ceremony_id = "0x" + "ab" * 32
+    request = object()
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=1,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=2_000_000_000,
+    )
+    observed: dict[str, object] = {}
+    gate_authorization = {
+        "gate": "ceremonyBroadcast",
+        "payloadHash": "0x" + "34" * 32,
+        "opensAt": 1_999_999_000,
+        "closesAt": 2_000_001_000,
+        "configuredState": "open",
+        "state": "open",
+        "approved": True,
+    }
+
+    def fake_gate_open(actual_settings, actual_store, actual_ceremony_id, gate_name):
+        assert actual_settings is settings
+        assert actual_store is store
+        assert actual_ceremony_id == ceremony_id
+        assert gate_name == "ceremonyBroadcast"
+        return gate_authorization
+
+    monkeypatch.setattr(
+        store,
+        "get",
+        lambda actual_ceremony_id: {
+            "ceremony_id": actual_ceremony_id,
+            "state": "plan_approved",
+            "broadcast": None,
+        },
+    )
+
+    async def fake_broadcast_ceremony(
+        actual_ceremony_id,
+        actual_request,
+        actual_settings,
+        actual_store,
+        *,
+        gate_authorization: dict[str, object] | None,
+    ):
+        observed.update(
+            ceremony_id=actual_ceremony_id,
+            request=actual_request,
+            settings=actual_settings,
+            store=actual_store,
+            gate_authorization=gate_authorization,
+        )
+        return {"submitted": True}
+
+    monkeypatch.setattr(launch_control_module, "_gate_open", fake_gate_open)
+    monkeypatch.setattr(
+        launch_control_module,
+        "_broadcast_ceremony",
+        fake_broadcast_ceremony,
+    )
+
+    result = await launch_control_module.guided_broadcast(
+        request=request,
+        settings=settings,
+        store=store,
+        session=session,
+    )
+
+    assert result == {"submitted": True}
+    assert observed == {
+        "ceremony_id": ceremony_id,
+        "request": request,
+        "settings": settings,
+        "store": store,
+        "gate_authorization": gate_authorization,
+    }
+
+
+@pytest.mark.asyncio
+async def test_guided_broadcast_finalized_recovery_does_not_require_new_gate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _, store, settings = _client(tmp_path)
+    ceremony_id = "0x" + "ac" * 32
+    request = object()
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=1,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=2_000_000_000,
+    )
+    monkeypatch.setattr(
+        store,
+        "get",
+        lambda actual_ceremony_id: {
+            "ceremony_id": actual_ceremony_id,
+            "state": "broadcast",
+            "broadcast": {"reservationState": "FINALIZED"},
+        },
+    )
+    monkeypatch.setattr(
+        launch_control_module,
+        "_gate_open",
+        lambda *_args, **_kwargs: pytest.fail(
+            "FINALIZED evidence recovery must not require a new write gate"
+        ),
+    )
+
+    async def fake_broadcast_ceremony(
+        actual_ceremony_id,
+        actual_request,
+        actual_settings,
+        actual_store,
+        *,
+        gate_authorization,
+    ):
+        assert actual_ceremony_id == ceremony_id
+        assert actual_request is request
+        assert actual_settings is settings
+        assert actual_store is store
+        assert gate_authorization is None
+        return {"recovered": True}
+
+    monkeypatch.setattr(
+        launch_control_module,
+        "_broadcast_ceremony",
+        fake_broadcast_ceremony,
+    )
+
+    assert await launch_control_module.guided_broadcast(
+        request=request,
+        settings=settings,
+        store=store,
+        session=session,
+    ) == {"recovered": True}
+
+
+@pytest.mark.asyncio
+async def test_guided_broadcast_maps_expired_plan_to_gone(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _, store, settings = _client(tmp_path)
+    ceremony_id = "0x" + "af" * 32
+
+    def expired_get(_ceremony_id):
+        raise GenesisExpired("ceremony plan expired")
+
+    monkeypatch.setattr(
+        store,
+        "get",
+        expired_get,
+    )
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=1,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=2_000_000_000,
+    )
+
+    with pytest.raises(launch_control_module.HTTPException) as error:
+        await launch_control_module.guided_broadcast(
+            request=object(),
+            settings=settings,
+            store=store,
+            session=session,
+        )
+
+    assert error.value.status_code == 410
+    assert "expired" in str(error.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_progress_retry_reports_locked_ceremony_complete(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _, store, settings = _client(tmp_path)
+    ceremony_id = "0x" + "ae" * 32
+    record = {"ceremony_id": ceremony_id, "state": "locked"}
+    monkeypatch.setattr(store, "get", lambda _ceremony_id: record)
+    monkeypatch.setattr(
+        launch_control_module,
+        "_public_ceremony",
+        lambda actual_record, actual_store: {
+            "ceremonyId": actual_record["ceremony_id"],
+            "state": actual_record["state"],
+        },
+    )
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=2,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=2_000_000_000,
+    )
+
+    result = await launch_control_module.progress_after_broadcast(
+        settings=settings,
+        store=store,
+        session=session,
+    )
+
+    assert result == {
+        "ceremony": {"ceremonyId": ceremony_id, "state": "locked"},
+        "waiting": False,
+        "complete": True,
+    }

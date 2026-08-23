@@ -11,11 +11,13 @@ def _read(relative: str) -> str:
 def test_genesis_runbook_pins_breaking_v2_contract() -> None:
     text = _read("GENESIS_README.md")
     for required in (
-        'schemaVersion: 2',
-        'protocolVersion: "solslot-v2"',
+        'schemaVersion: 4',
+        'sourceManifestVersion: 4',
+        'protocolVersion: "solslot-v2-rc23"',
         "SGT",
         "pool V3",
         "SmartDeed V2",
+        "protocol Statutes",
         "retired-coordinate denylist",
         "bootstrap_manifest_v2.json",
     ):
@@ -24,10 +26,13 @@ def test_genesis_runbook_pins_breaking_v2_contract() -> None:
 
 def test_genesis_runbook_locks_writes_and_minting() -> None:
     text = _read("GENESIS_README.md")
-    assert "SOLSLOT_ALPHA_WRITES_ENABLED=false" in text
+    assert "SOLSLOT_CEREMONY_MODE_ENABLED=true" in text
+    assert "SOLSLOT_ALPHA_WRITES_ENABLED=true" in text
     assert "SOLSLOT_MINTING_ENABLED=false" in text
     assert "Write `bootstrap_manifest_v2.json` last" in text
-    assert "failed ceremony is abandoned" in text.lower() or "partial or ambiguous push ends" in text
+    assert "only that exact preserved bundle" in text.lower()
+    assert "fresh owner-plus-one signed" in text.lower()
+    assert "never build or submit a replacement" in text.lower()
 
 
 def test_genesis_runbook_requires_complete_credential_smoke() -> None:
@@ -36,6 +41,7 @@ def test_genesis_runbook_requires_complete_credential_smoke() -> None:
     assert "fresh BLS vault" in text
     assert "zkPassport proof" in text
     assert "Coinset confirmation" in text
+    assert "synced local primary Chia node" in text
     assert "Attempt replay" in text
 
 

@@ -28,6 +28,7 @@ import base64
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -39,7 +40,7 @@ from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 
 from .admin import router as admin_router
-from .genesis import router as genesis_router
+from .genesis import get_genesis_store, router as genesis_router
 from .launch_control import router as launch_control_router
 from .admin_auth import (
     router as admin_auth_router,
@@ -116,7 +117,7 @@ from .evm_auth import (
     registration_typed_data,
     VAULT_SPEND_TYPEHASH_STRING,
 )
-from .faucet import Faucet
+from .faucet import Faucet, FaucetSelectionRestricted
 from .state import VaultRecord, VaultRegistry, get_registry
 from .server_hardening import (
     ServerHardeningMiddleware,
@@ -224,6 +225,40 @@ _warm_chia_puzzle_templates()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
 
+def _load_genesis_store_for_runtime(settings: Settings) -> Any | None:
+    """Open configured genesis state whenever it can affect faucet safety."""
+
+    database_path = settings.genesis_db_path
+    if (
+        database_path == ":memory:"
+        or settings.ceremony_mode_enabled
+        or settings.protocol_fee_funding_enabled
+        or Path(database_path).exists()
+    ):
+        return get_genesis_store(settings)
+    return None
+
+
+def _enforce_genesis_faucet_isolation(
+    *,
+    settings: Settings,
+    faucet: Faucet | None,
+    genesis_store: Any | None,
+) -> set[str]:
+    """Keep every non-genesis spender away from an unresolved exact bundle."""
+
+    pending_fee_coin_ids = (
+        genesis_store.pending_exact_fee_coin_ids()
+        if genesis_store is not None
+        else set()
+    )
+    if faucet is not None and (
+        settings.ceremony_mode_enabled or pending_fee_coin_ids
+    ):
+        faucet.restrict_coin_selection_to("genesis")
+    return pending_fee_coin_ids
+
+
 # ─── App lifecycle ──────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -233,6 +268,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     validate_server_hardening_at_startup(settings)
     preflight_challenge_storage(settings)
+    genesis_store = _load_genesis_store_for_runtime(settings)
 
     # POP-CANON-016: fail fast at boot if the admin desk is enabled but
     # SOLSLOT_ADMIN_JWT_SECRET is unset.  This complements the runtime
@@ -271,6 +307,21 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "Faucet not configured — vault registration endpoints will return 503. "
             "Set SOLSLOT_FAUCET_MASTER_SK_HEX, SOLSLOT_FAUCET_SEED_HEX, or SOLSLOT_FAUCET_MNEMONIC."
+        )
+
+    pending_genesis_fee_coin_ids = _enforce_genesis_faucet_isolation(
+        settings=settings,
+        faucet=app.state.faucet,
+        genesis_store=genesis_store,
+    )
+    genesis_faucet_exclusive = bool(
+        settings.ceremony_mode_enabled or pending_genesis_fee_coin_ids
+    )
+    if pending_genesis_fee_coin_ids and not settings.ceremony_mode_enabled:
+        logger.warning(
+            "Faucet remains genesis-exclusive because %d exact fee coin "
+            "reservation(s) require reconciliation.",
+            len(pending_genesis_fee_coin_ids),
         )
 
     if app.state.faucet is not None:
@@ -319,10 +370,17 @@ async def lifespan(app: FastAPI):
     if app.state.protocol_submitter is not None:
         from .stripe_delivery_store import get_stripe_delivery_store
 
+        if genesis_store is None:
+            raise RuntimeError(
+                "protocol fee funding started without durable genesis state"
+            )
         stripe_delivery_store = get_stripe_delivery_store(
             settings.stripe_delivery_db_path
         )
         presale_store = get_presale_store(settings)
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
+            genesis_store.pending_exact_fee_coin_ids
+        )
         app.state.protocol_submitter.add_fee_coin_reservation_source(
             stripe_delivery_store.pending_exact_fee_coin_ids
         )
@@ -413,7 +471,11 @@ async def lifespan(app: FastAPI):
     # task is owned by the FastAPI event loop and properly cancelled on
     # shutdown.
     app.state.faucet_worker = None
-    if app.state.faucet is not None and settings.faucet_consolidation_enabled:
+    if (
+        app.state.faucet is not None
+        and settings.faucet_consolidation_enabled
+        and not genesis_faucet_exclusive
+    ):
         from .faucet_worker import (
             FaucetConsolidationConfig,
             FaucetConsolidationWorker,
@@ -433,6 +495,10 @@ async def lifespan(app: FastAPI):
         )
         await worker.start()
         app.state.faucet_worker = worker
+    elif settings.faucet_consolidation_enabled and genesis_faucet_exclusive:
+        logger.warning(
+            "Faucet consolidation is suppressed while genesis owns the faucet."
+        )
 
     try:
         yield
@@ -465,6 +531,22 @@ app = FastAPI(
     lifespan=lifespan,
     **documentation_urls(_server_settings),
 )
+
+
+@app.exception_handler(FaucetSelectionRestricted)
+async def faucet_selection_restricted_handler(
+    _request: Request,
+    _exc: FaucetSelectionRestricted,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": (
+                "Faucet coin selection is temporarily reserved while the "
+                "genesis transaction is reconciled."
+            )
+        },
+    )
 
 
 # Localhost matching is available only in development/test. Staging and

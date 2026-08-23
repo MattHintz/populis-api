@@ -638,6 +638,29 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             raise RuntimeError(
                 "Ceremony mode must be same-origin and cannot configure CORS origins."
             )
+        incompatible_faucet_workers = [
+            name
+            for name, enabled in (
+                (
+                    "SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED",
+                    settings.stripe_delivery_worker_enabled,
+                ),
+                (
+                    "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED",
+                    settings.voucher_issuance_worker_enabled,
+                ),
+                (
+                    "SOLSLOT_FAUCET_CONSOLIDATION_ENABLED",
+                    settings.faucet_consolidation_enabled,
+                ),
+            )
+            if enabled
+        ]
+        if incompatible_faucet_workers:
+            raise RuntimeError(
+                "Ceremony mode requires exclusive faucet selection; disable "
+                + ", ".join(incompatible_faucet_workers)
+            )
     # Post-ceremony authority is validated cryptographically from the signed
     # RC23 V4 artifact by ``validate_admin_config_at_startup``. Keeping that check
     # out of this HTTP-posture validator avoids a second mutable coordinate

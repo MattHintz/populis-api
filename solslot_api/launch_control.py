@@ -47,12 +47,13 @@ from .genesis import (
     PlanRequest,
     SignaturePrepareRequest,
     SignatureRequest,
+    _broadcast_ceremony,
     _invitation_typed_data,
     _prepare_bundle,
+    _require_live_plan,
     _run_worker,
     _token_hash,
     accept_invitation,
-    broadcast,
     confirm,
     create_artifact,
     create_plan,
@@ -61,6 +62,7 @@ from .genesis import (
     get_genesis_store,
     prepare_artifact_signature,
     prepare_plan_signature,
+    renew_plan,
     sign_artifact,
     sign_plan,
 )
@@ -687,14 +689,27 @@ def _action_payload(
 
 def _gate_open(
     settings: Settings, store: GenesisStore, ceremony_id: str, gate_name: str
-) -> None:
+) -> dict[str, Any]:
     if not settings.alpha_writes_enabled:
         raise GenesisConflict("the server chain-write ceiling is closed")
     if gate_name == "ceremonyBroadcast" and not settings.ceremony_mode_enabled:
         raise GenesisConflict("the server ceremony ceiling is closed")
     gate = store.gates(ceremony_id).get(gate_name)
-    if not gate or gate["state"] != "open":
+    if (
+        not gate
+        or gate["configuredState"] != "open"
+        or gate["state"] != "open"
+    ):
         raise GenesisConflict(f"the signed {gate_name} window is closed")
+    return {
+        "gate": gate_name,
+        "payloadHash": gate["payloadHash"],
+        "opensAt": gate["opensAt"],
+        "closesAt": gate["closesAt"],
+        "configuredState": gate["configuredState"],
+        "state": gate["state"],
+        "approved": True,
+    }
 
 
 def _funding_ceiling_open(settings: Settings) -> None:
@@ -949,6 +964,34 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             "body": unfinished["impact"],
             "assignedRole": unfinished["assignedRole"],
             "action": unfinished.get("action"),
+        }
+    if (
+        state in {"planned", "plan_approved"}
+        and int(record.get("plan_expires_at") or 0) <= int(time.time())
+    ):
+        return {
+            "title": "Renew the expired launch plan",
+            "body": (
+                "The exact reviewed inputs will be rebuilt with a new expiry. "
+                "Every prior plan signature will be cleared."
+            ),
+            "assignedRole": "owner",
+            "action": "renewPlan",
+        }
+    broadcast = record.get("broadcast")
+    if (
+        state == "broadcast"
+        and isinstance(broadcast, Mapping)
+        and broadcast.get("reservationState") == "RESERVED"
+    ):
+        return {
+            "title": "Reconcile the exact reserved launch bundle",
+            "body": (
+                "Open a fresh owner-approved broadcast window, then replay only "
+                "the already reserved bundle. A replacement genesis is forbidden."
+            ),
+            "assignedRole": "owner",
+            "action": "broadcast",
         }
     mapping = {
         "roster_open": ("Confirm the administrator team", "technical-coadmin", "freezeRoster"),
@@ -1553,7 +1596,8 @@ async def claim_owner_link(
             "sessionExpiresAt": session_expiry,
         }
     except GenesisStoreError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        code = 410 if isinstance(exc, GenesisExpired) else 409
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
 
 
 @router.post("/invitations/prepare")
@@ -2022,6 +2066,7 @@ async def prepare_fixed_funding(
             records,
             min_amount=GENESIS_DEFAULT_TOTAL_FUNDING_AMOUNT,
             max_amount=settings.faucet_max_spend_mojos,
+            purpose="genesis",
         )
         if source is None:
             raise GenesisConflict(
@@ -2275,7 +2320,7 @@ async def activate_gate(
         opens_at=gate["opensAt"],
         closes_at=gate["closesAt"],
         payload_hash=gate["payloadHash"],
-        state="open" if gate["opensAt"] <= int(time.time()) else "pending",
+        state="open",
     )
 
 
@@ -2348,7 +2393,11 @@ async def execute_fixed_funding(
             Program.to([0, delegated, Program.to(0)]),
         )
         signature = G2Element.from_bytes(
-            faucet.sign_delegated_spend(source, conditions_program)
+            faucet.sign_delegated_spend(
+                source,
+                conditions_program,
+                purpose="genesis",
+            )
         )
         bundle = SpendBundle([coin_spend], signature)
         bundle_id = "0x" + bytes(bundle.name()).hex()
@@ -2465,6 +2514,16 @@ async def guided_prepare_plan_signature(
     return prepared
 
 
+@router.post("/plan/renew")
+async def guided_renew_plan(
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[GenesisStore, Depends(get_genesis_store)],
+    session: Annotated[LaunchSession, Depends(require_launch_session)],
+) -> dict[str, Any]:
+    _require_owner(session)
+    return await renew_plan(session.ceremony_id, settings, store)
+
+
 @router.post("/plan/signature")
 async def guided_sign_plan(
     body: SignatureSubmission,
@@ -2487,22 +2546,23 @@ async def guided_preflight(
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_wallet_session(session)
-    record = store.get(session.ceremony_id)
-    readiness = await _readiness(request, settings, store, record)
-    failures = [
-        item
-        for item in readiness
-        if item["status"] != "Healthy" and item.get("blocksCeremony", True)
-    ]
-    if failures:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Final launch check has unfinished items.",
-                "findings": failures,
-            },
-        )
     try:
+        record = store.get(session.ceremony_id)
+        _require_live_plan(record)
+        readiness = await _readiness(request, settings, store, record)
+        failures = [
+            item
+            for item in readiness
+            if item["status"] != "Healthy" and item.get("blocksCeremony", True)
+        ]
+        if failures:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Final launch check has unfinished items.",
+                    "findings": failures,
+                },
+            )
         plan, bundle, approval, validator_health = await _prepare_bundle(
             settings, record
         )
@@ -2519,27 +2579,51 @@ async def guided_preflight(
                 "network": "Testnet11",
                 "financialEffect": "Consumes only the nine fixed testnet funding coins.",
                 "customerImpact": "Creates the testnet protocol used by alpha vaults and SmartDeeds.",
-                "reversibility": "The chain transaction cannot be reversed. Unknown submission results abandon the launch.",
+                "reversibility": "The chain transaction cannot be reversed. An unknown result locks the exact bundle for reconciliation and forbids a replacement genesis.",
                 "requiredApprovers": "Already approved by the owner and one coadministrator",
                 "expectedResult": "The protocol confirms, creates a signed archive, and locks bootstrap.",
             },
         }
     except GenesisStoreError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        code = 410 if isinstance(exc, GenesisExpired) else 409
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
 
 
 @router.post("/broadcast")
 async def guided_broadcast(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_owner(session)
     try:
-        _gate_open(settings, store, session.ceremony_id, "ceremonyBroadcast")
-        return await broadcast(session.ceremony_id, settings, store)
+        record = store.get(session.ceremony_id)
+        broadcast_receipt = record.get("broadcast")
+        finalized_recovery = (
+            isinstance(broadcast_receipt, Mapping)
+            and broadcast_receipt.get("reservationState") == "FINALIZED"
+        )
+        gate_authorization = (
+            None
+            if finalized_recovery
+            else _gate_open(
+                settings,
+                store,
+                session.ceremony_id,
+                "ceremonyBroadcast",
+            )
+        )
+        return await _broadcast_ceremony(
+            session.ceremony_id,
+            request,
+            settings,
+            store,
+            gate_authorization=gate_authorization,
+        )
     except GenesisStoreError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        code = 410 if isinstance(exc, GenesisExpired) else 409
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
 
 
 @router.post("/progress")
@@ -2557,6 +2641,12 @@ async def progress_after_broadcast(
     if record["state"] == "artifact_signed":
         _require_owner(session)
         return await finalize(session.ceremony_id, settings, store)
+    if record["state"] == "locked":
+        return {
+            "ceremony": _public_ceremony(record, store),
+            "waiting": False,
+            "complete": True,
+        }
     return {"ceremony": _public_ceremony(record, store), "waiting": True}
 
 

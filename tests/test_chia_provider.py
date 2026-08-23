@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from chia_rs import G2Element, SpendBundle
 
 from solslot_api.chia_provider import (
     ChiaProvider,
@@ -162,12 +163,16 @@ def spend_bundle() -> dict[str, Any]:
                     "puzzle_hash": "0x" + "22" * 32,
                     "amount": 530,
                 },
-                "puzzle_reveal": "80",
-                "solution": "80",
+                "puzzle_reveal": "0x80",
+                "solution": "0x80",
             }
         ],
-        "aggregated_signature": "0x" + "00" * 96,
+        "aggregated_signature": "0x" + bytes(G2Element()).hex(),
     }
+
+
+def spend_bundle_id(bundle: dict[str, Any]) -> str:
+    return "0x" + SpendBundle.from_json_dict(bundle).name().hex()
 
 
 @pytest.mark.asyncio
@@ -257,11 +262,49 @@ async def test_required_primary_rejects_missing_configuration() -> None:
 
 
 @pytest.mark.asyncio
+async def test_genesis_primary_proof_never_falls_back_after_read_failure() -> None:
+    primary = FakeRpc(read_result={"coin": "primary"})
+    fallback = FakeRpc(read_result={"coin": "fallback"})
+    provider = ChiaProvider(primary, fallback, config())
+    await provider.start()
+    primary.read_error = TimeoutError("local proof failed")
+
+    with pytest.raises(ChiaProviderError, match="genesis coin-record proof"):
+        await provider.get_coin_record_by_name_primary("0x" + "33" * 32)
+
+    assert not any(
+        call[0] == "get_coin_record_by_name" for call in fallback.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_genesis_spend_and_peak_proofs_use_synced_primary_only() -> None:
+    primary = FakeRpc(read_result={"proof": "primary"})
+    fallback = FakeRpc(read_result={"proof": "fallback"})
+    provider = ChiaProvider(primary, fallback, config())
+    await provider.start()
+
+    spend = await provider.get_puzzle_and_solution_primary(
+        "0x" + "44" * 32, 123
+    )
+    peak = await provider.get_blockchain_state_primary()
+
+    assert spend == {"proof": "primary"}
+    assert peak["blockchain_state"]["peak"]["height"] == 123
+    assert not any(
+        call[0] in {"get_puzzle_and_solution", "get_blockchain_state"}
+        for call in fallback.calls
+    )
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_push_checks_each_input_before_fallback_submission() -> None:
     bundle = spend_bundle()
     [coin_id] = _input_coin_ids(bundle)
     primary = FakeRpc(push_error=TimeoutError("connection reset"))
-    fallback = FakeRpc(mempool={coin_id: [{"spend_bundle_name": "observed"}]})
+    fallback = FakeRpc(
+        mempool={coin_id: [{"spend_bundle_name": spend_bundle_id(bundle)}]}
+    )
     provider = ChiaProvider(primary, fallback, config())
     await provider.start()
 
@@ -292,10 +335,28 @@ async def test_ambiguous_push_submits_exactly_once_to_fallback_when_unobserved()
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_push_ignores_different_bundle_using_same_coin() -> None:
+    bundle = spend_bundle()
+    [coin_id] = _input_coin_ids(bundle)
+    primary = FakeRpc(push_error=TimeoutError("connection reset"))
+    fallback = FakeRpc(
+        mempool={coin_id: [{"spend_bundle_name": "0x" + "99" * 32}]}
+    )
+    provider = ChiaProvider(primary, fallback, config())
+    await provider.start()
+
+    result = await provider.push_tx(bundle)
+
+    assert result["success"] is True
+    assert sum(call[0] == "push_tx" for call in fallback.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_protocol_push_requires_primary_mempool_observation() -> None:
     bundle = spend_bundle()
     [coin_id] = _input_coin_ids(bundle)
-    primary = FakeRpc(mempool={coin_id: [{"spend_bundle_name": "observed"}]})
+    bundle_id = spend_bundle_id(bundle)
+    primary = FakeRpc(mempool={coin_id: [{"spend_bundle_name": bundle_id}]})
     fallback = FakeRpc()
     provider = ChiaProvider(primary, fallback, config())
     await provider.start()
@@ -303,6 +364,7 @@ async def test_protocol_push_requires_primary_mempool_observation() -> None:
     result = await provider.push_tx_confirmed_in_primary_mempool(
         bundle,
         required_coin_id=coin_id,
+        required_spend_bundle_id=bundle_id,
         timeout_seconds=1,
         poll_seconds=0.01,
     )
@@ -311,6 +373,23 @@ async def test_protocol_push_requires_primary_mempool_observation() -> None:
     assert result["provider"] == "local-full-node"
     assert any(call[0] == "push_tx" for call in primary.calls)
     assert not any(call[0] == "push_tx" for call in fallback.calls)
+
+
+@pytest.mark.asyncio
+async def test_protocol_push_rejects_wrong_required_bundle_id() -> None:
+    bundle = spend_bundle()
+    [coin_id] = _input_coin_ids(bundle)
+    provider = ChiaProvider(FakeRpc(), FakeRpc(), config())
+    await provider.start()
+
+    with pytest.raises(ChiaProviderError, match="does not match"):
+        await provider.push_tx_confirmed_in_primary_mempool(
+            bundle,
+            required_coin_id=coin_id,
+            required_spend_bundle_id="0x" + "99" * 32,
+            timeout_seconds=0,
+            poll_seconds=0.01,
+        )
 
 
 @pytest.mark.asyncio
@@ -339,6 +418,7 @@ async def test_protocol_push_rejection_or_missing_mempool_evidence_fails_closed(
         await rejected.push_tx_confirmed_in_primary_mempool(
             bundle,
             required_coin_id=coin_id,
+            required_spend_bundle_id=spend_bundle_id(bundle),
             timeout_seconds=0,
             poll_seconds=0.01,
         )
@@ -349,6 +429,7 @@ async def test_protocol_push_rejection_or_missing_mempool_evidence_fails_closed(
         await absent.push_tx_confirmed_in_primary_mempool(
             bundle,
             required_coin_id=coin_id,
+            required_spend_bundle_id=spend_bundle_id(bundle),
             timeout_seconds=0,
             poll_seconds=0.01,
         )

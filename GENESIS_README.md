@@ -18,8 +18,14 @@ Do not begin until:
 - the credential carryover record is complete, the provider credential found
   in public history is revoked and replaced, signer 1/2 and private-network
   material are generated, and the one-time ceremony token is ready;
-- `SOLSLOT_ALPHA_WRITES_ENABLED=false` and
-  `SOLSLOT_MINTING_ENABLED=false` are confirmed publicly.
+- `SOLSLOT_MINTING_ENABLED=false` is confirmed publicly. Keep ordinary Alpha
+  customer writes disabled before the ceremony. The isolated ceremony process
+  must then start with `SOLSLOT_CEREMONY_MODE_ENABLED=true` and
+  `SOLSLOT_ALPHA_WRITES_ENABLED=true`; startup rejects any other combination.
+  This temporary server ceiling does not authorize a push: the fresh signed
+  `ceremonyBroadcast` gate and exclusive genesis faucet purpose remain
+  mandatory. Stop the ceremony process after finalization before changing the
+  normal customer-write posture.
 
 ## Fresh State
 
@@ -27,6 +33,7 @@ Create a new private ceremony directory with mode `0700` and a new shared
 runtime state directory. The following files must not exist before the run:
 
 - `deployment_manifest_v2.json`
+- `public_artifact_v4.json`
 - `bootstrap_manifest_v2.json`
 - `bootstrap_recovery_anchor_v2.json`
 - `portal_runtime_config_v2.json`
@@ -44,13 +51,18 @@ Never rename an older file into one of these paths.
    contracts. Record chain ID, addresses, bytecode hashes, and transactions.
 3. Derive the V2 bridge policy from the new validator set and emitter.
 4. Run the Chia deployment dry-run using newly funded ceremony coins.
-5. Review every derived SGT, pool V3, DID, governance, NAV registry, protocol
-   config, admin authority, and vault-version-registry coordinate.
-6. Verify pool V3 commits the governance singleton struct, NAV trust roots,
-   treasury destinations, and deed commitment parameters.
-7. Push the Chia ceremony once. A partial or ambiguous push ends the ceremony;
-   do not reuse its coins or coordinates.
-8. Confirm every singleton and generated bridge-pool coin on Coinset.
+5. Review every derived SGT, pool V3, DID, governance, protocol Statutes,
+   protocol config, admin authority, and vault-version-registry coordinate.
+6. Verify pool V3 commits the governance singleton struct, Statutes-bound NAV
+   parameters, treasury destinations, and deed commitment parameters.
+7. Persist the exact fee-funded Chia spend bundle before pushing it. A partial
+   or ambiguous push preserves that durable bundle and its reserved fee coin
+   for reconciliation. After a fresh owner-plus-one signed
+   `ceremonyBroadcast` gate opens, only that exact preserved bundle may be
+   replayed; never build or submit a replacement bundle.
+8. Confirm every exact reserved input spend, singleton, and generated
+   bridge-pool coin through the synced local primary Chia node. Coinset is not
+   accepted as genesis confirmation authority.
 9. Bind the first administrator through the admin-authority flow and generate
    `admin_records_v2.json` from the confirmed state.
 10. Finalize public artifacts. Write `bootstrap_manifest_v2.json` last so its
@@ -64,9 +76,9 @@ Never rename an older file into one of these paths.
 
 The signed public bundle must include:
 
-- `schemaVersion: 2`
-- `sourceManifestVersion: 3`
-- `protocolVersion: "solslot-v2"`
+- `schemaVersion: 4`
+- `sourceManifestVersion: 4`
+- `protocolVersion: "solslot-v2-rc23"`
 - exact protocol, EVM, Omnichain, API, legacy Stripe adapter, Key of Solomon,
   Samuel, customer-web, and admin-portal commit SHAs
 - build timestamp and artifact hash
@@ -104,5 +116,6 @@ Before enabling minting:
    then exercise one offer, pool/deposit, and redemption path.
 8. Run ceremony preflight without report-only mode and archive its clean exit.
 
-Only then may an authorized operator set both write gates true and mint the
-first real testnet SmartDeed through the complete admin and committee path.
+Only then may an authorized operator exit ceremony mode, apply the separately
+approved customer-write and minting release gates, and mint the first real
+testnet SmartDeed through the complete admin and committee path.
