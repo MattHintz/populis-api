@@ -58,7 +58,7 @@ from solslot_puzzles.vault_v2_driver import (
 )
 
 from .admin_auth import AdminClaims, require_admin_jwt
-from .chia_provider import ChiaProviderError
+from .chia_provider import ChiaProviderError, _mempool_item_matches_bundle
 from .collection_store import CollectionStore, get_collection_store
 from .config import Settings, get_settings
 from .credential_auth import require_alpha_writes, verify_vault_session
@@ -299,7 +299,12 @@ async def _recover_funding_submission(
     transaction_id = _hex32(bundle.name())
     pending = False
     for coin_id in refreshed.input_coin_ids:
-        if await request.app.state.coinset.get_mempool_items_by_coin_name(coin_id):
+        items = await request.app.state.coinset.get_mempool_items_by_coin_name(
+            coin_id
+        )
+        if any(
+            _mempool_item_matches_bundle(item, transaction_id) for item in items
+        ):
             pending = True
             break
     if not pending:
@@ -315,6 +320,7 @@ async def _recover_funding_submission(
         mempool = await request.app.state.coinset.push_tx_confirmed_in_primary_mempool(
             bundle.to_json_dict(),
             required_coin_id=refreshed.input_coin_ids[0],
+            required_spend_bundle_id=transaction_id,
             timeout_seconds=submitter.policy.mempool_timeout_seconds,
             poll_seconds=submitter.policy.mempool_poll_seconds,
         )
@@ -589,6 +595,7 @@ async def submit_redemption_funding(
             return await request.app.state.coinset.push_tx_confirmed_in_primary_mempool(
                 prepared.bundle.to_json_dict(),
                 required_coin_id=prepared.fee_coin_id,
+                required_spend_bundle_id=prepared.spend_bundle_id,
                 timeout_seconds=submitter.policy.mempool_timeout_seconds,
                 poll_seconds=submitter.policy.mempool_poll_seconds,
             )

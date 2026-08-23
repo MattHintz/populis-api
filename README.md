@@ -83,11 +83,13 @@ share allocation, or delivery address.
   `SOLSLOT_STRIPE_SETTLEMENT_ENABLED` and
   `SOLSLOT_STRIPE_DELIVERY_WORKER_ENABLED`. Settlement requires independent
   provider verification through `SOLSLOT_STRIPE_RESTRICTED_KEY_FILE`. Install
-  a distinct Account/Event/PaymentIntent read-only key for the coordinator as
-  a non-symlink file inaccessible to group and other users; never reuse a
-  validator key or the Telonium fulfillment secret. The guided rehearsal
-  refuses to arm without this file. The worker also requires protocol fee
-  funding, mint writes, and a signed `purchases` operation window; a
+  a distinct Account/Event/PaymentIntent/Charges read-only key for the
+  coordinator as a non-symlink file inaccessible to group and other users;
+  Charges read access is required because the service may request
+  `GET /v1/charges/{id}`. Never reuse a validator key or the Telonium
+  fulfillment secret. The guided rehearsal refuses to arm without this file.
+  The worker also requires protocol fee funding, mint writes, and a signed
+  `purchases` operation window; a
   partial configuration fails closed. Store its SQLite-WAL ledger outside the
   release directory with `SOLSLOT_STRIPE_DELIVERY_DB_PATH`. Interval and lease
   settings are bounded by `SOLSLOT_STRIPE_DELIVERY_INTERVAL_SECONDS` and

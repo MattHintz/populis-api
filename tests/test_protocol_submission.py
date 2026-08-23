@@ -11,7 +11,7 @@ from chia_rs import G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
-from solslot_api.faucet import Faucet
+from solslot_api.faucet import Faucet, FaucetSelectionRestricted
 from solslot_api.config import Settings, validate_server_hardening_at_startup
 from solslot_api.protocol_submission import (
     PreparedProtocolBundle,
@@ -62,6 +62,7 @@ class FakeProvider:
         self.pending = pending
         self.estimates: list[dict[str, Any]] = []
         self.submitted: dict[str, Any] | None = None
+        self.required_spend_bundle_id: str | None = None
 
     async def get_fee_estimate(
         self,
@@ -90,10 +91,15 @@ class FakeProvider:
         spend_bundle_json: dict[str, Any],
         *,
         required_coin_id: str,
+        required_spend_bundle_id: str,
         timeout_seconds: float,
         poll_seconds: float,
     ) -> dict[str, Any]:
         self.submitted = spend_bundle_json
+        self.required_spend_bundle_id = required_spend_bundle_id
+        assert required_spend_bundle_id == "0x" + SpendBundle.from_json_dict(
+            spend_bundle_json
+        ).name().hex()
         return {
             "provider": "local-full-node",
             "observed_at": "2026-07-27T12:00:00+00:00",
@@ -123,6 +129,31 @@ def submitter(
     )
 
 
+def test_ceremony_faucet_exclusivity_blocks_every_other_selection_purpose() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    coin = Coin(b32(46), faucet.address_puzzle_hash, uint64(100))
+    records = [coin_record(coin)]
+    faucet.restrict_coin_selection_to("genesis")
+
+    with pytest.raises(RuntimeError, match="reserved for genesis"):
+        faucet.select_coin(records, 1)
+    with pytest.raises(RuntimeError, match="reserved for genesis"):
+        faucet.select_coin(records, 1, purpose="vault-launch")
+
+    selected = faucet.select_coin(records, 1, purpose="genesis")
+    assert selected is not None
+    assert selected.name() == coin.name()
+    with pytest.raises(FaucetSelectionRestricted, match="reserved for genesis"):
+        faucet.sign_delegated_spend(coin, Program.to([]))
+    assert len(
+        faucet.sign_delegated_spend(
+            coin,
+            Program.to([]),
+            purpose="genesis",
+        )
+    ) == 96
+
+
 @pytest.mark.asyncio
 async def test_medium_fee_is_added_from_till_without_changing_protocol_outputs() -> None:
     faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
@@ -149,6 +180,92 @@ async def test_medium_fee_is_added_from_till_without_changing_protocol_outputs()
     assert len(fee_additions) == 1
     assert fee_additions[0].puzzle_hash == faucet.address_puzzle_hash
     assert int(fee_additions[0].amount) == 93
+
+
+@pytest.mark.asyncio
+async def test_before_push_receives_exact_prepared_bundle_before_provider_push() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(42), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    observed: list[PreparedProtocolBundle] = []
+
+    async def before_push(prepared: PreparedProtocolBundle) -> None:
+        assert provider.submitted is None
+        assert prepared.spend_bundle_id == "0x" + prepared.bundle.name().hex()
+        assert prepared.to_json()["spendBundle"] == prepared.bundle.to_json_dict()
+        observed.append(prepared)
+
+    receipt = await submitter(provider, faucet).submit(
+        protocol_bundle().to_json_dict(),
+        before_push=before_push,
+    )
+
+    assert len(observed) == 1
+    assert provider.submitted == observed[0].bundle.to_json_dict()
+    assert receipt["spendBundleId"] == observed[0].spend_bundle_id
+
+
+@pytest.mark.asyncio
+async def test_sync_before_push_rejection_prevents_provider_push() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(43), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    observed_ids: list[str] = []
+
+    def before_push(prepared: PreparedProtocolBundle) -> None:
+        observed_ids.append(prepared.spend_bundle_id)
+        raise RuntimeError("durable reservation rejected")
+
+    with pytest.raises(RuntimeError, match="durable reservation rejected"):
+        await submitter(provider, faucet).submit(
+            protocol_bundle().to_json_dict(),
+            before_push=before_push,
+        )
+
+    assert len(observed_ids) == 1
+    assert provider.submitted is None
+
+
+@pytest.mark.asyncio
+async def test_reserved_replay_revalidates_inside_lock_and_pushes_exact_bundle() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(44), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    service = submitter(provider, faucet)
+    reservation = await service.submit(protocol_bundle().to_json_dict())
+    provider.submitted = None
+    callback_observations: list[bool] = []
+
+    def before_push() -> None:
+        callback_observations.append(service._lock.locked())
+        assert provider.submitted is None
+
+    receipt = await service.reconcile_reserved(
+        reservation,
+        before_push=before_push,
+    )
+
+    assert callback_observations == [True]
+    assert receipt["status"] == "MEMPOOL_RECONCILED"
+    assert receipt["spendBundleId"] == reservation["spendBundleId"]
+    assert provider.required_spend_bundle_id == reservation["spendBundleId"]
+    assert provider.submitted == reservation["spendBundle"]
+
+
+@pytest.mark.asyncio
+async def test_reserved_replay_rejects_changed_bundle_id_before_push() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    fee_coin = Coin(b32(45), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=fee_coin)
+    service = submitter(provider, faucet)
+    reservation = await service.submit(protocol_bundle().to_json_dict())
+    provider.submitted = None
+    changed = {**reservation, "spendBundleId": "0x" + "99" * 32}
+
+    with pytest.raises(ProtocolSubmissionError, match="changed its bundle id"):
+        await service.reconcile_reserved(changed)
+
+    assert provider.submitted is None
 
 
 @pytest.mark.asyncio

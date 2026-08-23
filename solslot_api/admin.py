@@ -366,6 +366,8 @@ def _build_single_coin_create_bundle(
     from chia.types.coin_spend import make_spend
     from chia_rs import AugSchemeMPL, SpendBundle
 
+    faucet.require_spend_purpose("bridge-top-up")
+
     total_outputs = sum(int(amount) for _, amount in outputs)
     change = int(source_coin.amount) - total_outputs - fee
     if change < 0:

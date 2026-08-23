@@ -23,6 +23,7 @@ from .validator_quorum import (
 )
 from .validator_service import (
     ValidatorEvidenceError,
+    load_stripe_restricted_key,
     load_validator_artifact,
     load_validator_private_key,
     sign_validator_claim,
@@ -114,6 +115,8 @@ def create_validator_app(
     async def lifespan(application: FastAPI):
         signer_settings = current_settings()
         load_validator_private_key(signer_settings)
+        if signer_settings.stripe_settlement_enabled:
+            load_stripe_restricted_key(signer_settings)
         active_ledger = configured_ledger or ValidatorLedger(
             signer_settings.ledger_db_path
         )

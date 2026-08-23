@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
+import pytest
 from chia_rs import AugSchemeMPL
 from fastapi.testclient import TestClient
 
 from solslot_api.validator_app import create_validator_app
 from solslot_api.validator_ledger import ValidatorLedger
-from solslot_api.validator_service import ValidatorEvidenceError, load_validator_private_key
+from solslot_api.validator_service import (
+    ValidatorEvidenceError,
+    load_stripe_restricted_key,
+    load_validator_private_key,
+)
 from solslot_api.validator_settings import ValidatorSettings
 from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
 
@@ -46,6 +52,25 @@ def _settings(tmp_path) -> ValidatorSettings:
         evm_verifier_adapter_address="0x" + "22" * 20,
         evm_attestation_emitter_address="0x" + "33" * 20,
     )
+
+
+def _enable_stripe(
+    settings: ValidatorSettings,
+    key_file,
+) -> ValidatorSettings:
+    settings.stripe_settlement_enabled = True
+    settings.stripe_account_id = "acct_test_solslot"
+    settings.stripe_mode = "test"
+    settings.stripe_restricted_key_file = str(key_file)
+    return settings
+
+
+def _run_lifespan(app) -> None:
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            pass
+
+    asyncio.run(run())
 
 
 def test_private_signer_health_exposes_public_fingerprints_only(tmp_path) -> None:
@@ -146,3 +171,106 @@ def test_writable_systemd_credential_file_fails_closed(tmp_path, monkeypatch) ->
         assert "group/other" in str(exc)
     else:
         raise AssertionError("writable systemd credential was accepted")
+
+
+def test_ubuntu_systemd_stripe_credential_mount_is_accepted(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    credentials_directory = tmp_path / "credentials"
+    credentials_directory.mkdir(mode=0o750)
+    key_file = credentials_directory / "stripe-read-key"
+    key_value = "rk_test_" + "a" * 24
+    key_file.write_text(key_value, encoding="ascii")
+    key_file.chmod(0o440)
+    settings = _enable_stripe(_settings(tmp_path), key_file)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_directory))
+
+    assert load_stripe_restricted_key(settings) == key_value
+
+
+@pytest.mark.parametrize(
+    ("name", "file_mode", "directory_mode"),
+    (
+        ("unexpected-read-key", 0o440, 0o750),
+        ("stripe-read-key", 0o640, 0o750),
+        ("stripe-read-key", 0o440, 0o770),
+    ),
+)
+def test_unsafe_systemd_stripe_credentials_fail_closed(
+    tmp_path,
+    monkeypatch,
+    name: str,
+    file_mode: int,
+    directory_mode: int,
+) -> None:
+    credentials_directory = tmp_path / "credentials"
+    credentials_directory.mkdir(mode=directory_mode)
+    credentials_directory.chmod(directory_mode)
+    key_file = credentials_directory / name
+    key_file.write_text("rk_test_" + "a" * 24, encoding="ascii")
+    key_file.chmod(file_mode)
+    settings = _enable_stripe(_settings(tmp_path), key_file)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_directory))
+
+    with pytest.raises(ValidatorEvidenceError, match="group/other"):
+        load_stripe_restricted_key(settings)
+
+
+def test_group_readable_stripe_key_outside_credentials_fails_closed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    credentials_directory = tmp_path / "credentials"
+    credentials_directory.mkdir(mode=0o750)
+    key_file = tmp_path / "stripe-read-key"
+    key_file.write_text("rk_test_" + "a" * 24, encoding="ascii")
+    key_file.chmod(0o440)
+    settings = _enable_stripe(_settings(tmp_path), key_file)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials_directory))
+
+    with pytest.raises(ValidatorEvidenceError, match="group/other"):
+        load_stripe_restricted_key(settings)
+
+
+def test_startup_does_not_require_stripe_key_when_settlement_is_disabled(
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path)
+    settings.stripe_restricted_key_file = str(tmp_path / "missing-stripe-key")
+    ledger = ValidatorLedger(":memory:")
+    app = create_validator_app(settings=settings, ledger=ledger)
+    try:
+        _run_lifespan(app)
+    finally:
+        ledger.close()
+
+
+def test_startup_validates_enabled_stripe_key(tmp_path) -> None:
+    key_file = tmp_path / "stripe.read.key"
+    key_file.write_text("rk_live_" + "a" * 24, encoding="ascii")
+    key_file.chmod(0o600)
+    settings = _enable_stripe(_settings(tmp_path), key_file)
+    ledger = ValidatorLedger(":memory:")
+    app = create_validator_app(settings=settings, ledger=ledger)
+    try:
+        with pytest.raises(
+            ValidatorEvidenceError,
+            match="does not match the configured mode",
+        ):
+            _run_lifespan(app)
+    finally:
+        ledger.close()
+
+
+def test_startup_accepts_valid_enabled_stripe_key(tmp_path) -> None:
+    key_file = tmp_path / "stripe.read.key"
+    key_file.write_text("rk_test_" + "a" * 24, encoding="ascii")
+    key_file.chmod(0o600)
+    settings = _enable_stripe(_settings(tmp_path), key_file)
+    ledger = ValidatorLedger(":memory:")
+    app = create_validator_app(settings=settings, ledger=ledger)
+    try:
+        _run_lifespan(app)
+    finally:
+        ledger.close()

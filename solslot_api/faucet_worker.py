@@ -173,6 +173,7 @@ class FaucetConsolidationWorker:
         Raises only when network / signing errors occur — the caller
         (``_run_forever``) catches and logs.
         """
+        self.faucet.require_spend_purpose("faucet-consolidation")
         records = await self.coinset.get_coin_records_by_puzzle_hash(
             "0x" + self.faucet.address_puzzle_hash.hex(), include_spent=False
         )
@@ -220,6 +221,7 @@ class FaucetConsolidationWorker:
         Returns None if ``records`` is empty, has only one coin (nothing
         to consolidate), or the total minus fee is non-positive.
         """
+        self.faucet.require_spend_purpose("faucet-consolidation")
         if len(records) < 2:
             return None
 

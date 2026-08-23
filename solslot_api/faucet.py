@@ -33,6 +33,10 @@ from chia_rs.sized_bytes import bytes32
 logger = logging.getLogger(__name__)
 
 
+class FaucetSelectionRestricted(RuntimeError):
+    """Coin selection is intentionally unavailable to this caller."""
+
+
 # Cache the p2_delegated_or_hidden MOD as bytes at this module's import
 # time.  chia_rs's `LazyNode` (the SEXP backing every chia ``Program``)
 # is *not* thread-safe — the underlying PyO3 binding panics with
@@ -99,6 +103,27 @@ class Faucet:
         self.master_sk = master_sk
         self.agg_sig_me_data = AGG_SIG_ME_DATA[network]
         self.key = self._derive_wallet_key(0)
+        self._exclusive_selection_purpose: str | None = None
+
+    def restrict_coin_selection_to(self, purpose: str) -> None:
+        """Fail closed for unrelated faucet spenders during one-shot work."""
+
+        normalized = purpose.strip()
+        if not normalized:
+            raise ValueError("exclusive faucet selection purpose is required")
+        self._exclusive_selection_purpose = normalized
+
+    def require_spend_purpose(self, purpose: str | None) -> None:
+        """Enforce the one-shot purpose at the shared signing boundary."""
+
+        if (
+            self._exclusive_selection_purpose is not None
+            and purpose != self._exclusive_selection_purpose
+        ):
+            raise FaucetSelectionRestricted(
+                "faucet coin selection is reserved for "
+                + self._exclusive_selection_purpose
+            )
 
     @classmethod
     def from_seed_hex(cls, seed_hex: str, network: str) -> Faucet:
@@ -182,6 +207,7 @@ class Faucet:
         min_amount: int,
         *,
         max_amount: Optional[int] = None,
+        purpose: str | None = None,
     ) -> Optional[Coin]:
         """Pick the smallest coin that meets the launcher budget.
 
@@ -197,6 +223,7 @@ class Faucet:
                 ``chia.wallet.util.tx_config.CoinSelectionConfig``: the
                 operator's configured ceiling on per-spend faucet usage.
         """
+        self.require_spend_purpose(purpose)
         usable: list[Coin] = []
         for rec in candidate_coins:
             if rec.get("spent_block_index") not in (0, None):
@@ -220,7 +247,11 @@ class Faucet:
         return usable[0]
 
     def sign_delegated_spend(
-        self, coin: Coin, conditions: Program
+        self,
+        coin: Coin,
+        conditions: Program,
+        *,
+        purpose: str | None = None,
     ) -> bytes:
         """Sign the faucet's standard p2_delegated spend with AGG_SIG_ME.
 
@@ -228,6 +259,7 @@ class Faucet:
             sha256tree(delegated_puzzle) + coin.name() + AGG_SIG_ME_ADDITIONAL_DATA
         and the signer is the wallet secret key.
         """
+        self.require_spend_purpose(purpose)
         delegated_puzzle = Program.to((1, conditions))  # (q . conditions)
         message = (
             bytes(delegated_puzzle.get_tree_hash())

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar
 from urllib.parse import urlsplit
 
 from .coinset_client import CoinsetClient
@@ -211,6 +211,27 @@ class ChiaProvider:
                 f"fallback={fallback_error}"
             ) from fallback_error
 
+    async def _primary_read(
+        self,
+        operation: str,
+        invoke: Callable[[CoinsetClient], Awaitable[T]],
+    ) -> T:
+        """Read only from the synced local primary; never fall back."""
+
+        if self.primary is None or not await self._primary_available():
+            raise ChiaProviderError(
+                f"local Chia full node is required for {operation}"
+            )
+        try:
+            result = await invoke(self.primary)
+            self._last_primary_success_at = _utc_now()
+            return result
+        except Exception as exc:
+            await self._mark_primary_failure(operation, exc)
+            raise ChiaProviderError(
+                f"local Chia {operation} failed: {exc}"
+            ) from exc
+
     async def get_blockchain_state(self) -> dict[str, Any]:
         return await self._read(
             "get_blockchain_state", lambda client: client.get_blockchain_state()
@@ -226,6 +247,14 @@ class ChiaProvider:
     ) -> Optional[dict[str, Any]]:
         return await self._read(
             "get_coin_record_by_name",
+            lambda client: client.get_coin_record_by_name(coin_id),
+        )
+
+    async def get_coin_record_by_name_primary(
+        self, coin_id: str
+    ) -> Optional[dict[str, Any]]:
+        return await self._primary_read(
+            "genesis coin-record proof",
             lambda client: client.get_coin_record_by_name(coin_id),
         )
 
@@ -301,6 +330,20 @@ class ChiaProvider:
             lambda client: client.get_puzzle_and_solution(coin_id, height),
         )
 
+    async def get_puzzle_and_solution_primary(
+        self, coin_id: str, height: int
+    ) -> Optional[dict[str, Any]]:
+        return await self._primary_read(
+            "genesis coin-spend proof",
+            lambda client: client.get_puzzle_and_solution(coin_id, height),
+        )
+
+    async def get_blockchain_state_primary(self) -> dict[str, Any]:
+        return await self._primary_read(
+            "genesis peak proof",
+            lambda client: client.get_blockchain_state(),
+        )
+
     async def get_mempool_items_by_coin_name(
         self, coin_id: str
     ) -> list[dict[str, Any]]:
@@ -370,11 +413,29 @@ class ChiaProvider:
         spend_bundle_json: dict[str, Any],
         *,
         required_coin_id: str,
+        required_spend_bundle_id: str | None = None,
         timeout_seconds: float,
         poll_seconds: float,
     ) -> dict[str, Any]:
         """Push locally and require this full node to observe the fee input."""
         normalized_coin_id = _normalize_coin_id(required_coin_id)
+        try:
+            from chia_rs import SpendBundle
+
+            computed_bundle_id = "0x" + bytes(
+                SpendBundle.from_json_dict(spend_bundle_json).name()
+            ).hex()
+        except Exception as exc:
+            raise ChiaProviderError("protocol spend bundle is malformed") from exc
+        normalized_bundle_id = _normalize_coin_id(computed_bundle_id)
+        if (
+            required_spend_bundle_id is not None
+            and _normalize_coin_id(required_spend_bundle_id)
+            != normalized_bundle_id
+        ):
+            raise ChiaProviderError(
+                "required spend bundle id does not match the submitted bundle"
+            )
         if normalized_coin_id not in set(_input_coin_ids(spend_bundle_json)):
             raise ChiaProviderError(
                 "mempool confirmation coin is not an input to the spend bundle"
@@ -407,7 +468,12 @@ class ChiaProvider:
                 items = await self.primary.get_mempool_items_by_coin_name(
                     normalized_coin_id
                 )
-                if items:
+                exact_items = [
+                    item
+                    for item in items
+                    if _mempool_item_matches_bundle(item, normalized_bundle_id)
+                ]
+                if exact_items:
                     self._last_primary_success_at = _utc_now()
                     return {
                         "success": True,
@@ -416,6 +482,7 @@ class ChiaProvider:
                         "required_coin_id": normalized_coin_id,
                         "push_response": push_result,
                         "ambiguous_push": push_error is not None,
+                        "spend_bundle_id": normalized_bundle_id,
                         "observed_at": _utc_now(),
                     }
             except Exception as exc:
@@ -431,6 +498,14 @@ class ChiaProvider:
             await asyncio.sleep(poll_seconds)
 
     async def _spend_observed(self, spend_bundle_json: dict[str, Any]) -> bool:
+        try:
+            from chia_rs import SpendBundle
+
+            expected_bundle_id = "0x" + bytes(
+                SpendBundle.from_json_dict(spend_bundle_json).name()
+            ).hex()
+        except Exception:
+            return False
         coin_ids = _input_coin_ids(spend_bundle_json)
         if not coin_ids:
             return False
@@ -438,7 +513,11 @@ class ChiaProvider:
         for coin_id in coin_ids:
             for client in clients:
                 try:
-                    if await client.get_mempool_items_by_coin_name(coin_id):
+                    items = await client.get_mempool_items_by_coin_name(coin_id)
+                    if any(
+                        _mempool_item_matches_bundle(item, expected_bundle_id)
+                        for item in items
+                    ):
                         return True
                 except Exception:
                     continue
@@ -503,6 +582,31 @@ def _normalize_coin_id(value: str) -> str:
     except ValueError as exc:
         raise ChiaProviderError("coin id must be hexadecimal") from exc
     return "0x" + clean
+
+
+def _mempool_item_matches_bundle(item: Any, expected_bundle_id: str) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    try:
+        normalized_expected = _normalize_coin_id(expected_bundle_id)
+    except ChiaProviderError:
+        return False
+    for key in (
+        "spend_bundle_name",
+        "spendBundleName",
+        "spend_bundle_id",
+        "spendBundleId",
+        "name",
+    ):
+        value = item.get(key)
+        if not isinstance(value, str):
+            continue
+        try:
+            if _normalize_coin_id(value) == normalized_expected:
+                return True
+        except ChiaProviderError:
+            continue
+    return False
 
 
 def create_chia_provider(config: ChiaProviderConfig) -> ChiaProvider:

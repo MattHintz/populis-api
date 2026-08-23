@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
@@ -47,9 +48,13 @@ class PreparedProtocolBundle:
     fee_mojos: int
     fee_coin_id: str
 
+    @property
+    def spend_bundle_id(self) -> str:
+        return "0x" + self.bundle.name().hex()
+
     def to_json(self) -> dict[str, Any]:
         return {
-            "spendBundleId": "0x" + self.bundle.name().hex(),
+            "spendBundleId": self.spend_bundle_id,
             "feeMojos": str(self.fee_mojos),
             "feeCoinId": self.fee_coin_id,
             "spendBundle": self.bundle.to_json_dict(),
@@ -83,15 +88,31 @@ class ProtocolBundleSubmitter:
         if source not in self._fee_coin_reservation_sources:
             self._fee_coin_reservation_sources.append(source)
 
-    async def submit(self, protocol_bundle_json: dict[str, Any]) -> dict[str, Any]:
+    async def submit(
+        self,
+        protocol_bundle_json: dict[str, Any],
+        *,
+        before_push: Callable[
+            [PreparedProtocolBundle], Awaitable[None] | None
+        ]
+        | None = None,
+        selection_purpose: str | None = None,
+    ) -> dict[str, Any]:
         # Production keeps one worker for faucet-backed writes. Holding this
         # lock until mempool observation prevents reuse of an unconfirmed coin.
         async with self._lock:
-            prepared = await self._prepare_locked(protocol_bundle_json)
+            prepared = await self._prepare_locked(
+                protocol_bundle_json, selection_purpose=selection_purpose
+            )
+            if before_push is not None:
+                callback_result = before_push(prepared)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
             try:
                 mempool = await self.provider.push_tx_confirmed_in_primary_mempool(
                     prepared.bundle.to_json_dict(),
                     required_coin_id=prepared.fee_coin_id,
+                    required_spend_bundle_id=prepared.spend_bundle_id,
                     timeout_seconds=self.policy.mempool_timeout_seconds,
                     poll_seconds=self.policy.mempool_poll_seconds,
                 )
@@ -120,11 +141,15 @@ class ProtocolBundleSubmitter:
             [PreparedProtocolBundle],
             Awaitable[Mapping[str, Any] | None],
         ],
+        *,
+        selection_purpose: str | None = None,
     ) -> dict[str, Any]:
         """Fund, persist, and hand one exact bundle to its sole executor."""
 
         async with self._lock:
-            prepared = await self._prepare_locked(protocol_bundle_json)
+            prepared = await self._prepare_locked(
+                protocol_bundle_json, selection_purpose=selection_purpose
+            )
             try:
                 dispatch_result = await dispatcher(prepared)
             except ProtocolSubmissionError:
@@ -144,9 +169,75 @@ class ProtocolBundleSubmitter:
             "dispatchResult": dict(dispatch_result or {}),
         }
 
+    async def reconcile_reserved(
+        self,
+        reservation: Mapping[str, Any],
+        *,
+        before_push: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently replay one exact durable bundle after an unknown push."""
+
+        try:
+            bundle_json = reservation["spendBundle"]
+            bundle = SpendBundle.from_json_dict(bundle_json)
+            spend_bundle_id = "0x" + bytes(bundle.name()).hex()
+            expected_bundle_id = str(reservation["spendBundleId"])
+            fee_coin_id = str(reservation["feeCoinId"])
+            fee_mojos = int(str(reservation["feeMojos"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProtocolSubmissionError(
+                "durable protocol reservation is malformed"
+            ) from exc
+        if spend_bundle_id != expected_bundle_id:
+            raise ProtocolSubmissionError(
+                "durable protocol reservation changed its bundle id"
+            )
+        removal_ids = {"0x" + coin.name().hex() for coin in bundle.removals()}
+        if fee_coin_id not in removal_ids:
+            raise ProtocolSubmissionError(
+                "durable protocol reservation fee coin is not an input"
+            )
+        if fee_mojos < 0 or fee_mojos > self.policy.maximum_mojos:
+            raise ProtocolSubmissionError(
+                "durable protocol reservation fee is outside policy"
+            )
+        async with self._lock:
+            if before_push is not None:
+                callback_result = before_push()
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+            try:
+                mempool = await self.provider.push_tx_confirmed_in_primary_mempool(
+                    dict(bundle_json),
+                    required_coin_id=fee_coin_id,
+                    required_spend_bundle_id=spend_bundle_id,
+                    timeout_seconds=self.policy.mempool_timeout_seconds,
+                    poll_seconds=self.policy.mempool_poll_seconds,
+                )
+            except ChiaProviderError as exc:
+                raise ProtocolSubmissionError(
+                    str(exc), submission_attempted=True
+                ) from exc
+        return {
+            "schemaVersion": 1,
+            "status": "MEMPOOL_RECONCILED",
+            "network": self.faucet.network,
+            "spendBundleId": spend_bundle_id,
+            "feeMojos": str(fee_mojos),
+            "feeCoinId": fee_coin_id,
+            "spendBundle": dict(bundle_json),
+            "feeTargetSeconds": self.policy.target_seconds,
+            "feeTillPuzzleHash": self.faucet.address_hex,
+            "submissionProvider": mempool["provider"],
+            "mempoolObservedAt": mempool["observed_at"],
+            "ambiguousPushRecovered": True,
+        }
+
     async def _prepare_locked(
         self,
         protocol_bundle_json: dict[str, Any],
+        *,
+        selection_purpose: str | None = None,
     ) -> PreparedProtocolBundle:
         if not self.policy.enabled:
             raise ProtocolSubmissionError("protocol fee funding is disabled")
@@ -175,11 +266,13 @@ class ProtocolBundleSubmitter:
         fee_coin = await self._select_fee_coin(
             preliminary_fee,
             excluded_coin_ids=protocol_input_ids,
+            selection_purpose=selection_purpose,
         )
         final_bundle, fee = await self._converge_fee(
             protocol_bundle,
             fee_coin,
             preliminary_fee,
+            selection_purpose=selection_purpose,
         )
         return PreparedProtocolBundle(
             bundle=final_bundle,
@@ -226,6 +319,7 @@ class ProtocolBundleSubmitter:
         fee: int,
         *,
         excluded_coin_ids: set[bytes],
+        selection_purpose: str | None,
     ):
         try:
             records = await self.provider.get_coin_records_by_puzzle_hash(
@@ -243,7 +337,10 @@ class ProtocolBundleSubmitter:
                     [record],
                     min_amount=fee,
                     max_amount=self.policy.maximum_funding_coin_mojos,
+                    purpose=selection_purpose,
                 )
+            except RuntimeError as exc:
+                raise ProtocolSubmissionError(str(exc)) from exc
             except (KeyError, TypeError, ValueError):
                 continue
             if coin is None:
@@ -261,11 +358,15 @@ class ProtocolBundleSubmitter:
             if not pending:
                 available.append(record)
 
-        selected = self.faucet.select_coin(
-            available,
-            min_amount=fee,
-            max_amount=self.policy.maximum_funding_coin_mojos,
-        )
+        try:
+            selected = self.faucet.select_coin(
+                available,
+                min_amount=fee,
+                max_amount=self.policy.maximum_funding_coin_mojos,
+                purpose=selection_purpose,
+            )
+        except RuntimeError as exc:
+            raise ProtocolSubmissionError(str(exc)) from exc
         if selected is None:
             raise ProtocolSubmissionError(
                 "protocol fee till has no eligible confirmed, unreserved coin"
@@ -303,6 +404,8 @@ class ProtocolBundleSubmitter:
         protocol_bundle: SpendBundle,
         fee_coin,
         preliminary_fee: int,
+        *,
+        selection_purpose: str | None,
     ) -> tuple[SpendBundle, int]:
         fee = preliminary_fee
         for _ in range(3):
@@ -311,7 +414,14 @@ class ProtocolBundleSubmitter:
                     "selected protocol fee coin is smaller than the medium fee"
                 )
             aggregate = SpendBundle.aggregate(
-                [protocol_bundle, self._fee_bundle(fee_coin, fee)]
+                [
+                    protocol_bundle,
+                    self._fee_bundle(
+                        fee_coin,
+                        fee,
+                        selection_purpose=selection_purpose,
+                    ),
+                ]
             )
             estimated = await self._estimate_fee(aggregate)
             next_fee = max(fee, estimated)
@@ -320,7 +430,13 @@ class ProtocolBundleSubmitter:
             fee = next_fee
         raise ProtocolSubmissionError("medium fee estimate did not converge")
 
-    def _fee_bundle(self, coin, fee: int) -> SpendBundle:
+    def _fee_bundle(
+        self,
+        coin,
+        fee: int,
+        *,
+        selection_purpose: str | None,
+    ) -> SpendBundle:
         conditions = [Program.to([RESERVE_FEE, fee])]
         change = int(coin.amount) - fee
         if change:
@@ -335,7 +451,11 @@ class ProtocolBundleSubmitter:
         solution = Program.to([0, delegated, Program.to(0)])
         spend = make_spend(coin, self.faucet.key.puzzle, solution)
         signature = G2Element.from_bytes(
-            self.faucet.sign_delegated_spend(coin, condition_program)
+            self.faucet.sign_delegated_spend(
+                coin,
+                condition_program,
+                purpose=selection_purpose,
+            )
         )
         return SpendBundle([spend], signature)
 

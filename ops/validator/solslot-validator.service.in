@@ -12,7 +12,7 @@ EnvironmentFile=/etc/solslot-validator/validator.env
 Environment=PYTHONUNBUFFERED=1
 Environment=SOLSLOT_VALIDATOR_SIGNER_INDEX=@SIGNER_INDEX@
 Environment=SOLSLOT_VALIDATOR_SEED_FILE=%d/validator-seed
-Environment=SOLSLOT_VALIDATOR_STRIPE_READ_ONLY_KEY_FILE=%d/stripe-read-key
+Environment=SOLSLOT_VALIDATOR_STRIPE_RESTRICTED_KEY_FILE=%d/stripe-read-key
 LoadCredential=validator-seed:/etc/solslot-validator/private/validator.seed
 LoadCredential=stripe-read-key:/etc/solslot-validator/private/stripe.read.key
 LoadCredential=tls-key:/etc/solslot-validator/private/server.key

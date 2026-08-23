@@ -9,6 +9,23 @@ usage() {
 [ "$#" -eq 9 ] || usage
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
+require_raw_secret_file() {
+  local raw_secret="$1"
+  local label="$2"
+  [ ! -L "$raw_secret" ] || {
+    echo "$label must not be a symlink" >&2
+    exit 1
+  }
+  [ -f "$raw_secret" ] || {
+    echo "$label must be a regular file" >&2
+    exit 1
+  }
+}
+
+require_raw_secret_file "$5" "validator seed"
+require_raw_secret_file "$8" "validator TLS private key"
+require_raw_secret_file "$9" "validator Stripe restricted key"
+
 index="$1"
 wg_ip="$2"
 archive="$(readlink -f "$3")"
@@ -110,7 +127,7 @@ import pathlib
 import sys
 
 from solslot_api.validator_service import (
-    load_stripe_read_only_key,
+    load_stripe_restricted_key,
     load_validator_private_key,
 )
 from solslot_api.validator_settings import ValidatorSettings
@@ -127,10 +144,10 @@ for raw_line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines
     os.environ[key] = value
 os.environ["SOLSLOT_VALIDATOR_SIGNER_INDEX"] = sys.argv[2]
 os.environ["SOLSLOT_VALIDATOR_SEED_FILE"] = sys.argv[3]
-os.environ["SOLSLOT_VALIDATOR_STRIPE_READ_ONLY_KEY_FILE"] = sys.argv[4]
+os.environ["SOLSLOT_VALIDATOR_STRIPE_RESTRICTED_KEY_FILE"] = sys.argv[4]
 settings = ValidatorSettings()
 load_validator_private_key(settings)
-load_stripe_read_only_key(settings)
+load_stripe_restricted_key(settings)
 PY
 
 install -m 0600 "$seed_file" /etc/solslot-validator/private/validator.seed

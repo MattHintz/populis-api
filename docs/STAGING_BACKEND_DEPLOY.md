@@ -163,12 +163,14 @@ rehearsal service URL. Keep all four rehearsal values unset until their genuine
 post-genesis counterparts exist.
 
 Before the Stripe test-mode rehearsal ceiling can be armed, install a distinct
-coordinator restricted read key with Account, Event, and PaymentIntent read
-permissions. Set `SOLSLOT_STRIPE_RESTRICTED_KEY_FILE` in the shared environment
-to its absolute path. The file must be a regular non-symlink, inaccessible to
-group and other users, and contain an `rk_test_` key. This does not enable
-Stripe or open a signed purchase window; the guided rehearsal workflow checks
-the file again before it changes the infrastructure ceiling.
+coordinator restricted read key with Account, Event, PaymentIntent, and Charges
+read permissions. Charges read access is required because the service may
+request `GET /v1/charges/{id}` while verifying evidence. Set
+`SOLSLOT_STRIPE_RESTRICTED_KEY_FILE` in the shared environment to its absolute
+path. The file must be a regular non-symlink, inaccessible to group and other
+users, and contain an `rk_test_` key. This does not enable Stripe or open a
+signed purchase window; the guided rehearsal workflow checks the file again
+before it changes the infrastructure ceiling.
 
 The challenge database is SQLite-WAL state shared by vault registration and
 admin-login namespaces. It makes issuance quotas and nonce consumption atomic

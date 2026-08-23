@@ -10,9 +10,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
+ABANDONABLE_STATES = frozenset(
+    {"draft", "roster_open", "roster_frozen", "planned", "plan_approved"}
+)
 OWNER_SLOT = 1
 COADMIN_SLOTS = frozenset({2, 3})
 
@@ -61,6 +64,7 @@ class GenesisStore:
             )
             self._configure(self._memory_connection)
         self._migrate()
+        self.validate_pending_broadcast_reservations()
 
     @staticmethod
     def _configure(connection: sqlite3.Connection) -> None:
@@ -739,6 +743,39 @@ class GenesisStore:
                     COMMIT;
                     """
                 )
+                version = 10
+            if version < 11:
+                rows = connection.execute(
+                    "SELECT ceremony_id,state,broadcast_json FROM ceremonies "
+                    "WHERE broadcast_json IS NOT NULL AND state!='locked'"
+                ).fetchall()
+                incompatible: list[str] = []
+                for row in rows:
+                    try:
+                        self._decode_broadcast_reservation(row["broadcast_json"])
+                    except GenesisConflict:
+                        incompatible.append(str(row["ceremony_id"]))
+                if incompatible:
+                    raise RuntimeError(
+                        "Genesis schema 11 cannot migrate unreconciled legacy "
+                        "broadcast evidence for ceremony IDs: "
+                        + ", ".join(incompatible)
+                    )
+                connection.execute("PRAGMA user_version = 11")
+                version = 11
+            if version < 12:
+                reservation_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(genesis_finalization_reservation)"
+                    ).fetchall()
+                }
+                if "publication_json" not in reservation_columns:
+                    connection.execute(
+                        "ALTER TABLE genesis_finalization_reservation "
+                        "ADD COLUMN publication_json TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 12")
 
     def _event(
         self,
@@ -1038,6 +1075,87 @@ class GenesisStore:
             )
         return self.get(ceremony_id)
 
+    def renew_expired_plan(
+        self,
+        ceremony_id: str,
+        *,
+        expected_plan_hash: str,
+        plan: dict[str, Any],
+        plan_hash: str,
+        expires_at: int,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically renew an expired plan without changing its signed bindings."""
+
+        timestamp = int(time.time()) if now is None else now
+        if expires_at <= timestamp:
+            raise GenesisExpired("renewed plan must expire in the future")
+        if str(plan.get("planHash") or "") != plan_hash:
+            raise GenesisConflict("renewed plan hash differs from its payload")
+        if int(plan.get("expiresAt") or 0) != expires_at:
+            raise GenesisConflict("renewed plan expiration differs from its payload")
+        with self._transaction() as connection:
+            ceremony = self._require_ceremony(connection, ceremony_id)
+            self._require_state(ceremony, "planned", "plan_approved")
+            previous_hash = str(ceremony["plan_hash"] or "")
+            if previous_hash != expected_plan_hash:
+                raise GenesisConflict("ceremony plan changed before renewal")
+            previous_expiry = int(ceremony["plan_expires_at"] or 0)
+            if previous_expiry > timestamp:
+                raise GenesisConflict("ceremony plan has not expired")
+            try:
+                previous_plan = json.loads(str(ceremony["plan_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise GenesisConflict("existing ceremony plan is invalid") from exc
+            previous_binding = {
+                key: value
+                for key, value in previous_plan.items()
+                if key not in {"expiresAt", "planHash"}
+            }
+            renewed_binding = {
+                key: value
+                for key, value in plan.items()
+                if key not in {"expiresAt", "planHash"}
+            }
+            if canonical_json(previous_binding) != canonical_json(renewed_binding):
+                raise GenesisConflict(
+                    "renewed plan changed immutable ceremony bindings"
+                )
+            connection.execute(
+                "DELETE FROM plan_signatures WHERE ceremony_id=?",
+                (ceremony_id,),
+            )
+            updated = connection.execute(
+                "UPDATE ceremonies SET state='planned',plan_json=?,plan_hash=?,"
+                "plan_expires_at=?,updated_at=? WHERE ceremony_id=? AND plan_hash=? "
+                "AND state IN ('planned','plan_approved') AND plan_expires_at<=?",
+                (
+                    canonical_json(plan),
+                    plan_hash,
+                    expires_at,
+                    timestamp,
+                    ceremony_id,
+                    expected_plan_hash,
+                    timestamp,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise GenesisConflict("ceremony plan changed before renewal")
+            self._event(
+                connection,
+                ceremony_id,
+                "plan_renewed",
+                {
+                    "previousPlanHash": previous_hash,
+                    "previousExpiresAt": previous_expiry,
+                    "planHash": plan_hash,
+                    "expiresAt": expires_at,
+                    "signaturesCleared": True,
+                },
+                timestamp,
+            )
+        return self.get(ceremony_id)
+
     def add_plan_signature(
         self,
         ceremony_id: str,
@@ -1054,7 +1172,7 @@ class GenesisStore:
             self._require_state(ceremony, "planned", "plan_approved")
             if ceremony["plan_hash"] != plan_hash:
                 raise GenesisConflict("signature does not match the current plan")
-            if int(ceremony["plan_expires_at"] or 0) < timestamp:
+            if int(ceremony["plan_expires_at"] or 0) <= timestamp:
                 raise GenesisExpired("ceremony plan expired")
             member = connection.execute(
                 "SELECT compressed_pubkey FROM invitations WHERE ceremony_id=? AND slot=? "
@@ -1097,6 +1215,168 @@ class GenesisStore:
             )
         return self.get(ceremony_id)
 
+    @staticmethod
+    def _decode_broadcast_reservation(raw: Any) -> dict[str, Any]:
+        try:
+            reservation = json.loads(str(raw))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise GenesisConflict("persisted broadcast reservation is invalid") from exc
+        if not isinstance(reservation, dict):
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        if reservation.get("reservationSchemaVersion") != 1:
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        if reservation.get("reservationState") not in {"RESERVED", "FINALIZED"}:
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        for key in ("planHash", "spendBundleId", "feeCoinId", "feeMojos"):
+            if not isinstance(reservation.get(key), str) or not reservation[key]:
+                raise GenesisConflict("persisted broadcast reservation is invalid")
+        if not isinstance(reservation.get("spendBundle"), dict):
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        if type(reservation.get("reservedAt")) is not int:
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        evidence = reservation.get("ceremonyEvidence")
+        if not isinstance(evidence, dict):
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        if not isinstance(evidence.get("auditApproval"), dict):
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        if not isinstance(evidence.get("authorityV3ReviewBase64"), str):
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        if not isinstance(evidence.get("validatorHealth"), dict):
+            raise GenesisConflict("persisted broadcast reservation is invalid")
+        return reservation
+
+    def reserve_broadcast(
+        self,
+        ceremony_id: str,
+        *,
+        expected_plan_hash: str,
+        spend_bundle_id: str,
+        spend_bundle: dict[str, Any],
+        fee_coin_id: str,
+        fee_mojos: int,
+        ceremony_evidence: dict[str, Any],
+        gate_authorization: dict[str, Any] | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Seal the exact funded bundle before any external submission begins."""
+
+        if not expected_plan_hash:
+            raise ValueError("expected plan hash is required")
+        if not spend_bundle_id:
+            raise ValueError("spend bundle id is required")
+        if not isinstance(spend_bundle, dict):
+            raise ValueError("spend bundle must be an object")
+        if not fee_coin_id:
+            raise ValueError("fee coin id is required")
+        if type(fee_mojos) is not int or fee_mojos < 0:
+            raise ValueError("fee mojos must be a nonnegative integer")
+        if not isinstance(ceremony_evidence, dict):
+            raise ValueError("ceremony evidence must be an object")
+        if not isinstance(ceremony_evidence.get("auditApproval"), dict):
+            raise ValueError("ceremony audit approval is required")
+        if not isinstance(ceremony_evidence.get("authorityV3ReviewBase64"), str):
+            raise ValueError("ceremony Authority V3 review is required")
+        if not isinstance(ceremony_evidence.get("validatorHealth"), dict):
+            raise ValueError("ceremony validator health is required")
+        timestamp = int(time.time()) if now is None else now
+        reservation: dict[str, Any] = {
+            "reservationSchemaVersion": 1,
+            "reservationState": "RESERVED",
+            "planHash": expected_plan_hash,
+            "spendBundleId": spend_bundle_id,
+            "spendBundle": spend_bundle,
+            "feeCoinId": fee_coin_id,
+            "feeMojos": str(fee_mojos),
+            "reservedAt": timestamp,
+            "ceremonyEvidence": ceremony_evidence,
+        }
+        with self._transaction() as connection:
+            ceremony = self._require_ceremony(connection, ceremony_id)
+            self._require_state(ceremony, "plan_approved")
+            if str(ceremony["plan_hash"] or "") != expected_plan_hash:
+                raise GenesisConflict("ceremony plan changed before broadcast reservation")
+            if int(ceremony["plan_expires_at"] or 0) <= timestamp:
+                raise GenesisExpired("ceremony plan expired before broadcast reservation")
+
+            global_reservation = connection.execute(
+                "SELECT ceremony_id FROM genesis_finalization_reservation "
+                "WHERE singleton_slot=1"
+            ).fetchone()
+            if global_reservation is None:
+                connection.execute(
+                    "INSERT INTO genesis_finalization_reservation("
+                    "singleton_slot,ceremony_id,reserved_at) VALUES(1,?,?)",
+                    (ceremony_id, timestamp),
+                )
+            elif str(global_reservation["ceremony_id"]) != ceremony_id:
+                raise GenesisConflict(
+                    "a different genesis ceremony owns the one-shot broadcast slot"
+                )
+
+            if gate_authorization is not None:
+                if not isinstance(gate_authorization, dict):
+                    raise GenesisConflict("broadcast gate authorization is invalid")
+                gate = connection.execute(
+                    "SELECT * FROM launch_gates WHERE ceremony_id=? AND gate_name=?",
+                    (ceremony_id, "ceremonyBroadcast"),
+                ).fetchone()
+                if gate is None:
+                    raise GenesisConflict("ceremony broadcast gate is unavailable")
+                opens_at = int(gate["opens_at"])
+                closes_at = int(gate["closes_at"])
+                if str(gate["state"]) != "open":
+                    raise GenesisConflict("ceremony broadcast gate is not approved")
+                if not opens_at <= timestamp < closes_at:
+                    raise GenesisConflict("ceremony broadcast gate is closed")
+                if (
+                    gate_authorization.get("gate") != "ceremonyBroadcast"
+                    or gate_authorization.get("payloadHash")
+                    != str(gate["payload_hash"])
+                    or type(gate_authorization.get("opensAt")) is not int
+                    or gate_authorization["opensAt"] != opens_at
+                    or type(gate_authorization.get("closesAt")) is not int
+                    or gate_authorization["closesAt"] != closes_at
+                    or gate_authorization.get("configuredState") != "open"
+                    or gate_authorization.get("state") != "open"
+                    or gate_authorization.get("approved") is not True
+                ):
+                    raise GenesisConflict("broadcast gate authorization changed")
+                reservation["gateAuthorization"] = gate_authorization
+
+            try:
+                updated = connection.execute(
+                    "UPDATE ceremonies SET state='broadcast',spend_bundle_id=?,"
+                    "broadcast_json=?,updated_at=? WHERE ceremony_id=? "
+                    "AND state='plan_approved' AND plan_hash=? "
+                    "AND plan_expires_at>?",
+                    (
+                        spend_bundle_id,
+                        canonical_json(reservation),
+                        timestamp,
+                        ceremony_id,
+                        expected_plan_hash,
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GenesisConflict("spend bundle is already reserved") from exc
+            if updated.rowcount != 1:
+                raise GenesisConflict("ceremony changed before broadcast reservation")
+            self._event(
+                connection,
+                ceremony_id,
+                "bundle_broadcast_reserved",
+                {
+                    "planHash": expected_plan_hash,
+                    "spendBundleId": spend_bundle_id,
+                    "feeCoinId": fee_coin_id,
+                    "feeMojos": str(fee_mojos),
+                    "gateAuthorization": gate_authorization,
+                },
+                timestamp,
+            )
+        return self.get(ceremony_id)
+
     def mark_broadcast(
         self,
         ceremony_id: str,
@@ -1108,28 +1388,336 @@ class GenesisStore:
         timestamp = int(time.time()) if now is None else now
         with self._transaction() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
-            self._require_state(ceremony, "plan_approved")
-            if int(ceremony["plan_expires_at"] or 0) < timestamp:
-                raise GenesisExpired("ceremony plan expired before broadcast")
-            connection.execute(
-                "UPDATE ceremonies SET state='broadcast',spend_bundle_id=?,broadcast_json=?,"
-                "updated_at=? WHERE ceremony_id=?",
-                (spend_bundle_id, canonical_json(response), timestamp, ceremony_id),
+            self._require_state(ceremony, "broadcast")
+            reservation = self._decode_broadcast_reservation(
+                ceremony["broadcast_json"]
+            )
+            stored_bundle_id = str(ceremony["spend_bundle_id"] or "")
+            if (
+                not stored_bundle_id
+                or reservation["spendBundleId"] != stored_bundle_id
+                or spend_bundle_id != stored_bundle_id
+            ):
+                raise GenesisConflict("broadcast response changed the reserved bundle id")
+            if not isinstance(response, dict):
+                raise GenesisConflict("broadcast response is invalid")
+            if response.get("spendBundleId") != stored_bundle_id:
+                raise GenesisConflict("broadcast response changed the reserved bundle id")
+            if response.get("feeCoinId") != reservation["feeCoinId"]:
+                raise GenesisConflict("broadcast response changed the reserved fee coin")
+            if str(response.get("feeMojos") or "") != reservation["feeMojos"]:
+                raise GenesisConflict("broadcast response changed the reserved fee")
+            try:
+                bundle_matches = canonical_json(response.get("spendBundle")) == canonical_json(
+                    reservation["spendBundle"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise GenesisConflict("broadcast response spend bundle is invalid") from exc
+            if not bundle_matches:
+                raise GenesisConflict("broadcast response changed the reserved spend bundle")
+
+            if reservation["reservationState"] == "FINALIZED":
+                metadata_keys = {
+                    "reservationSchemaVersion",
+                    "reservationState",
+                    "planHash",
+                    "reservedAt",
+                    "finalizedAt",
+                    "gateAuthorization",
+                    "ceremonyEvidence",
+                    "chainConfirmation",
+                }
+                finalized_response = {
+                    key: value
+                    for key, value in reservation.items()
+                    if key not in metadata_keys
+                }
+                if canonical_json(finalized_response) != canonical_json(response):
+                    raise GenesisConflict("broadcast response was already finalized")
+            else:
+                finalized = dict(response)
+                finalized.update(
+                    {
+                        "reservationSchemaVersion": 1,
+                        "reservationState": "FINALIZED",
+                        "planHash": reservation["planHash"],
+                        "spendBundleId": stored_bundle_id,
+                        "spendBundle": reservation["spendBundle"],
+                        "feeCoinId": reservation["feeCoinId"],
+                        "feeMojos": reservation["feeMojos"],
+                        "reservedAt": reservation["reservedAt"],
+                        "finalizedAt": timestamp,
+                        "ceremonyEvidence": reservation["ceremonyEvidence"],
+                    }
+                )
+                if "gateAuthorization" in reservation:
+                    finalized["gateAuthorization"] = reservation[
+                        "gateAuthorization"
+                    ]
+                updated = connection.execute(
+                    "UPDATE ceremonies SET broadcast_json=?,updated_at=? "
+                    "WHERE ceremony_id=? AND state='broadcast' AND spend_bundle_id=? "
+                    "AND broadcast_json=?",
+                    (
+                        canonical_json(finalized),
+                        timestamp,
+                        ceremony_id,
+                        stored_bundle_id,
+                        ceremony["broadcast_json"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise GenesisConflict(
+                        "broadcast reservation changed before finalization"
+                    )
+                self._event(
+                    connection,
+                    ceremony_id,
+                    "bundle_broadcast",
+                    {"spendBundleId": spend_bundle_id, "response": response},
+                    timestamp,
+                )
+        return self.get(ceremony_id)
+
+    def authorize_broadcast_reconciliation(
+        self,
+        ceremony_id: str,
+        *,
+        gate_authorization: dict[str, Any],
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Bind an exact replay attempt to a fresh owner-approved gate window."""
+
+        if not isinstance(gate_authorization, dict):
+            raise GenesisConflict(
+                "broadcast reconciliation authorization is invalid"
+            )
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            ceremony = self._require_ceremony(connection, ceremony_id)
+            self._require_state(ceremony, "broadcast")
+            reservation = self._decode_broadcast_reservation(
+                ceremony["broadcast_json"]
+            )
+            if reservation["reservationState"] != "RESERVED":
+                raise GenesisConflict(
+                    "broadcast reservation is already reconciled"
+                )
+            gate = connection.execute(
+                "SELECT * FROM launch_gates WHERE ceremony_id=? AND gate_name=?",
+                (ceremony_id, "ceremonyBroadcast"),
+            ).fetchone()
+            if gate is None or str(gate["state"]) != "open":
+                raise GenesisConflict("ceremony broadcast gate is not approved")
+            opens_at = int(gate["opens_at"])
+            closes_at = int(gate["closes_at"])
+            if not opens_at <= timestamp < closes_at:
+                raise GenesisConflict("ceremony broadcast gate is closed")
+            if (
+                gate_authorization.get("gate") != "ceremonyBroadcast"
+                or gate_authorization.get("payloadHash")
+                != str(gate["payload_hash"])
+                or gate_authorization.get("opensAt") != opens_at
+                or gate_authorization.get("closesAt") != closes_at
+                or gate_authorization.get("configuredState") != "open"
+                or gate_authorization.get("state") != "open"
+                or gate_authorization.get("approved") is not True
+            ):
+                raise GenesisConflict(
+                    "broadcast reconciliation authorization changed"
+                )
+            self._event(
+                connection,
+                ceremony_id,
+                "bundle_reconciliation_authorized",
+                {
+                    "spendBundleId": reservation["spendBundleId"],
+                    "gateAuthorization": gate_authorization,
+                },
+                timestamp,
+            )
+        return self.get(ceremony_id)
+
+    def mark_chain_reconciled_confirmed(
+        self,
+        ceremony_id: str,
+        *,
+        spend_bundle_id: str,
+        response: dict[str, Any],
+        confirmed_block_index: int,
+        confirmation_evidence: dict[str, Any],
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically finalize a reserved bundle already proven on chain."""
+
+        if confirmed_block_index <= 0:
+            raise ValueError("confirmed block index must be positive")
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            ceremony = self._require_ceremony(connection, ceremony_id)
+            self._require_state(ceremony, "broadcast")
+            reservation = self._decode_broadcast_reservation(
+                ceremony["broadcast_json"]
+            )
+            if reservation["reservationState"] != "RESERVED":
+                raise GenesisConflict(
+                    "broadcast reservation is already reconciled"
+                )
+            stored_bundle_id = str(ceremony["spend_bundle_id"] or "")
+            if (
+                not stored_bundle_id
+                or reservation["spendBundleId"] != stored_bundle_id
+                or spend_bundle_id != stored_bundle_id
+            ):
+                raise GenesisConflict(
+                    "chain reconciliation changed the reserved bundle id"
+                )
+            if not isinstance(response, dict):
+                raise GenesisConflict("chain reconciliation response is invalid")
+            if response.get("spendBundleId") != stored_bundle_id:
+                raise GenesisConflict(
+                    "chain reconciliation changed the reserved bundle id"
+                )
+            if response.get("feeCoinId") != reservation["feeCoinId"]:
+                raise GenesisConflict(
+                    "chain reconciliation changed the reserved fee coin"
+                )
+            if str(response.get("feeMojos") or "") != reservation["feeMojos"]:
+                raise GenesisConflict(
+                    "chain reconciliation changed the reserved fee"
+                )
+            try:
+                bundle_matches = canonical_json(
+                    response.get("spendBundle")
+                ) == canonical_json(reservation["spendBundle"])
+            except (TypeError, ValueError) as exc:
+                raise GenesisConflict(
+                    "chain reconciliation spend bundle is invalid"
+                ) from exc
+            if not bundle_matches:
+                raise GenesisConflict(
+                    "chain reconciliation changed the reserved spend bundle"
+                )
+            if not isinstance(confirmation_evidence, dict):
+                raise GenesisConflict(
+                    "exact broadcast confirmation evidence is invalid"
+                )
+            input_coin_ids = confirmation_evidence.get("inputCoinIds")
+            if (
+                confirmation_evidence.get("schemaVersion") != 1
+                or confirmation_evidence.get("exactReservedCoinSpends") is not True
+                or confirmation_evidence.get("spendBundleId") != stored_bundle_id
+                or confirmation_evidence.get("confirmedBlockIndex")
+                != confirmed_block_index
+                or not isinstance(input_coin_ids, list)
+                or not input_coin_ids
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in input_coin_ids
+                )
+            ):
+                raise GenesisConflict(
+                    "exact broadcast confirmation evidence is invalid"
+                )
+
+            finalized = dict(response)
+            finalized.update(
+                {
+                    "reservationSchemaVersion": 1,
+                    "reservationState": "FINALIZED",
+                    "planHash": reservation["planHash"],
+                    "spendBundleId": stored_bundle_id,
+                    "spendBundle": reservation["spendBundle"],
+                    "feeCoinId": reservation["feeCoinId"],
+                    "feeMojos": reservation["feeMojos"],
+                    "reservedAt": reservation["reservedAt"],
+                    "finalizedAt": timestamp,
+                    "ceremonyEvidence": reservation["ceremonyEvidence"],
+                    "chainConfirmation": confirmation_evidence,
+                }
+            )
+            if "gateAuthorization" in reservation:
+                finalized["gateAuthorization"] = reservation[
+                    "gateAuthorization"
+                ]
+            updated = connection.execute(
+                "UPDATE ceremonies SET state='confirmed',"
+                "confirmed_block_index=?,broadcast_json=?,updated_at=? "
+                "WHERE ceremony_id=? AND state='broadcast' "
+                "AND spend_bundle_id=? AND broadcast_json=?",
+                (
+                    confirmed_block_index,
+                    canonical_json(finalized),
+                    timestamp,
+                    ceremony_id,
+                    stored_bundle_id,
+                    ceremony["broadcast_json"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise GenesisConflict(
+                    "broadcast reservation changed before chain reconciliation"
+                )
+            self._event(
+                connection,
+                ceremony_id,
+                "bundle_chain_reconciled",
+                {"spendBundleId": spend_bundle_id, "response": response},
+                timestamp,
             )
             self._event(
                 connection,
                 ceremony_id,
-                "bundle_broadcast",
-                {"spendBundleId": spend_bundle_id, "response": response},
+                "bundle_confirmed",
+                confirmation_evidence,
                 timestamp,
             )
         return self.get(ceremony_id)
+
+    def pending_exact_fee_coin_ids(self) -> set[str]:
+        """Return fee coins held by broadcast reservations until confirmation."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT spend_bundle_id,broadcast_json FROM ceremonies "
+                "WHERE state IN ('broadcast','abandoned') "
+                "AND broadcast_json IS NOT NULL"
+            ).fetchall()
+        reserved: set[str] = set()
+        for row in rows:
+            reservation = self._decode_broadcast_reservation(row["broadcast_json"])
+            if reservation["spendBundleId"] != str(row["spend_bundle_id"] or ""):
+                raise GenesisConflict("persisted broadcast reservation is invalid")
+            reserved.add(str(reservation["feeCoinId"]))
+        return reserved
+
+    def validate_pending_broadcast_reservations(self) -> None:
+        """Fail startup if any non-final legacy broadcast lacks exact evidence.
+
+        Locked ceremonies are immutable historical evidence. Schema 11 does
+        not reinterpret or rewrite those completed records; every other state
+        with broadcast data must use the exact durable reservation format.
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT ceremony_id,spend_bundle_id,broadcast_json FROM ceremonies "
+                "WHERE broadcast_json IS NOT NULL AND state!='locked'"
+            ).fetchall()
+        for row in rows:
+            reservation = self._decode_broadcast_reservation(row["broadcast_json"])
+            if reservation["spendBundleId"] != str(row["spend_bundle_id"] or ""):
+                raise GenesisConflict(
+                    "persisted broadcast reservation is invalid for ceremony "
+                    + str(row["ceremony_id"])
+                )
 
     def mark_confirmed(
         self,
         ceremony_id: str,
         *,
         confirmed_block_index: int,
+        confirmation_evidence: dict[str, Any],
         now: int | None = None,
     ) -> dict[str, Any]:
         if confirmed_block_index <= 0:
@@ -1138,16 +1726,49 @@ class GenesisStore:
         with self._transaction() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
             self._require_state(ceremony, "broadcast")
-            connection.execute(
-                "UPDATE ceremonies SET state='confirmed',confirmed_block_index=?,updated_at=? "
-                "WHERE ceremony_id=?",
-                (confirmed_block_index, timestamp, ceremony_id),
+            reservation = self._decode_broadcast_reservation(
+                ceremony["broadcast_json"]
             )
+            if reservation["reservationState"] != "FINALIZED":
+                raise GenesisConflict(
+                    "broadcast reservation must be reconciled before confirmation"
+                )
+            if not isinstance(confirmation_evidence, dict):
+                raise GenesisConflict("exact broadcast confirmation evidence is invalid")
+            input_coin_ids = confirmation_evidence.get("inputCoinIds")
+            if (
+                confirmation_evidence.get("schemaVersion") != 1
+                or confirmation_evidence.get("exactReservedCoinSpends") is not True
+                or confirmation_evidence.get("spendBundleId")
+                != reservation["spendBundleId"]
+                or confirmation_evidence.get("confirmedBlockIndex")
+                != confirmed_block_index
+                or not isinstance(input_coin_ids, list)
+                or not input_coin_ids
+                or any(not isinstance(value, str) or not value for value in input_coin_ids)
+            ):
+                raise GenesisConflict("exact broadcast confirmation evidence is invalid")
+            finalized = dict(reservation)
+            finalized["chainConfirmation"] = confirmation_evidence
+            updated = connection.execute(
+                "UPDATE ceremonies SET state='confirmed',confirmed_block_index=?,"
+                "broadcast_json=?,updated_at=? WHERE ceremony_id=? AND state='broadcast' "
+                "AND broadcast_json=?",
+                (
+                    confirmed_block_index,
+                    canonical_json(finalized),
+                    timestamp,
+                    ceremony_id,
+                    ceremony["broadcast_json"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise GenesisConflict("broadcast changed before confirmation")
             self._event(
                 connection,
                 ceremony_id,
                 "bundle_confirmed",
-                {"confirmedBlockIndex": confirmed_block_index},
+                confirmation_evidence,
                 timestamp,
             )
         return self.get(ceremony_id)
@@ -1192,6 +1813,18 @@ class GenesisStore:
         with self._transaction() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
             self._require_state(ceremony, "artifact_pending", "artifact_signed")
+            finalization = connection.execute(
+                "SELECT publication_json FROM genesis_finalization_reservation "
+                "WHERE singleton_slot=1 AND ceremony_id=?",
+                (ceremony_id,),
+            ).fetchone()
+            if (
+                finalization is not None
+                and finalization["publication_json"] is not None
+            ):
+                raise GenesisConflict(
+                    "artifact signatures are frozen by finalization publication"
+                )
             if ceremony["artifact_hash"] != artifact_hash:
                 raise GenesisConflict("signature does not match the current artifact")
             member = connection.execute(
@@ -1249,20 +1882,23 @@ class GenesisStore:
         timestamp = int(time.time()) if now is None else now
         with self._transaction() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
-            self._require_state(ceremony, "artifact_signed")
+            self._require_state(ceremony, "artifact_signed", "locked")
             reservation = connection.execute(
-                "SELECT ceremony_id FROM genesis_finalization_reservation "
+                "SELECT ceremony_id,publication_json "
+                "FROM genesis_finalization_reservation "
                 "WHERE singleton_slot=1"
             ).fetchone()
             if reservation is None:
-                connection.execute(
-                    "INSERT INTO genesis_finalization_reservation("
-                    "singleton_slot,ceremony_id,reserved_at) VALUES(1,?,?)",
-                    (ceremony_id, timestamp),
+                raise GenesisConflict(
+                    "finalization publication is not reserved"
                 )
-            elif str(reservation["ceremony_id"]) != ceremony_id:
+            if str(reservation["ceremony_id"]) != ceremony_id:
                 raise GenesisConflict(
                     "a different genesis ceremony owns finalization"
+                )
+            if reservation["publication_json"] is None:
+                raise GenesisConflict(
+                    "finalization publication is not bound"
                 )
             existing = connection.execute(
                 "SELECT ceremony_id FROM ceremonies "
@@ -1271,6 +1907,8 @@ class GenesisStore:
             ).fetchone()
             if existing is not None:
                 raise GenesisConflict("a different genesis ceremony is already locked")
+            if ceremony["state"] == "locked":
+                return self.get(ceremony_id)
             connection.execute(
                 "UPDATE ceremonies SET state='locked',updated_at=? WHERE ceremony_id=?",
                 (timestamp, ceremony_id),
@@ -1279,15 +1917,60 @@ class GenesisStore:
         return self.get(ceremony_id)
 
     def reserve_finalization(
-        self, ceremony_id: str, *, now: int | None = None
-    ) -> None:
-        """Reserve the one canonical finalization slot before publishing files."""
+        self,
+        ceremony_id: str,
+        *,
+        publication: dict[str, Any] | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Reserve and durably bind the exact final publication payload."""
+
+        encoded_publication: str | None = None
+        if publication is not None:
+            if not isinstance(publication, dict):
+                raise ValueError("finalization publication must be an object")
+            encoded_publication = canonical_json(publication)
         timestamp = int(time.time()) if now is None else now
+        selected_publication: str | None = None
         with self._transaction() as connection:
             ceremony = self._require_ceremony(connection, ceremony_id)
-            self._require_state(ceremony, "artifact_signed")
+            self._require_state(ceremony, "artifact_signed", "locked")
+            if publication is not None:
+                publication_artifact = publication.get("artifact")
+                if (
+                    not isinstance(publication_artifact, dict)
+                    or publication_artifact.get("artifactHash")
+                    != ceremony["artifact_hash"]
+                    or not isinstance(
+                        publication_artifact.get("signatures"), list
+                    )
+                ):
+                    raise GenesisConflict(
+                        "finalization artifact signature set is invalid"
+                    )
+                signature_rows = connection.execute(
+                    "SELECT slot,compressed_pubkey,signature "
+                    "FROM artifact_signatures WHERE ceremony_id=? "
+                    "AND artifact_hash=? ORDER BY slot",
+                    (ceremony_id, ceremony["artifact_hash"]),
+                ).fetchall()
+                persisted_signatures = [
+                    {
+                        "adminIndex": int(row["slot"]) - 1,
+                        "compressedPubkey": str(row["compressed_pubkey"]),
+                        "signature": str(row["signature"]),
+                    }
+                    for row in signature_rows
+                ]
+                if canonical_json(
+                    publication_artifact["signatures"]
+                ) != canonical_json(persisted_signatures):
+                    raise GenesisConflict(
+                        "finalization artifact signature set changed"
+                    )
             reservation = connection.execute(
-                "SELECT ceremony_id FROM genesis_finalization_reservation "
+                "SELECT ceremony_id,publication_json "
+                "FROM genesis_finalization_reservation "
                 "WHERE singleton_slot=1"
             ).fetchone()
             if reservation is not None:
@@ -1295,19 +1978,69 @@ class GenesisStore:
                     raise GenesisConflict(
                         "a different genesis ceremony owns finalization"
                     )
-                return
-            connection.execute(
-                "INSERT INTO genesis_finalization_reservation("
-                "singleton_slot,ceremony_id,reserved_at) VALUES(1,?,?)",
-                (ceremony_id, timestamp),
-            )
-            self._event(
-                connection,
-                ceremony_id,
-                "finalization_reserved",
-                {},
-                timestamp,
-            )
+                selected_publication = reservation["publication_json"]
+                if encoded_publication is not None:
+                    if selected_publication is None:
+                        connection.execute(
+                            "UPDATE genesis_finalization_reservation "
+                            "SET publication_json=? WHERE singleton_slot=1 "
+                            "AND ceremony_id=? AND publication_json IS NULL",
+                            (encoded_publication, ceremony_id),
+                        )
+                        selected_publication = encoded_publication
+                        self._event(
+                            connection,
+                            ceremony_id,
+                            "finalization_publication_reserved",
+                            publication,
+                            timestamp,
+                        )
+                    elif selected_publication != encoded_publication:
+                        raise GenesisConflict(
+                            "finalization publication changed after reservation"
+                        )
+            else:
+                connection.execute(
+                    "INSERT INTO genesis_finalization_reservation("
+                    "singleton_slot,ceremony_id,reserved_at,publication_json) "
+                    "VALUES(1,?,?,?)",
+                    (ceremony_id, timestamp, encoded_publication),
+                )
+                selected_publication = encoded_publication
+                self._event(
+                    connection,
+                    ceremony_id,
+                    "finalization_reserved",
+                    {"publicationBound": publication is not None},
+                    timestamp,
+                )
+        return (
+            json.loads(selected_publication)
+            if selected_publication is not None
+            else None
+        )
+
+    def finalization_publication(
+        self, ceremony_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            reservation = connection.execute(
+                "SELECT ceremony_id,publication_json "
+                "FROM genesis_finalization_reservation WHERE singleton_slot=1"
+            ).fetchone()
+        if reservation is None:
+            return None
+        if str(reservation["ceremony_id"]) != ceremony_id:
+            raise GenesisConflict("a different genesis ceremony owns finalization")
+        if reservation["publication_json"] is None:
+            return None
+        try:
+            publication = json.loads(str(reservation["publication_json"]))
+        except json.JSONDecodeError as exc:
+            raise GenesisConflict("finalization publication is invalid") from exc
+        if not isinstance(publication, dict):
+            raise GenesisConflict("finalization publication is invalid")
+        return publication
 
     def abandon(
         self, ceremony_id: str, reason: str, *, now: int | None = None
@@ -1319,6 +2052,10 @@ class GenesisStore:
             ceremony = self._require_ceremony(connection, ceremony_id)
             if ceremony["state"] in TERMINAL_STATES:
                 raise GenesisConflict("ceremony is already terminal")
+            if ceremony["state"] not in ABANDONABLE_STATES:
+                raise GenesisConflict(
+                    "ceremony cannot be abandoned after broadcast reservation"
+                )
             connection.execute(
                 "UPDATE ceremonies SET state='abandoned',updated_at=? WHERE ceremony_id=?",
                 (timestamp, ceremony_id),
@@ -1743,12 +2480,11 @@ class GenesisStore:
         for row in rows:
             stored_state = str(row["state"])
             effective_state = stored_state
-            if stored_state == "open" and timestamp >= int(row["closes_at"]):
-                effective_state = "closed"
-            elif stored_state == "pending" and int(row["opens_at"]) <= timestamp < int(
-                row["closes_at"]
-            ):
-                effective_state = "open"
+            if stored_state == "open":
+                if timestamp < int(row["opens_at"]):
+                    effective_state = "pending"
+                elif timestamp >= int(row["closes_at"]):
+                    effective_state = "closed"
             result[str(row["gate_name"])] = {
                 "name": str(row["gate_name"]),
                 "network": str(row["network"]),
