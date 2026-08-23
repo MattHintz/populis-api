@@ -55,6 +55,69 @@ def test_owner_claim_consumption_and_draft_creation_are_atomic(tmp_path) -> None
     assert len(store.list_ceremonies()) == 1
 
 
+def test_owner_claim_rejects_active_draft_from_another_launch_policy(
+    tmp_path,
+) -> None:
+    store = GenesisStore(tmp_path / "stale-owner-claim.db")
+    stale_ceremony = "0x" + "a1" * 32
+    stale_draft = {
+        "schemaVersion": 2,
+        "sourceManifestVersion": 4,
+        "network": "testnet11",
+        "evmChainId": 11155111,
+        "reviewClass": "internal-engineering-testnet",
+        "releaseTag": "solslot-v2-alpha-rc27.32-20260823",
+        "releaseEvidenceHash": "0x" + "11" * 32,
+        "sourceShas": {"api": "1" * 40},
+    }
+    official_draft = {
+        **stale_draft,
+        "reviewClass": "independent-release-review",
+        "releaseTag": "solslot-v2-alpha-rc27.33-20260823",
+        "releaseEvidenceHash": "0x" + "22" * 32,
+        "sourceShas": {"api": "2" * 40},
+    }
+    store.create_draft(stale_ceremony, stale_draft, now=100)
+
+    with pytest.raises(GenesisConflict, match="protected launch policy"):
+        store.claim_or_create_draft(
+            token_hash="fresh-official-owner-link",
+            ceremony_id="0x" + "a2" * 32,
+            draft=official_draft,
+            now=101,
+        )
+
+    assert store.owner_claim_used("fresh-official-owner-link") is False
+    assert store.active()["ceremony_id"] == stale_ceremony
+
+
+def test_owner_claim_may_resume_only_an_exact_matching_active_draft(tmp_path) -> None:
+    store = GenesisStore(tmp_path / "matching-owner-claim.db")
+    ceremony_id = "0x" + "b1" * 32
+    draft = {
+        "schemaVersion": 2,
+        "sourceManifestVersion": 4,
+        "network": "testnet11",
+        "evmChainId": 11155111,
+        "reviewClass": "independent-release-review",
+        "releaseTag": "solslot-v2-alpha-rc27.33-20260823",
+        "releaseEvidenceHash": "0x" + "33" * 32,
+        "sourceShas": {"api": "3" * 40},
+    }
+    store.create_draft(ceremony_id, draft, now=100)
+
+    selected = store.claim_or_create_draft(
+        token_hash="matching-official-owner-link",
+        ceremony_id="0x" + "b2" * 32,
+        draft=draft,
+        now=101,
+    )
+
+    assert selected["ceremony_id"] == ceremony_id
+    assert selected["draft"] == draft
+    assert store.owner_claim_used("matching-official-owner-link") is True
+
+
 def test_only_one_ceremony_can_reserve_global_finalization(tmp_path) -> None:
     store = GenesisStore(tmp_path / "finalization.db")
     first = "0x" + "a1" * 32

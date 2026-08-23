@@ -4,17 +4,56 @@ This is a one-way launch. Existing testnet vaults, proofs, tokens, bridge
 coins, contracts, state databases, and singleton coordinates are abandoned.
 No artifact from a retired deployment may be copied into the V2 state tree.
 
+## Current Official Testnet11 Policy
+
+The current guided release target is
+`solslot-v2-alpha-rc27.33-20260823` on
+`release/testnet-alpha-rc27.33-20260823`. The browser cannot choose its review
+class. The protected server setting
+`SOLSLOT_LAUNCH_GENESIS_REVIEW_CLASS=independent-release-review` is mandatory
+for the official Testnet11 genesis. An operator may explicitly configure
+`internal-engineering-testnet` only for a disposable engineering run, which
+must never be represented as the official independently reviewed genesis.
+
+The official flow uses the guided owner claim. The protected direct
+`POST /admin/genesis/drafts` operator endpoint remains available for an
+explicitly authorized compatibility workflow; it is not a bypass when the
+guided readiness gate is incomplete. Retired bootstrap routes are not mounted.
+Keep the one-time owner claim, launch session secret, and ceremony operator
+token separate and server-generated. Deliver only the single-use owner claim
+to a trusted browser through the URL fragment; launch-session and ceremony
+operator secrets stay out of browser-readable storage. None of them belongs
+in logs, evidence, or source control.
+
+Fresh Sepolia identity-contract deployment evidence remains a pre-plan
+readiness requirement. The plan-bound independent audit approval is required
+after plan approval and again by strict preflight; do not create a placeholder
+approval before a plan exists. Base Sepolia payment-rail ownership does not
+block the ceremony. It remains mandatory for the separate, post-genesis
+payment-activation gate, and all payment workers stay disabled through
+genesis.
+
+The `V2`, `V3`, and `RC23` strings in artifact, puzzle, and on-chain schema
+names below are compatibility identifiers, not permission to use an older
+release or state tree.
+
 ## Hard Gate
 
 Do not begin until:
 
-- protocol, EVM, API, customer web, and admin portal commits are frozen and
-  clean;
+- protocol, EVM, Omnichain, API, legacy backend, Key of Solomon, Samuel,
+  customer web, and admin portal commits are frozen, clean, and bound to the
+  coordinated release manifest;
 - full suites and exploit regressions pass from those exact commits;
 - release archives and compiled assets pass the namespace scanner;
-- either the independent review lanes are signed off, or this is an explicit
+- for the official release, a reviewer outside the implementation team has
+  completed the pre-deployment source-scope review and recorded all findings;
+  the plan-bound approval and post-deployment addenda remain later strict
+  gates. Alternatively, this is an explicitly configured
   `internal-engineering-testnet` disposable run with three distinct enrolled
   administrators and normal 2-of-3 plan/artifact signatures;
+- guided launch configuration names the exact RC27.33 tag, source-evidence
+  path and SHA-256, plan-template path, and protected review class;
 - the credential carryover record is complete, the provider credential found
   in public history is revoked and replaced, signer 1/2 and private-network
   material are generated, and the one-time ceremony token is ready;
@@ -47,8 +86,9 @@ Never rename an older file into one of these paths.
 ## Sequence
 
 1. Record exact source commits and reproducible protocol package hash.
-2. Deploy fresh `SolslotForwarder`, verifier adapter, and attestation emitter
-   contracts. Record chain ID, addresses, bytecode hashes, and transactions.
+2. Deploy fresh Sepolia `SolslotForwarder`, verifier adapter, and attestation
+   emitter identity contracts. Record chain ID, addresses, bytecode hashes,
+   transactions, exact source SHAs, and at least 12 confirmations.
 3. Derive the V2 bridge policy from the new validator set and emitter.
 4. Run the Chia deployment dry-run using newly funded ceremony coins.
 5. Review every derived SGT, pool V3, DID, governance, protocol Statutes,
@@ -115,6 +155,10 @@ Before enabling minting:
    complete admin proposal, SGT vote, and five-spend committee execution path;
    then exercise one offer, pool/deposit, and redemption path.
 8. Run ceremony preflight without report-only mode and archive its clean exit.
+
+Payment-rail ownership, Stripe rehearsal, and settlement activation are not
+part of this smoke gate. They remain closed until their separately approved
+post-genesis activation evidence is complete.
 
 Only then may an authorized operator exit ceremony mode, apply the separately
 approved customer-write and minting release gates, and mint the first real

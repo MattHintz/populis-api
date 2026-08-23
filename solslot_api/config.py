@@ -357,7 +357,8 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             raise RuntimeError("Guided alpha launch control is restricted to Testnet11.")
         if not settings.launch_source_evidence_path:
             raise RuntimeError(
-                "SOLSLOT_LAUNCH_CONTROL_ENABLED requires RC21 source evidence."
+                "SOLSLOT_LAUNCH_CONTROL_ENABLED requires checksum-pinned "
+                "coordinated source evidence."
             )
         if settings.runtime_environment in {"staging", "production"}:
             if (
@@ -965,15 +966,24 @@ class Settings(BaseSettings):
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
     launch_cookie_path: str = "/protocol-api/admin/launch"
-    launch_release_tag: str = "solslot-v2-alpha-rc27-20260804"
+    # The guided browser never chooses the ceremony review class. Official
+    # Testnet11 releases use an independent review; an explicitly configured
+    # internal engineering run remains available only as a disposable operator
+    # workflow and must not be represented as the official genesis.
+    launch_genesis_review_class: Literal[
+        "independent-release-review", "internal-engineering-testnet"
+    ] = "independent-release-review"
+    launch_release_tag: str = "solslot-v2-alpha-rc27.33-20260823"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc27.json"
+        "./state/source-freeze-evidence-rc27.33.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
-    launch_plan_template_path: Optional[str] = "./state/plan-input-template-rc27.json"
+    launch_plan_template_path: Optional[str] = (
+        "./state/plan-input-template-rc27.33.json"
+    )
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc27.json"
+        "./state/settlement-rehearsal-rc27.33.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None

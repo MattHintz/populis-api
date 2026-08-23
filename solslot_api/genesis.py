@@ -1181,6 +1181,7 @@ def _validate_audit_approval(
     record: Mapping[str, Any],
     plan: Mapping[str, Any],
     spend_bundle_id: str,
+    evm_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     path = Path(settings.genesis_audit_approval_path)
     if not path.is_file():
@@ -1192,6 +1193,7 @@ def _validate_audit_approval(
     expected = {
         "schemaVersion": 2,
         "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
+        "reviewClass": INDEPENDENT_REVIEW_CLASS,
         "ceremonyId": record["ceremony_id"],
         "planHash": record["plan_hash"],
         "sourceShas": record["draft"]["sourceShas"],
@@ -1211,18 +1213,41 @@ def _validate_audit_approval(
         _hex_bytes(str(lane.get("evidenceHash", "")), 32, "audit evidence hash")
 
     deployments = approval.get("evmContracts")
+    live_deployments = evm_evidence.get("contracts")
     if not isinstance(deployments, Mapping) or set(deployments) != set(
         REQUIRED_EVM_ADDRESSES
     ):
         raise GenesisConflict("audit approval lacks fresh EVM deployment evidence")
+    if not isinstance(live_deployments, Mapping) or set(live_deployments) != set(
+        REQUIRED_EVM_ADDRESSES
+    ):
+        raise GenesisConflict("live EVM deployment evidence is incomplete")
     for name in REQUIRED_EVM_ADDRESSES:
         deployment = deployments[name]
+        live_deployment = live_deployments[name]
+        if not isinstance(deployment, Mapping) or not isinstance(
+            live_deployment, Mapping
+        ):
+            raise GenesisConflict(
+                f"EVM deployment evidence {name} is malformed"
+            )
         if (
             str(deployment.get("address", "")).lower()
             != str(plan["evmAddresses"][name]).lower()
         ):
             raise GenesisConflict(f"audited EVM address {name} does not match plan")
-        _hex_bytes(str(deployment.get("bytecodeHash", "")), 32, "bytecodeHash")
+        bytecode_hash = _hex_bytes(
+            str(deployment.get("bytecodeHash", "")), 32, "bytecodeHash"
+        )
+        if (
+            str(live_deployment.get("address", "")).lower()
+            != str(deployment.get("address", "")).lower()
+            or str(live_deployment.get("bytecodeHash", "")).lower()
+            != "0x" + bytecode_hash.hex()
+        ):
+            raise GenesisConflict(
+                f"audited EVM deployment {name} does not match live evidence"
+            )
         if int(deployment.get("confirmations", 0)) < settings.genesis_sepolia_confirmations:
             raise GenesisConflict(f"EVM deployment {name} lacks 12 confirmations")
 
@@ -1391,6 +1416,13 @@ async def _prepare_bundle(
         )
     except (KeyError, TypeError, ValidatorQuorumError) as exc:
         raise GenesisConflict(f"live validator preflight failed: {exc}") from exc
+    try:
+        evm_evidence = await asyncio.to_thread(
+            verify_genesis_evm_deployment, settings, record, plan
+        )
+    except GenesisEvmEvidenceError as exc:
+        raise GenesisConflict(f"live Sepolia preflight failed: {exc}") from exc
+
     review_class = str(
         record.get("draft", {}).get("reviewClass", INDEPENDENT_REVIEW_CLASS)
     )
@@ -1399,12 +1431,6 @@ async def _prepare_bundle(
             raise GenesisConflict(
                 "internal engineering review is permitted on testnet11 only"
             )
-        try:
-            evm_evidence = await asyncio.to_thread(
-                verify_genesis_evm_deployment, settings, record, plan
-            )
-        except GenesisEvmEvidenceError as exc:
-            raise GenesisConflict(f"live Sepolia preflight failed: {exc}") from exc
         approval = _internal_review_approval(
             record,
             plan,
@@ -1414,7 +1440,11 @@ async def _prepare_bundle(
         )
     elif review_class == INDEPENDENT_REVIEW_CLASS:
         approval = _validate_audit_approval(
-            settings, record, plan, str(result["spendBundleId"])
+            settings,
+            record,
+            plan,
+            str(result["spendBundleId"]),
+            evm_evidence,
         )
     else:
         raise GenesisConflict("unsupported genesis review class")

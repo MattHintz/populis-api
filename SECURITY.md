@@ -39,6 +39,9 @@ created until every gate in this document is green.
   before login. Those hashes are public singleton state, are informational
   only, and never grant authority; administrator addresses and Merkle paths are
   loaded from hash-verified records and are not returned by that route.
+- The `authority_v2` route and artifact field names are preserved Chia schema
+  identifiers. They do not replace the Authority V3 governance evidence and
+  independent-review receipt required by the official Testnet11 launch.
 - Public metadata is not an authorization source. Every mutation revalidates
   current chain state, owner proof, canonical coordinates, and replay guards.
 
@@ -69,8 +72,11 @@ created until every gate in this document is green.
   machine; there is no public signer endpoint.
 - Nullifiers, bridge coins, EVM events, relay nonces, and enrollment actions are
   single-use in a persistent SQLite-WAL ledger.
-- Mainnet production refuses to start with a validator threshold below two.
-  Alpha's explicit single-validator policy cannot be promoted to mainnet.
+- Staging and production refuse to start in protocol-write mode unless the
+  configured validator policy is exactly two-of-three. Official Testnet11
+  strict preflight requires the exact ordered three-member roster from the
+  coordinated manifest and three healthy mTLS responses before bundle
+  preparation; runtime authorization remains two-of-three.
 - The UI may report verified only when Coinset confirms the current unspent
   vault successor whose puzzle hash contains the receipt's identity root.
 - Browser storage is never an authorization source.
@@ -118,10 +124,11 @@ created until every gate in this document is green.
 
 ## Acceptance Evidence
 
-The launch packet must contain clean protocol, EVM, API, customer-web, and
-admin-portal test reports; namespace scans of release archives; exploit
-regressions; reproducible puzzle and contract hashes; secret-rotation evidence;
-the signed ceremony bundle; and EVM plus BLS zkPassport-to-Chia smoke receipts.
+The launch packet must contain clean Protocol, EVM, Omnichain, API, legacy
+backend, Key of Solomon, Samuel, customer-web, and admin-portal test reports;
+namespace scans of release archives; exploit regressions; reproducible puzzle
+and contract hashes; secret-rotation evidence; the signed ceremony bundle; and
+EVM plus BLS zkPassport-to-Chia smoke receipts.
 
 No Critical, High, Medium, or Low security finding is accepted for Alpha.
 Partial or ambiguous genesis submission is reconciled from the durable exact

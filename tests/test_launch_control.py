@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.testclient import TestClient
 from chia_rs import AugSchemeMPL
 
 import solslot_api.launch_control as launch_control_module
 from solslot_api.config import Settings, get_settings
 from solslot_api.genesis import get_genesis_store
-from solslot_api.genesis_store import GenesisExpired, GenesisStore
+from solslot_api.genesis_store import GenesisConflict, GenesisExpired, GenesisStore
 from solslot_api.launch_control import router
 
 
@@ -344,6 +345,120 @@ def test_owner_link_is_single_use_and_scrubbed_into_http_only_session(tmp_path) 
     assert "already consumed" in repeated.json()["detail"]
 
 
+def test_guided_owner_claim_rejects_browser_review_class(tmp_path) -> None:
+    client, store, _ = _client(tmp_path)
+
+    rejected = client.post(
+        "/admin/launch/claim",
+        json={
+            "token": ADMIN_TOKEN,
+            "displayName": "Owner Admin",
+            "reviewClass": "internal-engineering-testnet",
+        },
+    )
+
+    assert rejected.status_code == 422
+    assert store.active() is None
+
+
+@pytest.mark.asyncio
+async def test_guided_owner_claim_uses_server_review_class(
+    tmp_path,
+) -> None:
+    _, store, settings = _client(tmp_path)
+    assert settings.launch_genesis_review_class == "independent-release-review"
+
+    claimed = await launch_control_module.claim_owner_link(
+        launch_control_module.OwnerClaimRequest(
+            token=ADMIN_TOKEN, display_name="Owner Admin"
+        ),
+        Response(),
+        settings,
+        store,
+    )
+
+    assert claimed["claimed"] is True
+    assert store.active()["draft"]["reviewClass"] == "independent-release-review"
+
+
+@pytest.mark.asyncio
+async def test_guided_internal_disposable_flow_requires_server_selection(
+    tmp_path,
+) -> None:
+    _, store, settings = _client(tmp_path)
+    settings.launch_genesis_review_class = "internal-engineering-testnet"
+
+    claimed = await launch_control_module.claim_owner_link(
+        launch_control_module.OwnerClaimRequest(
+            token=ADMIN_TOKEN, display_name="Internal Test Owner"
+        ),
+        Response(),
+        settings,
+        store,
+    )
+
+    assert claimed["claimed"] is True
+    assert store.active()["draft"]["reviewClass"] == "internal-engineering-testnet"
+
+
+@pytest.mark.asyncio
+async def test_official_claim_rejects_stale_internal_draft_without_consuming_link(
+    tmp_path,
+) -> None:
+    _, store, settings = _client(tmp_path)
+    release = launch_control_module._load_release_evidence(settings)
+    stale_ceremony = "0x" + "ac" * 32
+    store.create_draft(
+        stale_ceremony,
+        {
+            "schemaVersion": 2,
+            "sourceManifestVersion": launch_control_module.SOURCE_MANIFEST_VERSION,
+            "network": "testnet11",
+            "evmChainId": 11155111,
+            "reviewClass": "internal-engineering-testnet",
+            "releaseTag": release["releaseTag"],
+            "releaseEvidenceHash": release["fileSha256"],
+            "sourceShas": release["sourceShas"],
+        },
+        now=100,
+    )
+    body = launch_control_module.OwnerClaimRequest(
+        token=ADMIN_TOKEN,
+        display_name="Official Owner",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await launch_control_module.claim_owner_link(
+            body,
+            Response(),
+            settings,
+            store,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "protected launch policy" in str(exc_info.value.detail)
+    claim_hash = launch_control_module._token_hash(ADMIN_TOKEN)
+    assert store.owner_claim_used(claim_hash) is False
+    assert store.active()["ceremony_id"] == stale_ceremony
+
+    store.abandon(
+        stale_ceremony,
+        "Superseded by the protected official release policy.",
+        now=101,
+    )
+    claimed = await launch_control_module.claim_owner_link(
+        body,
+        Response(),
+        settings,
+        store,
+    )
+
+    assert claimed["claimed"] is True
+    assert claimed["ceremonyId"] != stale_ceremony
+    assert store.active()["draft"]["reviewClass"] == "independent-release-review"
+    assert store.owner_claim_used(claim_hash) is True
+
+
 def test_enrolled_wallet_resumes_without_token_or_ceremony_id(tmp_path) -> None:
     client, _, _ = _client(tmp_path)
     owner, ceremony_id = _claim_and_enroll_owner(client)
@@ -369,7 +484,14 @@ def test_enrolled_wallet_resumes_without_token_or_ceremony_id(tmp_path) -> None:
     assert evm_readiness["status"] == "Blocked"
     assert evm_readiness["action"] == "installEvmEvidence"
     assert evm_readiness["evidence"]["deploymentEvidenceInstalled"] is False
-    assert evm_readiness["evidence"]["auditApprovalInstalled"] is False
+    assert "auditApprovalInstalled" not in evm_readiness["evidence"]
+
+    audit_readiness = next(
+        item for item in body["readiness"] if item["id"] == "planAudit"
+    )
+    assert audit_readiness["status"] == "Waiting"
+    assert audit_readiness["blocksCeremony"] is False
+    assert audit_readiness["evidence"]["auditApprovalRequired"] is False
 
     validator_readiness = next(
         item for item in body["readiness"] if item["id"] == "validators"
@@ -684,6 +806,194 @@ def test_post_genesis_settlement_does_not_block_ceremony_task_selection() -> Non
         readiness,
     )
     assert after_genesis["title"] == "Customer payment test follows launch"
+
+
+def test_incomplete_payment_rail_does_not_block_genesis_task_selection() -> None:
+    readiness = [
+        {
+            "id": "railOwnership",
+            "title": "Base Sepolia rail ownership",
+            "status": "Waiting",
+            "impact": "The payment rail remains inactive.",
+            "assignedRole": "administrator",
+            "blocksCeremony": False,
+        }
+    ]
+
+    task = launch_control_module._task_for(
+        {
+            "state": "plan_approved",
+            "plan_expires_at": int(time.time()) + 600,
+            "invitations": [{"consumed_at": 1}] * 3,
+        },
+        readiness,
+    )
+
+    assert task["action"] == "preflight"
+
+
+def test_plan_audit_waits_for_independent_plan_and_internal_flow_skips_file(
+    tmp_path,
+) -> None:
+    _, _, settings = _client(tmp_path)
+    independent = {
+        "state": "roster_frozen",
+        "draft": {"reviewClass": "independent-release-review"},
+    }
+
+    before_plan = launch_control_module._audit_readiness(settings, independent)
+    assert before_plan["status"] == "Waiting"
+    assert before_plan["blocksCeremony"] is False
+    assert before_plan["evidence"]["auditApprovalRequired"] is False
+
+    independent["state"] = "plan_approved"
+    strict_gate = launch_control_module._audit_readiness(settings, independent)
+    assert strict_gate["status"] == "Blocked"
+    assert strict_gate.get("blocksCeremony", True) is True
+    assert strict_gate["evidence"]["auditApprovalRequired"] is True
+
+    internal = {
+        "state": "plan_approved",
+        "draft": {"reviewClass": "internal-engineering-testnet"},
+    }
+    disposable = launch_control_module._audit_readiness(settings, internal)
+    assert disposable["status"] == "Healthy"
+    assert disposable["blocksCeremony"] is False
+    assert disposable["evidence"]["auditApprovalRequired"] is False
+
+
+def test_plan_build_requires_sepolia_deployment_but_not_plan_audit(tmp_path) -> None:
+    _, _, settings = _client(tmp_path)
+
+    with pytest.raises(GenesisConflict, match="Sepolia deployment evidence"):
+        launch_control_module._require_preplan_evm_evidence(settings)
+
+    deployment_path = tmp_path / "deployment.json"
+    deployment_path.write_text("{}", encoding="utf-8")
+    settings.genesis_evm_deployment_path = str(deployment_path)
+    settings.genesis_audit_approval_path = str(tmp_path / "not-created.json")
+
+    launch_control_module._require_preplan_evm_evidence(settings)
+    assert not Path(settings.genesis_audit_approval_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_guided_strict_preflight_stops_before_bundle_on_missing_audit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _, _, settings = _client(tmp_path)
+    ceremony_id = "0x" + "ab" * 32
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=1,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=int(time.time()) + 600,
+    )
+
+    class Store:
+        @staticmethod
+        def get(actual_ceremony_id):
+            assert actual_ceremony_id == ceremony_id
+            return {
+                "state": "plan_approved",
+                "plan_hash": "0x" + "34" * 32,
+                "plan_expires_at": int(time.time()) + 600,
+                "draft": {"reviewClass": "independent-release-review"},
+            }
+
+    async def fake_readiness(*_args):
+        return [
+            {
+                "id": "planAudit",
+                "title": "Independent plan audit",
+                "status": "Blocked",
+                "impact": "Missing plan-bound approval.",
+                "assignedRole": "technical-coadmin",
+            }
+        ]
+
+    async def unexpected_prepare(*_args):
+        raise AssertionError("bundle preparation must not run past the readiness gate")
+
+    monkeypatch.setattr(launch_control_module, "_readiness", fake_readiness)
+    monkeypatch.setattr(launch_control_module, "_prepare_bundle", unexpected_prepare)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await launch_control_module.guided_preflight(
+            object(), settings, Store(), session  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["findings"][0]["id"] == "planAudit"
+
+
+@pytest.mark.asyncio
+async def test_payment_activation_requires_completed_base_sepolia_ownership(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _, _, settings = _client(tmp_path)
+    ceremony_id = "0x" + "cd" * 32
+    gate = {
+        "payloadHash": "0x" + "56" * 32,
+        "opensAt": int(time.time()) - 60,
+        "closesAt": int(time.time()) + 600,
+        "configuredState": "pending",
+        "state": "pending",
+    }
+
+    class Store:
+        @staticmethod
+        def get(actual_ceremony_id):
+            assert actual_ceremony_id == ceremony_id
+            return {"state": "locked"}
+
+        @staticmethod
+        def gates(actual_ceremony_id):
+            assert actual_ceremony_id == ceremony_id
+            return {"purchases": gate}
+
+        @staticmethod
+        def action_approvals(actual_ceremony_id, _action_id):
+            assert actual_ceremony_id == ceremony_id
+            return {"approved": True}
+
+        @staticmethod
+        def upsert_gate(*_args, **_kwargs):
+            raise AssertionError("payment gate must stay closed")
+
+    session = launch_control_module.LaunchSession(
+        ceremony_id=ceremony_id,
+        slot=1,
+        wallet="0x" + "12" * 20,
+        setup=False,
+        expires_at=int(time.time()) + 600,
+    )
+    monkeypatch.setattr(
+        launch_control_module,
+        "require_completed_rehearsal",
+        lambda *_args: ({"state": "COMPLETE"}, "0x" + "78" * 32),
+    )
+    monkeypatch.setattr(
+        launch_control_module,
+        "get_ownership_activation_store",
+        lambda _settings: object(),
+    )
+    monkeypatch.setattr(
+        launch_control_module,
+        "_rail_phase_status",
+        lambda _settings, _store: {"state": "WAITING_FOR_DELAY"},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await launch_control_module.activate_gate(
+            "purchases", settings, Store(), session  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "rail ownership is active" in str(exc_info.value.detail)
 
 
 def test_expired_approved_plan_routes_owner_to_exact_renewal() -> None:

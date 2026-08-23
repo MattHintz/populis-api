@@ -848,7 +848,7 @@ class GenesisStore:
             ).fetchone():
                 raise GenesisConflict("owner launch link was already consumed")
             active = connection.execute(
-                "SELECT ceremony_id FROM ceremonies "
+                "SELECT ceremony_id,draft_json FROM ceremonies "
                 "WHERE state NOT IN ('locked', 'abandoned') ORDER BY created_at DESC"
             ).fetchall()
             if len(active) > 1:
@@ -857,6 +857,11 @@ class GenesisStore:
                 )
             if active:
                 selected_id = str(active[0]["ceremony_id"])
+                if str(active[0]["draft_json"]) != encoded:
+                    raise GenesisConflict(
+                        "active ceremony does not match the protected launch policy; "
+                        "abandon the stale launch before claiming this release"
+                    )
             else:
                 selected_id = ceremony_id
                 try:
