@@ -4,6 +4,13 @@ The Solslot V2 credential bridge uses three independent BLS signers and a
 two-signature threshold. The public API coordinates claims but holds no
 validator seed and never mounts validator signing routes.
 
+For the official Testnet11 ceremony, all three signer health responses must be
+bound to the exact API and Protocol commits in the coordinated
+`solslot-v2-alpha-rc27.33-20260823` source manifest. Do not substitute a prior
+RC placeholder, uploaded health JSON, or a two-of-three reachability result for
+the required three-of-three pre-genesis health check. Payment/Stripe readiness
+is a separate post-genesis activation gate.
+
 ## Topology
 
 | Role | WireGuard address | Runtime |
@@ -119,8 +126,8 @@ not satisfy preflight.
 
 ```bash
 .venv/bin/python scripts/check_validator_fleet.py \
-  --api-commit <rc2-api-sha> \
-  --protocol-commit <rc2-protocol-sha> \
+  --api-commit <exact-rc27.33-api-sha-from-source-manifest> \
+  --protocol-commit <exact-rc27.33-protocol-sha-from-source-manifest> \
   --bridge-policy-hash 0x<policy> \
   --forwarder 0x<address> \
   --verifier-adapter 0x<address> \

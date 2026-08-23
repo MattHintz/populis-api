@@ -260,11 +260,13 @@ release or shared state. Public seed-generation tooling is intentionally part
 of the release archive so operators can prepare signer hosts offline; its
 filename is not evidence that a private seed is present.
 
-Reusable credentials follow
-`docs/CREDENTIAL_CARRYOVER_RC2_20260714.md`. A release does not trigger blanket
-rotation. The exposed provider credential must be revoked and replaced; new
-signer and private-network credentials are installed directly on their target
-hosts.
+The dated `docs/CREDENTIAL_CARRYOVER_RC2_20260714.md` is historical provenance,
+not a current launch checklist. RC27.33 requires a new private carryover record
+bound to `solslot-v2-alpha-rc27.33-20260823`, verified by two current operators,
+and containing identifiers and public fingerprints only. A release does not
+trigger blanket rotation. The exposed provider credential must be revoked and
+replaced; new signer and private-network credentials are installed directly on
+their target hosts. Never reuse a prior one-time ceremony token.
 
 ## Bridge Pool
 

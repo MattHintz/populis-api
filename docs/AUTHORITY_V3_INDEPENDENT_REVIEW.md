@@ -1,5 +1,12 @@
 # Authority V3 Independent Review Handoff
 
+This procedure applies to the exact coordinated release. For the current
+official Testnet11 candidate, every request and receipt must bind to
+`solslot-v2-alpha-rc27.33-20260823` after all nine final commits are on
+`main`, `release/testnet-alpha-rc27.33-20260823`, and the annotated release
+tag. RC27.32 review notes remain historical evidence and cannot approve a
+changed RC27.33 source scope.
+
 ## Purpose
 
 Authority V3 cannot make the alpha ceremony ready by itself. A reviewer outside
@@ -108,7 +115,8 @@ the API evidence loader.
 
 ## Finalize The Receipt
 
-The independent reviewer can run:
+After the live Base Sepolia Authority V3 deployment exists, the independent
+reviewer can run:
 
 ```bash
 python scripts/finalize_authority_v3_review.py \

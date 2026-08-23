@@ -1,5 +1,13 @@
 # RC2 Credential Carryover Record - 2026-07-14
 
+> **Historical record — not a current ceremony checklist.** Preserve the dated
+> body below as July 2026 provenance, but do not complete its pending table or
+> use it to authorize RC27.33. The official Testnet11 release requires
+> a new private credential-carryover record bound to
+> `solslot-v2-alpha-rc27.33-20260823`, current host fingerprints, two current
+> operators, and proof that the exposed provider credential was revoked and
+> replaced. A July one-time `SOLSLOT_ADMIN_TOKEN` must never be reused.
+
 This record defines which credentials carry into the Solslot V2 Alpha release.
 It contains identifiers and public fingerprints only. Secret values, seed
 material, bearer tokens, recovery phrases, and private keys must never be

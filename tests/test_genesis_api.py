@@ -1949,6 +1949,114 @@ def test_preflight_returns_canonical_review_approval_for_offline_gate(
     ).hexdigest()
 
 
+def _independent_audit_fixture(tmp_path):
+    settings = Settings(
+        runtime_environment="test",
+        network="testnet11",
+        genesis_audit_approval_path=str(tmp_path / "independent-approval.json"),
+        cors_origins="",
+    )
+    ceremony_id = "0x" + "a1" * 32
+    plan_hash = "0x" + "a2" * 32
+    spend_bundle_id = "0x" + "a3" * 32
+    addresses = {
+        "forwarder": "0x" + "11" * 20,
+        "verifierAdapter": "0x" + "22" * 20,
+        "attestationEmitter": "0x" + "33" * 20,
+    }
+    contracts = {
+        name: {
+            "address": address,
+            "bytecodeHash": "0x" + bytes([index]).hex() * 32,
+            "confirmations": 12,
+        }
+        for index, (name, address) in enumerate(addresses.items(), start=1)
+    }
+    validator_keys = ["0x" + f"{index:02x}" * 48 for index in (1, 2, 3)]
+    record = {
+        "ceremony_id": ceremony_id,
+        "plan_hash": plan_hash,
+        "draft": {
+            "reviewClass": "independent-release-review",
+            "sourceShas": _source_shas(),
+        },
+    }
+    plan = {
+        "evmAddresses": addresses,
+        "validatorSet": {"pubkeys": validator_keys},
+    }
+    approval = {
+        "schemaVersion": 2,
+        "sourceManifestVersion": 4,
+        "reviewClass": "independent-release-review",
+        "ceremonyId": ceremony_id,
+        "planHash": plan_hash,
+        "sourceShas": _source_shas(),
+        "consensusSimulationBundleId": spend_bundle_id,
+        "approvals": [
+            {
+                "lane": lane,
+                "approved": True,
+                "reviewer": f"independent-{index}",
+                "evidenceHash": "0x" + bytes([index + 10]).hex() * 32,
+            }
+            for index, lane in enumerate(genesis_module.REQUIRED_AUDIT_LANES)
+        ],
+        "evmContracts": contracts,
+        "validators": {"threshold": 2, "pubkeys": validator_keys},
+    }
+    evm_evidence = {"contracts": contracts}
+    return settings, record, plan, spend_bundle_id, approval, evm_evidence
+
+
+def test_independent_audit_is_strictly_plan_and_live_deployment_bound(
+    tmp_path,
+) -> None:
+    settings, record, plan, spend_bundle_id, approval, evm_evidence = (
+        _independent_audit_fixture(tmp_path)
+    )
+    Path(settings.genesis_audit_approval_path).write_text(
+        json.dumps(approval), encoding="utf-8"
+    )
+
+    validated = genesis_module._validate_audit_approval(
+        settings, record, plan, spend_bundle_id, evm_evidence
+    )
+
+    assert validated == approval
+
+    approval["planHash"] = "0x" + "ff" * 32
+    Path(settings.genesis_audit_approval_path).write_text(
+        json.dumps(approval), encoding="utf-8"
+    )
+    with pytest.raises(GenesisConflict, match="planHash does not match"):
+        genesis_module._validate_audit_approval(
+            settings, record, plan, spend_bundle_id, evm_evidence
+        )
+
+
+def test_independent_audit_rejects_missing_or_live_mismatched_evidence(
+    tmp_path,
+) -> None:
+    settings, record, plan, spend_bundle_id, approval, evm_evidence = (
+        _independent_audit_fixture(tmp_path)
+    )
+
+    with pytest.raises(GenesisConflict, match="approval file is missing"):
+        genesis_module._validate_audit_approval(
+            settings, record, plan, spend_bundle_id, evm_evidence
+        )
+
+    Path(settings.genesis_audit_approval_path).write_text(
+        json.dumps(approval), encoding="utf-8"
+    )
+    evm_evidence["contracts"]["forwarder"]["bytecodeHash"] = "0x" + "ee" * 32
+    with pytest.raises(GenesisConflict, match="does not match live evidence"):
+        genesis_module._validate_audit_approval(
+            settings, record, plan, spend_bundle_id, evm_evidence
+        )
+
+
 def test_wrong_admin_cannot_sign_frozen_plan(tmp_path) -> None:
     client, store, _ = _client(tmp_path)
     ceremony_id, _ = _create_and_enroll(client, store)

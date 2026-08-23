@@ -23,6 +23,8 @@ The V2 cutover is intentionally breaking:
 - Admin JWTs are issued only to EIP-712 members in a records file whose
   launcher and hash match the current admin-authority singleton.
 - The bootstrap operator token is limited to the run-once ceremony surface.
+- The official guided Testnet11 launch review class is a protected server
+  setting. A browser cannot downgrade it from `independent-release-review`.
 - zkPassport validator signing is internal. There is no public signing route.
 - Offer artifacts require a current, server-confirmed Chia credential receipt.
 

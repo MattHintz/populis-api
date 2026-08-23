@@ -43,6 +43,7 @@ from .authority_v3_review import (
 from .config import Settings, get_settings
 from .evm_auth import normalize_evm_address, recover_evm_signer
 from .genesis import (
+    INDEPENDENT_REVIEW_CLASS,
     INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
     PlanRequest,
     SignaturePrepareRequest,
@@ -132,6 +133,16 @@ PLACEHOLDER_FUNDING_IDS = {
     name: "0x" + f"{index:02x}" * 32
     for index, name in enumerate(FUNDING_NAMES, start=1)
 }
+PLAN_BOUND_AUDIT_STATES = frozenset(
+    {
+        "plan_approved",
+        "broadcast",
+        "confirmed",
+        "artifact_pending",
+        "artifact_signed",
+        "locked",
+    }
+)
 
 
 class ApiModel(BaseModel):
@@ -139,6 +150,8 @@ class ApiModel(BaseModel):
 
 
 class OwnerClaimRequest(ApiModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
     token: str = Field(min_length=32, max_length=512)
     display_name: str = Field("Owner", alias="displayName", min_length=2, max_length=80)
     email: Optional[str] = Field(None, max_length=254)
@@ -1010,6 +1023,97 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
     return {"title": title, "body": "", "assignedRole": role, "action": action}
 
 
+def _audit_readiness(
+    settings: Settings,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe the plan-bound audit gate without blocking plan creation.
+
+    The guided review class is fixed when the server creates the draft.  An
+    independent approval cannot be meaningfully checked until that draft has
+    an owner-plus-one approved plan, because the approval binds the ceremony
+    id, plan hash, and deterministic simulation bundle id.
+    """
+
+    review_class = str(record.get("draft", {}).get("reviewClass", ""))
+    approval_installed = Path(settings.genesis_audit_approval_path).is_file()
+    if review_class == INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS:
+        return {
+            "id": "planAudit",
+            "title": "Disposable internal Testnet11 review",
+            "status": "Healthy",
+            "impact": (
+                "This server-selected disposable flow produces an unaudited "
+                "internal approval at strict preflight. It is not the official "
+                "independently reviewed genesis."
+            ),
+            "assignedRole": "system",
+            "blocksCeremony": False,
+            "evidence": {
+                "reviewClass": review_class,
+                "auditApprovalInstalled": approval_installed,
+                "auditApprovalRequired": False,
+            },
+        }
+    if review_class != INDEPENDENT_REVIEW_CLASS:
+        return {
+            "id": "planAudit",
+            "title": "Unsupported launch review policy",
+            "status": "Blocked",
+            "impact": "The protected server review class is not supported.",
+            "assignedRole": "technical-coadmin",
+            "action": "repairReviewPolicy",
+            "evidence": {"reviewClass": review_class},
+        }
+
+    plan_is_approved = str(record.get("state")) in PLAN_BOUND_AUDIT_STATES
+    if not plan_is_approved:
+        return {
+            "id": "planAudit",
+            "title": "Independent plan audit follows plan approval",
+            "status": "Waiting",
+            "impact": (
+                "After the owner and one coadministrator approve the exact plan, "
+                "install its independent audit approval before final preflight."
+            ),
+            "assignedRole": "technical-coadmin",
+            "blocksCeremony": False,
+            "evidence": {
+                "reviewClass": review_class,
+                "auditApprovalInstalled": approval_installed,
+                "auditApprovalRequired": False,
+            },
+        }
+    return {
+        "id": "planAudit",
+        "title": "Independent plan audit",
+        "status": "Healthy" if approval_installed else "Blocked",
+        "impact": (
+            "The plan-bound audit approval is installed and will be validated "
+            "against the exact plan and live Sepolia deployment at strict preflight."
+            if approval_installed
+            else (
+                "The approved plan requires a matching independent audit approval "
+                "before strict preflight."
+            )
+        ),
+        "assignedRole": "technical-coadmin",
+        "action": None if approval_installed else "installPlanAudit",
+        "evidence": {
+            "reviewClass": review_class,
+            "auditApprovalInstalled": approval_installed,
+            "auditApprovalRequired": True,
+        },
+    }
+
+
+def _require_preplan_evm_evidence(settings: Settings) -> None:
+    if not Path(settings.genesis_evm_deployment_path).is_file():
+        raise GenesisConflict(
+            "install the protected Sepolia deployment evidence before building the plan"
+        )
+
+
 async def _readiness(
     request: Request,
     settings: Settings,
@@ -1082,19 +1186,18 @@ async def _readiness(
         )
 
     deployment_path = Path(settings.genesis_evm_deployment_path)
-    approval_path = Path(settings.genesis_audit_approval_path)
-    evm_evidence_ready = deployment_path.is_file() and approval_path.is_file()
+    evm_evidence_ready = deployment_path.is_file()
     items.append(
         {
             "id": "evmEvidence",
             "title": "Sepolia identity contracts",
             "status": "Healthy" if evm_evidence_ready else "Blocked",
             "impact": (
-                "The reviewed deployment and audit evidence are installed. "
-                "The wizard will recheck receipts and contract code before launch."
+                "The Sepolia deployment evidence is installed. The wizard will "
+                "recheck receipts and contract code before launch."
                 if evm_evidence_ready
                 else (
-                    "The reviewed Sepolia deployment evidence is not installed. "
+                    "The Sepolia deployment evidence is not installed. "
                     "A technical coadministrator must finish this protected server step."
                 )
             ),
@@ -1102,11 +1205,11 @@ async def _readiness(
             "action": None if evm_evidence_ready else "installEvmEvidence",
             "evidence": {
                 "deploymentEvidenceInstalled": deployment_path.is_file(),
-                "auditApprovalInstalled": approval_path.is_file(),
                 "requiredConfirmations": settings.genesis_sepolia_confirmations,
             },
         }
     )
+    items.append(_audit_readiness(settings, record))
 
     recovery_kits = store.recovery_kits(str(record["ceremony_id"]))
     recovery_ready = (
@@ -1392,6 +1495,7 @@ async def _readiness(
                 ),
                 "assignedRole": "administrator",
                 "action": None if done else "railOwnership",
+                "blocksCeremony": False,
                 "evidence": ownership,
             }
         )
@@ -1407,6 +1511,7 @@ async def _readiness(
                 ),
                 "assignedRole": "administrator",
                 "action": "railOwnership",
+                "blocksCeremony": False,
                 "evidence": {
                     "technicalReason": str(getattr(exc, "detail", exc)),
                 },
@@ -1555,7 +1660,7 @@ async def claim_owner_link(
                 "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
                 "network": "testnet11",
                 "evmChainId": 11155111,
-                "reviewClass": INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS,
+                "reviewClass": settings.launch_genesis_review_class,
                 "releaseTag": release["releaseTag"],
                 "releaseEvidenceHash": release["fileSha256"],
                 "sourceShas": release["sourceShas"],
@@ -2314,6 +2419,25 @@ async def activate_gate(
                     f"and exact-refund test passes: {exc}"
                 ),
             ) from exc
+        try:
+            ownership_store = get_ownership_activation_store(settings)
+            ownership = _rail_phase_status(settings, ownership_store)
+        except (OwnershipActivationError, HTTPException) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Customer payments remain locked until Base Sepolia rail "
+                    "ownership is active."
+                ),
+            ) from exc
+        if ownership.get("state") != "DONE":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Customer payments remain locked until Base Sepolia rail "
+                    "ownership is active."
+                ),
+            )
     return store.upsert_gate(
         session.ceremony_id,
         gate_name=gate_name,
@@ -2478,6 +2602,7 @@ async def build_guided_plan(
         record = store.get(session.ceremony_id)
         if record["state"] != "roster_frozen":
             raise GenesisConflict("confirm the three-administrator roster first")
+        _require_preplan_evm_evidence(settings)
         funding = store.funding_receipt(session.ceremony_id)
         if not funding or funding["state"] != "confirmed":
             raise GenesisConflict("confirm the fixed ceremony funding first")

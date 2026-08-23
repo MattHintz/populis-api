@@ -88,7 +88,7 @@ def test_example_uses_only_live_validator_stripe_setting_names() -> None:
         / "validator.env.example"
     ).read_text(encoding="utf-8")
 
-    assert "SOLSLOT_VALIDATOR_STRIPE_SETTLEMENT_ENABLED=true" in example
+    assert "SOLSLOT_VALIDATOR_STRIPE_SETTLEMENT_ENABLED=false" in example
     assert "SOLSLOT_VALIDATOR_STRIPE_MODE=test" in example
     assert "SOLSLOT_VALIDATOR_STRIPE_API_URL=https://api.stripe.com" in example
     assert "SOLSLOT_VALIDATOR_STRIPE_LIVEMODE" not in example

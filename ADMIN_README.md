@@ -1,22 +1,36 @@
 # Solslot V2 Administrator Authority
 
-The API has two deliberately separate authority surfaces.
+The API has deliberately separate ceremony and post-genesis authority
+surfaces.
+
+## Official Testnet11 Operator Boundary
+
+For `solslot-v2-alpha-rc27.33-20260823`, the official initialization path is
+the guided owner claim with the protected server review class
+`independent-release-review`. The protected direct genesis API is an operator
+compatibility surface, not a way to bypass guided readiness, independent
+evidence, or strict preflight.
+
+Names such as `admin_authority_v2`, `bootstrap_manifest_v2.json`, and the
+`/admin/auth/authority_v2` route identify preserved Chia puzzle, artifact, or
+API schemas. They do not describe the current release authority model and do
+not replace the cross-chain Authority V3 evidence and independent-review
+receipt required for the official Testnet11 ceremony.
 
 ## Ceremony Authority
 
-`SOLSLOT_ADMIN_TOKEN` unlocks only the run-once ceremony endpoints while no
-bootstrap lock exists:
+`SOLSLOT_ADMIN_TOKEN` unlocks only the protected direct `/admin/genesis/*`
+operator endpoints while isolated ceremony mode is active. The retired
+`/admin/bootstrap/*`, `/admin/deploy/protocol`, `/admin/deployment`, and
+`/admin/protocol-config/finalize` routes are intentionally not mounted.
 
-- `POST /admin/bootstrap/challenge`
-- `POST /admin/deploy/protocol`
-- `POST /admin/protocol-config/finalize`
-- `GET /admin/deployment`
-
-The challenge exchanges the bearer credential for an HTTP-only, secure,
-same-site bootstrap cookie. The cookie is scoped to `/admin/bootstrap`, has a
-short TTL, and cannot authorize normal admin routes. Finalization writes the
-bootstrap lock last. The bearer credential must be rotated or removed after
-the ceremony evidence is archived.
+The official guided flow instead starts from the single-use owner claim and
+issues an HTTP-only, secure, same-site launch session. Administrator wallets
+then sign the exact enrollment, plan, gate, and artifact actions required by
+the ceremony. Neither a guided session nor the direct operator token can
+authorize normal post-genesis admin routes. Finalization writes the bootstrap
+lock last; remove the owner-claim and operator-token material immediately
+after the ceremony evidence is archived.
 
 ## Chain-Bound Admin Authority
 
