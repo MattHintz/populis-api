@@ -973,17 +973,17 @@ class Settings(BaseSettings):
     launch_genesis_review_class: Literal[
         "independent-release-review", "internal-engineering-testnet"
     ] = "independent-release-review"
-    launch_release_tag: str = "solslot-v2-alpha-rc27.33-20260823"
+    launch_release_tag: str = "solslot-v2-alpha-rc27.35-20260823"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (
-        "./state/source-freeze-evidence-rc27.33.json"
+        "./state/source-freeze-evidence-rc27.35.json"
     )
     launch_source_evidence_sha256: Optional[str] = None
     launch_plan_template_path: Optional[str] = (
-        "./state/plan-input-template-rc27.33.json"
+        "./state/plan-input-template-rc27.35.json"
     )
     launch_settlement_rehearsal_path: Optional[str] = (
-        "./state/settlement-rehearsal-rc27.33.json"
+        "./state/settlement-rehearsal-rc27.35.json"
     )
     launch_rehearsal_service_url: Optional[str] = None
     launch_rehearsal_service_token: Optional[str] = None

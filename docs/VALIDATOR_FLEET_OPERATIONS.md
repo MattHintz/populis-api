@@ -6,7 +6,7 @@ validator seed and never mounts validator signing routes.
 
 For the official Testnet11 ceremony, all three signer health responses must be
 bound to the exact API and Protocol commits in the coordinated
-`solslot-v2-alpha-rc27.33-20260823` source manifest. Do not substitute a prior
+`solslot-v2-alpha-rc27.35-20260823` source manifest. Do not substitute a prior
 RC placeholder, uploaded health JSON, or a two-of-three reachability result for
 the required three-of-three pre-genesis health check. Payment/Stripe readiness
 is a separate post-genesis activation gate.
@@ -126,8 +126,8 @@ not satisfy preflight.
 
 ```bash
 .venv/bin/python scripts/check_validator_fleet.py \
-  --api-commit <exact-rc27.33-api-sha-from-source-manifest> \
-  --protocol-commit <exact-rc27.33-protocol-sha-from-source-manifest> \
+  --api-commit <exact-rc27.35-api-sha-from-source-manifest> \
+  --protocol-commit <exact-rc27.35-protocol-sha-from-source-manifest> \
   --bridge-policy-hash 0x<policy> \
   --forwarder 0x<address> \
   --verifier-adapter 0x<address> \
