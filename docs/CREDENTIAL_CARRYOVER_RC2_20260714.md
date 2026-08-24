@@ -2,9 +2,9 @@
 
 > **Historical record — not a current ceremony checklist.** Preserve the dated
 > body below as July 2026 provenance, but do not complete its pending table or
-> use it to authorize RC27.33. The official Testnet11 release requires
+> use it to authorize RC27.35. The official Testnet11 release requires
 > a new private credential-carryover record bound to
-> `solslot-v2-alpha-rc27.33-20260823`, current host fingerprints, two current
+> `solslot-v2-alpha-rc27.35-20260823`, current host fingerprints, two current
 > operators, and proof that the exposed provider credential was revoked and
 > replaced. A July one-time `SOLSLOT_ADMIN_TOKEN` must never be reused.
 

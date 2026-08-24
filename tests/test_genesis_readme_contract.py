@@ -1,11 +1,26 @@
 from pathlib import Path
 
+from solslot_api.config import Settings
+
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_TAG = "solslot-v2-alpha-rc27.35-20260823"
+RELEASE_BRANCH = "release/testnet-alpha-rc27.35-20260823"
 
 
 def _read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
+
+
+def test_official_release_identity_is_consistent() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.launch_release_tag == RELEASE_TAG
+    assert RELEASE_TAG in _read(".env.example")
+    assert RELEASE_TAG in _read("GENESIS_README.md")
+    assert RELEASE_BRANCH in _read("GENESIS_README.md")
+    assert RELEASE_TAG in _read("docs/AUTHORITY_V3_INDEPENDENT_REVIEW.md")
+    assert RELEASE_BRANCH in _read("docs/AUTHORITY_V3_INDEPENDENT_REVIEW.md")
 
 
 def test_genesis_runbook_pins_breaking_v2_contract() -> None:

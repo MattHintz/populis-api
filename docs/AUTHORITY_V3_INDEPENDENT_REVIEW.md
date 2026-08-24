@@ -2,10 +2,10 @@
 
 This procedure applies to the exact coordinated release. For the current
 official Testnet11 candidate, every request and receipt must bind to
-`solslot-v2-alpha-rc27.33-20260823` after all nine final commits are on
-`main`, `release/testnet-alpha-rc27.33-20260823`, and the annotated release
+`solslot-v2-alpha-rc27.35-20260823` after all nine final commits are on
+`main`, `release/testnet-alpha-rc27.35-20260823`, and the annotated release
 tag. RC27.32 review notes remain historical evidence and cannot approve a
-changed RC27.33 source scope.
+changed RC27.35 source scope.
 
 ## Purpose
 

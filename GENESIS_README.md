@@ -7,8 +7,8 @@ No artifact from a retired deployment may be copied into the V2 state tree.
 ## Current Official Testnet11 Policy
 
 The current guided release target is
-`solslot-v2-alpha-rc27.33-20260823` on
-`release/testnet-alpha-rc27.33-20260823`. The browser cannot choose its review
+`solslot-v2-alpha-rc27.35-20260823` on
+`release/testnet-alpha-rc27.35-20260823`. The browser cannot choose its review
 class. The protected server setting
 `SOLSLOT_LAUNCH_GENESIS_REVIEW_CLASS=independent-release-review` is mandatory
 for the official Testnet11 genesis. An operator may explicitly configure
@@ -52,7 +52,7 @@ Do not begin until:
   gates. Alternatively, this is an explicitly configured
   `internal-engineering-testnet` disposable run with three distinct enrolled
   administrators and normal 2-of-3 plan/artifact signatures;
-- guided launch configuration names the exact RC27.33 tag, source-evidence
+- guided launch configuration names the exact RC27.35 tag, source-evidence
   path and SHA-256, plan-template path, and protected review class;
 - the credential carryover record is complete, the provider credential found
   in public history is revoked and replaced, signer 1/2 and private-network

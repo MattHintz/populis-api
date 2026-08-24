@@ -5,7 +5,7 @@ surfaces.
 
 ## Official Testnet11 Operator Boundary
 
-For `solslot-v2-alpha-rc27.33-20260823`, the official initialization path is
+For `solslot-v2-alpha-rc27.35-20260823`, the official initialization path is
 the guided owner claim with the protected server review class
 `independent-release-review`. The protected direct genesis API is an operator
 compatibility surface, not a way to bypass guided readiness, independent
