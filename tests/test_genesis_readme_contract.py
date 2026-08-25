@@ -4,8 +4,8 @@ from solslot_api.config import Settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE_TAG = "solslot-v2-alpha-rc27.35-20260823"
-RELEASE_BRANCH = "release/testnet-alpha-rc27.35-20260823"
+RELEASE_TAG = "solslot-v2-alpha-rc27.36-20260824"
+RELEASE_BRANCH = "release/testnet-alpha-rc27.36-20260824"
 
 
 def _read(relative: str) -> str:

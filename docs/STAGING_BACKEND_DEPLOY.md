@@ -261,8 +261,8 @@ of the release archive so operators can prepare signer hosts offline; its
 filename is not evidence that a private seed is present.
 
 The dated `docs/CREDENTIAL_CARRYOVER_RC2_20260714.md` is historical provenance,
-not a current launch checklist. RC27.35 requires a new private carryover record
-bound to `solslot-v2-alpha-rc27.35-20260823`, verified by two current operators,
+not a current launch checklist. RC27.36 requires a new private carryover record
+bound to `solslot-v2-alpha-rc27.36-20260824`, verified by two current operators,
 and containing identifiers and public fingerprints only. A release does not
 trigger blanket rotation. The exposed provider credential must be revoked and
 replaced; new signer and private-network credentials are installed directly on

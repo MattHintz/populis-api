@@ -73,7 +73,7 @@ def test_owner_claim_rejects_active_draft_from_another_launch_policy(
     official_draft = {
         **stale_draft,
         "reviewClass": "independent-release-review",
-        "releaseTag": "solslot-v2-alpha-rc27.35-20260823",
+        "releaseTag": "solslot-v2-alpha-rc27.36-20260824",
         "releaseEvidenceHash": "0x" + "22" * 32,
         "sourceShas": {"api": "2" * 40},
     }
@@ -100,7 +100,7 @@ def test_owner_claim_may_resume_only_an_exact_matching_active_draft(tmp_path) ->
         "network": "testnet11",
         "evmChainId": 11155111,
         "reviewClass": "independent-release-review",
-        "releaseTag": "solslot-v2-alpha-rc27.35-20260823",
+        "releaseTag": "solslot-v2-alpha-rc27.36-20260824",
         "releaseEvidenceHash": "0x" + "33" * 32,
         "sourceShas": {"api": "3" * 40},
     }
