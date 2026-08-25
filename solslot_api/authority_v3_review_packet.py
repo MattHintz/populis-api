@@ -290,7 +290,7 @@ def _release(value: object) -> tuple[str, str, str]:
     release_branch = "release/testnet-alpha-" + release_id.removeprefix(
         "solslot-v2-alpha-"
     )
-    inventory_release = match.group(1).split(".", 1)[0].upper()
+    inventory_release = match.group(1).upper()
     return release_id, release_branch, inventory_release
 
 

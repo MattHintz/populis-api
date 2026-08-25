@@ -85,7 +85,7 @@ def _request() -> dict:
     }
     puzzle_inventory = {
         "schema": "solslot.puzzle-hashes.v1",
-        "release": "RC27",
+        "release": "RC27.4",
         "canonicalChecksum": "11" * 32,
         "newPuzzleHashes": {},
         "changedPuzzleHashes": {},
@@ -124,6 +124,7 @@ def test_review_request_is_complete_and_cannot_approve() -> None:
     assert validated["schemaVersion"] == 2
     assert validated["release"]["releaseId"] == RELEASE_ID
     assert validated["release"]["releaseRefsVerified"] is True
+    assert validated["chiaAuthority"]["puzzleInventoryRelease"] == "RC27.4"
     assert "pullRequests" not in validated
     assert {
         item["scope"] for item in validated["trustBoundaries"]
@@ -213,7 +214,7 @@ def test_release_manifest_rejects_noncanonical_source_metadata() -> None:
             source_manifest_file_sha256="44" * 32,
             puzzle_inventory={
                 "schema": "solslot.puzzle-hashes.v1",
-                "release": "RC27",
+                "release": "RC27.4",
                 "canonicalChecksum": "11" * 32,
                 "newPuzzleHashes": {},
                 "changedPuzzleHashes": {},
