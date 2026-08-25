@@ -24,6 +24,15 @@ builder = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(builder)
 
 
+def test_patch_release_inventory_line_preserves_patch_identity() -> None:
+    assert (
+        builder._inventory_release_line(
+            "solslot-v2-alpha-rc27.35-20260823"
+        )
+        == "rc27.35"
+    )
+
+
 def test_release_ref_verification_requires_main_branch_and_tag(
     monkeypatch,
 ) -> None:

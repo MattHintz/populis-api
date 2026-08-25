@@ -36,6 +36,12 @@ ARGUMENT_NAMES = {
     "customerWeb": "customer-web-repo",
     "adminPortal": "admin-portal-repo",
 }
+
+
+def _inventory_release_line(release_id: str) -> str:
+    return release_id.removeprefix("solslot-v2-alpha-").split("-", 1)[0]
+
+
 def _git(path: Path, *args: str) -> str:
     try:
         result = subprocess.run(
@@ -166,12 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             release_branch=manifest["releaseBranch"],
             expected_commit=manifest["sourceShas"][source],
         )
-    release_line = (
-        manifest["releaseId"]
-        .removeprefix("solslot-v2-alpha-")
-        .split("-", 1)[0]
-        .split(".", 1)[0]
-    )
+    release_line = _inventory_release_line(manifest["releaseId"])
     inventory_path = args.puzzle_inventory or (
         args.protocol.resolve()
         / "release-manifests"
